@@ -10,6 +10,7 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -79,6 +80,13 @@ func New(beats []config.Beat, notifier Notifier, now func() time.Time) *Watcher 
 		metrics.BeatLastSeen.Set(float64(start.Unix()), b.ID)
 		metrics.BeatsReceived.Add(0, b.ID)
 	}
+	// Pre-mint the notification counter series at zero so an increase()
+	// alert sees the very first failure: a counter series born at a
+	// nonzero value has no earlier sample to diff against.
+	for _, kind := range []string{"missing", "recovered"} {
+		metrics.NotificationsSent.Add(0, kind)
+		metrics.NotificationsFailed.Add(0, kind)
+	}
 	return w
 }
 
@@ -98,11 +106,12 @@ func (w *Watcher) Beat(id string) bool {
 	wasAlerted := st.alerted
 	st.lastSeen = now
 	st.alerted = false
-	w.mu.Unlock()
-
+	// Publish the gauges under the lock so concurrent pings cannot write
+	// them out of state order (an older timestamp overwriting a newer one).
 	metrics.BeatsReceived.Inc(id)
 	metrics.BeatFresh.Set(1, id)
 	metrics.BeatLastSeen.Set(float64(now.Unix()), id)
+	w.mu.Unlock()
 
 	if wasAlerted {
 		select {
@@ -120,6 +129,22 @@ func (w *Watcher) Beat(id string) bool {
 // immediate delivery of queued recovered transitions. It is the only
 // goroutine that calls the notifier.
 func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
+	// Freshness gauges refresh on their own ticker: one overdue send can
+	// block the sender loop for tens of seconds (3x10s attempts + backoff,
+	// or 30s rate-limit waits), and the fresh gauge is the documented
+	// ground truth precisely when the webhook path is down.
+	go func() {
+		gauges := time.NewTicker(tick)
+		defer gauges.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-gauges.C:
+				w.refreshFreshness()
+			}
+		}
+	}()
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	for {
@@ -129,20 +154,40 @@ func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
 		case ev := <-w.recoveries:
 			w.sendRecovered(ctx, ev)
 		case <-ticker.C:
-			w.Sweep(ctx)
+			w.sweep(ctx)
 		}
 	}
 }
 
-// Sweep checks every beat against its deadline and sends the missing
+// refreshFreshness updates the per-beat freshness gauges without touching
+// notification state, so the metric ground truth stays current even while
+// the sender loop is blocked on a slow or unreachable webhook.
+func (w *Watcher) refreshFreshness() {
+	now := w.now()
+	w.mu.Lock()
+	for id, st := range w.beats {
+		if now.Sub(st.lastSeen) <= st.deadline {
+			metrics.BeatFresh.Set(1, id)
+		} else {
+			metrics.BeatFresh.Set(0, id)
+		}
+	}
+	w.mu.Unlock()
+}
+
+// sweep checks every beat against its deadline and sends the missing
 // notification for newly overdue beats. A failed send is not marked
 // alerted, so the next sweep retries it; the beat stays in one Discord
 // message per outage because alerted flips only on a delivered send.
-// Exported for tests; Run calls it on every tick.
-func (w *Watcher) Sweep(ctx context.Context) {
+// A delivered send that a ping raced (the beat pinged while the notice was
+// in flight) emits the recovered transition immediately and leaves the beat
+// armed for the next outage. Run calls it on every tick; in-package tests
+// call it directly.
+func (w *Watcher) sweep(ctx context.Context) {
 	now := w.now()
 
 	type due struct {
+		seen    time.Time // lastSeen observed when deciding to notify
 		id      string
 		silence time.Duration
 	}
@@ -157,13 +202,17 @@ func (w *Watcher) Sweep(ctx context.Context) {
 		}
 		metrics.BeatFresh.Set(0, id)
 		if !st.alerted {
-			overdue = append(overdue, due{id: id, silence: silence})
+			overdue = append(overdue, due{id: id, silence: silence, seen: st.lastSeen})
 		}
 	}
 	w.mu.Unlock()
 
 	for _, d := range overdue {
 		if err := w.notifier.BeatMissing(ctx, d.id, d.silence); err != nil {
+			if errors.Is(err, context.Canceled) {
+				slog.Info("missing notification abandoned, shutting down", "beat", d.id)
+				return
+			}
 			metrics.NotificationsFailed.Inc("missing")
 			slog.Error("missing notification failed, will retry next sweep",
 				"beat", d.id, "silence", d.silence.String(), "error", err)
@@ -171,15 +220,30 @@ func (w *Watcher) Sweep(ctx context.Context) {
 		}
 		metrics.NotificationsSent.Inc("missing")
 		slog.Info("beat missing, notified", "beat", d.id, "silence", d.silence.String())
-		w.mu.Lock()
-		if st, ok := w.beats[d.id]; ok {
-			// Mark alerted even if a ping raced in during the send: the
-			// missing message is out, so the next ping's recovered message
-			// keeps the story consistent.
-			st.alerted = true
+		if ev, raced := w.markDelivered(d.id, d.seen); raced {
+			w.sendRecovered(ctx, ev)
 		}
-		w.mu.Unlock()
 	}
+}
+
+// markDelivered records the outcome of a delivered missing send for id,
+// given the lastSeen observed when the sweep decided to notify. Normally it
+// marks the beat alerted. When a ping raced the send (lastSeen moved), Beat
+// saw alerted=false and queued no recovery, and marking alerted now would
+// swallow the NEXT outage's missing notice — so the beat stays re-armed and
+// the pending recovered transition is returned for immediate delivery.
+func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	st, ok := w.beats[id]
+	if !ok {
+		return recoveryEvent{}, false
+	}
+	if st.lastSeen.Equal(seen) {
+		st.alerted = true
+		return recoveryEvent{}, false
+	}
+	return recoveryEvent{id: id, downFor: st.lastSeen.Sub(seen)}, true
 }
 
 // sendRecovered delivers one queued recovered transition. Best-effort by
@@ -188,6 +252,10 @@ func (w *Watcher) Sweep(ctx context.Context) {
 // missing alert arrives.
 func (w *Watcher) sendRecovered(ctx context.Context, ev recoveryEvent) {
 	if err := w.notifier.BeatRecovered(ctx, ev.id, ev.downFor); err != nil {
+		if errors.Is(err, context.Canceled) {
+			slog.Info("recovered notification abandoned, shutting down", "beat", ev.id)
+			return
+		}
 		metrics.NotificationsFailed.Inc("recovered")
 		slog.Error("recovered notification failed",
 			"beat", ev.id, "down_for", ev.downFor.String(), "error", err)

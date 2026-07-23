@@ -18,7 +18,7 @@ Monitoring tells you when something visibly breaks. It stays quiet when the thin
 You configure named beats, each with a deadline. Anything that can send an HTTP request pings its beat (`POST /beat/<id>`); if a beat stays silent past its deadline, knell posts a missing notice to your Discord webhook, and a recovered notice when the pings return. Per-beat freshness is also exposed as Prometheus metrics, so a metrics stack can aggregate several knell instances into quorum views.
 
 - One binary on a `scratch` base — no shell, no libc, no dependencies to patch
-- Deadline clock starts at boot: a beat that never pings at all still alerts one deadline after start, so a restart never silently disarms the switch
+- Deadline clock starts at boot: a beat that never pings at all still alerts one deadline after start, so a restart never silently disarms the switch (the flip side: each restart re-arms full deadlines — see the restart-churn rule under Alerting)
 - One missing notice per outage (delivery is retried every sweep until it succeeds), one recovered notice when the beat returns
 - Unknown beat ids are rejected with 404 and never create metric series
 
@@ -57,6 +57,7 @@ Silence past the deadline rings the bell:
 | `BEATS` | — | required; comma-separated `id:deadline` list, e.g. `api:20m,backup:26h`. Ids match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; deadlines are Go durations, minimum `30s`, maximum 64 beats |
 | `DISCORD_WEBHOOK_URL` | — | required; the webhook notifications post to. `DISCORD_WEBHOOK_URL_FILE` points at a mounted secret file instead |
 | `NODE_NAME` | container hostname | names this observer instance in every notification |
+| `BEAT_TOKEN` | — | optional; when set, `/beat/{id}` requires `Authorization: Bearer <token>` from senders. Empty leaves the endpoint open |
 | `LISTEN_ADDR` | `:9190` | TCP listen address (`host:port`) |
 | `LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error`; unknown falls back to `info` |
 
@@ -71,6 +72,8 @@ A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup with a clear error ra
 | `GET /metrics` | Prometheus exposition |
 
 Request bodies on `/beat/{id}` are ignored, so webhook-shaped senders (an Alertmanager `webhook_configs` target, a CI notification hook) can point at it unchanged.
+
+Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away from anything that fetches links automatically — a chat client's URL preview, a crawler, an uptime prober. An automated fetch feeds the switch and can mask a dead sender.
 
 ## Notification semantics
 
@@ -114,6 +117,19 @@ knell is itself the alert path for the things it watches, so alert rules about k
     summary: "knell on {{ $labels.hostname }} is failing to deliver notifications"
 ```
 
+One caveat comes with the boot-armed clock: every restart re-arms each beat's full deadline, so an observer restarting more often than a beat's deadline never fires that beat's alert. The runtime metrics already expose this — alert on restart churn within your longest deadline window:
+
+```yaml
+# knell restarting faster than a beat's deadline (26h here) keeps re-arming
+# that beat's clock; the alert for an ongoing outage is deferred each time.
+- alert: KnellRestartChurn
+  expr: changes(process_start_time_seconds{job="knell"}[26h]) > 1
+  labels:
+    severity: warning
+  annotations:
+    summary: "knell on {{ $labels.instance }} keeps restarting within a beat deadline window; boot-armed clocks are re-armed before they can fire"
+```
+
 Running several instances? Point each sender at all of them and aggregate: `sum by (beat) (knell_beat_fresh)` gives an N-of-M quorum view where one observer being down degrades the count instead of paging falsely.
 
 ## Healthcheck
@@ -149,4 +165,4 @@ GPL-3.0 — see [LICENSE](LICENSE).
 
 This project is built with care and follows security best practices, but it is intended for personal / self-hosted use. No guarantees of fitness for production environments. Use at your own risk.
 
-This project was built with AI-assisted tooling using [Claude Opus](https://www.anthropic.com/claude) and [Kiro](https://kiro.dev). The human maintainer defines architecture, supervises implementation, and makes all final decisions.
+This project was built with AI-assisted tooling using [Claude](https://claude.com), [GPT](https://openai.com), and [Kiro](https://kiro.dev). The human maintainer defines architecture, supervises implementation, and makes all final decisions.

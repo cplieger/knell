@@ -222,3 +222,18 @@ func FuzzParseBeats(f *testing.F) {
 		}
 	})
 }
+
+func TestLoadInvalidLogLevelFallsBackToInfo(t *testing.T) {
+	t.Setenv("BEATS", "api:20m")
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
+	t.Setenv("NODE_NAME", "node-1")
+	t.Setenv("LOG_LEVEL", "chatty")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.LogLevel.String() != "INFO" {
+		t.Errorf("LogLevel = %v, want INFO (fallback for unknown value)", cfg.LogLevel)
+	}
+}

@@ -162,3 +162,52 @@ func TestErrorsNeverLeakWebhookURL(t *testing.T) {
 		t.Errorf("status error leaks webhook secret: %v", err)
 	}
 }
+
+func TestRateLimitRetriesAfterRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	// 429 is retried via WithRateLimitRetry, honoring Retry-After. Without
+	// that option a 429 would be terminal like the 404 case above.
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	d := New(srv.URL, "node-1")
+	defer d.Close()
+
+	start := time.Now()
+	if err := d.BeatMissing(context.Background(), "api", time.Hour); err != nil {
+		t.Fatalf("BeatMissing after rate-limit retry: %v", err)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Errorf("attempts = %d, want 2", got)
+	}
+	if elapsed := time.Since(start); elapsed < time.Second {
+		t.Errorf("retry waited %s, want >= 1s (Retry-After honored)", elapsed)
+	}
+}
+
+func TestRequestBuildErrorNeverLeaksWebhookURL(t *testing.T) {
+	t.Parallel()
+
+	// A control character makes http.NewRequestWithContext reject the URL;
+	// the raw parse error embeds the full URL (with its secret path), so
+	// the returned error must be reduced to the cause only.
+	d := New("http://127.0.0.1:9/api/webhooks/1234567890/verysecrettoken\x00", "node-1")
+	defer d.Close()
+
+	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	if err == nil {
+		t.Fatal("expected request-build error")
+	}
+	if strings.Contains(err.Error(), "verysecrettoken") {
+		t.Errorf("request-build error leaks webhook secret: %v", err)
+	}
+}

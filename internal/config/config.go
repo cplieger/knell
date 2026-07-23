@@ -45,6 +45,7 @@ type Config struct {
 	WebhookURL string
 	Node       string
 	ListenAddr string
+	BeatToken  string
 	Beats      []Beat
 	LogLevel   slog.Level
 }
@@ -71,6 +72,10 @@ func Load() (Config, error) {
 	if err := validateWebhookURL(webhook); err != nil {
 		return cfg, fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
 	}
+	// The URL itself is a secret and never logged; warn on scheme only.
+	if strings.HasPrefix(webhook, "http://") {
+		slog.Warn("DISCORD_WEBHOOK_URL uses plain http; the webhook URL is a secret and will transit unencrypted")
+	}
 	cfg.WebhookURL = webhook
 
 	cfg.Node = envx.String("NODE_NAME", "")
@@ -84,9 +89,13 @@ func Load() (Config, error) {
 
 	cfg.ListenAddr = envx.String("LISTEN_ADDR", ":9190")
 
-	level, ok := slogx.ParseLevel(envx.String("LOG_LEVEL", ""), slog.LevelInfo)
+	// BEAT_TOKEN optionally gates POST/GET /beat/{id}; empty disables the check.
+	cfg.BeatToken = envx.String("BEAT_TOKEN", "")
+
+	rawLevel := envx.String("LOG_LEVEL", "")
+	level, ok := slogx.ParseLevel(rawLevel, slog.LevelInfo)
 	if !ok {
-		slog.Warn("invalid LOG_LEVEL, using info", "value", os.Getenv("LOG_LEVEL"))
+		slog.Warn("invalid LOG_LEVEL, using info", "value", rawLevel)
 	}
 	cfg.LogLevel = level
 
@@ -142,6 +151,8 @@ func ParseBeats(raw string) ([]Beat, error) {
 func validateWebhookURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
+		// Deliberately not wrapped: a url.Error embeds the raw URL, and the
+		// webhook URL is a secret that must not reach the startup error log.
 		return errors.New("not a valid URL")
 	}
 	if u.Scheme != "https" && u.Scheme != "http" {

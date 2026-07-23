@@ -39,11 +39,14 @@ type call struct {
 	elapsed time.Duration
 }
 
-// fakeNotifier records calls and fails on demand.
+// fakeNotifier records calls and fails on demand. onMissing, when set, runs
+// inside BeatMissing to interleave work with an in-flight send (set it from
+// the same goroutine that calls sweep; no concurrent mutation).
 type fakeNotifier struct {
-	mu    sync.Mutex
-	calls []call
-	fail  error
+	mu        sync.Mutex
+	calls     []call
+	fail      error
+	onMissing func()
 }
 
 func (n *fakeNotifier) BeatMissing(_ context.Context, id string, silence time.Duration) error {
@@ -51,6 +54,9 @@ func (n *fakeNotifier) BeatMissing(_ context.Context, id string, silence time.Du
 	defer n.mu.Unlock()
 	if n.fail != nil {
 		return n.fail
+	}
+	if n.onMissing != nil {
+		n.onMissing()
 	}
 	n.calls = append(n.calls, call{kind: "missing", id: id, elapsed: silence})
 	return nil
@@ -120,7 +126,7 @@ func TestFreshBeatNeverNotifies(t *testing.T) {
 		if !w.Beat("api") {
 			t.Fatal("Beat(api) = false")
 		}
-		w.Sweep(context.Background())
+		w.sweep(context.Background())
 	}
 	if got := n.snapshot(); len(got) != 0 {
 		t.Errorf("fresh beat produced notifications: %v", got)
@@ -134,10 +140,10 @@ func TestMissingFiresOncePerOutage(t *testing.T) {
 	w.Beat("api")
 
 	clock.Advance(11 * time.Minute)
-	w.Sweep(context.Background())
-	w.Sweep(context.Background())
+	w.sweep(context.Background())
+	w.sweep(context.Background())
 	clock.Advance(time.Hour)
-	w.Sweep(context.Background())
+	w.sweep(context.Background())
 
 	got := n.snapshot()
 	if len(got) != 1 || got[0].kind != "missing" || got[0].id != "api" {
@@ -154,13 +160,13 @@ func TestBootGraceFiresWithoutAnyBeat(t *testing.T) {
 	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
 
 	clock.Advance(9 * time.Minute)
-	w.Sweep(context.Background())
+	w.sweep(context.Background())
 	if got := n.snapshot(); len(got) != 0 {
 		t.Fatalf("notified before boot deadline: %v", got)
 	}
 
 	clock.Advance(2 * time.Minute)
-	w.Sweep(context.Background())
+	w.sweep(context.Background())
 	got := n.snapshot()
 	if len(got) != 1 || got[0].kind != "missing" {
 		t.Fatalf("calls = %v, want one missing after boot deadline", got)
@@ -174,7 +180,7 @@ func TestRecoveryAfterMissing(t *testing.T) {
 	w.Beat("api")
 
 	clock.Advance(30 * time.Minute)
-	w.Sweep(context.Background())
+	w.sweep(context.Background())
 
 	w.Beat("api")
 	drainRecoveries(w)
@@ -206,21 +212,21 @@ func TestFailedMissingRetriesNextSweep(t *testing.T) {
 	clock.Advance(11 * time.Minute)
 
 	n.setFail(errors.New("discord down"))
-	w.Sweep(context.Background())
-	w.Sweep(context.Background())
+	w.sweep(context.Background())
+	w.sweep(context.Background())
 	if got := n.snapshot(); len(got) != 0 {
 		t.Fatalf("failed sends recorded calls: %v", got)
 	}
 
 	n.setFail(nil)
-	w.Sweep(context.Background())
+	w.sweep(context.Background())
 	got := n.snapshot()
 	if len(got) != 1 || got[0].kind != "missing" {
 		t.Fatalf("calls = %v, want one missing after recovery of the notifier", got)
 	}
 
 	// Delivered once: further sweeps stay silent.
-	w.Sweep(context.Background())
+	w.sweep(context.Background())
 	if got := n.snapshot(); len(got) != 1 {
 		t.Errorf("post-delivery sweep re-sent: %v", got)
 	}
@@ -233,12 +239,12 @@ func TestSecondOutageNotifiesAgain(t *testing.T) {
 	w.Beat("api")
 
 	clock.Advance(11 * time.Minute)
-	w.Sweep(context.Background())
+	w.sweep(context.Background())
 	w.Beat("api")
 	drainRecoveries(w)
 
 	clock.Advance(11 * time.Minute)
-	w.Sweep(context.Background())
+	w.sweep(context.Background())
 
 	got := n.snapshot()
 	if len(got) != 3 {
@@ -246,6 +252,46 @@ func TestSecondOutageNotifiesAgain(t *testing.T) {
 	}
 	if got[2].kind != "missing" {
 		t.Errorf("third call = %+v, want missing", got[2])
+	}
+}
+
+func TestPingRacingDeliveredMissingEmitsRecoveryAndRearms(t *testing.T) {
+	t.Parallel()
+
+	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w.Beat("api")
+
+	// The ping lands while the missing notification is in flight: Beat sees
+	// alerted=false and queues no recovery, so the sweep must emit it.
+	clock.Advance(11 * time.Minute)
+	n.onMissing = func() { w.Beat("api") }
+	w.sweep(context.Background())
+	n.onMissing = nil
+
+	got := n.snapshot()
+	if len(got) != 2 || got[0].kind != "missing" || got[1].kind != "recovered" {
+		t.Fatalf("calls = %v, want [missing recovered]", got)
+	}
+	if got[1].id != "api" {
+		t.Errorf("recovered id = %s, want api", got[1].id)
+	}
+	if got[1].elapsed < 11*time.Minute {
+		t.Errorf("downFor = %s, want >= 11m", got[1].elapsed)
+	}
+
+	// The recovery came from the sweep itself; nothing extra may be queued.
+	drainRecoveries(w)
+	if got := n.snapshot(); len(got) != 2 {
+		t.Fatalf("recovery was double-queued: %v", got)
+	}
+
+	// The beat is re-armed: a second silence must produce a second missing
+	// (before the fix, alerted stayed true and this outage was swallowed).
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	got = n.snapshot()
+	if len(got) != 3 || got[2].kind != "missing" {
+		t.Fatalf("calls = %v, want a second missing after re-silence", got)
 	}
 }
 
@@ -260,7 +306,7 @@ func TestBeatsAreIndependent(t *testing.T) {
 	w.Beat("slow")
 
 	clock.Advance(2 * time.Minute)
-	w.Sweep(context.Background())
+	w.sweep(context.Background())
 
 	got := n.snapshot()
 	if len(got) != 1 || got[0].id != "fast" {
@@ -311,4 +357,37 @@ func waitFor(t *testing.T, cond func() bool, what string) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestFailedRecoveredIsBestEffortOnce(t *testing.T) {
+	t.Parallel()
+
+	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w.Beat("api")
+
+	// First outage: missing delivered, then the beat pings again while the
+	// notifier is down, so the queued recovered send fails.
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	n.setFail(errors.New("discord down"))
+	w.Beat("api")
+	drainRecoveries(w)
+
+	// Best-effort means the failed recovery is consumed, never retried:
+	// after the notifier heals, nothing is re-queued or re-sent.
+	n.setFail(nil)
+	drainRecoveries(w)
+	w.sweep(context.Background())
+	got := n.snapshot()
+	if len(got) != 1 || got[0].kind != "missing" {
+		t.Fatalf("calls = %v, want only the original missing (failed recovery never retried)", got)
+	}
+
+	// The switch stays armed: the next silence still fires a missing notice.
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	got = n.snapshot()
+	if len(got) != 2 || got[1].kind != "missing" {
+		t.Fatalf("calls = %v, want a second missing after the next outage", got)
+	}
 }

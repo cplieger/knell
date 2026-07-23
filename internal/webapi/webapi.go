@@ -4,6 +4,7 @@
 package webapi
 
 import (
+	"crypto/subtle"
 	"io"
 	"net/http"
 
@@ -22,13 +23,15 @@ type Beater interface {
 }
 
 // New assembles the routed and middleware-wrapped root handler.
-// healthz answers liveness; metricsHandler serves the Prometheus exposition.
-func New(b Beater, healthz, metricsHandler http.Handler) http.Handler {
+// token optionally gates the beat endpoint (empty = open); healthz answers
+// liveness; metricsHandler serves the Prometheus exposition.
+func New(b Beater, token string, healthz, metricsHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	// POST is the canonical ping; GET is accepted too so ad-hoc senders
 	// (curl without flags, simple healthcheck hooks) can participate.
-	mux.HandleFunc("POST /beat/{id}", beatHandler(b))
-	mux.HandleFunc("GET /beat/{id}", beatHandler(b))
+	beat := beatHandler(b, token)
+	mux.HandleFunc("POST /beat/{id}", beat)
+	mux.HandleFunc("GET /beat/{id}", beat)
 	mux.Handle("GET /healthz", healthz)
 	mux.Handle("GET /metrics", metricsHandler)
 
@@ -41,12 +44,20 @@ func New(b Beater, healthz, metricsHandler http.Handler) http.Handler {
 
 // beatHandler records a ping and answers {"ok":true}, or 404 for an id that
 // is not configured. Unknown ids are never recorded or counted: the id feeds
-// a metric label, so arbitrary paths must not mint series.
-func beatHandler(b Beater) http.HandlerFunc {
+// a metric label, so arbitrary paths must not mint series. A non-empty token
+// requires senders to present Authorization: Bearer <token>.
+func beatHandler(b Beater, token string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Drain a bounded amount of body so keep-alive connections stay
 		// reusable; the payload itself is deliberately ignored.
 		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxBeatBody))
+		if token != "" {
+			want := "Bearer " + token
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(want)) != 1 {
+				webhttp.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
+				return
+			}
+		}
 		id := r.PathValue("id")
 		if !b.Beat(id) {
 			webhttp.WriteError(w, r, http.StatusNotFound, "unknown_beat", "unknown beat id")

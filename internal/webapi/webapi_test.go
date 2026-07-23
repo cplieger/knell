@@ -27,7 +27,7 @@ func newTestHandler(b *fakeBeater) http.Handler {
 	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	return New(b, healthz, metrics.Registry.Handler())
+	return New(b, "", healthz, metrics.Registry.Handler())
 }
 
 func TestBeatEndpoint(t *testing.T) {
@@ -50,13 +50,7 @@ func TestBeatEndpoint(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			b := &fakeBeater{known: map[string]bool{"api": true}}
 			h := newTestHandler(b)
-			var body *strings.Reader
-			if tt.body != "" {
-				body = strings.NewReader(tt.body)
-			} else {
-				body = strings.NewReader("")
-			}
-			req := httptest.NewRequest(tt.method, tt.path, body)
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 			if rec.Code != tt.wantStatus {

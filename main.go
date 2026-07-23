@@ -66,7 +66,7 @@ func run() error {
 
 	watcher := watch.New(cfg.Beats, notifier, time.Now)
 
-	handler := webapi.New(watcher, health.Handler(marker), metrics.Registry.Handler())
+	handler := webapi.New(watcher, cfg.BeatToken, health.Handler(marker), metrics.Registry.Handler())
 	srv := webhttp.NewServer(handler)
 
 	// Bind up front so a port-in-use error surfaces synchronously.
