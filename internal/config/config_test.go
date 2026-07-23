@@ -237,3 +237,30 @@ func TestLoadInvalidLogLevelFallsBackToInfo(t *testing.T) {
 		t.Errorf("LogLevel = %v, want INFO (fallback for unknown value)", cfg.LogLevel)
 	}
 }
+
+func TestLoadRejectsMalformedBeats(t *testing.T) {
+	t.Setenv("BEATS", "api:1s")
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() with below-minimum deadline = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "parsing BEATS") {
+		t.Errorf("error = %q, want it wrapped with \"parsing BEATS\"", err)
+	}
+}
+
+func TestLoadAcceptsPlainHTTPWebhook(t *testing.T) {
+	t.Setenv("BEATS", "api:20m")
+	t.Setenv("DISCORD_WEBHOOK_URL", "http://127.0.0.1:9/hook")
+	t.Setenv("NODE_NAME", "node-1")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with plain-http webhook = %v, want accepted (warn, not fail)", err)
+	}
+	if cfg.WebhookURL != "http://127.0.0.1:9/hook" {
+		t.Errorf("WebhookURL = %q", cfg.WebhookURL)
+	}
+}

@@ -30,8 +30,12 @@ func main() {
 	// CLI liveness probe for the Docker healthcheck (scratch image: no
 	// shell, no curl). The marker is level-based boot state — set once the
 	// listener is bound, removed on shutdown — so no freshness deadline.
-	if len(os.Args) > 1 && os.Args[1] == "health" {
-		health.RunProbe(health.DefaultPath)
+	if len(os.Args) > 1 {
+		if os.Args[1] == "health" {
+			health.RunProbe(health.DefaultPath)
+		}
+		fmt.Fprintf(os.Stderr, "unknown command %q (the only subcommand is \"health\")\n", os.Args[1])
+		os.Exit(2)
 	}
 
 	if err := run(); err != nil {
@@ -67,10 +71,14 @@ func run() error {
 	watcher := watch.New(cfg.Beats, notifier, time.Now)
 
 	handler := webapi.New(watcher, cfg.BeatToken, health.Handler(marker), metrics.Registry.Handler())
-	// No route streams, so a whole-request read bound is safe here: it
-	// stops a slow-trickled body from holding a handler goroutine forever
-	// (the 1 MiB drain cap bounds bytes, not time).
-	srv := webhttp.NewServer(handler, webhttp.WithReadTimeout(30*time.Second))
+	// No route streams, so whole-request read and write bounds are safe
+	// here: the read bound stops a slow-trickled body from holding a
+	// handler goroutine forever (the 1 MiB drain cap bounds bytes, not
+	// time), and the write bound stops a client that requests /metrics
+	// and never reads the response from pinning the goroutine in Write.
+	srv := webhttp.NewServer(handler,
+		webhttp.WithReadTimeout(30*time.Second),
+		webhttp.WithWriteTimeout(30*time.Second))
 
 	// Bind up front so a port-in-use error surfaces synchronously.
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ListenAddr)
@@ -95,9 +103,14 @@ func logConfig(cfg *config.Config) {
 	for _, b := range cfg.Beats {
 		slog.Info("watching beat", "beat", b.ID, "deadline", b.Deadline.String())
 	}
+	beatAuth := "open"
+	if cfg.BeatToken != "" {
+		beatAuth = "required"
+	}
 	slog.Info("configuration loaded",
 		"beats", len(cfg.Beats),
 		"node", cfg.Node,
 		"listen_addr", cfg.ListenAddr,
-		"webhook", "configured")
+		"webhook", "configured",
+		"beat_auth", beatAuth)
 }

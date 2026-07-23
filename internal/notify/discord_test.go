@@ -211,3 +211,25 @@ func TestRequestBuildErrorNeverLeaksWebhookURL(t *testing.T) {
 		t.Errorf("request-build error leaks webhook secret: %v", err)
 	}
 }
+
+func TestTransientFailuresExhaustAttempts(t *testing.T) {
+	t.Parallel()
+
+	// Every attempt answers 503 (transient): delivery must stop after
+	// maxAttempts total attempts and surface an error, never retry
+	// unbounded against a hard-down webhook.
+	rec := newWebhookRecorder(http.StatusServiceUnavailable)
+	srv := httptest.NewServer(rec.handler(t))
+	defer srv.Close()
+
+	d := New(srv.URL, "node-1")
+	defer d.Close()
+
+	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	if err == nil {
+		t.Fatal("BeatMissing with persistent 503 = nil, want error")
+	}
+	if got := rec.hits.Load(); got != maxAttempts {
+		t.Errorf("attempts = %d, want %d (maxAttempts is total, including the first)", got, maxAttempts)
+	}
+}

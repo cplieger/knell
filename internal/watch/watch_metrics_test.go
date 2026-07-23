@@ -58,3 +58,54 @@ func TestBeatFreshGaugeTracksOverdueAndRecovery(t *testing.T) {
 		t.Errorf("beat_last_seen after ping = %s, still the boot baseline", got)
 	}
 }
+
+// kindCounter scrapes the metrics exposition and returns the value token of
+// name{kind="<kind>"}, failing the test when the series is absent.
+func kindCounter(t *testing.T, name, kind string) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	metrics.Registry.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	prefix := name + `{kind="` + kind + `"} `
+	for line := range strings.Lines(rec.Body.String()) {
+		if value, ok := strings.CutPrefix(line, prefix); ok {
+			return strings.TrimSpace(value)
+		}
+	}
+	t.Fatalf("series %s{kind=%q} not in exposition", name, kind)
+	return ""
+}
+
+func TestCanceledNotificationsAreNotCountedAsFailed(t *testing.T) {
+	// Serial (no t.Parallel): it asserts deltas on the package-global
+	// failure counters, which the parallel tests also increment.
+	const id = "cancel-probe"
+	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+	clock.Advance(11 * time.Minute)
+
+	failedBefore := kindCounter(t, "knell_notifications_failed_total", "missing")
+	n.setFail(context.Canceled)
+	w.sweep(context.Background())
+	if got := kindCounter(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
+		t.Errorf("failed{missing} = %s after canceled send, want unchanged %s (a shutdown must not page KnellNotifyFailing)", got, failedBefore)
+	}
+
+	// The abandoned send did not mark the beat alerted: once the notifier
+	// heals, the outage is still reported.
+	n.setFail(nil)
+	w.sweep(context.Background())
+	got := n.snapshot()
+	if len(got) != 1 || got[0].kind != "missing" {
+		t.Fatalf("calls = %v, want the missing notice retried after a shutdown-abandoned send", got)
+	}
+
+	// Recovered direction: queue a recovery, cancel its delivery; the
+	// failed counter must not move either.
+	w.Beat(id)
+	failedBefore = kindCounter(t, "knell_notifications_failed_total", "recovered")
+	n.setFail(context.Canceled)
+	drainRecoveries(w)
+	if got := kindCounter(t, "knell_notifications_failed_total", "recovered"); got != failedBefore {
+		t.Errorf("failed{recovered} = %s after canceled send, want unchanged %s", got, failedBefore)
+	}
+}

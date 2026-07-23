@@ -46,17 +46,7 @@ func New(b Beater, token string, healthz, metricsHandler http.Handler) http.Hand
 // a metric label, so arbitrary paths must not mint series. A non-empty token
 // requires senders to present Authorization: Bearer <token>.
 func beatHandler(b Beater, token string) http.HandlerFunc {
-	// The verifier is built once, outside the request path, over the full
-	// expected header value so acceptance stays exactly
-	// "Authorization: Bearer <token>".
-	verifier := webhttp.NewStaticTokenVerifier("Bearer " + token)
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Authorize before touching the body: a rejected sender must not
-		// be able to hold the handler open by trickling a payload.
-		if token != "" && !verifier.Verify(r.Header.Get("Authorization")) {
-			webhttp.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
-			return
-		}
+	record := func(w http.ResponseWriter, r *http.Request) {
 		// Drain a bounded amount of body so keep-alive connections stay
 		// reusable; the payload itself is deliberately ignored.
 		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxBeatBody))
@@ -66,5 +56,23 @@ func beatHandler(b Beater, token string) http.HandlerFunc {
 			return
 		}
 		webhttp.Ok(w)
+	}
+	if token == "" {
+		// Open endpoint: skip the gate explicitly (an armed verifier must
+		// never exist for the empty-token configuration).
+		return record
+	}
+	// The verifier is built once, outside the request path, over the full
+	// expected header value so acceptance stays exactly
+	// "Authorization: Bearer <token>".
+	verifier := webhttp.NewStaticTokenVerifier("Bearer " + token)
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Authorize before touching the body: a rejected sender must not
+		// be able to hold the handler open by trickling a payload.
+		if !verifier.Verify(r.Header.Get("Authorization")) {
+			webhttp.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
+			return
+		}
+		record(w, r)
 	}
 }

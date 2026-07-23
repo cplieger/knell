@@ -73,7 +73,7 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
 	}
 	// The URL itself is a secret and never logged; warn on scheme only.
-	if strings.HasPrefix(webhook, "http://") {
+	if strings.HasPrefix(strings.ToLower(webhook), "http://") {
 		slog.Warn("DISCORD_WEBHOOK_URL uses plain http; the webhook URL is a secret and will transit unencrypted")
 	}
 	cfg.WebhookURL = webhook
@@ -92,6 +92,9 @@ func Load() (Config, error) {
 
 	// BEAT_TOKEN optionally gates POST/GET /beat/{id}; empty disables the check.
 	cfg.BeatToken = envx.String("BEAT_TOKEN", "")
+	if cfg.BeatToken != "" && len(cfg.BeatToken) < 16 {
+		slog.Warn("BEAT_TOKEN is shorter than 16 bytes; a short token is guessable, prefer a long random value", "length", len(cfg.BeatToken))
+	}
 
 	rawLevel := envx.String("LOG_LEVEL", "")
 	level, ok := slogx.ParseLevel(rawLevel, slog.LevelInfo)

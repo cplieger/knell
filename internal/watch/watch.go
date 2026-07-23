@@ -40,6 +40,13 @@ const DefaultTick = 15 * time.Second
 // is also the queue bound.
 const recoveryQueueSize = config.MaxBeats
 
+// Notification kinds are the label values on the sent/failed notification
+// counters; dashboards and the KnellNotifyFailing alert key on them.
+const (
+	kindMissing   = "missing"
+	kindRecovered = "recovered"
+)
+
 // beatState is the per-beat tracking record.
 type beatState struct {
 	lastSeen time.Time
@@ -87,7 +94,7 @@ func New(beats []config.Beat, notifier Notifier, now func() time.Time) *Watcher 
 	// Pre-mint the notification counter series at zero so an increase()
 	// alert sees the very first failure: a counter series born at a
 	// nonzero value has no earlier sample to diff against.
-	for _, kind := range []string{"missing", "recovered"} {
+	for _, kind := range []string{kindMissing, kindRecovered} {
 		metrics.NotificationsSent.Add(0, kind)
 		metrics.NotificationsFailed.Add(0, kind)
 	}
@@ -131,6 +138,7 @@ func (w *Watcher) Beat(id string) bool {
 			w.mu.Lock()
 			st.recovering = false
 			w.mu.Unlock()
+			metrics.NotificationsFailed.Inc(kindRecovered)
 			slog.Warn("recovery queue full, dropping recovered notification", "beat", id)
 		}
 	}
@@ -233,12 +241,12 @@ func (w *Watcher) sweep(ctx context.Context) {
 				slog.Info("missing notification abandoned, shutting down", "beat", d.id)
 				return
 			}
-			metrics.NotificationsFailed.Inc("missing")
+			metrics.NotificationsFailed.Inc(kindMissing)
 			slog.Error("missing notification failed, will retry next sweep",
 				"beat", d.id, "silence", d.silence.String(), "error", err)
 			continue
 		}
-		metrics.NotificationsSent.Inc("missing")
+		metrics.NotificationsSent.Inc(kindMissing)
 		slog.Info("beat missing, notified", "beat", d.id, "silence", d.silence.String())
 		if ev, raced := w.markDelivered(d.id, d.seen); raced {
 			w.sendRecovered(ctx, ev)
@@ -288,11 +296,11 @@ func (w *Watcher) sendRecovered(ctx context.Context, ev recoveryEvent) {
 			slog.Info("recovered notification abandoned, shutting down", "beat", ev.id)
 			return
 		}
-		metrics.NotificationsFailed.Inc("recovered")
+		metrics.NotificationsFailed.Inc(kindRecovered)
 		slog.Error("recovered notification failed",
 			"beat", ev.id, "down_for", ev.downFor.String(), "error", err)
 		return
 	}
-	metrics.NotificationsSent.Inc("recovered")
+	metrics.NotificationsSent.Inc(kindRecovered)
 	slog.Info("beat recovered, notified", "beat", ev.id, "down_for", ev.downFor.String())
 }
