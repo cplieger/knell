@@ -117,3 +117,39 @@ func TestSecurityHeadersPresent(t *testing.T) {
 		t.Errorf("X-Content-Type-Options = %q", got)
 	}
 }
+
+func TestBeatTokenGate(t *testing.T) {
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	h := New(b, "s3cret", healthz, metrics.Registry.Handler())
+
+	tests := []struct {
+		name       string
+		auth       string
+		wantStatus int
+		wantSeen   int
+	}{
+		{name: "no header", auth: "", wantStatus: 401},
+		{name: "wrong token", auth: "Bearer nope", wantStatus: 401},
+		{name: "correct token", auth: "Bearer s3cret", wantStatus: 200, wantSeen: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := len(b.seen)
+			req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
+			if tt.auth != "" {
+				req.Header.Set("Authorization", tt.auth)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if got := len(b.seen) - before; got != tt.wantSeen {
+				t.Errorf("recorded beats = %d, want %d (unauthorized pings must not be recorded)", got, tt.wantSeen)
+			}
+		})
+	}
+}
