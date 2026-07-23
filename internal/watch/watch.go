@@ -45,6 +45,10 @@ type beatState struct {
 	lastSeen time.Time
 	deadline time.Duration
 	alerted  bool
+	// recovering marks a recovered transition that is queued or in flight;
+	// sweep must not start another missing transition until it is
+	// delivered, so transitions reach Discord in chronological order.
+	recovering bool
 }
 
 // recoveryEvent is a queued recovered transition, measured at ping arrival.
@@ -106,6 +110,9 @@ func (w *Watcher) Beat(id string) bool {
 	wasAlerted := st.alerted
 	st.lastSeen = now
 	st.alerted = false
+	if wasAlerted {
+		st.recovering = true
+	}
 	// Publish the gauges under the lock so concurrent pings cannot write
 	// them out of state order (an older timestamp overwriting a newer one).
 	metrics.BeatsReceived.Inc(id)
@@ -119,6 +126,11 @@ func (w *Watcher) Beat(id string) bool {
 		default:
 			// Cannot happen while the queue bound matches the beat cap
 			// (one pending recovery per beat), but never block a ping.
+			// The dropped recovery is no longer pending, so un-mark it or
+			// the beat could never alert again.
+			w.mu.Lock()
+			st.recovering = false
+			w.mu.Unlock()
 			slog.Warn("recovery queue full, dropping recovered notification", "beat", id)
 		}
 	}
@@ -166,13 +178,23 @@ func (w *Watcher) refreshFreshness() {
 	now := w.now()
 	w.mu.Lock()
 	for id, st := range w.beats {
-		if now.Sub(st.lastSeen) <= st.deadline {
-			metrics.BeatFresh.Set(1, id)
-		} else {
-			metrics.BeatFresh.Set(0, id)
-		}
+		publishFreshness(id, now.Sub(st.lastSeen), st.deadline)
 	}
 	w.mu.Unlock()
+}
+
+// publishFreshness publishes the freshness gauge for id given its observed
+// silence and deadline, reporting whether the beat is still fresh. It is the
+// single home of the freshness boundary and gauge mapping shared by sweep
+// and refreshFreshness, so the quorum ground truth cannot drift between the
+// two writers. Callers hold w.mu.
+func publishFreshness(id string, silence, deadline time.Duration) bool {
+	if silence <= deadline {
+		metrics.BeatFresh.Set(1, id)
+		return true
+	}
+	metrics.BeatFresh.Set(0, id)
+	return false
 }
 
 // sweep checks every beat against its deadline and sends the missing
@@ -196,12 +218,10 @@ func (w *Watcher) sweep(ctx context.Context) {
 	w.mu.Lock()
 	for id, st := range w.beats {
 		silence := now.Sub(st.lastSeen)
-		if silence <= st.deadline {
-			metrics.BeatFresh.Set(1, id)
+		if publishFreshness(id, silence, st.deadline) {
 			continue
 		}
-		metrics.BeatFresh.Set(0, id)
-		if !st.alerted {
+		if !st.alerted && !st.recovering {
 			overdue = append(overdue, due{id: id, silence: silence, seen: st.lastSeen})
 		}
 	}
@@ -243,7 +263,18 @@ func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool)
 		st.alerted = true
 		return recoveryEvent{}, false
 	}
+	st.recovering = true
 	return recoveryEvent{id: id, downFor: st.lastSeen.Sub(seen)}, true
+}
+
+// finishRecovery clears the pending-recovery mark for id, re-enabling sweep
+// to start the beat's next missing transition.
+func (w *Watcher) finishRecovery(id string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if st, ok := w.beats[id]; ok {
+		st.recovering = false
+	}
 }
 
 // sendRecovered delivers one queued recovered transition. Best-effort by
@@ -251,6 +282,7 @@ func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool)
 // sweep-level retry; a lost recovery notice self-explains once the next
 // missing alert arrives.
 func (w *Watcher) sendRecovered(ctx context.Context, ev recoveryEvent) {
+	defer w.finishRecovery(ev.id)
 	if err := w.notifier.BeatRecovered(ctx, ev.id, ev.downFor); err != nil {
 		if errors.Is(err, context.Canceled) {
 			slog.Info("recovered notification abandoned, shutting down", "beat", ev.id)

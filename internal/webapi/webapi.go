@@ -4,7 +4,6 @@
 package webapi
 
 import (
-	"crypto/subtle"
 	"io"
 	"net/http"
 
@@ -47,17 +46,20 @@ func New(b Beater, token string, healthz, metricsHandler http.Handler) http.Hand
 // a metric label, so arbitrary paths must not mint series. A non-empty token
 // requires senders to present Authorization: Bearer <token>.
 func beatHandler(b Beater, token string) http.HandlerFunc {
+	// The verifier is built once, outside the request path, over the full
+	// expected header value so acceptance stays exactly
+	// "Authorization: Bearer <token>".
+	verifier := webhttp.NewStaticTokenVerifier("Bearer " + token)
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Authorize before touching the body: a rejected sender must not
+		// be able to hold the handler open by trickling a payload.
+		if token != "" && !verifier.Verify(r.Header.Get("Authorization")) {
+			webhttp.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
+			return
+		}
 		// Drain a bounded amount of body so keep-alive connections stay
 		// reusable; the payload itself is deliberately ignored.
 		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxBeatBody))
-		if token != "" {
-			want := "Bearer " + token
-			if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(want)) != 1 {
-				webhttp.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
-				return
-			}
-		}
 		id := r.PathValue("id")
 		if !b.Beat(id) {
 			webhttp.WriteError(w, r, http.StatusNotFound, "unknown_beat", "unknown beat id")

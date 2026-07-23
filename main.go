@@ -67,7 +67,10 @@ func run() error {
 	watcher := watch.New(cfg.Beats, notifier, time.Now)
 
 	handler := webapi.New(watcher, cfg.BeatToken, health.Handler(marker), metrics.Registry.Handler())
-	srv := webhttp.NewServer(handler)
+	// No route streams, so a whole-request read bound is safe here: it
+	// stops a slow-trickled body from holding a handler goroutine forever
+	// (the 1 MiB drain cap bounds bytes, not time).
+	srv := webhttp.NewServer(handler, webhttp.WithReadTimeout(30*time.Second))
 
 	// Bind up front so a port-in-use error surfaces synchronously.
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ListenAddr)

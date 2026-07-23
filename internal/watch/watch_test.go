@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cplieger/knell/internal/config"
@@ -317,46 +318,41 @@ func TestBeatsAreIndependent(t *testing.T) {
 func TestRunLoopDeliversSweepAndRecovery(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: time.Minute})
-	w.Beat("api")
-	clock.Advance(2 * time.Minute)
+	synctest.Test(t, func(t *testing.T) {
+		w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: time.Minute})
+		w.Beat("api")
+		clock.Advance(2 * time.Minute)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		w.Run(ctx, 5*time.Millisecond)
-	}()
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			w.Run(ctx, 5*time.Millisecond)
+		}()
 
-	waitFor(t, func() bool {
-		calls := n.snapshot()
-		return len(calls) == 1 && calls[0].kind == "missing"
-	}, "missing notification via Run loop")
-
-	w.Beat("api")
-	waitFor(t, func() bool {
-		calls := n.snapshot()
-		return len(calls) == 2 && calls[1].kind == "recovered"
-	}, "recovered notification via Run loop")
-
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("Run did not stop on ctx cancel")
-	}
-}
-
-func waitFor(t *testing.T, cond func() bool, what string) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
+		synctest.Wait()
+		time.Sleep(5 * time.Millisecond)
+		synctest.Wait()
+		got := n.snapshot()
+		if len(got) != 1 || got[0].kind != "missing" {
+			t.Fatalf("calls after sweep tick = %v, want one missing", got)
 		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", what)
+
+		w.Beat("api")
+		synctest.Wait()
+		got = n.snapshot()
+		if len(got) != 2 || got[1].kind != "recovered" {
+			t.Fatalf("calls after recovered beat = %v, want missing then recovered", got)
+		}
+
+		cancel()
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("Run did not stop on ctx cancel")
+		}
+	})
 }
 
 func TestFailedRecoveredIsBestEffortOnce(t *testing.T) {
@@ -389,5 +385,44 @@ func TestFailedRecoveredIsBestEffortOnce(t *testing.T) {
 	got = n.snapshot()
 	if len(got) != 2 || got[1].kind != "missing" {
 		t.Fatalf("calls = %v, want a second missing after the next outage", got)
+	}
+}
+
+func TestPendingRecoveryBlocksNextMissingUntilDelivered(t *testing.T) {
+	t.Parallel()
+
+	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w.Beat("api")
+
+	// First outage: missing delivered, then a ping queues the recovery,
+	// which stays undrained (the Run loop is busy elsewhere).
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	w.Beat("api")
+
+	// The beat goes silent past its deadline again while the recovery is
+	// still queued. The sweep must not start the next missing transition
+	// ahead of the pending recovery, or Discord would observe
+	// missing/missing/recovered out of chronological order.
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	got := n.snapshot()
+	if len(got) != 1 || got[0].kind != "missing" {
+		t.Fatalf("calls = %v, want only the first missing while a recovery is pending", got)
+	}
+
+	// Once the recovery is delivered, the next sweep sends the second
+	// missing: chronologically ordered [missing recovered missing].
+	drainRecoveries(w)
+	w.sweep(context.Background())
+	got = n.snapshot()
+	want := []string{"missing", "recovered", "missing"}
+	if len(got) != len(want) {
+		t.Fatalf("calls = %v, want missing/recovered/missing", got)
+	}
+	for i, kind := range want {
+		if got[i].kind != kind {
+			t.Errorf("calls[%d].kind = %s, want %s", i, got[i].kind, kind)
+		}
 	}
 }

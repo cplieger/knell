@@ -1,6 +1,7 @@
 package webapi
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -118,6 +119,17 @@ func TestSecurityHeadersPresent(t *testing.T) {
 	}
 }
 
+// countingReader counts Read calls so tests can assert the handler never
+// touches the body of a rejected request.
+type countingReader struct {
+	reads int
+}
+
+func (c *countingReader) Read([]byte) (int, error) {
+	c.reads++
+	return 0, io.EOF
+}
+
 func TestBeatTokenGate(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -152,4 +164,17 @@ func TestBeatTokenGate(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("unauthorized body never read", func(t *testing.T) {
+		body := &countingReader{}
+		req := httptest.NewRequest(http.MethodPost, "/beat/api", body)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", rec.Code)
+		}
+		if body.reads != 0 {
+			t.Errorf("body reads = %d, want 0 (rejected requests must not be drained)", body.reads)
+		}
+	})
 }

@@ -82,6 +82,7 @@ func Load() (Config, error) {
 	if cfg.Node == "" {
 		host, err := os.Hostname()
 		if err != nil {
+			slog.Warn("failed to determine hostname, using fallback node name", "node", "unknown", "error", err)
 			host = "unknown"
 		}
 		cfg.Node = host
