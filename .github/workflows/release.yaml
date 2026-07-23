@@ -1,0 +1,74 @@
+# Synced from cplieger/ci/.github/workflow-templates/release.yml — DO NOT EDIT.
+# The release pipeline is fully centralized; all logic and per-repo policy
+# lives in cplieger/ci/.github/workflows/release.yaml. This file just calls it.
+#
+# Behavior:
+#   - On every push to main and on workflow_dispatch, the central detect job
+#     computes the cliff version, classifies the repo type (docker/go/ts),
+#     identifies which paths actually changed, and dispatches to the right
+#     downstream branch (Docker build/sign/publish, Go tag, TS publish to
+#     npm+JSR, or any combination for hybrid repos with subpackages).
+#   - To change behavior for this repo (e.g., disable Docker Hub mirror,
+#     force arm64-only), edit the "Resolve repo policy" step in
+#     cplieger/ci/.github/workflows/release.yaml — there is no per-repo
+#     override surface here.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      # Set by the scheduled staleness rebuild in cplieger/ci
+      # (rebuild-stale.yaml): a dispatched rebuild publishes only when the
+      # rebuilt image's package inventory differs from what :latest already
+      # ships. Deliberately NOT forwarded via `with:` below; the central
+      # pipeline reads it from this run's dispatch context
+      # (github.event.inputs, which inside a reusable workflow is the
+      # caller's), so this stub stays valid even while its pinned SHA predates
+      # the input (a `with:` key the pinned workflow does not declare would
+      # fail every run until Renovate moves the pin). Plain manual dispatches
+      # keep today's always-publish semantics (default false). Docker-type
+      # repos only; go/ts releases ignore it.
+      skip_if_unchanged:
+        description: "Skip publishing when the rebuilt image is package-identical to :latest (used by the scheduled staleness rebuild)."
+        type: boolean
+        default: false
+
+# Serialize release runs per repo. Two merges seconds apart otherwise race:
+# the losing run can 403 even on the git-refs tag create and strand a
+# releasable commit behind a root_changed=false skip (observed on
+# web-terminal-server, 2026-07-19). Queued, never cancelled — when GitHub
+# replaces a superseded queued run with a newer one, the newer run's cliff
+# window covers the superseded run's commits, so nothing is lost. Lives here
+# and not in the reusable workflow: workflow-level concurrency only takes
+# effect in the workflow GitHub actually schedules (the caller); the called
+# workflow supports it at job level only.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Top-level permissions are read-only (OpenSSF Scorecard Token-Permissions);
+# the release job declares the write scopes it actually needs. GitHub takes the
+# intersection of these job-level grants and what the called reusable workflow
+# declares, so scoping them to the job is functionally equivalent.
+permissions:
+  contents: read
+
+jobs:
+  release:
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    uses: cplieger/ci/.github/workflows/release.yaml@0fb9ba790d89417fa63593c7f89e9e63b5e77edf # v2
+    # Forward only the two Docker Hub publish credentials the reusable pipeline
+    # actually declares and consumes, rather than `secrets: inherit` (which
+    # exposes every repo secret to the reusable-workflow trust boundary). Both
+    # are `required: false` upstream, so repos without them (Go/TS libs that
+    # publish via OIDC) pass empty values and skip the Docker Hub job entirely.
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
