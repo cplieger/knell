@@ -1,0 +1,14 @@
+# Example compose for knell. See the README for all configuration options and hardening.
+services:
+  knell:
+    image: ghcr.io/cplieger/knell:latest
+    container_name: knell
+    restart: unless-stopped
+
+    environment:
+      BEATS: "cron-backup:26h,pipeline-watchdog:20m"  # id:deadline list, see README
+      DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/..."  # where the bell rings
+      NODE_NAME: "server-1"  # names this observer in notifications
+
+    ports:
+      - "9190:9190"
