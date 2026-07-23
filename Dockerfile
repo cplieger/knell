@@ -20,7 +20,11 @@ FROM scratch
 
 # CA bundle for the outbound Discord webhook TLS handshake.
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /outfs/tmp /tmp
+# --chmod: a plain COPY recreates the target dir 0755 regardless of the source
+# mode, and engines that replicate the image dir's mode onto a tmpfs mount
+# (observed on Docker 24 / DSM) then make /tmp unwritable for the nonroot
+# user even when the compose tmpfs says mode=1777. Bake the 1777.
+COPY --from=builder --chmod=1777 /outfs/tmp /tmp
 COPY --chmod=755 --from=builder /knell /knell
 
 # Non-root numeric uid:gid (scratch has no /etc/passwd). knell binds a high
