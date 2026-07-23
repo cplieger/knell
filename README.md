@@ -53,7 +53,7 @@ Silence past the deadline rings the bell:
 ## Configuration
 
 | Env | Default | Notes |
-|-----|---------|-------|
+| ----- | ------- | ----- |
 | `BEATS` | — | required; comma-separated `id:deadline` list, e.g. `api:20m,backup:26h`. Ids match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; deadlines are Go durations, minimum `30s`, maximum 64 beats |
 | `DISCORD_WEBHOOK_URL` | — | required; the webhook notifications post to. `DISCORD_WEBHOOK_URL_FILE` points at a mounted secret file instead |
 | `NODE_NAME` | container hostname | names this observer instance in every notification |
@@ -65,7 +65,7 @@ A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup with a clear error ra
 ## Endpoints
 
 | Endpoint | Purpose |
-|----------|---------|
+| -------- | ------- |
 | `POST /beat/{id}` | record a ping (`GET` works too, for ad-hoc senders); `{"ok":true}` on success, 404 for unknown ids |
 | `GET /healthz` | liveness (`{"status":"OK"}`) |
 | `GET /metrics` | Prometheus exposition |
@@ -81,7 +81,7 @@ Request bodies on `/beat/{id}` are ignored, so webhook-shaped senders (an Alertm
 ## Metrics
 
 | Metric | Type | Notes |
-|--------|------|-------|
+| ----- | ------- | ----- |
 | `knell_beat_fresh{beat}` | gauge | 1 = last ping within deadline, 0 = overdue. The aggregation input for multi-observer quorum rules |
 | `knell_beat_last_seen_timestamp_seconds{beat}` | gauge | Unix time of the last accepted ping (process start until the first ping) |
 | `knell_beats_received_total{beat}` | counter | accepted pings; unknown ids are rejected, not counted |
