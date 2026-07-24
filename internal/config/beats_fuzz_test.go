@@ -39,7 +39,7 @@ func FuzzParseBeats(f *testing.F) {
 			if !beatIDPattern.MatchString(b.ID) {
 				t.Fatalf("accepted id %q violates grammar", b.ID)
 			}
-			if b.Deadline < MinDeadline {
+			if b.Deadline < minDeadline {
 				t.Fatalf("accepted deadline %s below minimum", b.Deadline)
 			}
 			if _, dup := seen[b.ID]; dup {

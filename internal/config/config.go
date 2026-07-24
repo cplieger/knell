@@ -24,10 +24,10 @@ import (
 // past it is almost certainly a generator bug.
 const MaxBeats = 64
 
-// MinDeadline is the smallest accepted beat deadline. Anything shorter turns
+// minDeadline is the smallest accepted beat deadline. Anything shorter turns
 // transient sender hiccups into alert spam; a sender that beats more often
 // than every 30 seconds still works with a longer deadline.
-const MinDeadline = 30 * time.Second
+const minDeadline = 30 * time.Second
 
 // beatIDPattern is the accepted beat-id grammar: URL-path and metric-label
 // safe, human-readable, bounded.
@@ -134,7 +134,7 @@ func loadWebhook() (string, error) {
 // ParseBeats parses the BEATS spec list: comma-separated "id:deadline"
 // entries, e.g. "watchdog-mimir:20m,watchdog-loki:20m". IDs must match
 // [A-Za-z0-9][A-Za-z0-9_-]{0,63} and be unique; deadlines are Go durations
-// of at least MinDeadline.
+// of at least minDeadline.
 func ParseBeats(raw string) ([]Beat, error) {
 	entries := strings.Split(raw, ",")
 	beats := make([]Beat, 0, len(entries))
@@ -178,8 +178,8 @@ func parseBeatEntry(entry string, seen map[string]struct{}) (Beat, error) {
 	if err != nil {
 		return Beat{}, fmt.Errorf("entry %q: invalid deadline: %w", entry, err)
 	}
-	if deadline < MinDeadline {
-		return Beat{}, fmt.Errorf("entry %q: deadline below minimum %s", entry, MinDeadline)
+	if deadline < minDeadline {
+		return Beat{}, fmt.Errorf("entry %q: deadline below minimum %s", entry, minDeadline)
 	}
 	seen[id] = struct{}{}
 	return Beat{ID: id, Deadline: deadline}, nil

@@ -117,8 +117,18 @@ func (w *Watcher) Beat(id string) bool {
 		return false
 	}
 	now := w.now()
-	downFor := now.Sub(st.lastSeen)
+	previousSeen := st.lastSeen
+	downFor := now.Sub(previousSeen)
 	wasAlerted := st.alerted
+	if st.pendingMissing == nil && !wasAlerted && !st.recovering && downFor > st.deadline {
+		pending := overdueBeat{
+			id:          id,
+			silence:     downFor,
+			seen:        previousSeen,
+			recoveredAt: now,
+		}
+		st.pendingMissing = &pending
+	}
 	st.lastSeen = now
 	st.alerted = false
 	if st.pendingMissing != nil && st.pendingMissing.recoveredAt.IsZero() {
@@ -297,10 +307,7 @@ func (w *Watcher) sendMissing(ctx context.Context, beat overdueBeat) bool {
 func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	st, ok := w.beats[id]
-	if !ok {
-		return recoveryEvent{}, false
-	}
+	st := w.beats[id]
 	pm := st.pendingMissing
 	st.pendingMissing = nil
 	if st.lastSeen.Equal(seen) {
@@ -309,7 +316,7 @@ func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool)
 	}
 	st.recovering = true
 	recoveredAt := st.lastSeen
-	if pm != nil && !pm.recoveredAt.IsZero() {
+	if !pm.recoveredAt.IsZero() {
 		recoveredAt = pm.recoveredAt
 	}
 	return recoveryEvent{id: id, downFor: recoveredAt.Sub(seen)}, true
@@ -320,9 +327,7 @@ func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool)
 func (w *Watcher) finishRecovery(id string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if st, ok := w.beats[id]; ok {
-		st.recovering = false
-	}
+	w.beats[id].recovering = false
 }
 
 // sendRecovered delivers one queued recovered transition. Best-effort by

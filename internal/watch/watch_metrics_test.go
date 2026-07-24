@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -124,10 +125,12 @@ func TestSweepExactDeadlineBoundaryIsFresh(t *testing.T) {
 	}
 }
 
+var refreshProbeSequence atomic.Uint64
+
 func TestRefreshFreshnessUpdatesGaugeWithoutNotifying(t *testing.T) {
 	t.Parallel()
 
-	const id = "refresh-probe"
+	id := "refresh-probe-" + strconv.FormatUint(refreshProbeSequence.Add(1), 10)
 	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
 
 	// Construction pre-mints the received counter at zero so increase()

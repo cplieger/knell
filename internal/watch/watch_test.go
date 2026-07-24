@@ -569,18 +569,26 @@ func TestFreshnessGaugeUpdatesWhileSenderBlocked(t *testing.T) {
 	})
 }
 
-func TestMarkDeliveredUnknownBeatIsNoOp(t *testing.T) {
+func TestLatePingBeforeSweepPreservesOutage(t *testing.T) {
 	t.Parallel()
 
 	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
-	ev, raced := w.markDelivered("ghost", clock.Now())
-	if raced {
-		t.Fatal("markDelivered(ghost) raced = true, want false (an unconfigured id must be a no-op, not a queued recovery)")
+	w.Beat("api")
+	clock.Advance(11 * time.Minute)
+
+	if !w.Beat("api") {
+		t.Fatal("late Beat(api) = false")
 	}
-	if ev != (recoveryEvent{}) {
-		t.Errorf("markDelivered(ghost) event = %+v, want zero value", ev)
+	if calls := n.snapshot(); len(calls) != 0 {
+		t.Fatalf("late ping notified synchronously: %v", calls)
 	}
-	if got := n.snapshot(); len(got) != 0 {
-		t.Errorf("markDelivered on unknown id caused notifications: %v", got)
+
+	w.sweep(context.Background())
+	got := n.snapshot()
+	if len(got) != 2 || got[0].kind != "missing" || got[1].kind != "recovered" {
+		t.Fatalf("calls = %v, want missing then recovered for the deadline crossing", got)
+	}
+	if got[0].elapsed < 11*time.Minute || got[1].elapsed < 11*time.Minute {
+		t.Errorf("elapsed values = %v, want the full overdue interval preserved", got)
 	}
 }
