@@ -331,3 +331,22 @@ func TestLoadBeatTokenFromFile(t *testing.T) {
 		t.Errorf("BeatToken = %q, want the file-borne token (BEAT_TOKEN_FILE alone must arm the gate, trimmed)", cfg.BeatToken)
 	}
 }
+
+func TestLoadWebhookFromFile(t *testing.T) {
+	hookFile := filepath.Join(t.TempDir(), "webhook-url")
+	if err := os.WriteFile(hookFile, []byte("https://discord.example/file-borne-hook\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEATS", "api:20m")
+	t.Setenv("DISCORD_WEBHOOK_URL", "")
+	t.Setenv("NODE_NAME", "node-1")
+	t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.WebhookURL != "https://discord.example/file-borne-hook" {
+		t.Errorf("WebhookURL = %q, want the file-borne URL (DISCORD_WEBHOOK_URL_FILE is the documented secret-file convention, trimmed)", cfg.WebhookURL)
+	}
+}

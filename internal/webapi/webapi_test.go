@@ -256,3 +256,16 @@ func TestBeatTokenGateAppliesToGet(t *testing.T) {
 		t.Errorf("authorized GET recorded %d beats, want 1", len(b.seen))
 	}
 }
+
+func TestHeadRejectionSetsAllowHeader(t *testing.T) {
+	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
+	req := httptest.NewRequest(http.MethodHead, "/beat/api", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("HEAD /beat/api = %d, want 405", rec.Code)
+	}
+	if got := rec.Header().Get("Allow"); got != "GET, POST" {
+		t.Errorf("Allow = %q, want \"GET, POST\" (a 405 must name the permitted methods so a HEAD-only prober learns how pings are recorded)", got)
+	}
+}

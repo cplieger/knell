@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"strconv"
+	"strings"
+	"testing"
+)
 
 // FuzzParseBeats pins the parser's safety invariants: it never panics, and
 // every accepted result respects the documented grammar and caps.
@@ -16,6 +20,12 @@ func FuzzParseBeats(f *testing.F) {
 	f.Add("api beat:20m")
 	f.Add("api:1ns")
 	f.Add("🚨:20m")
+	f.Add(strings.Repeat("a", 64) + ":20m")
+	overCap := make([]string, 0, MaxBeats+1)
+	for i := range MaxBeats + 1 {
+		overCap = append(overCap, "b"+strconv.Itoa(i)+":20m")
+	}
+	f.Add(strings.Join(overCap, ","))
 	f.Fuzz(func(t *testing.T, raw string) {
 		beats, err := ParseBeats(raw)
 		if err != nil {
