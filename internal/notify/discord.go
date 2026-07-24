@@ -67,7 +67,7 @@ func (d *Discord) Close() {
 // BeatMissing announces that a beat's deadline of silence has passed.
 func (d *Discord) BeatMissing(ctx context.Context, id string, silence time.Duration) error {
 	msg := fmt.Sprintf(
-		"🚨 [knell %s] beat **%s** MISSING — silent for %s. The sender is down, or nothing on its path can reach this observer.",
+		"🚨 [knell %s] beat **%s** MISSING: silent for %s. The sender is down, or nothing on its path can reach this observer.",
 		d.node, id, silence.Truncate(time.Second),
 	)
 	return d.post(ctx, "missing "+id, msg)
@@ -76,7 +76,7 @@ func (d *Discord) BeatMissing(ctx context.Context, id string, silence time.Durat
 // BeatRecovered announces the first ping after a missing alert.
 func (d *Discord) BeatRecovered(ctx context.Context, id string, downFor time.Duration) error {
 	msg := fmt.Sprintf(
-		"✅ [knell %s] beat **%s** recovered — pings arriving again after %s of silence.",
+		"✅ [knell %s] beat **%s** recovered: pings arriving again after %s of silence.",
 		d.node, id, downFor.Truncate(time.Second),
 	)
 	return d.post(ctx, "recovered "+id, msg)

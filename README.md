@@ -51,7 +51,7 @@ curl -fsS -X POST http://knell:9190/beat/cron-backup
 
 Silence past the deadline rings the bell:
 
-> 🚨 [knell server-1] beat **cron-backup** MISSING — silent for 26h0m1s. The sender is down, or nothing on its path can reach this observer.
+> 🚨 [knell server-1] beat **cron-backup** MISSING: silent for 26h0m1s. The sender is down, or nothing on its path can reach this observer.
 
 ## Configuration reference
 
