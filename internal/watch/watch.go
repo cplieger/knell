@@ -120,7 +120,7 @@ func (w *Watcher) Beat(id string) bool {
 	previousSeen := st.lastSeen
 	downFor := now.Sub(previousSeen)
 	wasAlerted := st.alerted
-	if st.pendingMissing == nil && !wasAlerted && !st.recovering && downFor > st.deadline {
+	if st.pendingMissing == nil && !wasAlerted && downFor > st.deadline {
 		pending := overdueBeat{
 			id:          id,
 			silence:     downFor,
@@ -264,7 +264,11 @@ func (w *Watcher) collectOverdue() []overdueBeat {
 			if st.lastSeen.Equal(st.pendingMissing.seen) {
 				st.pendingMissing.silence = silence
 			}
-			overdue = append(overdue, *st.pendingMissing)
+			// Held while an earlier recovery is queued or in flight, so
+			// transitions reach Discord in chronological order.
+			if !st.recovering {
+				overdue = append(overdue, *st.pendingMissing)
+			}
 			continue
 		}
 		if fresh || st.alerted || st.recovering {

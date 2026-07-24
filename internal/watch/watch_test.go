@@ -592,3 +592,51 @@ func TestLatePingBeforeSweepPreservesOutage(t *testing.T) {
 		t.Errorf("elapsed values = %v, want the full overdue interval preserved", got)
 	}
 }
+
+
+func TestLatePingDuringPendingRecoveryPreservesSecondOutage(t *testing.T) {
+	t.Parallel()
+
+	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w.Beat("api")
+
+	// First outage: missing delivered, then a ping queues the recovery,
+	// which stays undrained (the Run loop is busy on a slow send).
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	w.Beat("api")
+
+	// A second full deadline passes and a late ping arrives while the
+	// first recovery is still queued. Beat must retain the crossed
+	// deadline even in the recovering state, and the sweep must hold it
+	// behind the pending recovery so Discord observes the transitions in
+	// chronological order.
+	clock.Advance(11 * time.Minute)
+	if !w.Beat("api") {
+		t.Fatal("late Beat(api) = false")
+	}
+	w.sweep(context.Background())
+	got := n.snapshot()
+	if len(got) != 1 || got[0].kind != "missing" {
+		t.Fatalf("calls = %v, want only the first missing while the recovery is queued", got)
+	}
+
+	// Draining the first recovery unblocks the held second outage: the
+	// next sweep emits its missing and, because the late ping already
+	// ended it, the recovered notice immediately after.
+	drainRecoveries(w)
+	w.sweep(context.Background())
+	got = n.snapshot()
+	want := []string{"missing", "recovered", "missing", "recovered"}
+	if len(got) != len(want) {
+		t.Fatalf("calls = %v, want missing/recovered/missing/recovered", got)
+	}
+	for i, kind := range want {
+		if got[i].kind != kind {
+			t.Errorf("calls[%d].kind = %s, want %s", i, got[i].kind, kind)
+		}
+	}
+	if got[3].elapsed < 11*time.Minute {
+		t.Errorf("second recovered downFor = %s, want the full second-outage interval", got[3].elapsed)
+	}
+}
