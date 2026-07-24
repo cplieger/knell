@@ -25,7 +25,7 @@ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifi
 # (observed on Docker 24 / DSM) then make /tmp unwritable for the nonroot
 # user even when the compose tmpfs says mode=1777. Bake the 1777.
 COPY --from=builder --chmod=1777 /outfs/tmp /tmp
-COPY --chmod=755 --from=builder /knell /knell
+COPY --from=builder --chmod=755 /knell /knell
 
 # Non-root numeric uid:gid (scratch has no /etc/passwd). knell binds a high
 # port and writes only its /tmp health marker, so it never needs root.

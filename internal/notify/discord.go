@@ -35,8 +35,10 @@ type Discord struct {
 func New(webhookURL, node string) *Discord {
 	return &Discord{
 		// Client timeout above the per-attempt context timeout so the
-		// context is the effective per-attempt bound.
-		client: &http.Client{Timeout: attemptTimeout + 5*time.Second},
+		// context is the effective per-attempt bound. NewClient also
+		// installs the same-host redirect policy so the webhook POST
+		// can never be silently re-routed cross-host.
+		client: httpx.NewClient(attemptTimeout + 5*time.Second),
 		url:    webhookURL,
 		node:   node,
 	}

@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -231,5 +232,43 @@ func TestTransientFailuresExhaustAttempts(t *testing.T) {
 	}
 	if got := rec.hits.Load(); got != maxAttempts {
 		t.Errorf("attempts = %d, want %d (maxAttempts is total, including the first)", got, maxAttempts)
+	}
+}
+
+func TestCanceledDeliveryErrorIsCanceled(t *testing.T) {
+	t.Parallel()
+
+	// watch.sweep and watch.sendRecovered key their shutdown handling on
+	// errors.Is(err, context.Canceled): an abandoned send must not count
+	// as failed (KnellNotifyFailing would page on every shutdown). That
+	// contract crosses post's whole wrap chain (client error -> httpx
+	// LogSafeError -> %w wrap), so pin it against the real notifier.
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	d := New(srv.URL, "node-1")
+	defer d.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-started
+		cancel()
+	}()
+
+	err := d.BeatMissing(ctx, "api", time.Hour)
+	if err == nil {
+		t.Fatal("BeatMissing with canceled context = nil, want error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want errors.Is(err, context.Canceled) to hold through the wrap chain", err)
 	}
 }

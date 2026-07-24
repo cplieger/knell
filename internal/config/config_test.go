@@ -264,3 +264,33 @@ func TestLoadAcceptsPlainHTTPWebhook(t *testing.T) {
 		t.Errorf("WebhookURL = %q", cfg.WebhookURL)
 	}
 }
+
+func TestLoadBeatToken(t *testing.T) {
+	t.Setenv("BEATS", "api:20m")
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
+	t.Setenv("NODE_NAME", "node-1")
+	t.Setenv("BEAT_TOKEN", "unit-test-beat-token")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.BeatToken != "unit-test-beat-token" {
+		t.Errorf("BeatToken = %q, want the configured token (webapi's gate arms only when config carries it)", cfg.BeatToken)
+	}
+}
+
+func TestLoadBeatTokenDefaultsEmpty(t *testing.T) {
+	t.Setenv("BEATS", "api:20m")
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
+	t.Setenv("NODE_NAME", "node-1")
+	t.Setenv("BEAT_TOKEN", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.BeatToken != "" {
+		t.Errorf("BeatToken = %q, want empty (open endpoint) when BEAT_TOKEN is unset", cfg.BeatToken)
+	}
+}

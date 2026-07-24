@@ -57,7 +57,7 @@ Silence past the deadline rings the bell:
 | `BEATS` | — | required; comma-separated `id:deadline` list, e.g. `api:20m,backup:26h`. Ids match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; deadlines are Go durations, minimum `30s`, maximum 64 beats |
 | `DISCORD_WEBHOOK_URL` | — | required; the webhook notifications post to. `DISCORD_WEBHOOK_URL_FILE` points at a mounted secret file instead |
 | `NODE_NAME` | container hostname | names this observer instance in every notification |
-| `BEAT_TOKEN` | — | optional; when set, `/beat/{id}` requires `Authorization: Bearer <token>` from senders. Empty leaves the endpoint open |
+| `BEAT_TOKEN` | — | optional; when set, `/beat/{id}` requires `Authorization: Bearer <token>` from senders. Empty leaves the endpoint open. `BEAT_TOKEN_FILE` points at a mounted secret file instead |
 | `LISTEN_ADDR` | `:9190` | TCP listen address (`host:port`) |
 | `LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error`; unknown falls back to `info` |
 
@@ -106,7 +106,7 @@ knell is itself the alert path for the things it watches, so alert rules about k
   labels:
     severity: warning
   annotations:
-    summary: "beat {{ $labels.beat }} is overdue on {{ $labels.hostname }}"
+    summary: "beat {{ $labels.beat }} is overdue on {{ $labels.instance }}"
 
 # knell cannot reach its webhook: if a beat goes missing now, nobody hears it.
 - alert: KnellNotifyFailing
@@ -114,7 +114,7 @@ knell is itself the alert path for the things it watches, so alert rules about k
   labels:
     severity: warning
   annotations:
-    summary: "knell on {{ $labels.hostname }} is failing to deliver notifications"
+    summary: "knell on {{ $labels.instance }} is failing to deliver notifications"
 ```
 
 One caveat comes with the boot-armed clock: every restart re-arms each beat's full deadline, so an observer restarting more often than a beat's deadline never fires that beat's alert. The runtime metrics already expose this — alert on restart churn within your longest deadline window:

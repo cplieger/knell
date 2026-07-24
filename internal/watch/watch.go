@@ -183,8 +183,8 @@ func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
 // notification state, so the metric ground truth stays current even while
 // the sender loop is blocked on a slow or unreachable webhook.
 func (w *Watcher) refreshFreshness() {
-	now := w.now()
 	w.mu.Lock()
+	now := w.now()
 	for id, st := range w.beats {
 		publishFreshness(id, now.Sub(st.lastSeen), st.deadline)
 	}
@@ -214,8 +214,6 @@ func publishFreshness(id string, silence, deadline time.Duration) bool {
 // armed for the next outage. Run calls it on every tick; in-package tests
 // call it directly.
 func (w *Watcher) sweep(ctx context.Context) {
-	now := w.now()
-
 	type due struct {
 		seen    time.Time // lastSeen observed when deciding to notify
 		id      string
@@ -224,6 +222,7 @@ func (w *Watcher) sweep(ctx context.Context) {
 	var overdue []due
 
 	w.mu.Lock()
+	now := w.now()
 	for id, st := range w.beats {
 		silence := now.Sub(st.lastSeen)
 		if publishFreshness(id, silence, st.deadline) {

@@ -12,19 +12,19 @@ import (
 	"github.com/cplieger/knell/internal/metrics"
 )
 
-// beatGauge scrapes the metrics exposition and returns the value token of
-// name{beat="<beat>"}, failing the test when the series is absent.
-func beatGauge(t *testing.T, name, beat string) string {
+// labeledValue scrapes the metrics exposition and returns the value token
+// of name{label="<value>"}, failing the test when the series is absent.
+func labeledValue(t *testing.T, name, label, value string) string {
 	t.Helper()
 	rec := httptest.NewRecorder()
 	metrics.Registry.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	prefix := name + `{beat="` + beat + `"} `
+	prefix := name + `{` + label + `="` + value + `"} `
 	for line := range strings.Lines(rec.Body.String()) {
-		if value, ok := strings.CutPrefix(line, prefix); ok {
-			return strings.TrimSpace(value)
+		if v, ok := strings.CutPrefix(line, prefix); ok {
+			return strings.TrimSpace(v)
 		}
 	}
-	t.Fatalf("series %s{beat=%q} not in exposition", name, beat)
+	t.Fatalf("series %s{%s=%q} not in exposition", name, label, value)
 	return ""
 }
 
@@ -37,42 +37,26 @@ func TestBeatFreshGaugeTracksOverdueAndRecovery(t *testing.T) {
 	const id = "metrics-quorum-probe"
 	w, clock, _ := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
 
-	if got := beatGauge(t, "knell_beat_fresh", id); got != "1" {
+	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
 		t.Fatalf("beat_fresh at boot = %s, want 1", got)
 	}
-	bootSeen := beatGauge(t, "knell_beat_last_seen_timestamp_seconds", id)
+	bootSeen := labeledValue(t, "knell_beat_last_seen_timestamp_seconds", "beat", id)
 
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
-	if got := beatGauge(t, "knell_beat_fresh", id); got != "0" {
+	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "0" {
 		t.Fatalf("beat_fresh when overdue = %s, want 0", got)
 	}
 
 	if !w.Beat(id) {
 		t.Fatal("Beat returned false for configured id")
 	}
-	if got := beatGauge(t, "knell_beat_fresh", id); got != "1" {
+	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
 		t.Fatalf("beat_fresh after ping = %s, want 1", got)
 	}
-	if got := beatGauge(t, "knell_beat_last_seen_timestamp_seconds", id); got == bootSeen {
+	if got := labeledValue(t, "knell_beat_last_seen_timestamp_seconds", "beat", id); got == bootSeen {
 		t.Errorf("beat_last_seen after ping = %s, still the boot baseline", got)
 	}
-}
-
-// kindCounter scrapes the metrics exposition and returns the value token of
-// name{kind="<kind>"}, failing the test when the series is absent.
-func kindCounter(t *testing.T, name, kind string) string {
-	t.Helper()
-	rec := httptest.NewRecorder()
-	metrics.Registry.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	prefix := name + `{kind="` + kind + `"} `
-	for line := range strings.Lines(rec.Body.String()) {
-		if value, ok := strings.CutPrefix(line, prefix); ok {
-			return strings.TrimSpace(value)
-		}
-	}
-	t.Fatalf("series %s{kind=%q} not in exposition", name, kind)
-	return ""
 }
 
 func TestCanceledNotificationsAreNotCountedAsFailed(t *testing.T) {
@@ -83,10 +67,10 @@ func TestCanceledNotificationsAreNotCountedAsFailed(t *testing.T) {
 	w.Beat(id)
 	clock.Advance(11 * time.Minute)
 
-	failedBefore := kindCounter(t, "knell_notifications_failed_total", "missing")
+	failedBefore := labeledValue(t, "knell_notifications_failed_total", "kind", "missing")
 	n.setFail(context.Canceled)
 	w.sweep(context.Background())
-	if got := kindCounter(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
+	if got := labeledValue(t, "knell_notifications_failed_total", "kind", "missing"); got != failedBefore {
 		t.Errorf("failed{missing} = %s after canceled send, want unchanged %s (a shutdown must not page KnellNotifyFailing)", got, failedBefore)
 	}
 
@@ -102,10 +86,73 @@ func TestCanceledNotificationsAreNotCountedAsFailed(t *testing.T) {
 	// Recovered direction: queue a recovery, cancel its delivery; the
 	// failed counter must not move either.
 	w.Beat(id)
-	failedBefore = kindCounter(t, "knell_notifications_failed_total", "recovered")
+	failedBefore = labeledValue(t, "knell_notifications_failed_total", "kind", "recovered")
 	n.setFail(context.Canceled)
 	drainRecoveries(w)
-	if got := kindCounter(t, "knell_notifications_failed_total", "recovered"); got != failedBefore {
+	if got := labeledValue(t, "knell_notifications_failed_total", "kind", "recovered"); got != failedBefore {
 		t.Errorf("failed{recovered} = %s after canceled send, want unchanged %s", got, failedBefore)
+	}
+}
+
+func TestSweepExactDeadlineBoundaryIsFresh(t *testing.T) {
+	t.Parallel()
+
+	// silence == deadline is still fresh ("within its deadline" is
+	// inclusive); only silence strictly past the deadline is overdue.
+	const id = "boundary-probe"
+	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+
+	clock.Advance(10 * time.Minute)
+	w.sweep(context.Background())
+	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
+		t.Fatalf("beat_fresh at silence == deadline = %s, want 1 (inclusive boundary)", got)
+	}
+	if calls := n.snapshot(); len(calls) != 0 {
+		t.Fatalf("exact-deadline sweep notified: %v", calls)
+	}
+
+	clock.Advance(time.Nanosecond)
+	w.sweep(context.Background())
+	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "0" {
+		t.Fatalf("beat_fresh just past deadline = %s, want 0", got)
+	}
+	calls := n.snapshot()
+	if len(calls) != 1 || calls[0].kind != "missing" {
+		t.Fatalf("calls just past deadline = %v, want one missing", calls)
+	}
+}
+
+func TestRefreshFreshnessUpdatesGaugeWithoutNotifying(t *testing.T) {
+	t.Parallel()
+
+	const id = "refresh-probe"
+	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+
+	// Construction pre-mints the received counter at zero so increase()
+	// alerts have a baseline sample before the first ping.
+	if got := labeledValue(t, "knell_beats_received_total", "beat", id); got != "0" {
+		t.Errorf("beats_received_total at boot = %s, want 0", got)
+	}
+
+	// refreshFreshness alone must flip the gauge when the beat goes
+	// overdue -- without sending any notification (that is sweep's job).
+	// This is the documented ground-truth path while the sender loop is
+	// blocked on a slow webhook.
+	clock.Advance(11 * time.Minute)
+	w.refreshFreshness()
+	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "0" {
+		t.Fatalf("beat_fresh after refreshFreshness = %s, want 0", got)
+	}
+	if calls := n.snapshot(); len(calls) != 0 {
+		t.Fatalf("refreshFreshness sent notifications: %v", calls)
+	}
+
+	// A ping restores the gauge; refreshFreshness must keep it at 1.
+	if !w.Beat(id) {
+		t.Fatal("Beat returned false for configured id")
+	}
+	w.refreshFreshness()
+	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
+		t.Fatalf("beat_fresh after ping + refresh = %s, want 1", got)
 	}
 }
