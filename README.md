@@ -13,16 +13,19 @@ A dead man's switch in a single tiny container: things ping it while they're ali
 
 ## What it does
 
-Monitoring tells you when something visibly breaks. It stays quiet when the thing that was supposed to run simply never ran — the cron job that silently stopped, the alerting pipeline that died along with its own ability to alert. knell watches for that silence.
+Monitoring tells you when something visibly breaks. It stays quiet when the thing that was supposed to run simply never ran: the cron job that silently stopped, the alerting pipeline that died along with its own ability to alert. knell watches for that silence.
 
 You configure named beats, each with a deadline. Anything that can send an HTTP request pings its beat (`POST /beat/<id>`); if a beat stays silent past its deadline, knell posts a missing notice to your Discord webhook, and a recovered notice when the pings return. Per-beat freshness is also exposed as Prometheus metrics, so a metrics stack can aggregate several knell instances into quorum views.
 
-- One binary on a `scratch` base — no shell, no libc, no dependencies to patch
-- Deadline clock starts at boot: a beat that never pings at all still alerts one deadline after start, so a restart never silently disarms the switch (the flip side: each restart re-arms full deadlines — see the restart-churn rule under Alerting)
+- One binary on a `scratch` base: no shell, no libc, no dependencies to patch
+- Deadline clock starts at boot: a beat that never pings at all still alerts one deadline after start, so a restart never silently disarms the switch (the flip side: each restart re-arms full deadlines; see the restart-churn rule under Alerting)
 - One missing notice per outage (delivery is retried every sweep until it succeeds), one recovered notice when the beat returns
 - Unknown beat ids are rejected with 404 and never create metric series
 
 ## Quick start
+
+Images are published to GHCR (`ghcr.io/cplieger/knell`) and Docker Hub
+(`cplieger/knell`).
 
 ```yaml
 # compose.yaml
@@ -54,14 +57,16 @@ Silence past the deadline rings the bell:
 
 | Env | Default | Notes |
 | ----- | ------- | ----- |
-| `BEATS` | — | required; comma-separated `id:deadline` list, e.g. `api:20m,backup:26h`. Ids match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; deadlines are Go durations, minimum `30s`, maximum 64 beats |
-| `DISCORD_WEBHOOK_URL` | — | required; the webhook notifications post to. `DISCORD_WEBHOOK_URL_FILE` points at a mounted secret file instead |
+| `BEATS` | _none_ | required; comma-separated `id:deadline` list, e.g. `api:20m,backup:26h`. Ids match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; deadlines are Go durations, minimum `30s`, maximum 64 beats |
+| `DISCORD_WEBHOOK_URL` | _none_ | required; the webhook notifications post to. `DISCORD_WEBHOOK_URL_FILE` points at a mounted secret file instead |
 | `NODE_NAME` | container hostname | names this observer instance in every notification |
-| `BEAT_TOKEN` | — | optional; when set, `/beat/{id}` requires `Authorization: Bearer <token>` from senders. Empty leaves the endpoint open. `BEAT_TOKEN_FILE` points at a mounted secret file instead. knell serves plain HTTP, so the token crosses the network in cleartext; put a TLS reverse proxy in front (or keep pings on a trusted network) when senders cross untrusted networks |
+| `BEAT_TOKEN` | _(unset)_ | optional; when set, `/beat/{id}` requires `Authorization: Bearer <token>` from senders. Empty leaves the endpoint open. `BEAT_TOKEN_FILE` points at a mounted secret file instead |
 | `LISTEN_ADDR` | `:9190` | TCP listen address (`host:port`) |
 | `LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error`; unknown falls back to `info` |
 
-A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup with a clear error rather than falling back — a dead-man switch running with the wrong config is worse than one that refuses to start.
+knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext. Put a TLS reverse proxy in front, or keep pings on a trusted network.
+
+A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling back: a dead-man switch running with the wrong config is worse than one that refuses to start.
 
 ## Endpoints
 
@@ -73,7 +78,7 @@ A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup with a clear error ra
 
 Request bodies on `/beat/{id}` are ignored, so webhook-shaped senders (an Alertmanager `webhook_configs` target, a CI notification hook) can point at it unchanged.
 
-Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away from anything that fetches links automatically — a chat client's URL preview, a crawler, an uptime prober. An automated fetch feeds the switch and can mask a dead sender. (`HEAD` requests are deliberately rejected with 405 and never record a ping, so a HEAD-only prober cannot feed the switch.)
+Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away from anything that fetches links automatically: a chat client's URL preview, a crawler, an uptime prober. An automated fetch feeds the switch and can mask a dead sender. `HEAD` requests are rejected with 405 and never record a ping, so a HEAD-only prober cannot feed the switch.
 
 ## Notification semantics
 
@@ -111,19 +116,21 @@ knell is itself the alert path for the things it watches, so alert rules about k
 # knell cannot reach its webhook: if a beat goes missing now, nobody hears it.
 - alert: KnellNotifyFailing
   expr: increase(knell_notifications_failed_total[15m]) > 0
+  for: 0m
   labels:
     severity: warning
   annotations:
     summary: "knell on {{ $labels.instance }} is failing to deliver notifications"
 ```
 
-One caveat comes with the boot-armed clock: every restart re-arms each beat's full deadline, so an observer restarting more often than a beat's deadline never fires that beat's alert. The runtime metrics already expose this — alert on restart churn within your longest deadline window:
+One caveat comes with the boot-armed clock: every restart re-arms each beat's full deadline, so an observer restarting more often than a beat's deadline never fires that beat's alert. The runtime metrics already expose this; alert on restart churn within your longest deadline window:
 
 ```yaml
 # knell restarting faster than a beat's deadline (26h here) keeps re-arming
 # that beat's clock; the alert for an ongoing outage is deferred each time.
 - alert: KnellRestartChurn
   expr: changes(process_start_time_seconds{job="knell"}[26h]) > 1
+  for: 0m
   labels:
     severity: warning
   annotations:
@@ -131,6 +138,8 @@ One caveat comes with the boot-armed clock: every restart re-arms each beat's fu
 ```
 
 Running several instances? Point each sender at all of them and aggregate: `sum by (beat) (knell_beat_fresh)` gives an N-of-M quorum view where one observer being down degrades the count instead of paging falsely.
+
+Thresholds and windows are starting points: set the churn window to your longest beat deadline, match the `job` selector to your scrape config, and route by whatever labels your Alertmanager uses.
 
 ## Healthcheck
 

@@ -24,11 +24,13 @@ func (f *fakeBeater) Beat(id string) bool {
 	return true
 }
 
-func newTestHandler(b *fakeBeater) http.Handler {
+// newTestHandler assembles the routed handler around b; token gates the
+// beat endpoint exactly as in production ("" = open).
+func newTestHandler(b *fakeBeater, token string) http.Handler {
 	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	return New(b, "", healthz, metrics.Registry.Handler())
+	return New(b, token, healthz, metrics.Registry.Handler())
 }
 
 func TestBeatEndpoint(t *testing.T) {
@@ -51,7 +53,7 @@ func TestBeatEndpoint(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := &fakeBeater{known: map[string]bool{"api": true}}
-			h := newTestHandler(b)
+			h := newTestHandler(b, "")
 			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
@@ -73,7 +75,7 @@ func TestBeatEndpoint(t *testing.T) {
 }
 
 func TestHealthzRouted(t *testing.T) {
-	h := newTestHandler(&fakeBeater{})
+	h := newTestHandler(&fakeBeater{}, "")
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -90,7 +92,7 @@ func TestMetricsExposition(t *testing.T) {
 	metrics.BeatFresh.Set(1, "webapi-test")
 	metrics.NotificationsSent.Add(0, "missing")
 
-	h := newTestHandler(&fakeBeater{})
+	h := newTestHandler(&fakeBeater{}, "")
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -111,7 +113,7 @@ func TestMetricsExposition(t *testing.T) {
 }
 
 func TestSecurityHeadersPresent(t *testing.T) {
-	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}})
+	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
 	req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -150,7 +152,7 @@ func TestBeatBodyDrainIsBounded(t *testing.T) {
 	// reusable, but only up to maxBeatBody: a hostile endless body must
 	// not tie the handler goroutine to an unbounded read.
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandler(b)
+	h := newTestHandler(b, "")
 	body := &unboundedReader{}
 	req := httptest.NewRequest(http.MethodPost, "/beat/api", body)
 	rec := httptest.NewRecorder()
@@ -165,10 +167,7 @@ func TestBeatBodyDrainIsBounded(t *testing.T) {
 
 func TestBeatTokenGate(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	h := New(b, "s3cret", healthz, metrics.Registry.Handler())
+	h := newTestHandler(b, "s3cret")
 
 	tests := []struct {
 		name       string
@@ -217,10 +216,7 @@ func TestTokenGateScopedToBeatEndpoint(t *testing.T) {
 	// the docker healthcheck and the Prometheus scraper carry no
 	// Authorization header, and gating them would break liveness and the
 	// quorum ground truth the moment BEAT_TOKEN is set.
-	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	h := New(&fakeBeater{}, "s3cret", healthz, metrics.Registry.Handler())
+	h := newTestHandler(&fakeBeater{}, "s3cret")
 
 	for _, path := range []string{"/healthz", "/metrics"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -237,10 +233,7 @@ func TestBeatTokenGateAppliesToGet(t *testing.T) {
 	// gate it identically: an ungated GET route would let any sender feed
 	// the switch without the credential.
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	h := New(b, "s3cret", healthz, metrics.Registry.Handler())
+	h := newTestHandler(b, "s3cret")
 
 	req := httptest.NewRequest(http.MethodGet, "/beat/api", nil)
 	rec := httptest.NewRecorder()
