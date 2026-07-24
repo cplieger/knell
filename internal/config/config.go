@@ -29,6 +29,12 @@ const MaxBeats = 64
 // than every 30 seconds still works with a longer deadline.
 const minDeadline = 30 * time.Second
 
+// minTokenLength is the shortest BEAT_TOKEN that does not draw a startup
+// warning: anything shorter is realistically guessable, so operators are
+// nudged toward a long random value (the check stays warn-only; the gate
+// still arms).
+const minTokenLength = 16
+
 // beatIDPattern is the accepted beat-id grammar: URL-path and metric-label
 // safe, human-readable, bounded.
 var beatIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
@@ -86,8 +92,8 @@ func Load() (Config, error) {
 	case !errors.As(err, new(*envx.MissingError)):
 		return cfg, fmt.Errorf("BEAT_TOKEN: %w", err)
 	}
-	if cfg.BeatToken != "" && len(cfg.BeatToken) < 16 {
-		slog.Warn("BEAT_TOKEN is shorter than 16 bytes; a short token is guessable, prefer a long random value", "length", len(cfg.BeatToken))
+	if cfg.BeatToken != "" && len(cfg.BeatToken) < minTokenLength {
+		slog.Warn("BEAT_TOKEN is shorter than the recommended minimum; a short token is guessable, prefer a long random value", "length", len(cfg.BeatToken), "minimum", minTokenLength)
 	}
 
 	rawLevel := envx.String("LOG_LEVEL", "")

@@ -23,6 +23,15 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// setValidLoadEnv sets the minimal environment Load accepts. Tests that
+// exercise a variant override individual keys with t.Setenv afterwards.
+func setValidLoadEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("BEATS", "api:20m")
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
+	t.Setenv("NODE_NAME", "node-1")
+}
+
 func TestParseBeats(t *testing.T) {
 	t.Parallel()
 
@@ -120,6 +129,27 @@ func TestParseBeatsMaxCap(t *testing.T) {
 	}
 }
 
+func TestParseBeatsAcceptsExactlyMaxCap(t *testing.T) {
+	t.Parallel()
+
+	entries := make([]string, 0, MaxBeats)
+	for r := 'a'; r <= 'h'; r++ {
+		for s := 'a'; s <= 'h'; s++ {
+			entries = append(entries, string(r)+string(s)+":20m")
+		}
+	}
+	if len(entries) != MaxBeats {
+		t.Fatalf("test built %d entries, want exactly %d", len(entries), MaxBeats)
+	}
+	beats, err := ParseBeats(strings.Join(entries, ","))
+	if err != nil {
+		t.Fatalf("ParseBeats with exactly %d beats = %v, want accepted (the cap is inclusive)", MaxBeats, err)
+	}
+	if len(beats) != MaxBeats {
+		t.Errorf("len(beats) = %d, want %d", len(beats), MaxBeats)
+	}
+}
+
 func TestParseWebhookURL(t *testing.T) {
 	t.Parallel()
 
@@ -150,9 +180,7 @@ func TestParseWebhookURL(t *testing.T) {
 }
 
 func TestLoad(t *testing.T) {
-	t.Setenv("BEATS", "api:20m")
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
-	t.Setenv("NODE_NAME", "node-1")
+	setValidLoadEnv(t)
 	t.Setenv("LISTEN_ADDR", ":9999")
 	t.Setenv("LOG_LEVEL", "debug")
 
@@ -178,8 +206,7 @@ func TestLoad(t *testing.T) {
 }
 
 func TestLoadDefaultsAndFailures(t *testing.T) {
-	t.Setenv("BEATS", "api:20m")
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
+	setValidLoadEnv(t)
 	t.Setenv("NODE_NAME", "")
 	t.Setenv("LISTEN_ADDR", "")
 	t.Setenv("LOG_LEVEL", "")
@@ -213,9 +240,7 @@ func TestLoadDefaultsAndFailures(t *testing.T) {
 }
 
 func TestLoadInvalidLogLevelFallsBackToInfo(t *testing.T) {
-	t.Setenv("BEATS", "api:20m")
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
-	t.Setenv("NODE_NAME", "node-1")
+	setValidLoadEnv(t)
 	t.Setenv("LOG_LEVEL", "chatty")
 
 	cfg, err := Load()
@@ -228,8 +253,8 @@ func TestLoadInvalidLogLevelFallsBackToInfo(t *testing.T) {
 }
 
 func TestLoadRejectsMalformedBeats(t *testing.T) {
+	setValidLoadEnv(t)
 	t.Setenv("BEATS", "api:1s")
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
 
 	_, err := Load()
 	if err == nil {
@@ -241,9 +266,8 @@ func TestLoadRejectsMalformedBeats(t *testing.T) {
 }
 
 func TestLoadAcceptsPlainHTTPWebhook(t *testing.T) {
-	t.Setenv("BEATS", "api:20m")
+	setValidLoadEnv(t)
 	t.Setenv("DISCORD_WEBHOOK_URL", "http://127.0.0.1:9/hook")
-	t.Setenv("NODE_NAME", "node-1")
 
 	cfg, err := Load()
 	if err != nil {
@@ -255,9 +279,7 @@ func TestLoadAcceptsPlainHTTPWebhook(t *testing.T) {
 }
 
 func TestLoadBeatToken(t *testing.T) {
-	t.Setenv("BEATS", "api:20m")
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
-	t.Setenv("NODE_NAME", "node-1")
+	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "unit-test-beat-token")
 	t.Setenv("BEAT_TOKEN_FILE", "")
 
@@ -271,9 +293,7 @@ func TestLoadBeatToken(t *testing.T) {
 }
 
 func TestLoadBeatTokenDefaultsEmpty(t *testing.T) {
-	t.Setenv("BEATS", "api:20m")
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
-	t.Setenv("NODE_NAME", "node-1")
+	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "")
 	t.Setenv("BEAT_TOKEN_FILE", "")
 
@@ -289,9 +309,7 @@ func TestLoadBeatTokenDefaultsEmpty(t *testing.T) {
 func TestLoadShortBeatTokenWarnsWithoutLeakingIt(t *testing.T) {
 	// Serial (t.Setenv forbids t.Parallel anyway): swaps the process-global
 	// slog default to capture the short-token warning.
-	t.Setenv("BEATS", "api:20m")
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
-	t.Setenv("NODE_NAME", "node-1")
+	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "shorty")
 	t.Setenv("BEAT_TOKEN_FILE", "")
 
@@ -317,9 +335,7 @@ func TestLoadBeatTokenFromFile(t *testing.T) {
 	if err := os.WriteFile(tokenFile, []byte("file-borne-beat-token\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("BEATS", "api:20m")
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
-	t.Setenv("NODE_NAME", "node-1")
+	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "")
 	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
 
@@ -337,9 +353,8 @@ func TestLoadWebhookFromFile(t *testing.T) {
 	if err := os.WriteFile(hookFile, []byte("https://discord.example/file-borne-hook\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("BEATS", "api:20m")
+	setValidLoadEnv(t)
 	t.Setenv("DISCORD_WEBHOOK_URL", "")
-	t.Setenv("NODE_NAME", "node-1")
 	t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
 
 	cfg, err := Load()
@@ -367,10 +382,9 @@ func TestParseWebhookURLDoesNotLeakScheme(t *testing.T) {
 
 func TestLoadRejectsUnreadableWebhookFile(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing-webhook")
-	t.Setenv("BEATS", "api:20m")
+	setValidLoadEnv(t)
 	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/fallback")
 	t.Setenv("DISCORD_WEBHOOK_URL_FILE", missing)
-	t.Setenv("NODE_NAME", "node-1")
 
 	_, err := Load()
 	if err == nil {
@@ -381,5 +395,26 @@ func TestLoadRejectsUnreadableWebhookFile(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "discord.example") {
 		t.Errorf("error leaks the fallback webhook URL: %v", err)
+	}
+}
+
+func TestLoadBeatTokenAtWarnBoundaryDoesNotWarn(t *testing.T) {
+	// Serial (t.Setenv forbids t.Parallel): swaps the process-global slog
+	// default to assert the absence of the short-token warning.
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", strings.Repeat("x", 16))
+	t.Setenv("BEAT_TOKEN_FILE", "")
+
+	rec := capture.Default(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.BeatToken != strings.Repeat("x", 16) {
+		t.Errorf("BeatToken = %q, want the configured 16-byte token", cfg.BeatToken)
+	}
+	if rec.Contains("BEAT_TOKEN is shorter") {
+		t.Errorf("16-byte token triggered the short-token warning (warn only below 16 bytes): %v", rec.Messages())
 	}
 }
