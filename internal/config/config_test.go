@@ -10,6 +10,19 @@ import (
 	"github.com/cplieger/slogx/capture"
 )
 
+func TestMain(m *testing.M) {
+	for _, key := range []string{
+		"DISCORD_WEBHOOK_URL_FILE",
+		"BEAT_TOKEN",
+		"BEAT_TOKEN_FILE",
+	} {
+		if err := os.Unsetenv(key); err != nil {
+			panic(err)
+		}
+	}
+	os.Exit(m.Run())
+}
+
 func TestParseBeats(t *testing.T) {
 	t.Parallel()
 
