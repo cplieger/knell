@@ -33,15 +33,27 @@ type Discord struct {
 // observer instance in every message so multi-node deployments read as
 // distinct reports.
 func New(webhookURL, node string) *Discord {
+	client := httpx.NewClient(attemptTimeout + 5*time.Second)
+	client.CheckRedirect = webhookRedirectPolicy
 	return &Discord{
 		// Client timeout above the per-attempt context timeout so the
-		// context is the effective per-attempt bound. NewClient also
-		// installs the same-host redirect policy so the webhook POST
-		// can never be silently re-routed cross-host.
-		client: httpx.NewClient(attemptTimeout + 5*time.Second),
+		// context is the effective per-attempt bound. The redirect policy
+		// keeps same-host POST-preserving redirects while refusing any hop
+		// that net/http would rewrite to a bodyless method.
+		client: client,
 		url:    webhookURL,
 		node:   node,
 	}
+}
+
+func webhookRedirectPolicy(req *http.Request, via []*http.Request) error {
+	if err := httpx.DefaultRedirectPolicy(req, via); err != nil {
+		return err
+	}
+	if len(via) > 0 && via[0].Method == http.MethodPost && req.Method != http.MethodPost {
+		return http.ErrUseLastResponse
+	}
+	return nil
 }
 
 // Close releases idle connections. Call once on shutdown.

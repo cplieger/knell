@@ -316,3 +316,35 @@ func TestPlainServerErrorIsTerminalPerAttempt(t *testing.T) {
 		t.Errorf("attempts = %d, want 1 (500 is not in the transient retry set)", got)
 	}
 }
+
+func TestMethodChangingRedirectIsNotDelivery(t *testing.T) {
+	t.Parallel()
+
+	var postHits, redirectedHits atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			postHits.Add(1)
+		}
+		http.Redirect(w, r, "/finish", http.StatusFound)
+	})
+	mux.HandleFunc("/finish", func(w http.ResponseWriter, _ *http.Request) {
+		redirectedHits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	d := New(srv.URL+"/start", "node-1")
+	defer d.Close()
+
+	if err := d.BeatMissing(context.Background(), "api", time.Hour); err == nil {
+		t.Fatal("BeatMissing through a POST-to-GET redirect = nil, want delivery error")
+	}
+	if got := postHits.Load(); got != 1 {
+		t.Errorf("initial POST hits = %d, want 1", got)
+	}
+	if got := redirectedHits.Load(); got != 0 {
+		t.Errorf("redirect target hits = %d, want 0 (the webhook POST must not become GET)", got)
+	}
+}

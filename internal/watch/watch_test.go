@@ -110,12 +110,19 @@ func drainRecoveries(w *Watcher) {
 func TestBeatUnknownID(t *testing.T) {
 	t.Parallel()
 
-	w, _, n := newTestWatcher(config.Beat{ID: "api", Deadline: time.Minute})
+	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
 	if w.Beat("ghost") {
 		t.Error("Beat(ghost) = true, want false")
 	}
 	if got := n.snapshot(); len(got) != 0 {
-		t.Errorf("unknown id caused notifications: %v", got)
+		t.Fatalf("unknown id caused notifications: %v", got)
+	}
+
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	got := n.snapshot()
+	if len(got) != 1 || got[0].kind != "missing" || got[0].id != "api" {
+		t.Errorf("calls after unknown beat = %v, want one missing notification for api", got)
 	}
 }
 
@@ -560,17 +567,4 @@ func TestFreshnessGaugeUpdatesWhileSenderBlocked(t *testing.T) {
 			t.Fatal("Run did not stop on ctx cancel")
 		}
 	})
-}
-
-func TestMarkDeliveredUnknownBeatIsNoOp(t *testing.T) {
-	t.Parallel()
-
-	w, _, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
-	ev, raced := w.markDelivered("ghost", time.Time{})
-	if raced || ev != (recoveryEvent{}) {
-		t.Errorf("markDelivered(ghost) = (%+v, %t), want zero event and false", ev, raced)
-	}
-	if got := n.snapshot(); len(got) != 0 {
-		t.Errorf("unknown-id markDelivered caused notifications: %v", got)
-	}
 }
