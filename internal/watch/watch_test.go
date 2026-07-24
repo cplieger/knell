@@ -473,3 +473,74 @@ func TestRecoveryQueueOverflowDropKeepsBeatArmed(t *testing.T) {
 		t.Fatalf("dropped-recovery beat %s did not re-alert; recovering flag leaked", last)
 	}
 }
+
+// blockingNotifier blocks every BeatMissing until released, simulating a
+// send stuck on a slow or unreachable webhook.
+type blockingNotifier struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (n *blockingNotifier) BeatMissing(ctx context.Context, _ string, _ time.Duration) error {
+	n.entered <- struct{}{}
+	select {
+	case <-n.release:
+	case <-ctx.Done():
+	}
+	return ctx.Err()
+}
+
+func (n *blockingNotifier) BeatRecovered(context.Context, string, time.Duration) error {
+	return nil
+}
+
+func TestFreshnessGaugeUpdatesWhileSenderBlocked(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		// Unique beat ids: the metric registry is package-global.
+		clock := newFakeClock()
+		n := &blockingNotifier{entered: make(chan struct{}, 8), release: make(chan struct{})}
+		w := New([]config.Beat{
+			{ID: "blocked-sender-a", Deadline: 10 * time.Minute},
+			{ID: "blocked-sender-b", Deadline: 30 * time.Minute},
+		}, n, clock.Now)
+
+		// Beat a goes overdue before the loop starts; its missing send
+		// will block the sender loop indefinitely.
+		clock.Advance(11 * time.Minute)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			w.Run(ctx, 5*time.Millisecond)
+		}()
+
+		time.Sleep(5 * time.Millisecond)
+		<-n.entered // sender loop is now stuck inside BeatMissing
+
+		// Beat b passes its own deadline while the sender is blocked.
+		// The sweep cannot run, so only the independent gauge ticker can
+		// flip b's freshness -- the documented ground-truth path.
+		clock.Advance(25 * time.Minute)
+		time.Sleep(5 * time.Millisecond)
+		synctest.Wait()
+
+		if got := labeledValue(t, "knell_beat_fresh", "beat", "blocked-sender-b"); got != "0" {
+			t.Fatalf("beat_fresh for b while sender blocked = %s, want 0 (gauge ticker must not depend on the sender loop)", got)
+		}
+
+		// Cancel before releasing: the blocked send then returns
+		// context.Canceled, the sweep stops, and Run exits without the
+		// sender ever starting beat b's (also overdue) transition.
+		cancel()
+		close(n.release)
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("Run did not stop on ctx cancel")
+		}
+	})
+}

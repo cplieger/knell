@@ -179,3 +179,23 @@ func TestBeatTokenGate(t *testing.T) {
 		}
 	})
 }
+
+func TestTokenGateScopedToBeatEndpoint(t *testing.T) {
+	// /healthz and /metrics must stay reachable without the beat token:
+	// the docker healthcheck and the Prometheus scraper carry no
+	// Authorization header, and gating them would break liveness and the
+	// quorum ground truth the moment BEAT_TOKEN is set.
+	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	h := New(&fakeBeater{}, "s3cret", healthz, metrics.Registry.Handler())
+
+	for _, path := range []string{"/healthz", "/metrics"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("GET %s without token = %d, want 200 (token gates only /beat)", path, rec.Code)
+		}
+	}
+}

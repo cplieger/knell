@@ -50,14 +50,14 @@ Silence past the deadline rings the bell:
 
 > 🚨 [knell server-1] beat **cron-backup** MISSING — silent for 26h0m1s. The sender is down, or nothing on its path can reach this observer.
 
-## Configuration
+## Configuration reference
 
 | Env | Default | Notes |
 | ----- | ------- | ----- |
 | `BEATS` | — | required; comma-separated `id:deadline` list, e.g. `api:20m,backup:26h`. Ids match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; deadlines are Go durations, minimum `30s`, maximum 64 beats |
 | `DISCORD_WEBHOOK_URL` | — | required; the webhook notifications post to. `DISCORD_WEBHOOK_URL_FILE` points at a mounted secret file instead |
 | `NODE_NAME` | container hostname | names this observer instance in every notification |
-| `BEAT_TOKEN` | — | optional; when set, `/beat/{id}` requires `Authorization: Bearer <token>` from senders. Empty leaves the endpoint open. `BEAT_TOKEN_FILE` points at a mounted secret file instead |
+| `BEAT_TOKEN` | — | optional; when set, `/beat/{id}` requires `Authorization: Bearer <token>` from senders. Empty leaves the endpoint open. `BEAT_TOKEN_FILE` points at a mounted secret file instead. knell serves plain HTTP, so the token crosses the network in cleartext; put a TLS reverse proxy in front (or keep pings on a trusted network) when senders cross untrusted networks |
 | `LISTEN_ADDR` | `:9190` | TCP listen address (`host:port`) |
 | `LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error`; unknown falls back to `info` |
 
@@ -73,7 +73,7 @@ A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup with a clear error ra
 
 Request bodies on `/beat/{id}` are ignored, so webhook-shaped senders (an Alertmanager `webhook_configs` target, a CI notification hook) can point at it unchanged.
 
-Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away from anything that fetches links automatically — a chat client's URL preview, a crawler, an uptime prober. An automated fetch feeds the switch and can mask a dead sender.
+Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away from anything that fetches links automatically — a chat client's URL preview, a crawler, an uptime prober. An automated fetch feeds the switch and can mask a dead sender. (`HEAD` requests are deliberately rejected with 405 and never record a ping, so a HEAD-only prober cannot feed the switch.)
 
 ## Notification semantics
 
@@ -136,7 +136,7 @@ Running several instances? Point each sender at all of them and aggregate: `sum 
 
 The image bakes a shell-less healthcheck: `knell health` checks a marker file the server touches once its listener is bound and removes on shutdown. Nothing to configure; `docker ps` shows `healthy` once knell is serving.
 
-## Hardening
+## Security
 
 The image runs as a non-root numeric user (65534) on `scratch` and writes only its `/tmp` health marker. A hardened deployment profile:
 
@@ -157,12 +157,12 @@ go build -trimpath -ldflags="-s -w" -o knell .
 docker build -t knell .
 ```
 
-## License
-
-GPL-3.0 — see [LICENSE](LICENSE).
-
 ## Disclaimer
 
 This project is built with care and follows security best practices, but it is intended for personal / self-hosted use. No guarantees of fitness for production environments. Use at your own risk.
 
 This project was built with AI-assisted tooling using [Claude](https://claude.com), [GPT](https://openai.com), and [Kiro](https://kiro.dev). The human maintainer defines architecture, supervises implementation, and makes all final decisions.
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).

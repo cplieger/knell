@@ -79,12 +79,12 @@ func Load() (Config, error) {
 	// check. BEAT_TOKEN_FILE points at a mounted secret file instead (the
 	// same convention DISCORD_WEBHOOK_URL uses), keeping the credential out
 	// of `docker inspect` output.
-	if os.Getenv("BEAT_TOKEN") != "" || os.Getenv("BEAT_TOKEN_FILE") != "" {
-		token, err := envx.Secret("BEAT_TOKEN")
-		if err != nil {
-			return cfg, fmt.Errorf("BEAT_TOKEN: %w", err)
-		}
+	token, err := envx.Secret("BEAT_TOKEN")
+	switch {
+	case err == nil:
 		cfg.BeatToken = token
+	case !errors.As(err, new(*envx.MissingError)):
+		return cfg, fmt.Errorf("BEAT_TOKEN: %w", err)
 	}
 	if cfg.BeatToken != "" && len(cfg.BeatToken) < 16 {
 		slog.Warn("BEAT_TOKEN is shorter than 16 bytes; a short token is guessable, prefer a long random value", "length", len(cfg.BeatToken))
@@ -121,10 +121,11 @@ func loadWebhook() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("DISCORD_WEBHOOK_URL is required: %w", err)
 	}
-	if err := validateWebhookURL(webhook); err != nil {
+	u, err := parseWebhookURL(webhook)
+	if err != nil {
 		return "", fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
 	}
-	if strings.HasPrefix(strings.ToLower(webhook), "http://") {
+	if u.Scheme == "http" {
 		slog.Warn("DISCORD_WEBHOOK_URL uses plain http; the webhook URL is a secret and will transit unencrypted")
 	}
 	return webhook, nil
@@ -184,21 +185,23 @@ func parseBeatEntry(entry string, seen map[string]struct{}) (Beat, error) {
 	return Beat{ID: id, Deadline: deadline}, nil
 }
 
-// validateWebhookURL checks the webhook is an absolute http(s) URL with a
-// host. The value is operator-supplied config, so this is a shape check
-// against paste accidents, not an SSRF guard.
-func validateWebhookURL(raw string) error {
+// parseWebhookURL checks the webhook is an absolute http(s) URL with a host
+// and returns the parsed URL so the caller branches on the canonical
+// (lowercased) scheme instead of re-deriving it from the raw string. The
+// value is operator-supplied config, so this is a shape check against paste
+// accidents, not an SSRF guard.
+func parseWebhookURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		// Deliberately not wrapped: a url.Error embeds the raw URL, and the
 		// webhook URL is a secret that must not reach the startup error log.
-		return errors.New("not a valid URL")
+		return nil, errors.New("not a valid URL")
 	}
 	if u.Scheme != "https" && u.Scheme != "http" {
-		return fmt.Errorf("scheme must be http or https, got %q", u.Scheme)
+		return nil, fmt.Errorf("scheme must be http or https, got %q", u.Scheme)
 	}
 	if u.Host == "" {
-		return errors.New("missing host")
+		return nil, errors.New("missing host")
 	}
-	return nil
+	return u, nil
 }

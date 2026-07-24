@@ -1,6 +1,10 @@
 package config
 
 import (
+	"bytes"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -93,7 +97,7 @@ func TestParseBeatsMaxCap(t *testing.T) {
 	}
 }
 
-func TestValidateWebhookURL(t *testing.T) {
+func TestParseWebhookURL(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -111,12 +115,12 @@ func TestValidateWebhookURL(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			err := validateWebhookURL(tt.raw)
+			_, err := parseWebhookURL(tt.raw)
 			if tt.ok && err != nil {
-				t.Fatalf("validateWebhookURL(%q) = %v, want nil", tt.raw, err)
+				t.Fatalf("parseWebhookURL(%q) = %v, want nil", tt.raw, err)
 			}
 			if !tt.ok && err == nil {
-				t.Fatalf("validateWebhookURL(%q) = nil, want error", tt.raw)
+				t.Fatalf("parseWebhookURL(%q) = nil, want error", tt.raw)
 			}
 		})
 	}
@@ -270,6 +274,7 @@ func TestLoadBeatToken(t *testing.T) {
 	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
 	t.Setenv("NODE_NAME", "node-1")
 	t.Setenv("BEAT_TOKEN", "unit-test-beat-token")
+	t.Setenv("BEAT_TOKEN_FILE", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -285,6 +290,7 @@ func TestLoadBeatTokenDefaultsEmpty(t *testing.T) {
 	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
 	t.Setenv("NODE_NAME", "node-1")
 	t.Setenv("BEAT_TOKEN", "")
+	t.Setenv("BEAT_TOKEN_FILE", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -292,5 +298,54 @@ func TestLoadBeatTokenDefaultsEmpty(t *testing.T) {
 	}
 	if cfg.BeatToken != "" {
 		t.Errorf("BeatToken = %q, want empty (open endpoint) when BEAT_TOKEN is unset", cfg.BeatToken)
+	}
+}
+
+func TestLoadShortBeatTokenWarnsWithoutLeakingIt(t *testing.T) {
+	// Serial (t.Setenv forbids t.Parallel anyway): swaps the process-global
+	// slog default to capture the short-token warning.
+	t.Setenv("BEATS", "api:20m")
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
+	t.Setenv("NODE_NAME", "node-1")
+	t.Setenv("BEAT_TOKEN", "shorty")
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with short BEAT_TOKEN = %v, want accepted (warn, not fail)", err)
+	}
+	if cfg.BeatToken != "shorty" {
+		t.Errorf("BeatToken = %q, want the configured token (short tokens warn but still arm the gate)", cfg.BeatToken)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "BEAT_TOKEN is shorter") {
+		t.Errorf("log output %q missing the short-token warning", logged)
+	}
+	if strings.Contains(logged, "shorty") {
+		t.Errorf("log output leaks the token value: %q", logged)
+	}
+}
+
+func TestLoadBeatTokenFromFile(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "beat-token")
+	if err := os.WriteFile(tokenFile, []byte("file-borne-beat-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEATS", "api:20m")
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
+	t.Setenv("NODE_NAME", "node-1")
+	t.Setenv("BEAT_TOKEN", "")
+	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.BeatToken != "file-borne-beat-token" {
+		t.Errorf("BeatToken = %q, want the file-borne token (BEAT_TOKEN_FILE alone must arm the gate, trimmed)", cfg.BeatToken)
 	}
 }

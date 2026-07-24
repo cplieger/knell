@@ -8,8 +8,12 @@ import (
 	metricslib "github.com/cplieger/metrics/v3"
 )
 
-// beatLabel is the label naming the watched beat on per-beat metrics.
-const beatLabel = "beat"
+// beatLabel names the watched beat on per-beat metrics; kindLabel names the
+// notification kind (missing, recovered) on the delivery counters.
+const (
+	beatLabel = "beat"
+	kindLabel = "kind"
+)
 
 // Registry serves every registered metric plus process metrics on /metrics.
 var Registry = metricslib.NewRegistry("knell")
@@ -46,7 +50,7 @@ var BeatsReceived = metricslib.NewLabeledCounter(
 var NotificationsSent = metricslib.NewLabeledCounter(
 	"notifications_sent_total",
 	"Webhook notifications delivered, by kind (missing, recovered).",
-	[]string{"kind"},
+	[]string{kindLabel},
 )
 
 // NotificationsFailed counts webhook notifications that failed after
@@ -55,7 +59,7 @@ var NotificationsSent = metricslib.NewLabeledCounter(
 var NotificationsFailed = metricslib.NewLabeledCounter(
 	"notifications_failed_total",
 	"Webhook notifications that failed after retries, by kind (missing, recovered).",
-	[]string{"kind"},
+	[]string{kindLabel},
 )
 
 func init() {

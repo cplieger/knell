@@ -272,3 +272,26 @@ func TestCanceledDeliveryErrorIsCanceled(t *testing.T) {
 		t.Errorf("err = %v, want errors.Is(err, context.Canceled) to hold through the wrap chain", err)
 	}
 }
+
+func TestPlainServerErrorIsTerminalPerAttempt(t *testing.T) {
+	t.Parallel()
+
+	// httpx's transient set is 502/503/504: a plain 500 is terminal for
+	// this delivery call by design; the watch sweep retries the whole
+	// notification 15s later. If 500 ever joined the in-call retry set,
+	// the second scripted status (204) would make this call succeed.
+	rec := newWebhookRecorder(http.StatusInternalServerError, http.StatusNoContent)
+	srv := httptest.NewServer(rec.handler(t))
+	defer srv.Close()
+
+	d := New(srv.URL, "node-1")
+	defer d.Close()
+
+	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	if err == nil {
+		t.Fatal("BeatMissing on 500 = nil, want error (sweep-level retry owns this failure)")
+	}
+	if got := rec.hits.Load(); got != 1 {
+		t.Errorf("attempts = %d, want 1 (500 is not in the transient retry set)", got)
+	}
+}
