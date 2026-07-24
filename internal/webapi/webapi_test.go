@@ -131,6 +131,38 @@ func (c *countingReader) Read([]byte) (int, error) {
 	return 0, io.EOF
 }
 
+// unboundedReader serves an endless zero stream and counts bytes read, so a
+// test can observe exactly how much of a hostile body the handler drains.
+type unboundedReader struct {
+	n int64
+}
+
+func (r *unboundedReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	r.n += int64(len(p))
+	return len(p), nil
+}
+
+func TestBeatBodyDrainIsBounded(t *testing.T) {
+	// The handler drains the ignored body so keep-alive connections stay
+	// reusable, but only up to maxBeatBody: a hostile endless body must
+	// not tie the handler goroutine to an unbounded read.
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	h := newTestHandler(b)
+	body := &unboundedReader{}
+	req := httptest.NewRequest(http.MethodPost, "/beat/api", body)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	if body.n != 1<<20 {
+		t.Errorf("drained %d bytes, want exactly 1 MiB (drain must happen for connection reuse and stop at the documented cap)", body.n)
+	}
+}
+
 func TestBeatTokenGate(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -197,5 +229,37 @@ func TestTokenGateScopedToBeatEndpoint(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Errorf("GET %s without token = %d, want 200 (token gates only /beat)", path, rec.Code)
 		}
+	}
+}
+
+func TestBeatTokenGateAppliesToGet(t *testing.T) {
+	// GET /beat/{id} records a ping exactly like POST, so the token must
+	// gate it identically: an ungated GET route would let any sender feed
+	// the switch without the credential.
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	h := New(b, "s3cret", healthz, metrics.Registry.Handler())
+
+	req := httptest.NewRequest(http.MethodGet, "/beat/api", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET without token = %d, want 401", rec.Code)
+	}
+	if len(b.seen) != 0 {
+		t.Errorf("unauthorized GET recorded a beat: %v", b.seen)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/beat/api", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET with token = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	if len(b.seen) != 1 {
+		t.Errorf("authorized GET recorded %d beats, want 1", len(b.seen))
 	}
 }

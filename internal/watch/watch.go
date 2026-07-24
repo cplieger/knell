@@ -121,6 +121,9 @@ func (w *Watcher) Beat(id string) bool {
 	wasAlerted := st.alerted
 	st.lastSeen = now
 	st.alerted = false
+	if st.pendingMissing != nil && st.pendingMissing.recoveredAt.IsZero() {
+		st.pendingMissing.recoveredAt = now
+	}
 	if wasAlerted {
 		st.recovering = true
 	}
@@ -188,11 +191,11 @@ func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
 // the sender loop is blocked on a slow or unreachable webhook.
 func (w *Watcher) refreshFreshness() {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	now := w.now()
 	for id, st := range w.beats {
 		publishFreshness(id, now.Sub(st.lastSeen), st.deadline)
 	}
-	w.mu.Unlock()
 }
 
 // publishFreshness publishes the freshness gauge for id given its observed
@@ -212,9 +215,10 @@ func publishFreshness(id string, silence, deadline time.Duration) bool {
 // overdueBeat is a beat collectOverdue found past its deadline, captured
 // with the lastSeen observed when the sweep decided to notify.
 type overdueBeat struct {
-	seen    time.Time
-	id      string
-	silence time.Duration
+	seen        time.Time
+	recoveredAt time.Time
+	id          string
+	silence     time.Duration
 }
 
 // sweep checks every beat against its deadline and sends the missing
@@ -247,6 +251,9 @@ func (w *Watcher) collectOverdue() []overdueBeat {
 		silence := now.Sub(st.lastSeen)
 		fresh := publishFreshness(id, silence, st.deadline)
 		if st.pendingMissing != nil {
+			if st.lastSeen.Equal(st.pendingMissing.seen) {
+				st.pendingMissing.silence = silence
+			}
 			overdue = append(overdue, *st.pendingMissing)
 			continue
 		}
@@ -294,13 +301,18 @@ func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool)
 	if !ok {
 		return recoveryEvent{}, false
 	}
+	pm := st.pendingMissing
 	st.pendingMissing = nil
 	if st.lastSeen.Equal(seen) {
 		st.alerted = true
 		return recoveryEvent{}, false
 	}
 	st.recovering = true
-	return recoveryEvent{id: id, downFor: st.lastSeen.Sub(seen)}, true
+	recoveredAt := st.lastSeen
+	if pm != nil && !pm.recoveredAt.IsZero() {
+		recoveredAt = pm.recoveredAt
+	}
+	return recoveryEvent{id: id, downFor: recoveredAt.Sub(seen)}, true
 }
 
 // finishRecovery clears the pending-recovery mark for id, re-enabling sweep

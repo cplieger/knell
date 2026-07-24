@@ -94,6 +94,10 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 		if statusErr := httpx.CheckHTTPStatus(resp); statusErr != nil {
 			return struct{}{}, statusErr
 		}
+		// CheckHTTPStatus treats all of 200-399 as success, so it alone
+		// would count an unfollowed redirect (3xx) as a delivered webhook.
+		// Only a 2xx is an accepted delivery; anything else must error so
+		// the sweep keeps retrying (pinned by TestUnfollowedRedirectIsNotDelivery).
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 			return struct{}{}, &httpx.HTTPStatusError{Code: resp.StatusCode}
 		}

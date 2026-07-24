@@ -38,6 +38,16 @@ func TestParseBeats(t *testing.T) {
 			raw:  "api:20m,",
 			want: []Beat{{ID: "api", Deadline: 20 * time.Minute}},
 		},
+		{
+			name: "exact minimum deadline accepted",
+			raw:  "api:30s",
+			want: []Beat{{ID: "api", Deadline: 30 * time.Second}},
+		},
+		{
+			name: "max length id accepted",
+			raw:  strings.Repeat("a", 64) + ":20m",
+			want: []Beat{{ID: strings.Repeat("a", 64), Deadline: 20 * time.Minute}},
+		},
 		{name: "empty", raw: "", wantErr: "no beats"},
 		{name: "only commas", raw: ",,,", wantErr: "no beats"},
 		{name: "missing deadline", raw: "api", wantErr: "expected"},
@@ -308,6 +318,7 @@ func TestLoadShortBeatTokenWarnsWithoutLeakingIt(t *testing.T) {
 	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
 	t.Setenv("NODE_NAME", "node-1")
 	t.Setenv("BEAT_TOKEN", "shorty")
+	t.Setenv("BEAT_TOKEN_FILE", "")
 
 	rec := capture.Default(t)
 

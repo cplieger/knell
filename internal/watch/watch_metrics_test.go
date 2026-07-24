@@ -2,8 +2,10 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -154,5 +156,58 @@ func TestRefreshFreshnessUpdatesGaugeWithoutNotifying(t *testing.T) {
 	w.refreshFreshness()
 	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
 		t.Fatalf("beat_fresh after ping + refresh = %s, want 1", got)
+	}
+}
+
+// counterValue parses the exposition value of name{kind="<kind>"} as a float.
+func counterValue(t *testing.T, name, kind string) float64 {
+	t.Helper()
+	v, err := strconv.ParseFloat(labeledValue(t, name, "kind", kind), 64)
+	if err != nil {
+		t.Fatalf("parsing %s{kind=%q} value: %v", name, kind, err)
+	}
+	return v
+}
+
+func TestDeliveredNotificationsIncrementSentCounters(t *testing.T) {
+	// Serial (no t.Parallel): asserts deltas on the package-global sent
+	// counters, which the parallel tests also increment.
+	const id = "sent-counter-probe"
+	w, clock, _ := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+	clock.Advance(11 * time.Minute)
+
+	missingBefore := counterValue(t, "knell_notifications_sent_total", "missing")
+	w.sweep(context.Background())
+	if got := counterValue(t, "knell_notifications_sent_total", "missing"); got != missingBefore+1 {
+		t.Errorf("sent{missing} = %v after delivered send, want %v (the sent counter is the delivery ground truth dashboards read)", got, missingBefore+1)
+	}
+
+	recoveredBefore := counterValue(t, "knell_notifications_sent_total", "recovered")
+	w.Beat(id)
+	drainRecoveries(w)
+	if got := counterValue(t, "knell_notifications_sent_total", "recovered"); got != recoveredBefore+1 {
+		t.Errorf("sent{recovered} = %v after delivered recovery, want %v", got, recoveredBefore+1)
+	}
+}
+
+func TestFailedMissingNotificationIncrementsFailedCounter(t *testing.T) {
+	// Serial (no t.Parallel): asserts deltas on the package-global failed
+	// counter. A real (non-canceled) delivery failure must move it: the
+	// KnellNotifyFailing alert increases() over exactly this series.
+	const id = "failed-counter-probe"
+	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+	clock.Advance(11 * time.Minute)
+
+	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
+	sentBefore := counterValue(t, "knell_notifications_sent_total", "missing")
+	n.setFail(errors.New("discord down"))
+	w.sweep(context.Background())
+	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore+1 {
+		t.Errorf("failed{missing} = %v after failed send, want %v (KnellNotifyFailing increases() over this counter)", got, failedBefore+1)
+	}
+	if got := counterValue(t, "knell_notifications_sent_total", "missing"); got != sentBefore {
+		t.Errorf("sent{missing} = %v after failed send, want unchanged %v", got, sentBefore)
 	}
 }
