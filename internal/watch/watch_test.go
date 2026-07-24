@@ -561,3 +561,16 @@ func TestFreshnessGaugeUpdatesWhileSenderBlocked(t *testing.T) {
 		}
 	})
 }
+
+func TestMarkDeliveredUnknownBeatIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	w, _, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	ev, raced := w.markDelivered("ghost", time.Time{})
+	if raced || ev != (recoveryEvent{}) {
+		t.Errorf("markDelivered(ghost) = (%+v, %t), want zero event and false", ev, raced)
+	}
+	if got := n.snapshot(); len(got) != 0 {
+		t.Errorf("unknown-id markDelivered caused notifications: %v", got)
+	}
+}
