@@ -593,7 +593,6 @@ func TestLatePingBeforeSweepPreservesOutage(t *testing.T) {
 	}
 }
 
-
 func TestLatePingDuringPendingRecoveryPreservesSecondOutage(t *testing.T) {
 	t.Parallel()
 
@@ -638,5 +637,70 @@ func TestLatePingDuringPendingRecoveryPreservesSecondOutage(t *testing.T) {
 	}
 	if got[3].elapsed < 11*time.Minute {
 		t.Errorf("second recovered downFor = %s, want the full second-outage interval", got[3].elapsed)
+	}
+}
+
+func TestRecoveredDownForMeasuresToFirstPingAfterOutage(t *testing.T) {
+	t.Parallel()
+
+	w, clock, n := newTestWatcher(config.Beat{ID: "downfor-first-ping", Deadline: 10 * time.Minute})
+	w.Beat("downfor-first-ping")
+
+	// Outage detected at t+11m but the missing send fails, so the
+	// transition stays pending while pings resume.
+	clock.Advance(11 * time.Minute)
+	n.setFail(errors.New("discord down"))
+	w.sweep(context.Background())
+
+	// First ping after the outage at t+12m ends it; a later ping at
+	// t+17m must NOT move the recovery point (first ping wins).
+	clock.Advance(time.Minute)
+	if !w.Beat("downfor-first-ping") {
+		t.Fatal("Beat = false")
+	}
+	clock.Advance(5 * time.Minute)
+	if !w.Beat("downfor-first-ping") {
+		t.Fatal("second Beat = false")
+	}
+
+	n.setFail(nil)
+	w.sweep(context.Background())
+
+	got := n.snapshot()
+	if len(got) != 2 || got[0].kind != "missing" || got[1].kind != "recovered" {
+		t.Fatalf("calls = %v, want [missing recovered]", got)
+	}
+	if got[0].elapsed != 11*time.Minute {
+		t.Errorf("missing silence = %s, want exactly 11m (captured when the sweep first detected the outage)", got[0].elapsed)
+	}
+	if got[1].elapsed != 12*time.Minute {
+		t.Errorf("recovered downFor = %s, want exactly 12m (measured to the FIRST ping after the outage, not a later one)", got[1].elapsed)
+	}
+}
+
+func TestRetriedMissingReportsCurrentSilence(t *testing.T) {
+	t.Parallel()
+
+	w, clock, n := newTestWatcher(config.Beat{ID: "silence-refresh", Deadline: 10 * time.Minute})
+	w.Beat("silence-refresh")
+
+	// Outage detected at t+11m; the missing send fails and stays pending.
+	clock.Advance(11 * time.Minute)
+	n.setFail(errors.New("discord down"))
+	w.sweep(context.Background())
+
+	// The beat stays silent for another 49m before the notifier heals.
+	// The retried missing notice must report the CURRENT silence (1h),
+	// not the stale 11m captured when the outage was first detected.
+	clock.Advance(49 * time.Minute)
+	n.setFail(nil)
+	w.sweep(context.Background())
+
+	got := n.snapshot()
+	if len(got) != 1 || got[0].kind != "missing" {
+		t.Fatalf("calls = %v, want one missing", got)
+	}
+	if got[0].elapsed != time.Hour {
+		t.Errorf("missing silence = %s, want exactly 1h (silence refreshed on each retry sweep while the beat stays silent)", got[0].elapsed)
 	}
 }

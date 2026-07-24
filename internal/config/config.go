@@ -119,7 +119,11 @@ func nodeName() string {
 func loadWebhook() (string, error) {
 	webhook, err := envx.Secret("DISCORD_WEBHOOK_URL")
 	if err != nil {
-		return "", fmt.Errorf("DISCORD_WEBHOOK_URL is required: %w", err)
+		if errors.As(err, new(*envx.MissingError)) {
+			return "", fmt.Errorf("DISCORD_WEBHOOK_URL is required: %w", err)
+		}
+		// Provided via _FILE but unreadable/empty: not a missing-variable case.
+		return "", fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
 	}
 	u, err := parseWebhookURL(webhook)
 	if err != nil {
