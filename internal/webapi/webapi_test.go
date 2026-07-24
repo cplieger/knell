@@ -44,6 +44,7 @@ func TestBeatEndpoint(t *testing.T) {
 		{name: "get known", method: http.MethodGet, path: "/beat/api", wantStatus: 200, wantSeen: 1},
 		{name: "post unknown", method: http.MethodPost, path: "/beat/ghost", wantStatus: 404},
 		{name: "missing id segment", method: http.MethodPost, path: "/beat/", wantStatus: 404},
+		{name: "head rejected without recording", method: http.MethodHead, path: "/beat/api", wantStatus: 405},
 		{name: "delete rejected", method: http.MethodDelete, path: "/beat/api", wantStatus: 405},
 		{name: "nested path rejected", method: http.MethodPost, path: "/beat/api/extra", wantStatus: 404},
 	}

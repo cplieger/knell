@@ -31,6 +31,10 @@ func New(b Beater, token string, healthz, metricsHandler http.Handler) http.Hand
 	beat := beatHandler(b, token)
 	mux.HandleFunc("POST /beat/{id}", beat)
 	mux.HandleFunc("GET /beat/{id}", beat)
+	mux.HandleFunc("HEAD /beat/{id}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Allow", "GET, POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
 	mux.Handle("GET /healthz", healthz)
 	mux.Handle("GET /metrics", metricsHandler)
 

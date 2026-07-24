@@ -205,6 +205,14 @@ func publishFreshness(id string, silence, deadline time.Duration) bool {
 	return false
 }
 
+// overdueBeat is a beat collectOverdue found past its deadline, captured
+// with the lastSeen observed when the sweep decided to notify.
+type overdueBeat struct {
+	seen    time.Time
+	id      string
+	silence time.Duration
+}
+
 // sweep checks every beat against its deadline and sends the missing
 // notification for newly overdue beats. A failed send is not marked
 // alerted, so the next sweep retries it; the beat stays in one Discord
@@ -214,43 +222,50 @@ func publishFreshness(id string, silence, deadline time.Duration) bool {
 // armed for the next outage. Run calls it on every tick; in-package tests
 // call it directly.
 func (w *Watcher) sweep(ctx context.Context) {
-	type due struct {
-		seen    time.Time // lastSeen observed when deciding to notify
-		id      string
-		silence time.Duration
+	for _, beat := range w.collectOverdue() {
+		if w.sendMissing(ctx, beat) {
+			return
+		}
 	}
-	var overdue []due
+}
 
+// collectOverdue publishes every beat's freshness gauge and returns the
+// beats past their deadline that need a missing notification (not yet
+// alerted and not mid-recovery).
+func (w *Watcher) collectOverdue() []overdueBeat {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	now := w.now()
+	var overdue []overdueBeat
 	for id, st := range w.beats {
 		silence := now.Sub(st.lastSeen)
-		if publishFreshness(id, silence, st.deadline) {
+		if publishFreshness(id, silence, st.deadline) || st.alerted || st.recovering {
 			continue
 		}
-		if !st.alerted && !st.recovering {
-			overdue = append(overdue, due{id: id, silence: silence, seen: st.lastSeen})
-		}
+		overdue = append(overdue, overdueBeat{id: id, silence: silence, seen: st.lastSeen})
 	}
-	w.mu.Unlock()
+	return overdue
+}
 
-	for _, d := range overdue {
-		if err := w.notifier.BeatMissing(ctx, d.id, d.silence); err != nil {
-			if errors.Is(err, context.Canceled) {
-				slog.Info("missing notification abandoned, shutting down", "beat", d.id)
-				return
-			}
-			metrics.NotificationsFailed.Inc(kindMissing)
-			slog.Error("missing notification failed, will retry next sweep",
-				"beat", d.id, "silence", d.silence.String(), "error", err)
-			continue
+// sendMissing delivers one due missing transition and reports whether
+// shutdown cancellation should stop the sweep.
+func (w *Watcher) sendMissing(ctx context.Context, beat overdueBeat) bool {
+	if err := w.notifier.BeatMissing(ctx, beat.id, beat.silence); err != nil {
+		if errors.Is(err, context.Canceled) {
+			slog.Info("missing notification abandoned, shutting down", "beat", beat.id)
+			return true
 		}
-		metrics.NotificationsSent.Inc(kindMissing)
-		slog.Info("beat missing, notified", "beat", d.id, "silence", d.silence.String())
-		if ev, raced := w.markDelivered(d.id, d.seen); raced {
-			w.sendRecovered(ctx, ev)
-		}
+		metrics.NotificationsFailed.Inc(kindMissing)
+		slog.Error("missing notification failed, will retry next sweep",
+			"beat", beat.id, "silence", beat.silence.String(), "error", err)
+		return false
 	}
+	metrics.NotificationsSent.Inc(kindMissing)
+	slog.Info("beat missing, notified", "beat", beat.id, "silence", beat.silence.String())
+	if event, raced := w.markDelivered(beat.id, beat.seen); raced {
+		w.sendRecovered(ctx, event)
+	}
+	return false
 }
 
 // markDelivered records the outcome of a delivered missing send for id,
