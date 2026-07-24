@@ -350,3 +350,36 @@ func TestLoadWebhookFromFile(t *testing.T) {
 		t.Errorf("WebhookURL = %q, want the file-borne URL (DISCORD_WEBHOOK_URL_FILE is the documented secret-file convention, trimmed)", cfg.WebhookURL)
 	}
 }
+
+func TestParseWebhookURLDoesNotLeakScheme(t *testing.T) {
+	t.Parallel()
+
+	// A malformed secret value like "credentialmaterial:rest" parses with the
+	// secret prefix as its scheme; the validation error must not embed it.
+	_, err := parseWebhookURL("credentialmaterial:rest")
+	if err == nil {
+		t.Fatal("parseWebhookURL with a non-http scheme = nil, want error")
+	}
+	if strings.Contains(err.Error(), "credentialmaterial") {
+		t.Errorf("error leaks the parsed scheme (a secret prefix): %v", err)
+	}
+}
+
+func TestLoadRejectsUnreadableWebhookFile(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-webhook")
+	t.Setenv("BEATS", "api:20m")
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/fallback")
+	t.Setenv("DISCORD_WEBHOOK_URL_FILE", missing)
+	t.Setenv("NODE_NAME", "node-1")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() with unreadable DISCORD_WEBHOOK_URL_FILE = nil, want error (the secret file must not silently fall back to the environment value)")
+	}
+	if !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL") {
+		t.Errorf("error = %q, want DISCORD_WEBHOOK_URL context", err)
+	}
+	if strings.Contains(err.Error(), "discord.example") {
+		t.Errorf("error leaks the fallback webhook URL: %v", err)
+	}
+}

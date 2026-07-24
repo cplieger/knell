@@ -202,7 +202,10 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		return nil, errors.New("not a valid URL")
 	}
 	if u.Scheme != "https" && u.Scheme != "http" {
-		return nil, fmt.Errorf("scheme must be http or https, got %q", u.Scheme)
+		// Deliberately omits the parsed scheme: a malformed secret value like
+		// "credentialmaterial:rest" parses with the secret prefix as its
+		// scheme, and this error reaches the startup log.
+		return nil, errors.New("scheme must be http or https")
 	}
 	if u.Host == "" {
 		return nil, errors.New("missing host")
