@@ -1,13 +1,13 @@
 package config
 
 import (
-	"bytes"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cplieger/slogx/capture"
 )
 
 func TestParseBeats(t *testing.T) {
@@ -309,10 +309,7 @@ func TestLoadShortBeatTokenWarnsWithoutLeakingIt(t *testing.T) {
 	t.Setenv("NODE_NAME", "node-1")
 	t.Setenv("BEAT_TOKEN", "shorty")
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	defer slog.SetDefault(prev)
+	rec := capture.Default(t)
 
 	cfg, err := Load()
 	if err != nil {
@@ -321,12 +318,11 @@ func TestLoadShortBeatTokenWarnsWithoutLeakingIt(t *testing.T) {
 	if cfg.BeatToken != "shorty" {
 		t.Errorf("BeatToken = %q, want the configured token (short tokens warn but still arm the gate)", cfg.BeatToken)
 	}
-	logged := buf.String()
-	if !strings.Contains(logged, "BEAT_TOKEN is shorter") {
-		t.Errorf("log output %q missing the short-token warning", logged)
+	if !rec.Contains("BEAT_TOKEN is shorter") {
+		t.Errorf("log output %v missing the short-token warning", rec.Messages())
 	}
-	if strings.Contains(logged, "shorty") {
-		t.Errorf("log output leaks the token value: %q", logged)
+	if rec.Contains("shorty") || rec.AttrContains("", "", "shorty") {
+		t.Errorf("log output leaks the token value: %v", rec.Messages())
 	}
 }
 

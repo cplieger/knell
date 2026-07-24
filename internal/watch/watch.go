@@ -49,9 +49,13 @@ const (
 
 // beatState is the per-beat tracking record.
 type beatState struct {
-	lastSeen time.Time
-	deadline time.Duration
-	alerted  bool
+	// pendingMissing retains a detected missing transition until its
+	// notification is delivered, so a ping cannot erase the evidence of an
+	// undelivered outage notice by moving lastSeen.
+	pendingMissing *overdueBeat
+	lastSeen       time.Time
+	deadline       time.Duration
+	alerted        bool
 	// recovering marks a recovered transition that is queued or in flight;
 	// sweep must not start another missing transition until it is
 	// delivered, so transitions reach Discord in chronological order.
@@ -231,7 +235,9 @@ func (w *Watcher) sweep(ctx context.Context) {
 
 // collectOverdue publishes every beat's freshness gauge and returns the
 // beats past their deadline that need a missing notification (not yet
-// alerted and not mid-recovery).
+// alerted and not mid-recovery), plus any beat whose earlier missing
+// transition is still undelivered (pendingMissing), so a failed send is
+// retried even after a ping refreshes the beat.
 func (w *Watcher) collectOverdue() []overdueBeat {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -239,10 +245,17 @@ func (w *Watcher) collectOverdue() []overdueBeat {
 	var overdue []overdueBeat
 	for id, st := range w.beats {
 		silence := now.Sub(st.lastSeen)
-		if publishFreshness(id, silence, st.deadline) || st.alerted || st.recovering {
+		fresh := publishFreshness(id, silence, st.deadline)
+		if st.pendingMissing != nil {
+			overdue = append(overdue, *st.pendingMissing)
 			continue
 		}
-		overdue = append(overdue, overdueBeat{id: id, silence: silence, seen: st.lastSeen})
+		if fresh || st.alerted || st.recovering {
+			continue
+		}
+		pending := overdueBeat{id: id, silence: silence, seen: st.lastSeen}
+		st.pendingMissing = &pending
+		overdue = append(overdue, pending)
 	}
 	return overdue
 }
@@ -281,6 +294,7 @@ func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool)
 	if !ok {
 		return recoveryEvent{}, false
 	}
+	st.pendingMissing = nil
 	if st.lastSeen.Equal(seen) {
 		st.alerted = true
 		return recoveryEvent{}, false

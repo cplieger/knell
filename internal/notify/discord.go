@@ -94,6 +94,9 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 		if statusErr := httpx.CheckHTTPStatus(resp); statusErr != nil {
 			return struct{}{}, statusErr
 		}
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			return struct{}{}, &httpx.HTTPStatusError{Code: resp.StatusCode}
+		}
 		return struct{}{}, nil
 	}, httpx.WithLabel("discord webhook "+label), httpx.WithMaxAttempts(maxAttempts), httpx.WithRateLimitRetry(30*time.Second))
 	if err != nil {

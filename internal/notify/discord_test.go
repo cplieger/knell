@@ -132,6 +132,27 @@ func TestPermanentFailureDoesNotRetry(t *testing.T) {
 	}
 }
 
+func TestUnfollowedRedirectIsNotDelivery(t *testing.T) {
+	t.Parallel()
+
+	// A final 3xx (unfollowed redirect) means the webhook was NOT accepted;
+	// post must report an error so the sweep keeps retrying delivery.
+	rec := newWebhookRecorder(http.StatusMultipleChoices)
+	srv := httptest.NewServer(rec.handler(t))
+	defer srv.Close()
+
+	d := New(srv.URL, "node-1")
+	defer d.Close()
+
+	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	if err == nil {
+		t.Fatal("BeatMissing on 300 = nil, want error (unfollowed 3xx is not delivery)")
+	}
+	if got := rec.hits.Load(); got != 1 {
+		t.Errorf("attempts = %d, want 1 (non-transient status, no per-attempt retry)", got)
+	}
+}
+
 func TestErrorsNeverLeakWebhookURL(t *testing.T) {
 	t.Parallel()
 

@@ -234,6 +234,23 @@ func TestFailedMissingRetriesNextSweep(t *testing.T) {
 	}
 }
 
+func TestFailedMissingStillDeliversAfterBeatRecovers(t *testing.T) {
+	t.Parallel()
+
+	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w.Beat("api")
+	clock.Advance(11 * time.Minute)
+	n.setFail(errors.New("discord down"))
+	w.sweep(context.Background())
+	w.Beat("api")
+	n.setFail(nil)
+	w.sweep(context.Background())
+	got := n.snapshot()
+	if len(got) != 2 || got[0].kind != "missing" || got[1].kind != "recovered" {
+		t.Fatalf("calls = %v, want the pending missing followed by recovered", got)
+	}
+}
+
 func TestSecondOutageNotifiesAgain(t *testing.T) {
 	t.Parallel()
 
