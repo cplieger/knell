@@ -159,7 +159,7 @@ func TestParseWebhookURL(t *testing.T) {
 		name string
 	}{
 		{name: "https", raw: "https://discord.com/api/webhooks/1/abc", ok: true},
-		{name: "http", raw: "http://127.0.0.1:9/hook", ok: true},
+		{name: "plain http rejected", raw: "http://127.0.0.1:9/hook", ok: false},
 		{name: "no scheme", raw: "discord.com/api/webhooks/1/abc", ok: false},
 		{name: "wrong scheme", raw: "ftp://discord.com/hook", ok: false},
 		{name: "no host", raw: "https:///hook", ok: false},
@@ -265,16 +265,32 @@ func TestLoadRejectsMalformedBeats(t *testing.T) {
 	}
 }
 
-func TestLoadAcceptsPlainHTTPWebhook(t *testing.T) {
+func TestLoadRejectsPlainHTTPWebhook(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("DISCORD_WEBHOOK_URL", "http://127.0.0.1:9/hook")
 
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() with a plain-http webhook = nil, want error (the webhook URL is a secret and must not transit in cleartext)")
+	}
+	if !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL") {
+		t.Errorf("error = %q, want DISCORD_WEBHOOK_URL context", err)
+	}
+	if strings.Contains(err.Error(), "127.0.0.1") || strings.Contains(err.Error(), "/hook") {
+		t.Errorf("error leaks the rejected webhook URL: %v", err)
+	}
+}
+
+func TestLoadAcceptsHTTPSWebhook(t *testing.T) {
+	setValidLoadEnv(t)
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://127.0.0.1:9/hook")
+
 	cfg, err := Load()
 	if err != nil {
-		t.Fatalf("Load() with plain-http webhook = %v, want accepted (warn, not fail)", err)
+		t.Fatalf("Load() with an https webhook = %v, want accepted", err)
 	}
-	if cfg.WebhookURL != "http://127.0.0.1:9/hook" {
-		t.Errorf("WebhookURL = %q", cfg.WebhookURL)
+	if cfg.WebhookURL != "https://127.0.0.1:9/hook" {
+		t.Errorf("WebhookURL = %q, want the configured URL verbatim (Load must not rewrite the secret)", cfg.WebhookURL)
 	}
 }
 
@@ -373,7 +389,7 @@ func TestParseWebhookURLDoesNotLeakScheme(t *testing.T) {
 	// secret prefix as its scheme; the validation error must not embed it.
 	_, err := parseWebhookURL("credentialmaterial:rest")
 	if err == nil {
-		t.Fatal("parseWebhookURL with a non-http scheme = nil, want error")
+		t.Fatal("parseWebhookURL with a non-https scheme = nil, want error")
 	}
 	if strings.Contains(err.Error(), "credentialmaterial") {
 		t.Errorf("error leaks the parsed scheme (a secret prefix): %v", err)
@@ -395,6 +411,47 @@ func TestLoadRejectsUnreadableWebhookFile(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "discord.example") {
 		t.Errorf("error leaks the fallback webhook URL: %v", err)
+	}
+}
+
+func TestLoadRejectsUnreadableBeatTokenFile(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-beat-token")
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", "env-fallback-token")
+	t.Setenv("BEAT_TOKEN_FILE", missing)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() with unreadable BEAT_TOKEN_FILE = nil, want error (the secret file must not silently fall back to the environment value, which would arm the gate with the wrong token)")
+	}
+	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
+		t.Errorf("error = %q, want BEAT_TOKEN context", err)
+	}
+	if strings.Contains(err.Error(), "env-fallback-token") {
+		t.Errorf("error leaks the fallback token value: %v", err)
+	}
+}
+
+func TestLoadRejectsEmptyBeatTokenFile(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "beat-token")
+	// envx trims before its empty check, so a whitespace-only file is the
+	// same condition as a zero-byte one.
+	if err := os.WriteFile(tokenFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", "env-fallback-token")
+	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() with an empty BEAT_TOKEN_FILE = nil, want error (an empty secret file is a broken mount, not an open endpoint)")
+	}
+	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
+		t.Errorf("error = %q, want BEAT_TOKEN context", err)
+	}
+	if strings.Contains(err.Error(), "env-fallback-token") {
+		t.Errorf("error leaks the fallback token value: %v", err)
 	}
 }
 

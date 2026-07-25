@@ -55,18 +55,18 @@ Silence past the deadline rings the bell:
 
 ## Configuration reference
 
-| Env | Default | Notes |
-| ----- | ------- | ----- |
-| `BEATS` | _none_ | required; comma-separated `id:deadline` list, e.g. `api:20m,backup:26h`. Ids match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; deadlines are Go durations, minimum `30s`, maximum 64 beats |
-| `DISCORD_WEBHOOK_URL` | _none_ | required; the webhook notifications post to. `DISCORD_WEBHOOK_URL_FILE` points at a mounted secret file instead |
-| `NODE_NAME` | container hostname | names this observer instance in every notification |
-| `BEAT_TOKEN` | _(unset)_ | optional; when set, `/beat/{id}` requires `Authorization: Bearer <token>` from senders. Empty leaves the endpoint open. `BEAT_TOKEN_FILE` points at a mounted secret file instead |
-| `LISTEN_ADDR` | `:9190` | TCP listen address (`host:port`) |
-| `LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error`; unknown falls back to `info` |
+| Variable | Description | Default | Required |
+| --- | --- | --- | --- |
+| `BEATS` | comma-separated `id:deadline` list, e.g. `api:20m,backup:26h`. Ids match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; deadlines are Go durations, minimum `30s`, maximum 64 beats | _none_ | Yes |
+| `DISCORD_WEBHOOK_URL` | the webhook notifications post to, `https` only: the URL's own path carries the credential, so a plain-http webhook would put it on the wire in cleartext. `DISCORD_WEBHOOK_URL_FILE` points at a mounted secret file instead | _none_ | Yes |
+| `NODE_NAME` | names this observer instance in every notification | container hostname | No |
+| `BEAT_TOKEN` | when set, `/beat/{id}` requires `Authorization: Bearer <token>` from senders. Empty leaves the endpoint open. `BEAT_TOKEN_FILE` points at a mounted secret file instead | _(unset)_ | No |
+| `LISTEN_ADDR` | TCP listen address (`host:port`) | `:9190` | No |
+| `LOG_LEVEL` | `debug`/`info`/`warn`/`error`; unknown falls back to `info` | `info` | No |
 
 knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext. Put a TLS reverse proxy in front, or keep pings on a trusted network.
 
-A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling back: a dead-man switch running with the wrong config is worse than one that refuses to start.
+A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling back, and so does a webhook URL on any scheme other than `https`. A `_FILE` secret that cannot be read, because the path is missing or the file is empty, fails startup too instead of falling back to the plain variable. A dead-man switch running with the wrong config is worse than one that refuses to start.
 
 ## Endpoints
 
@@ -83,6 +83,7 @@ Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away
 ## Notification semantics
 
 - **Missing**: sent once per outage, when a beat first passes its deadline. A failed delivery (Discord outage, network) is retried on every 15s sweep until one succeeds; the beat is only marked notified after a delivered send.
+- **Queued outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of erasing the earlier one. Each beat queues up to 8 records and drains them oldest first, one notice per beat per sweep, so notices arrive in the order the outages happened. When a beat's queue is full, the newest record is dropped, `knell_notifications_failed_total{kind="missing"}` increments and a warning is logged, so a dropped outage is never silent.
 - **Recovered**: sent on the first accepted ping after a missing notice, best-effort. Delivery uses bounded retries with jittered backoff and honors `Retry-After` on rate limits.
 - The webhook URL is treated as a secret: it is never logged and never appears in error messages.
 

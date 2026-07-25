@@ -640,6 +640,174 @@ func TestLatePingDuringPendingRecoveryPreservesSecondOutage(t *testing.T) {
 	}
 }
 
+func TestSecondOutageDuringUndeliveredMissingIsNotErased(t *testing.T) {
+	t.Parallel()
+
+	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w.Beat("api")
+
+	// Outage A: detected at t+11m, but the webhook is down, so its missing
+	// notice stays undelivered. A ping at the same instant ends A.
+	clock.Advance(11 * time.Minute)
+	n.setFail(errors.New("discord down"))
+	w.sweep(context.Background())
+	if !w.Beat("api") {
+		t.Fatal("Beat(api) = false")
+	}
+
+	// Outage B begins AND ends entirely while A's missing notice is still
+	// undelivered: another full deadline of silence, then a late ping.
+	// Detection must not be gated on A's delivery, or B leaves no trace at
+	// all -- no notification, no counter movement, the outage erased.
+	clock.Advance(11 * time.Minute)
+	if !w.Beat("api") {
+		t.Fatal("late Beat(api) = false")
+	}
+	if calls := n.snapshot(); len(calls) != 0 {
+		t.Fatalf("pings notified while the notifier was down: %v", calls)
+	}
+
+	// The webhook heals: A drains first (missing then recovered), and only
+	// the next sweep drains B -- one queued outage per beat per sweep,
+	// oldest first, so Discord reads chronologically.
+	n.setFail(nil)
+	w.sweep(context.Background())
+	if got := n.snapshot(); len(got) != 2 {
+		t.Fatalf("calls after the first drain sweep = %v, want outage A's missing/recovered pair only", got)
+	}
+	w.sweep(context.Background())
+
+	got := n.snapshot()
+	want := []string{"missing", "recovered", "missing", "recovered"}
+	if len(got) != len(want) {
+		t.Fatalf("calls = %v, want %v (the second outage was collapsed into the first)", got, want)
+	}
+	for i, kind := range want {
+		if got[i].kind != kind {
+			t.Errorf("calls[%d].kind = %s, want %s", i, got[i].kind, kind)
+		}
+		if got[i].elapsed != 11*time.Minute {
+			t.Errorf("calls[%d] (%s) elapsed = %s, want exactly 11m", i, got[i].kind, got[i].elapsed)
+		}
+	}
+}
+
+func TestThreeOutagesQueueWhileNoticesAreUndelivered(t *testing.T) {
+	t.Parallel()
+
+	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w.Beat("api")
+	n.setFail(errors.New("discord down"))
+
+	// Outage A (11m): sweep-detected, then ended by a ping.
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	if !w.Beat("api") {
+		t.Fatal("Beat(api) = false ending outage A")
+	}
+
+	// Outage B (13m): detected by a sweep while A is still queued, so the
+	// sweep itself must record a crossing behind an undelivered notice.
+	clock.Advance(13 * time.Minute)
+	w.sweep(context.Background())
+	if !w.Beat("api") {
+		t.Fatal("Beat(api) = false ending outage B")
+	}
+
+	// Outage C (17m): no sweep ever sees it -- a late ping records the
+	// whole closed outage while A and B are both still queued.
+	clock.Advance(17 * time.Minute)
+	if !w.Beat("api") {
+		t.Fatal("late Beat(api) = false ending outage C")
+	}
+	if calls := n.snapshot(); len(calls) != 0 {
+		t.Fatalf("calls while the notifier was down = %v, want none delivered", calls)
+	}
+
+	// All three outages survive with their own measurements: a two-slot
+	// patch drops one of them, and collapsing them loses two.
+	n.setFail(nil)
+	for range 3 {
+		w.sweep(context.Background())
+	}
+	got := n.snapshot()
+	want := []call{
+		{kind: "missing", id: "api", elapsed: 11 * time.Minute},
+		{kind: "recovered", id: "api", elapsed: 11 * time.Minute},
+		{kind: "missing", id: "api", elapsed: 13 * time.Minute},
+		{kind: "recovered", id: "api", elapsed: 13 * time.Minute},
+		{kind: "missing", id: "api", elapsed: 17 * time.Minute},
+		{kind: "recovered", id: "api", elapsed: 17 * time.Minute},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("calls = %v, want three chronological missing/recovered pairs %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("calls[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestPendingMissingQueueOverflowIsAccountedNotSilent(t *testing.T) {
+	// Serial (no t.Parallel): it asserts a delta on the package-global
+	// failed-notification counter, which the parallel tests also move.
+	const id = "missing-overflow-probe"
+	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+
+	// Fill the queue to its bound: every late ping past the deadline
+	// records one whole closed outage, and no sweep runs to drain them.
+	for range missingQueueSize {
+		clock.Advance(11 * time.Minute)
+		if !w.Beat(id) {
+			t.Fatalf("Beat(%s) = false", id)
+		}
+	}
+	if got := len(w.beats[id].pendingMissing); got != missingQueueSize {
+		t.Fatalf("queued outages = %d, want the full bound %d", got, missingQueueSize)
+	}
+
+	// One more outage, of a distinctive length, overflows the queue. The
+	// drop must move the failure counter (the series KnellNotifyFailing
+	// alerts on) so a lost outage is never silent.
+	const droppedSilence = 47 * time.Minute
+	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
+	clock.Advance(droppedSilence)
+	if !w.Beat(id) {
+		t.Fatalf("overflow Beat(%s) = false", id)
+	}
+	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore+1 {
+		t.Errorf("failed{missing} = %v after the queue-full drop, want %v (a dropped outage must be accounted)", got, failedBefore+1)
+	}
+	if got := len(w.beats[id].pendingMissing); got != missingQueueSize {
+		t.Errorf("queued outages = %d after overflow, want the bound %d to hold", got, missingQueueSize)
+	}
+
+	// The queued outages still drain oldest-first, one per sweep, and the
+	// dropped one contributes nothing.
+	for range missingQueueSize {
+		w.sweep(context.Background())
+	}
+	got := n.snapshot()
+	if len(got) != 2*missingQueueSize {
+		t.Fatalf("calls = %v, want %d (one missing/recovered pair per queued outage)", got, 2*missingQueueSize)
+	}
+	for i, c := range got {
+		if c.elapsed == droppedSilence {
+			t.Errorf("calls[%d] = %+v reports the dropped outage's interval", i, c)
+		}
+	}
+
+	// The beat stays armed after an overflow: the next crossing alerts.
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	got = n.snapshot()
+	if len(got) != 2*missingQueueSize+1 || got[len(got)-1].kind != "missing" {
+		t.Fatalf("calls = %v, want one more missing once the queue drained", got)
+	}
+}
+
 func TestRecoveredDownForMeasuresToFirstPingAfterOutage(t *testing.T) {
 	t.Parallel()
 

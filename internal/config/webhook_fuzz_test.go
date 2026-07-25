@@ -7,9 +7,10 @@ import (
 )
 
 // FuzzParseWebhookURL pins the webhook validator's safety and secret-hygiene
-// invariants: it never panics, every accepted URL is an absolute http(s) URL
-// with a host, and no rejection error ever embeds the raw URL or its path
-// (the path carries the webhook credential, and startup errors are logged).
+// invariants: it never panics, every accepted URL is an absolute https URL
+// with a host (plain http is rejected — the URL's path is a credential), and
+// no rejection error ever embeds the raw URL or its path (the path carries the
+// webhook credential, and startup errors are logged).
 func FuzzParseWebhookURL(f *testing.F) {
 	f.Add("https://discord.com/api/webhooks/1/abc")
 	f.Add("http://127.0.0.1:9/hook")
@@ -21,8 +22,8 @@ func FuzzParseWebhookURL(f *testing.F) {
 	f.Fuzz(func(t *testing.T, raw string) {
 		u, err := parseWebhookURL(raw)
 		if err == nil {
-			if u.Scheme != "http" && u.Scheme != "https" {
-				t.Fatalf("accepted scheme %q", u.Scheme)
+			if u.Scheme != "https" {
+				t.Fatalf("accepted scheme %q, want https only", u.Scheme)
 			}
 			if u.Host == "" {
 				t.Fatal("accepted URL without host")

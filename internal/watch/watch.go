@@ -40,6 +40,16 @@ const DefaultTick = 15 * time.Second
 // is also the queue bound.
 const recoveryQueueSize = config.MaxBeats
 
+// missingQueueSize bounds the per-beat queue of detected-but-undelivered
+// missing transitions. Every queued entry costs a full deadline of silence
+// (30s minimum, minutes to hours in practice) plus a ping, while the head
+// is retried every tick, so a queue this deep only forms during a sustained
+// webhook outage. It is deliberately small: the oldest notices are the
+// actionable ones, and the bound keeps a stuck webhook from growing state
+// without limit. Overflow drops with accounting, never silently, the same
+// way a full recovery queue does.
+const missingQueueSize = 8
+
 // Notification kinds are the label values on the sent/failed notification
 // counters; dashboards and the KnellNotifyFailing alert key on them.
 const (
@@ -49,17 +59,82 @@ const (
 
 // beatState is the per-beat tracking record.
 type beatState struct {
-	// pendingMissing retains a detected missing transition until its
-	// notification is delivered, so a ping cannot erase the evidence of an
-	// undelivered outage notice by moving lastSeen.
-	pendingMissing *overdueBeat
-	lastSeen       time.Time
+	lastSeen time.Time
+	// pendingMissing is the FIFO of detected missing transitions whose
+	// notification is not yet delivered, oldest first. It retains the
+	// evidence of an outage so a ping cannot erase it by moving lastSeen.
+	// Detection appends to it independently of delivery: an outage that
+	// both begins and ends while an earlier notice is still queued gets
+	// its own entry instead of being collapsed into the earlier one.
+	pendingMissing []overdueBeat
 	deadline       time.Duration
 	alerted        bool
 	// recovering marks a recovered transition that is queued or in flight;
-	// sweep must not start another missing transition until it is
+	// sweep must not send another missing transition until it is
 	// delivered, so transitions reach Discord in chronological order.
 	recovering bool
+}
+
+// headMissing returns the oldest queued missing transition — the one the
+// sweep delivers and retries — or nil when nothing is queued.
+func (st *beatState) headMissing() *overdueBeat {
+	if len(st.pendingMissing) == 0 {
+		return nil
+	}
+	return &st.pendingMissing[0]
+}
+
+// openMissing returns the queued record of an outage that has not ended
+// yet, or nil when every queued outage already carries its recovery point.
+// Records are appended in outage order and only a ping closes one, so the
+// open record can only ever be the tail.
+func (st *beatState) openMissing() *overdueBeat {
+	if len(st.pendingMissing) == 0 {
+		return nil
+	}
+	tail := &st.pendingMissing[len(st.pendingMissing)-1]
+	if tail.recoveredAt.IsZero() {
+		return tail
+	}
+	return nil
+}
+
+// pushMissing appends a detected missing transition, reporting false when
+// the queue is already at its bound (the caller accounts for the drop).
+func (st *beatState) pushMissing(rec overdueBeat) bool {
+	if len(st.pendingMissing) >= missingQueueSize {
+		return false
+	}
+	st.pendingMissing = append(st.pendingMissing, rec)
+	return true
+}
+
+// popMissing removes and returns the head, promoting the next queued
+// transition. It returns the zero record on an empty queue: only the single
+// sender pops, and only records collectOverdue handed it, so an empty pop
+// cannot happen and the zero record degrades to the pre-queue behaviour.
+func (st *beatState) popMissing() overdueBeat {
+	head := st.headMissing()
+	if head == nil {
+		return overdueBeat{}
+	}
+	rec := *head
+	st.pendingMissing = st.pendingMissing[1:]
+	return rec
+}
+
+// recordMissing queues a detected missing transition for the beat, or
+// accounts for the drop when the queue is full. Dropping the newest keeps
+// the queued chronology and the in-flight retry of the head intact, and
+// every drop moves the same failure counter (and log) a dropped recovery
+// does, so a lost outage is never silent. Callers hold w.mu.
+func recordMissing(st *beatState, rec overdueBeat) {
+	if st.pushMissing(rec) {
+		return
+	}
+	metrics.NotificationsFailed.Inc(kindMissing)
+	slog.Warn("pending missing queue full, dropping missing notification",
+		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.String())
 }
 
 // recoveryEvent is a queued recovered transition, measured at ping arrival.
@@ -120,20 +195,24 @@ func (w *Watcher) Beat(id string) bool {
 	previousSeen := st.lastSeen
 	downFor := now.Sub(previousSeen)
 	wasAlerted := st.alerted
-	if st.pendingMissing == nil && !wasAlerted && downFor > st.deadline {
-		pending := overdueBeat{
+	// A late ping ends an outage. When the sweep already recorded that
+	// outage, seal the record it has not delivered yet; when the crossing
+	// is one no sweep has seen at all, record the whole closed outage so
+	// this ping cannot erase it. Recording no longer depends on the queue
+	// being empty, so an outage that both begins AND ends while an earlier
+	// notice is undelivered still reaches Discord instead of vanishing.
+	if open := st.openMissing(); open != nil {
+		open.recoveredAt = now
+	} else if !wasAlerted && downFor > st.deadline {
+		recordMissing(st, overdueBeat{
 			id:          id,
 			silence:     downFor,
 			seen:        previousSeen,
 			recoveredAt: now,
-		}
-		st.pendingMissing = &pending
+		})
 	}
 	st.lastSeen = now
 	st.alerted = false
-	if st.pendingMissing != nil && st.pendingMissing.recoveredAt.IsZero() {
-		st.pendingMissing.recoveredAt = now
-	}
 	if wasAlerted {
 		st.recovering = true
 	}
@@ -222,8 +301,11 @@ func publishFreshness(id string, silence, deadline time.Duration) bool {
 	return false
 }
 
-// overdueBeat is a beat collectOverdue found past its deadline, captured
-// with the lastSeen observed when the sweep decided to notify.
+// overdueBeat is one detected missing transition: a beat past its deadline,
+// captured with the lastSeen observed when the crossing was detected. It
+// stays queued on the beat until its notification is delivered.
+// recoveredAt is set once a ping ends the outage (zero while it is still
+// ongoing), so the closing ping's recovery notice survives the wait.
 type overdueBeat struct {
 	seen        time.Time
 	recoveredAt time.Time
@@ -235,10 +317,12 @@ type overdueBeat struct {
 // notification for newly overdue beats. A failed send is not marked
 // alerted, so the next sweep retries it; the beat stays in one Discord
 // message per outage because alerted flips only on a delivered send.
-// A delivered send that a ping raced (the beat pinged while the notice was
-// in flight) emits the recovered transition immediately and leaves the beat
-// armed for the next outage. Run calls it on every tick; in-package tests
-// call it directly.
+// A delivered send for an outage that is already over (a ping raced the
+// notice, or ended the outage while it waited its turn) emits the recovered
+// transition immediately and leaves the beat armed for the next outage.
+// One missing notification per beat per sweep: a beat holding several
+// undelivered outages drains them oldest-first, a tick apart. Run calls it
+// on every tick; in-package tests call it directly.
 func (w *Watcher) sweep(ctx context.Context) {
 	for _, beat := range w.collectOverdue() {
 		if w.sendMissing(ctx, beat) {
@@ -247,11 +331,12 @@ func (w *Watcher) sweep(ctx context.Context) {
 	}
 }
 
-// collectOverdue publishes every beat's freshness gauge and returns the
-// beats past their deadline that need a missing notification (not yet
-// alerted and not mid-recovery), plus any beat whose earlier missing
-// transition is still undelivered (pendingMissing), so a failed send is
-// retried even after a ping refreshes the beat.
+// collectOverdue publishes every beat's freshness gauge and returns, per
+// beat, the one missing notification due now: the head of its pending queue
+// (a newly detected deadline crossing, or an earlier crossing whose send
+// failed and is being retried). Detection is independent of delivery, so a
+// crossing is recorded even while earlier notices are still queued; only
+// beats mid-recovery are held back, keeping transitions chronological.
 func (w *Watcher) collectOverdue() []overdueBeat {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -260,23 +345,29 @@ func (w *Watcher) collectOverdue() []overdueBeat {
 	for id, st := range w.beats {
 		silence := now.Sub(st.lastSeen)
 		fresh := publishFreshness(id, silence, st.deadline)
-		if st.pendingMissing != nil {
-			if st.lastSeen.Equal(st.pendingMissing.seen) {
-				st.pendingMissing.silence = silence
-			}
-			// Held while an earlier recovery is queued or in flight, so
-			// transitions reach Discord in chronological order.
-			if !st.recovering {
-				overdue = append(overdue, *st.pendingMissing)
-			}
+		// An overdue beat whose current outage is not on the queue yet is
+		// a fresh crossing to record. Recording it here rather than
+		// skipping the beat is what keeps a second outage alive while an
+		// earlier notice is still undelivered.
+		if !fresh && !st.alerted && st.openMissing() == nil {
+			recordMissing(st, overdueBeat{id: id, silence: silence, seen: st.lastSeen})
+		}
+		head := st.headMissing()
+		if head == nil {
 			continue
 		}
-		if fresh || st.alerted || st.recovering {
+		// Only the still-open current outage refreshes its silence, so a
+		// retry reports how long the beat has been quiet; a closed outage
+		// keeps the interval it actually spanned.
+		if head.recoveredAt.IsZero() && head.seen.Equal(st.lastSeen) {
+			head.silence = silence
+		}
+		// Held while an earlier recovery is queued or in flight, so
+		// transitions reach Discord in chronological order.
+		if st.recovering {
 			continue
 		}
-		pending := overdueBeat{id: id, silence: silence, seen: st.lastSeen}
-		st.pendingMissing = &pending
-		overdue = append(overdue, pending)
+		overdue = append(overdue, *head)
 	}
 	return overdue
 }
@@ -303,25 +394,26 @@ func (w *Watcher) sendMissing(ctx context.Context, beat overdueBeat) bool {
 }
 
 // markDelivered records the outcome of a delivered missing send for id,
-// given the lastSeen observed when the sweep decided to notify. Normally it
-// marks the beat alerted. When a ping raced the send (lastSeen moved), Beat
-// saw alerted=false and queued no recovery, and marking alerted now would
-// swallow the NEXT outage's missing notice — so the beat stays re-armed and
-// the pending recovered transition is returned for immediate delivery.
+// given the lastSeen observed when the sweep decided to notify. It pops the
+// delivered transition, promoting any later queued outage to the head for
+// the next sweep. Normally it marks the beat alerted. When the outage is
+// already over — the popped record carries its recovery point, or a ping
+// raced the send and moved lastSeen — marking alerted would swallow the
+// NEXT outage's missing notice, so the beat stays re-armed and the pending
+// recovered transition is returned for immediate delivery.
 func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	st := w.beats[id]
-	pm := st.pendingMissing
-	st.pendingMissing = nil
-	if st.lastSeen.Equal(seen) {
+	delivered := st.popMissing()
+	if delivered.recoveredAt.IsZero() && st.lastSeen.Equal(seen) {
 		st.alerted = true
 		return recoveryEvent{}, false
 	}
 	st.recovering = true
 	recoveredAt := st.lastSeen
-	if !pm.recoveredAt.IsZero() {
-		recoveredAt = pm.recoveredAt
+	if !delivered.recoveredAt.IsZero() {
+		recoveredAt = delivered.recoveredAt
 	}
 	return recoveryEvent{id: id, downFor: recoveredAt.Sub(seen)}, true
 }

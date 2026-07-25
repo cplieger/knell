@@ -121,7 +121,9 @@ func nodeName() string {
 }
 
 // loadWebhook reads and shape-checks DISCORD_WEBHOOK_URL. The URL is a
-// secret: errors never embed it, and plain http only warns on the scheme.
+// secret: errors never embed it, and only https is accepted — the URL's own
+// path carries the webhook credential, so a plain-http webhook would put the
+// secret on the wire in cleartext on every notification.
 func loadWebhook() (string, error) {
 	webhook, err := envx.Secret("DISCORD_WEBHOOK_URL")
 	if err != nil {
@@ -131,12 +133,8 @@ func loadWebhook() (string, error) {
 		// Provided via _FILE but unreadable/empty: not a missing-variable case.
 		return "", fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
 	}
-	u, err := parseWebhookURL(webhook)
-	if err != nil {
+	if _, err := parseWebhookURL(webhook); err != nil {
 		return "", fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
-	}
-	if u.Scheme == "http" {
-		slog.Warn("DISCORD_WEBHOOK_URL uses plain http; the webhook URL is a secret and will transit unencrypted")
 	}
 	return webhook, nil
 }
@@ -195,11 +193,12 @@ func parseBeatEntry(entry string, seen map[string]struct{}) (Beat, error) {
 	return Beat{ID: id, Deadline: deadline}, nil
 }
 
-// parseWebhookURL checks the webhook is an absolute http(s) URL with a host
-// and returns the parsed URL so the caller branches on the canonical
-// (lowercased) scheme instead of re-deriving it from the raw string. The
-// value is operator-supplied config, so this is a shape check against paste
-// accidents, not an SSRF guard.
+// parseWebhookURL checks the webhook is an absolute https URL with a host and
+// returns the parsed URL so callers can inspect the canonical (lowercased)
+// scheme and host instead of re-deriving them from the raw string. The value
+// is operator-supplied config, so this is a shape check against paste
+// accidents, not an SSRF guard — except for the scheme, which is a hard
+// requirement: the URL is a credential and plain http leaks it in transit.
 func parseWebhookURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -207,11 +206,12 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		// webhook URL is a secret that must not reach the startup error log.
 		return nil, errors.New("not a valid URL")
 	}
-	if u.Scheme != "https" && u.Scheme != "http" {
-		// Deliberately omits the parsed scheme: a malformed secret value like
-		// "credentialmaterial:rest" parses with the secret prefix as its
-		// scheme, and this error reaches the startup log.
-		return nil, errors.New("scheme must be http or https")
+	if u.Scheme != "https" {
+		// Deliberately omits the provided scheme: a malformed secret value
+		// like "credentialmaterial:rest" parses with the secret prefix as its
+		// scheme, and this error reaches the startup log. Naming only the
+		// required scheme keeps the message actionable and leak-free.
+		return nil, errors.New("scheme must be https")
 	}
 	if u.Host == "" {
 		return nil, errors.New("missing host")
