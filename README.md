@@ -96,7 +96,9 @@ A live incident and one that is already over are reported differently: nothing a
   > 🕓 [knell server-1] beat **cron-backup** had 3 outages while notifications were failing: longest 47m0s, last recovered at 14:07 UTC.
 
   The whole run of ended outages goes out in a single sweep, so a genuinely live outage queued behind it waits one sweep rather than one sweep per stale record. Because the notice states the outages are over, no recovered notice follows for them.
-- **Queued outages**: each beat queues up to 8 records and reports them oldest first. When a beat's queue is full, the newest record is not queued: a closed outage (one a ping already ended) is dropped, while an ongoing outage stays detectable and is queued once a slot opens. Either case increments `knell_notifications_failed_total{kind="missing"}` and logs a warning once for that outage, not once per sweep while the queue stays full, so queue saturation is never silent.
+- **Queued outages**: each beat queues up to 8 records and reports them oldest first. When a beat's queue is full, the newest record is not queued, and the two cases that can arise differ in consequence:
+  - an outage a ping has already ended is **dropped for good**: its record was the last trace of it, so no notice for it will ever arrive. `knell_notifications_dropped_total{kind="missing"}` increments and a warning is logged, once for that outage. Reconstruct the missed window from `knell_beat_last_seen_timestamp_seconds`.
+  - an outage still in progress **loses nothing**: it stays detected (`knell_beat_outages_total{beat}` already counted it), and it is queued and delivered once a slot opens. That is ordinary back-pressure while notifications are failing, so it is logged at debug level and moves no delivery counter.
 - The webhook URL is treated as a secret: it is never logged and never appears in error messages.
 
 ## Metrics
@@ -108,7 +110,8 @@ A live incident and one that is already over are reported differently: nothing a
 | `knell_beats_received_total{beat}` | counter | accepted pings; unknown ids are rejected, not counted |
 | `knell_beat_outages_total{beat}` | counter | outages detected per beat, counted when the deadline is crossed and independent of any delivery. Count outages with this one, not with the notification counters |
 | `knell_notifications_sent_total{kind}` | counter | delivered webhook notifications (`missing`, `recovered`, `history`), one per delivered message: a `history` message covering several ended outages counts once |
-| `knell_notifications_failed_total{kind}` | counter | failed delivery attempts after retries, one per failed message, plus transitions their queue was too full to accept |
+| `knell_notifications_failed_total{kind}` | counter | delivery attempts that failed after retries (`missing`, `recovered`, `history`), one per failed message. This counter means exactly that: something was sent and did not get through. A `missing` or `history` failure is retried on the next sweep |
+| `knell_notifications_dropped_total{kind}` | counter | notifications that will never be delivered, because their record was discarded when the per-beat queue was full. Nothing retries a drop: reconstruct the missed window from `knell_beat_last_seen_timestamp_seconds` |
 
 Plus standard `go_*` / `process_*` runtime metrics.
 
@@ -127,16 +130,23 @@ knell is itself the alert path for the things it watches, so alert rules about k
   annotations:
     summary: "beat {{ $labels.beat }} is overdue on {{ $labels.instance }}"
 
-# knell failed to deliver a notification (webhook unreachable after retries)
-# or could not queue a transition because its queue was full: some transitions
-# may not have reached you.
+# knell could not get a notification through, for one of two reasons the
+# counters keep apart:
+#   failed  = a delivery attempt failed after retries (the webhook is
+#             unreachable). The record is still queued and retried every 15s
+#             sweep, so the notice is late, not lost: wait for it.
+#   dropped = a record was discarded because its queue was full, so that
+#             notice will never arrive. Reconstruct the missed window from
+#             knell_beat_last_seen_timestamp_seconds.
 - alert: KnellNotifyFailing
-  expr: increase(knell_notifications_failed_total[15m]) > 0
+  expr: >
+    increase(knell_notifications_failed_total[15m]) > 0
+    or increase(knell_notifications_dropped_total[15m]) > 0
   for: 0m
   labels:
     severity: warning
   annotations:
-    summary: "knell on {{ $labels.instance }} failed to deliver or queue a notification"
+    summary: "knell on {{ $labels.instance }} failed to deliver or dropped a notification"
 ```
 
 One caveat comes with the boot-armed clock: every restart re-arms each beat's full deadline, so an observer restarting more often than a beat's deadline never fires that beat's alert. The runtime metrics already expose this; alert on restart churn within your longest deadline window:

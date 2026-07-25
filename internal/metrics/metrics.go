@@ -68,17 +68,32 @@ var NotificationsSent = metricslib.NewLabeledCounter(
 	[]string{kindLabel},
 )
 
-// NotificationsFailed counts unsuccessful webhook delivery attempts after
-// retries and transitions a full queue could not accept, by kind. A closed
-// outage that overflows is lost, while an ongoing one stays detectable and
-// is queued once a slot opens; either case is accounted once per affected
-// outage. A failed missing or history delivery is retried on the next watch
-// tick; a recovered notification is best-effort. One increment per failed
-// MESSAGE, so a failed history message counts once whatever number of ended
-// outages it covered.
+// NotificationsFailed counts webhook delivery attempts that failed after
+// retries, by kind. That is its only meaning: something was sent and did not
+// get through. A failed missing or history delivery is retried on the next
+// watch tick; a recovered notification is best-effort. One increment per
+// failed MESSAGE, so a failed history message counts once whatever number of
+// ended outages it covered. A notification that was never attempted because
+// its record was discarded by a full queue is NOT counted here (nothing
+// failed and nothing will retry): see NotificationsDropped.
 var NotificationsFailed = metricslib.NewLabeledCounter(
 	"notifications_failed_total",
-	"Unsuccessful webhook delivery attempts after retries and transitions a full queue could not accept, by kind (missing, recovered, history).",
+	"Webhook delivery attempts that failed after retries, by kind (missing, recovered, history); one per failed message.",
+	[]string{kindLabel},
+)
+
+// NotificationsDropped counts notifications that will never be delivered
+// because their record was discarded when the per-beat queue was full, by
+// kind. It is distinct from NotificationsFailed: a failed delivery still has
+// its record and retries, while a dropped one has nothing left to retry from,
+// so no notice for that transition will ever arrive. Reconstruct the missed
+// window from BeatLastSeen; BeatOutages already counted the outage itself at
+// detection. A queue-full event that loses nothing — an ongoing outage that
+// stays detected and is queued once a slot frees — is not counted here
+// either, because nothing was dropped.
+var NotificationsDropped = metricslib.NewLabeledCounter(
+	"notifications_dropped_total",
+	"Notifications that will never be delivered because their record was discarded when the per-beat queue was full, by kind (missing, recovered, history); distinct from a delivery that failed and will retry.",
 	[]string{kindLabel},
 )
 
@@ -89,4 +104,5 @@ func init() {
 	Registry.RegisterLabeledCounter(BeatOutages)
 	Registry.RegisterLabeledCounter(NotificationsSent)
 	Registry.RegisterLabeledCounter(NotificationsFailed)
+	Registry.RegisterLabeledCounter(NotificationsDropped)
 }

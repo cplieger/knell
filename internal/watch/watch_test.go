@@ -895,8 +895,8 @@ func TestFailedHistoryDeliveryKeepsRecordsAndRetries(t *testing.T) {
 }
 
 func TestPendingMissingQueueOverflowIsAccountedNotSilent(t *testing.T) {
-	// Serial (no t.Parallel): it asserts a delta on the package-global
-	// failed-notification counter, which the parallel tests also move.
+	// Serial (no t.Parallel): it asserts deltas on the package-global
+	// notification counters, which the parallel tests also move.
 	const id = "missing-overflow-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
@@ -913,20 +913,24 @@ func TestPendingMissingQueueOverflowIsAccountedNotSilent(t *testing.T) {
 		t.Fatalf("queued outages = %d, want the full bound %d", got, missingQueueSize)
 	}
 
-	// One more outage, of a distinctive length, overflows the queue. The
-	// drop must move the failure counter (the series KnellNotifyFailing
-	// alerts on) so a lost outage is never silent, and it must still count
-	// as a detected outage: the counter is the only remaining trace of an
-	// outage whose notice was dropped.
+	// One more outage, of a distinctive length, overflows the queue. That
+	// outage already ended, so its record was its last trace: no notice for
+	// it will ever arrive. A permanent loss is what the DROPPED counter
+	// reports (failed means a delivery attempt that will retry, which this
+	// is not), and the outage must still count as detected.
 	const droppedSilence = 47 * time.Minute
 	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
+	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "missing")
 	outagesBefore := beatCounterValue(t, "knell_beat_outages_total", id)
 	clock.Advance(droppedSilence)
 	if !w.Beat(id) {
 		t.Fatalf("overflow Beat(%s) = false", id)
 	}
-	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore+1 {
-		t.Errorf("failed{missing} = %v after the queue-full drop, want %v (a dropped outage must be accounted)", got, failedBefore+1)
+	if got, want := counterValue(t, "knell_notifications_dropped_total", "missing"), droppedBefore+1; got != want {
+		t.Errorf("dropped{missing} = %v after the queue-full drop, want %v (a lost outage must be accounted)", got, want)
+	}
+	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
+		t.Errorf("failed{missing} = %v after the queue-full drop, want unchanged %v (nothing was attempted and nothing will retry)", got, failedBefore)
 	}
 	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), outagesBefore+1; got != want {
 		t.Errorf("beat_outages_total = %v after the dropped outage, want %v (a detected outage counts even when its notice is dropped)", got, want)
@@ -950,12 +954,18 @@ func TestPendingMissingQueueOverflowIsAccountedNotSilent(t *testing.T) {
 	}
 
 	// The beat stays armed after an overflow: the next crossing alerts, and
-	// as a live outage (present tense), not as more history.
+	// as a live outage (present tense), not as more history. The dropped
+	// outage stays gone: no later sweep resurrects its notice.
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
 	got = n.snapshot()
 	if len(got) != 2 || got[1].kind != "missing" {
 		t.Fatalf("calls = %v, want one live missing notice once the queue drained", got)
+	}
+	for _, c := range got {
+		if c.elapsed == droppedSilence {
+			t.Errorf("call %+v delivered the dropped outage; a dropped record must never reach Discord", c)
+		}
 	}
 }
 
@@ -1030,8 +1040,8 @@ func TestRetriedMissingReportsCurrentSilence(t *testing.T) {
 }
 
 func TestSweepDetectedCrossingSurvivesAQueueFullOverflow(t *testing.T) {
-	t.Parallel()
-
+	// Serial (no t.Parallel): it asserts deltas on the package-global
+	// notification counters, which the parallel tests also move.
 	const id = "sweep-overflow-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
@@ -1047,6 +1057,8 @@ func TestSweepDetectedCrossingSurvivesAQueueFullOverflow(t *testing.T) {
 	// its bound. The overflow must not mark the beat alerted: a dead-man
 	// switch that swallows an ongoing outage because its queue was briefly
 	// full is the worst failure it can have.
+	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
+	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "missing")
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
 
@@ -1067,6 +1079,18 @@ func TestSweepDetectedCrossingSurvivesAQueueFullOverflow(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("calls[%d] = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+
+	// Nothing failed and nothing was lost on this path, and the notice above
+	// proves it: the sweep-path queue-full event only deferred the outage by
+	// one tick, so neither delivery counter may move for it. Counting it as
+	// a failure would page KnellNotifyFailing for an outage that WAS
+	// delivered, every 15s while the queue stayed full.
+	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
+		t.Errorf("failed{missing} = %v after a sweep-path queue-full event, want unchanged %v (nothing failed: the outage was delivered a tick later)", got, failedBefore)
+	}
+	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
+		t.Errorf("dropped{missing} = %v after a sweep-path queue-full event, want unchanged %v (nothing was dropped: the record was queued once a slot freed)", got, droppedBefore)
 	}
 }
 
