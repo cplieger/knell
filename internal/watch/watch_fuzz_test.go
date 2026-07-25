@@ -42,17 +42,23 @@ func checkMissingQueueInvariants(t *testing.T, w *Watcher, id string, deadline t
 // sweeps, clock advances and webhook outages, and pins the pending-missing
 // queue's structural invariants after every operation (checkMissingQueue-
 // Invariants). The table tests cover named scenarios; this covers the
-// interleavings nobody enumerated, which is where a queue with four
+// interleavings nobody enumerated, which is where a queue with five
 // interacting rules (append on detection, seal on ping, retry the head, drop
-// the newest when full) breaks.
+// the newest when full, pop the whole ended run on a delivered history
+// notice) breaks.
 func FuzzMissingQueue(f *testing.F) {
 	f.Add("pAsp")
 	f.Add("fpAsAspAsoss")
 	f.Add("pAAAsssppAs")
 	f.Add("fAsAsAsAsAsAsAsAsAsoss")
 	f.Add("pAspArfAsAspos")
+	// Ended outages queued behind a webhook outage, then drained as one
+	// collapsed history notice (the multi-record pop).
+	f.Add("fpApApApAsossA")
 	// Enough closed outages to fill the queue and take the overflow path.
 	f.Add(strings.Repeat("Ap", missingQueueSize+2))
+	// The same, then drained in a single sweep and re-armed.
+	f.Add(strings.Repeat("Ap", missingQueueSize+2) + "ssAs")
 	f.Fuzz(func(t *testing.T, ops string) {
 		const (
 			id       = "fuzz-queue-probe"

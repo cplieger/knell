@@ -6,6 +6,12 @@
 // so a beat that never pings at all still alerts one deadline after boot.
 // That deliberately closes the classic dead-man blind spot where a receiver
 // restart silently disarms the switch until the first ping re-arms it.
+//
+// Notifications are split by whether the incident is still open. A live
+// outage gets the present-tense missing notice and, when the beat returns,
+// its recovered notice. Outages that had already ended before their notice
+// could be delivered (a webhook outage held them back) are reported once as
+// history, so a resolved incident is never announced as a new live failure.
 package watch
 
 import (
@@ -18,16 +24,64 @@ import (
 	"github.com/cplieger/knell/internal/metrics"
 )
 
-// Notifier delivers the two transition notifications. Implementations are
+// Notifier delivers the transition notifications. Implementations are
 // expected to retry transient failures internally and return the final
 // outcome.
+//
+// The first two methods report a LIVE incident as it happens; the third
+// reports outages that were already over by the time their notice could be
+// delivered, so an implementation must render it in the past tense. Nothing
+// else distinguishes the two: a live outage never reaches
+// BeatOutageHistory, and a history notice is never followed by
+// BeatRecovered calls for the outages it covers.
 type Notifier interface {
 	// BeatMissing reports that id has been silent for silence (its deadline
-	// has passed).
+	// has passed) and the outage is still open.
 	BeatMissing(ctx context.Context, id string, silence time.Duration) error
 	// BeatRecovered reports that id pinged again after having been declared
 	// missing, downFor after its last accepted ping.
 	BeatRecovered(ctx context.Context, id string, downFor time.Duration) error
+	// BeatOutageHistory reports outages of id that had already ended before
+	// their notice could be delivered, collapsed into a single past-tense
+	// notice. outages is chronological and never empty, and every entry
+	// carries its own recovery point, so the implementation must not
+	// present them as ongoing.
+	BeatOutageHistory(ctx context.Context, id string, outages []Outage) error
+}
+
+// Outage is one already-ended outage as the state machine observed it, the
+// unit BeatOutageHistory reports. It is the watch package's own output type,
+// so the notifier renders the outage from the state machine's shape without
+// the state machine depending on how (or where) it is rendered.
+type Outage struct {
+	// Started is the last accepted ping before the outage: the instant the
+	// beat's silence began.
+	Started time.Time
+	// Recovered is the first accepted ping after the outage: the instant it
+	// ended. Always after Started.
+	Recovered time.Time
+	// Silence is how long the beat had been quiet when the deadline crossing
+	// was detected. It is a reading taken during the outage, so it is at or
+	// below the outage's full span; DownFor is the span itself.
+	Silence time.Duration
+}
+
+// DownFor is the outage's full span: from the last ping before it to the
+// first ping after it. It is the figure a past-tense notice reports ("was
+// missing for ..."), derived here so every renderer measures it the same way.
+func (o Outage) DownFor() time.Duration {
+	return o.Recovered.Sub(o.Started)
+}
+
+// LongestOutage returns the longest span among outages, or zero for an empty
+// slice. It lives here, next to the type, so the notifier's summary and the
+// sender's log line report the same figure by construction.
+func LongestOutage(outages []Outage) time.Duration {
+	var longest time.Duration
+	for _, o := range outages {
+		longest = max(longest, o.DownFor())
+	}
+	return longest
 }
 
 // DefaultTick is the watch loop's check cadence. Deadlines are minutes to
@@ -55,10 +109,13 @@ type Beat struct {
 const missingQueueSize = 8
 
 // Notification kinds are the label values on the sent/failed notification
-// counters; dashboards and the KnellNotifyFailing alert key on them.
+// counters; dashboards and the KnellNotifyFailing alert key on them. They
+// count MESSAGES, so kindHistory moves by one for a notice covering any
+// number of ended outages; metrics.BeatOutages is what counts outages.
 const (
 	kindMissing   = "missing"
 	kindRecovered = "recovered"
+	kindHistory   = "history"
 )
 
 // beatState is the per-beat tracking record.
@@ -69,7 +126,9 @@ type beatState struct {
 	// evidence of an outage so a ping cannot erase it by moving lastSeen.
 	// Detection appends to it independently of delivery: an outage that
 	// both begins and ends while an earlier notice is still queued gets
-	// its own entry instead of being collapsed into the earlier one.
+	// its own entry, so its own span survives. Delivery then collapses the
+	// ended entries at the head into a single history notice; the records
+	// stay distinct, only the message is one.
 	pendingMissing []overdueBeat
 	deadline       time.Duration
 	alerted        bool
@@ -77,16 +136,19 @@ type beatState struct {
 	// sweep must not send another missing transition until it is
 	// delivered, so transitions reach Discord in chronological order.
 	recovering bool
-	// overflowAccounted records that the current outage has already moved
-	// the failure counter and warning for a full pending queue. A closed
-	// outage may be lost, while an ongoing outage remains detectable and is
-	// queued after space opens; either case is accounted only once until a
-	// successful push or the closing ping clears the flag.
+	// overflowAccounted records that the current outage has already been
+	// counted as detected and has moved the failure counter and warning for
+	// a full pending queue. A closed outage may be lost, while an ongoing
+	// outage remains detectable and is queued after space opens; either case
+	// is accounted only once until a successful push or the closing ping
+	// clears the flag.
 	overflowAccounted bool
 }
 
-// headMissing returns the oldest queued missing transition — the one the
-// sweep delivers and retries — or nil when nothing is queued.
+// headMissing returns the oldest queued missing transition — the one whose
+// state decides the beat's next notice (open: a live missing notice to
+// deliver and retry; ended: the start of a history run) — or nil when
+// nothing is queued.
 func (st *beatState) headMissing() *overdueBeat {
 	if len(st.pendingMissing) == 0 {
 		return nil
@@ -121,7 +183,7 @@ func (st *beatState) pushMissing(rec overdueBeat) bool {
 
 // popMissing removes and returns the head, promoting the next queued
 // transition. It returns the zero record on an empty queue: only the single
-// sender pops, and only for a head collectOverdue handed it, so an empty pop
+// sender pops, and only for a head collectDue handed it, so an empty pop
 // cannot happen and the zero record degrades to the pre-queue behavior.
 func (st *beatState) popMissing() overdueBeat {
 	head := st.headMissing()
@@ -133,6 +195,37 @@ func (st *beatState) popMissing() overdueBeat {
 	return rec
 }
 
+// dropMissing removes the first n queued records: the run of already-ended
+// outages a delivered history notice covered. Only the single sender pops,
+// and it drops exactly the count it collected from the head, so n can never
+// exceed the queue length; the clamp keeps a future caller in range.
+func (st *beatState) dropMissing(n int) {
+	st.pendingMissing = st.pendingMissing[min(n, len(st.pendingMissing)):]
+}
+
+// closedRun returns the already-ended outages queued in an unbroken run at
+// the head, oldest first, or nil when the head is still an open outage. They
+// are the beat's history: one collapsed past-tense notice covers all of them
+// (see sendHistory), instead of replaying each as a live missing transition.
+// Records are appended in outage order and only the tail can be open, so the
+// run is the whole queue minus an open tail; the loop stops at the first open
+// record regardless, so the run cannot silently depend on that invariant.
+func (st *beatState) closedRun() []Outage {
+	var run []Outage
+	for i := range st.pendingMissing {
+		rec := st.pendingMissing[i]
+		if rec.recoveredAt.IsZero() {
+			break
+		}
+		run = append(run, Outage{
+			Started:   rec.seen,
+			Recovered: rec.recoveredAt,
+			Silence:   rec.silence,
+		})
+	}
+	return run
+}
+
 // recordMissing queues a detected missing transition for the beat, or
 // accounts for a queue-full event once when the queue is full. Dropping the
 // newest keeps the queued chronology and the in-flight retry of the head
@@ -140,7 +233,16 @@ func (st *beatState) popMissing() overdueBeat {
 // dropped recovery does, so saturation is never silent — once per affected
 // outage, not once per sweep. A closed outage that overflows is lost; an
 // ongoing one is re-detected and queued once a slot opens. Callers hold w.mu.
+//
+// The outage counter moves exactly once per detected outage, whether or not
+// the notice found a queue slot: overflowAccounted already means "this same
+// outage was detected and counted by an earlier call", which covers both a
+// re-detection while the queue stays full and the later call that finally
+// queues that outage.
 func recordMissing(st *beatState, rec overdueBeat) {
+	if !st.overflowAccounted {
+		metrics.BeatOutages.Inc(rec.id)
+	}
 	if st.pushMissing(rec) {
 		st.overflowAccounted = false
 		return
@@ -191,12 +293,15 @@ func New(beats []Beat, notifier Notifier, now func() time.Time) *Watcher {
 		w.beats[b.ID] = &beatState{lastSeen: start, deadline: b.Deadline}
 		metrics.BeatFresh.Set(1, b.ID)
 		metrics.BeatLastSeen.Set(float64(start.Unix()), b.ID)
+		// Pre-mint the per-beat counters at zero for the same reason as the
+		// notification counters below: increase() needs an earlier sample.
 		metrics.BeatsReceived.Add(0, b.ID)
+		metrics.BeatOutages.Add(0, b.ID)
 	}
 	// Pre-mint the notification counter series at zero so an increase()
 	// alert sees the very first failure: a counter series born at a
 	// nonzero value has no earlier sample to diff against.
-	for _, kind := range []string{kindMissing, kindRecovered} {
+	for _, kind := range []string{kindMissing, kindRecovered, kindHistory} {
 		metrics.NotificationsSent.Add(0, kind)
 		metrics.NotificationsFailed.Add(0, kind)
 	}
@@ -339,7 +444,8 @@ func publishFreshness(id string, silence, deadline time.Duration) bool {
 // captured with the lastSeen observed when the crossing was detected. It
 // stays queued on the beat until its notification is delivered.
 // recoveredAt is set once a ping ends the outage (zero while it is still
-// ongoing), so the closing ping's recovery notice survives the wait.
+// ongoing), so the ended outage's span survives the wait and its notice can
+// report it in the past tense instead of as a live failure.
 type overdueBeat struct {
 	seen        time.Time
 	recoveredAt time.Time
@@ -347,36 +453,53 @@ type overdueBeat struct {
 	silence     time.Duration
 }
 
-// sweep checks every beat against its deadline and sends the missing
-// notification for newly overdue beats. A failed send is not marked
-// alerted, so the next sweep retries it; the beat stays in one Discord
-// message per outage because alerted flips only on a delivered send.
+// sweep checks every beat against its deadline and sends the one
+// notification each beat owes now. A failed send is not marked alerted, so
+// the next sweep retries it; the beat stays in one Discord message per live
+// outage because alerted flips only on a delivered send.
 // A delivered send for an outage that is already over (a ping raced the
-// notice, or ended the outage while it waited its turn) emits the recovered
-// transition immediately and leaves the beat armed for the next outage.
-// One missing notification per beat per sweep: a beat holding several
-// undelivered outages drains them oldest-first, a tick apart. Run calls it
-// on every tick; in-package tests call it directly.
+// notice) emits the recovered transition immediately and leaves the beat
+// armed for the next outage.
+// One notification per beat per sweep, and history goes first so the oldest
+// events lead: a beat whose queue head is an outage that already ended
+// delivers every consecutive ended outage as ONE past-tense notice in this
+// sweep, which is why a live outage queued behind a backlog waits a single
+// tick rather than one tick per stale record. Run calls sweep on every tick;
+// in-package tests call it directly.
 func (w *Watcher) sweep(ctx context.Context) {
-	for _, beat := range w.collectOverdue() {
+	live, history := w.collectDue()
+	for _, past := range history {
+		if w.sendHistory(ctx, past) {
+			return
+		}
+	}
+	for _, beat := range live {
 		if w.sendMissing(ctx, beat) {
 			return
 		}
 	}
 }
 
-// collectOverdue publishes every beat's freshness gauge and returns, per
-// beat, the one missing notification due now: the head of its pending queue
-// (a newly detected deadline crossing, an earlier crossing whose send failed
-// and is being retried, or an earlier crossing still waiting its turn behind
-// the notices queued before it). Detection is independent of delivery, so a
-// crossing is recorded even while earlier notices are still queued; only
-// beats mid-recovery are held back, keeping transitions chronological.
-func (w *Watcher) collectOverdue() []overdueBeat {
+// beatOutages is one beat's run of already-ended outages, the payload of a
+// single collapsed history notice.
+type beatOutages struct {
+	id      string
+	outages []Outage
+}
+
+// collectDue publishes every beat's freshness gauge and returns this sweep's
+// due notifications, at most one per beat: either the beat's live missing
+// notice (the head of its pending queue is an outage still in progress: a
+// newly detected deadline crossing, or an earlier one whose send failed and
+// is being retried) or its history notice (the head already ended, so every
+// consecutive ended record at the head is collapsed into one notice).
+// Detection is independent of delivery, so a crossing is recorded even while
+// earlier notices are still queued; only beats mid-recovery are held back,
+// keeping transitions chronological.
+func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	now := w.now()
-	var due []overdueBeat
 	for id, st := range w.beats {
 		silence := now.Sub(st.lastSeen)
 		fresh := publishFreshness(id, silence, st.deadline)
@@ -394,8 +517,9 @@ func (w *Watcher) collectOverdue() []overdueBeat {
 		// Only the still-open current outage refreshes its silence, so a
 		// retry reports how long the beat has been quiet. Once a ping seals
 		// the record, its silence freezes at the reading taken when the
-		// outage was detected — the recovered notice carries the full span
-		// (see markDelivered), so the pair stays readable together.
+		// outage was detected — a history notice reports the outage's full
+		// span (Outage.DownFor) instead, so the frozen reading is only
+		// supplementary detail.
 		if head.recoveredAt.IsZero() && head.seen.Equal(st.lastSeen) {
 			head.silence = silence
 		}
@@ -404,9 +528,15 @@ func (w *Watcher) collectOverdue() []overdueBeat {
 		if st.recovering {
 			continue
 		}
-		due = append(due, *head)
+		// An ended head is history: collapse its whole run into one notice.
+		// An open head is a live incident and keeps the present-tense path.
+		if run := st.closedRun(); len(run) > 0 {
+			history = append(history, beatOutages{id: id, outages: run})
+			continue
+		}
+		live = append(live, *head)
 	}
-	return due
+	return live, history
 }
 
 // sendMissing delivers one due missing transition and reports whether
@@ -428,6 +558,44 @@ func (w *Watcher) sendMissing(ctx context.Context, beat overdueBeat) bool {
 		w.sendRecovered(ctx, event)
 	}
 	return false
+}
+
+// sendHistory delivers one beat's collapsed history notice — every outage
+// that had already ended when its turn came, in a single past-tense message —
+// and reports whether shutdown cancellation should stop the sweep. The
+// records stay queued until the notice is delivered, so a failure (or a
+// shutdown) retries the whole run on the next sweep exactly like a live
+// missing notice, and nothing is lost. The delivered notice states that the
+// outages are over, so no recovered notification follows for them; the
+// counters therefore move once for the message while metrics.BeatOutages
+// already moved once per outage at detection.
+func (w *Watcher) sendHistory(ctx context.Context, past beatOutages) bool {
+	if err := w.notifier.BeatOutageHistory(ctx, past.id, past.outages); err != nil {
+		if errors.Is(err, context.Canceled) {
+			slog.Info("outage history notification abandoned, shutting down", "beat", past.id)
+			return true
+		}
+		metrics.NotificationsFailed.Inc(kindHistory)
+		slog.Error("outage history notification failed, will retry next sweep",
+			"beat", past.id, "outages", len(past.outages), "error", err)
+		return false
+	}
+	metrics.NotificationsSent.Inc(kindHistory)
+	slog.Info("ended outages notified as history",
+		"beat", past.id, "outages", len(past.outages),
+		"longest", LongestOutage(past.outages).String())
+	w.dropDelivered(past.id, len(past.outages))
+	return false
+}
+
+// dropDelivered removes the n head records a delivered history notice
+// covered. Only the sender pops and it drops exactly what it collected from
+// the head, so concurrent pings (which append at the tail, or seal the open
+// tail) cannot shift the run out from under it.
+func (w *Watcher) dropDelivered(id string, n int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.beats[id].dropMissing(n)
 }
 
 // markDelivered records the outcome of a delivered missing send for id,

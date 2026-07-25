@@ -19,7 +19,8 @@ You configure named beats, each with a deadline. Anything that can send an HTTP 
 
 - One binary on a `scratch` base: no shell, no libc, no dependencies to patch
 - Deadline clock starts at boot: a beat that never pings at all still alerts one deadline after start, so a restart never silently disarms the switch (the flip side: each restart re-arms full deadlines; see the restart-churn rule under Alerting)
-- One missing notice per outage (delivery is retried every sweep until it succeeds), one recovered notice when the beat returns
+- One missing notice per live outage (delivery is retried every sweep until it succeeds), one recovered notice when the beat returns
+- Outages that ended while notifications were failing are reported once, in the past tense, instead of arriving as apparent new failures
 - Unknown beat ids are rejected with 404 and never create metric series
 
 ## Quick start
@@ -82,9 +83,20 @@ Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away
 
 ## Notification semantics
 
-- **Missing**: sent once per outage, when a beat first passes its deadline. A failed delivery (Discord outage, network) is retried on every 15s sweep until one succeeds; the beat is only marked notified after a delivered send.
-- **Queued outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of being collapsed into that earlier one and lost. Each beat queues up to 8 records and drains them oldest first, one notice per beat per sweep, so notices arrive in the order the outages happened. When a beat's queue is full, the newest record is not queued: a closed outage (one a ping already ended) is dropped, while an ongoing outage stays detectable and is queued once a slot opens. Either case increments `knell_notifications_failed_total{kind="missing"}` and logs a warning once for that outage, not once per sweep while the queue stays full, so queue saturation is never silent.
+A live incident and one that is already over are reported differently: nothing an operator reads should announce a resolved outage as a beat that is down right now.
+
+- **Missing**: sent once per live outage, when a beat first passes its deadline. A failed delivery (Discord outage, network) is retried on every 15s sweep until one succeeds; the beat is only marked notified after a delivered send.
 - **Recovered**: sent on the first accepted ping after a missing notice, best-effort. Delivery uses bounded retries with jittered backoff and honors `Retry-After` on rate limits.
+- **Ended outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of being collapsed into that earlier one and lost. Records whose outage has already ended by the time they can be delivered are reported once in the past tense. One ended outage reads as a single sentence:
+
+  > 🕓 [knell server-1] beat **cron-backup** was missing for 12m0s, recovered at 14:07 UTC. This notice is late: notifications were failing while the outage happened.
+
+  Several become one summary:
+
+  > 🕓 [knell server-1] beat **cron-backup** had 3 outages while notifications were failing: longest 47m0s, last recovered at 14:07 UTC.
+
+  The whole run of ended outages goes out in a single sweep, so a genuinely live outage queued behind it waits one sweep rather than one sweep per stale record. Because the notice states the outages are over, no recovered notice follows for them.
+- **Queued outages**: each beat queues up to 8 records and reports them oldest first. When a beat's queue is full, the newest record is not queued: a closed outage (one a ping already ended) is dropped, while an ongoing outage stays detectable and is queued once a slot opens. Either case increments `knell_notifications_failed_total{kind="missing"}` and logs a warning once for that outage, not once per sweep while the queue stays full, so queue saturation is never silent.
 - The webhook URL is treated as a secret: it is never logged and never appears in error messages.
 
 ## Metrics
@@ -94,8 +106,9 @@ Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away
 | `knell_beat_fresh{beat}` | gauge | 1 = last ping within deadline, 0 = overdue. The aggregation input for multi-observer quorum rules |
 | `knell_beat_last_seen_timestamp_seconds{beat}` | gauge | Unix time of the last accepted ping (process start until the first ping) |
 | `knell_beats_received_total{beat}` | counter | accepted pings; unknown ids are rejected, not counted |
-| `knell_notifications_sent_total{kind}` | counter | delivered webhook notifications (`missing`, `recovered`) |
-| `knell_notifications_failed_total{kind}` | counter | failed delivery attempts after retries, plus transitions their queue was too full to accept |
+| `knell_beat_outages_total{beat}` | counter | outages detected per beat, counted when the deadline is crossed and independent of any delivery. Count outages with this one, not with the notification counters |
+| `knell_notifications_sent_total{kind}` | counter | delivered webhook notifications (`missing`, `recovered`, `history`), one per delivered message: a `history` message covering several ended outages counts once |
+| `knell_notifications_failed_total{kind}` | counter | failed delivery attempts after retries, one per failed message, plus transitions their queue was too full to accept |
 
 Plus standard `go_*` / `process_*` runtime metrics.
 

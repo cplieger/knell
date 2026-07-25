@@ -9,7 +9,7 @@ import (
 )
 
 // beatLabel names the watched beat on per-beat metrics; kindLabel names the
-// notification kind (missing, recovered) on the delivery counters.
+// notification kind (missing, recovered, history) on the delivery counters.
 const (
 	beatLabel = "beat"
 	kindLabel = "kind"
@@ -45,11 +45,26 @@ var BeatsReceived = metricslib.NewLabeledCounter(
 	[]string{beatLabel},
 )
 
+// BeatOutages counts detected outages per beat: exactly one increment for
+// every deadline crossing the state machine detects, at detection time and
+// independent of notification delivery. An outage whose notice was never
+// delivered, or was dropped by a full queue, or was collapsed with others
+// into one history message is counted here all the same. This is the only
+// series that counts OUTAGES: the notification counters count MESSAGES, and
+// one history message can cover several outages.
+var BeatOutages = metricslib.NewLabeledCounter(
+	"beat_outages_total",
+	"Detected outages per beat: one increment per deadline crossing detected, independent of notification delivery.",
+	[]string{beatLabel},
+)
+
 // NotificationsSent counts webhook notifications delivered, by kind
-// (missing, recovered).
+// (missing, recovered, history). One increment per delivered MESSAGE: a
+// history message covering several ended outages counts once, so pair this
+// with BeatOutages to reason about outages rather than messages.
 var NotificationsSent = metricslib.NewLabeledCounter(
 	"notifications_sent_total",
-	"Webhook notifications delivered, by kind (missing, recovered).",
+	"Webhook notifications delivered, by kind (missing, recovered, history); one per delivered message.",
 	[]string{kindLabel},
 )
 
@@ -57,11 +72,13 @@ var NotificationsSent = metricslib.NewLabeledCounter(
 // retries and transitions a full queue could not accept, by kind. A closed
 // outage that overflows is lost, while an ongoing one stays detectable and
 // is queued once a slot opens; either case is accounted once per affected
-// outage. A failed missing delivery is retried on the next watch tick; a
-// recovered notification is best-effort.
+// outage. A failed missing or history delivery is retried on the next watch
+// tick; a recovered notification is best-effort. One increment per failed
+// MESSAGE, so a failed history message counts once whatever number of ended
+// outages it covered.
 var NotificationsFailed = metricslib.NewLabeledCounter(
 	"notifications_failed_total",
-	"Unsuccessful webhook delivery attempts after retries and transitions a full queue could not accept, by kind (missing, recovered).",
+	"Unsuccessful webhook delivery attempts after retries and transitions a full queue could not accept, by kind (missing, recovered, history).",
 	[]string{kindLabel},
 )
 
@@ -69,6 +86,7 @@ func init() {
 	Registry.RegisterLabeledGauge(BeatFresh)
 	Registry.RegisterLabeledGauge(BeatLastSeen)
 	Registry.RegisterLabeledCounter(BeatsReceived)
+	Registry.RegisterLabeledCounter(BeatOutages)
 	Registry.RegisterLabeledCounter(NotificationsSent)
 	Registry.RegisterLabeledCounter(NotificationsFailed)
 }

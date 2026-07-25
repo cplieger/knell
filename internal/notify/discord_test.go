@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/cplieger/knell/internal/watch"
 )
 
 // webhookRecorder captures posted payloads and serves scripted status codes.
@@ -89,6 +91,98 @@ func TestBeatRecoveredDelivers(t *testing.T) {
 		if !strings.Contains(content, want) {
 			t.Errorf("content %q missing %q", content, want)
 		}
+	}
+}
+
+func TestBeatOutageHistoryReportsOneEndedOutageInThePastTense(t *testing.T) {
+	t.Parallel()
+
+	rec := newWebhookRecorder(http.StatusNoContent)
+	srv := httptest.NewServer(rec.handler(t))
+	defer srv.Close()
+
+	d := New(srv.URL, "node-1")
+	defer d.Close()
+
+	recovered := time.Date(2026, 7, 23, 14, 7, 0, 0, time.UTC)
+	outages := []watch.Outage{{
+		Started:   recovered.Add(-12 * time.Minute),
+		Recovered: recovered,
+		Silence:   11 * time.Minute,
+	}}
+	if err := d.BeatOutageHistory(context.Background(), "api", outages); err != nil {
+		t.Fatalf("BeatOutageHistory: %v", err)
+	}
+	content := <-rec.contents
+	for _, want := range []string{"node-1", "api", "was missing for 12m0s", "recovered at 14:07 UTC"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("content %q missing %q", content, want)
+		}
+	}
+	// The whole point of the history notice: an outage that is over must
+	// never read like the live alarm for a beat that is down right now.
+	for _, forbidden := range []string{"MISSING", "The sender is down", "recovered: pings arriving again"} {
+		if strings.Contains(content, forbidden) {
+			t.Errorf("content %q reports an ended outage with live-incident wording %q", content, forbidden)
+		}
+	}
+}
+
+func TestBeatOutageHistorySummarizesSeveralEndedOutages(t *testing.T) {
+	t.Parallel()
+
+	rec := newWebhookRecorder(http.StatusNoContent)
+	srv := httptest.NewServer(rec.handler(t))
+	defer srv.Close()
+
+	d := New(srv.URL, "node-1")
+	defer d.Close()
+
+	base := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	last := time.Date(2026, 7, 23, 14, 7, 0, 0, time.UTC)
+	outages := []watch.Outage{
+		{Started: base, Recovered: base.Add(12 * time.Minute), Silence: 11 * time.Minute},
+		// The longest outage is deliberately in the middle, so a summary
+		// that just reports the last or first span fails here.
+		{Started: base.Add(20 * time.Minute), Recovered: base.Add(67 * time.Minute), Silence: 11 * time.Minute},
+		{Started: last.Add(-15 * time.Minute), Recovered: last, Silence: 11 * time.Minute},
+	}
+	if err := d.BeatOutageHistory(context.Background(), "api", outages); err != nil {
+		t.Fatalf("BeatOutageHistory: %v", err)
+	}
+	content := <-rec.contents
+	for _, want := range []string{
+		"node-1", "api",
+		"had 3 outages while notifications were failing",
+		"longest 47m0s",
+		"last recovered at 14:07 UTC",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("content %q missing %q", content, want)
+		}
+	}
+	if strings.Contains(content, "MISSING") {
+		t.Errorf("content %q reports ended outages with the live-alarm wording", content)
+	}
+}
+
+func TestBeatOutageHistoryWithoutOutagesIsNotDelivered(t *testing.T) {
+	t.Parallel()
+
+	// watch never sends an empty history notice; if a future caller does,
+	// posting a message that reports nothing is worse than refusing it.
+	rec := newWebhookRecorder(http.StatusNoContent)
+	srv := httptest.NewServer(rec.handler(t))
+	defer srv.Close()
+
+	d := New(srv.URL, "node-1")
+	defer d.Close()
+
+	if err := d.BeatOutageHistory(context.Background(), "api", nil); err == nil {
+		t.Fatal("BeatOutageHistory with no outages = nil, want error")
+	}
+	if got := rec.hits.Load(); got != 0 {
+		t.Errorf("webhook hits = %d, want 0 (nothing to report must post nothing)", got)
 	}
 }
 

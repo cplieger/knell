@@ -1,17 +1,23 @@
 // Package notify delivers knell's transition notifications to a Discord
 // webhook. It is the app's only outbound-network package and retries
 // transient delivery failures via httpx.
+//
+// Wording lives here, not in the state machine: internal/watch decides WHICH
+// transition happened and hands over its own types (watch.Outage), and this
+// package decides how an operator reads it.
 package notify
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/cplieger/httpx/v4"
+	"github.com/cplieger/knell/internal/watch"
 )
 
 // attemptTimeout bounds each delivery attempt when the caller's context
@@ -84,6 +90,43 @@ func (d *Discord) BeatRecovered(ctx context.Context, id string, downFor time.Dur
 		d.node, id, downFor.Truncate(time.Second),
 	)
 	return d.post(ctx, "recovered "+id, msg)
+}
+
+// historyTimeFormat renders a recovery point for an operator reading the
+// notice minutes after the fact: wall-clock time plus zone, so it lines up
+// with a dashboard without guessing which observer's timezone it came from.
+const historyTimeFormat = "15:04 MST"
+
+// BeatOutageHistory announces outages that had already ended before this
+// observer could deliver their notices, in one past-tense message so a
+// resolved incident never reads as a new live failure. One outage is reported
+// on its own; several are summarized, because the point of the message is
+// that they are over, not to replay each of them.
+func (d *Discord) BeatOutageHistory(ctx context.Context, id string, outages []watch.Outage) error {
+	if len(outages) == 0 {
+		// watch never sends an empty history notice; guard so a future
+		// caller cannot post a message that reports nothing.
+		return errors.New("delivering history notification: no ended outages to report")
+	}
+	return d.post(ctx, "history "+id, d.historyMessage(id, outages))
+}
+
+// historyMessage renders the history notice for id. outages is chronological
+// and non-empty (BeatOutageHistory's contract), so the last entry is the most
+// recent recovery.
+func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
+	last := outages[len(outages)-1]
+	if len(outages) == 1 {
+		return fmt.Sprintf(
+			"🕓 [knell %s] beat **%s** was missing for %s, recovered at %s. This notice is late: notifications were failing while the outage happened.",
+			d.node, id, last.DownFor().Truncate(time.Second), last.Recovered.Format(historyTimeFormat),
+		)
+	}
+	return fmt.Sprintf(
+		"🕓 [knell %s] beat **%s** had %d outages while notifications were failing: longest %s, last recovered at %s.",
+		d.node, id, len(outages),
+		watch.LongestOutage(outages).Truncate(time.Second), last.Recovered.Format(historyTimeFormat),
+	)
 }
 
 // post delivers one message, retrying transient failures. The webhook URL

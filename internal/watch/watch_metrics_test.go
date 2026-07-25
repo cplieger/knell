@@ -173,6 +173,17 @@ func counterValue(t *testing.T, name, kind string) float64 {
 	return v
 }
 
+// beatCounterValue parses the exposition value of name{beat="<beat>"} as a
+// float, for the per-beat counters (outages, received pings).
+func beatCounterValue(t *testing.T, name, beat string) float64 {
+	t.Helper()
+	v, err := strconv.ParseFloat(labeledValue(t, name, "beat", beat), 64)
+	if err != nil {
+		t.Fatalf("parsing %s{beat=%q} value: %v", name, beat, err)
+	}
+	return v
+}
+
 func TestDeliveredNotificationsIncrementSentCounters(t *testing.T) {
 	// Serial (no t.Parallel): asserts deltas on the package-global sent
 	// counters, which the parallel tests also increment.
@@ -268,15 +279,24 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	n.setFail(errors.New("discord down"))
 	clock.Advance(11 * time.Minute)
 	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
+	historyBefore := counterValue(t, "knell_notifications_failed_total", "history")
+	outagesBefore := beatCounterValue(t, "knell_beat_outages_total", id)
 	rec := capture.Default(t)
 	const sweeps = 3
 	for range sweeps {
 		w.sweep(context.Background())
 	}
-	// One increment per sweep for the head's failed send, plus exactly one
-	// for the queue-full overflow.
-	if got, want := counterValue(t, "knell_notifications_failed_total", "missing"), failedBefore+sweeps+1; got != want {
-		t.Errorf("failed{missing} = %v after %d sweeps with a full queue, want %v (%d send failures + 1 overflow)", got, sweeps, want, sweeps)
+	// The queue head is an ended outage, so every sweep's failed send is a
+	// history message: one failure per message, on the history kind. The
+	// missing kind moves exactly once, for the queue-full overflow.
+	if got, want := counterValue(t, "knell_notifications_failed_total", "missing"), failedBefore+1; got != want {
+		t.Errorf("failed{missing} = %v after %d sweeps with a full queue, want %v (the overflow, accounted once)", got, sweeps, want)
+	}
+	if got, want := counterValue(t, "knell_notifications_failed_total", "history"), historyBefore+sweeps; got != want {
+		t.Errorf("failed{history} = %v after %d failed history sends, want %v (one per failed message)", got, sweeps, want)
+	}
+	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), outagesBefore+1; got != want {
+		t.Errorf("beat_outages_total = %v after %d re-detections of one outage, want %v (one increment per outage, even when its notice was dropped)", got, sweeps, want)
 	}
 	if got := rec.CountLevel(slog.LevelWarn, "pending missing queue full"); got != 1 {
 		t.Errorf("queue-full warnings = %d over %d sweeps, want exactly 1 per affected outage: %v", got, sweeps, rec.Messages())
@@ -285,6 +305,7 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	// The ping that ends that outage closes the same record the sweeps
 	// already accounted, so it must not count a second time.
 	failedBefore = counterValue(t, "knell_notifications_failed_total", "missing")
+	outagesBefore = beatCounterValue(t, "knell_beat_outages_total", id)
 	clock.Advance(11 * time.Minute)
 	if !w.Beat(id) {
 		t.Fatalf("closing Beat(%s) = false", id)
@@ -292,13 +313,110 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
 		t.Errorf("failed{missing} = %v after the ping closing an already-accounted outage, want unchanged %v", got, failedBefore)
 	}
+	if got := beatCounterValue(t, "knell_beat_outages_total", id); got != outagesBefore {
+		t.Errorf("beat_outages_total = %v after the ping closing an already-counted outage, want unchanged %v", got, outagesBefore)
+	}
 
 	// A genuinely NEW outage is accounted on its own: the accounting mark is
 	// per outage, not a permanent mute.
 	failedBefore = counterValue(t, "knell_notifications_failed_total", "missing")
+	outagesBefore = beatCounterValue(t, "knell_beat_outages_total", id)
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
-	if got, want := counterValue(t, "knell_notifications_failed_total", "missing"), failedBefore+2; got != want {
-		t.Errorf("failed{missing} = %v after a new affected outage, want %v (1 send failure + 1 fresh overflow)", got, want)
+	if got, want := counterValue(t, "knell_notifications_failed_total", "missing"), failedBefore+1; got != want {
+		t.Errorf("failed{missing} = %v after a new affected outage, want %v (a fresh overflow)", got, want)
+	}
+	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), outagesBefore+1; got != want {
+		t.Errorf("beat_outages_total = %v after a new outage, want %v", got, want)
+	}
+}
+
+func TestHistoryNoticeCountsOncePerMessageWhileOutagesCountEach(t *testing.T) {
+	// Serial (no t.Parallel): asserts deltas on the package-global
+	// notification counters, which the parallel tests also move.
+	const id = "history-counter-probe"
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+
+	// Both history kinds are pre-minted at boot, alongside missing and
+	// recovered: without an earlier zero sample, an increase() alert would
+	// miss the very first history failure. labeledValue fails when a series
+	// is absent, so these lookups ARE the pre-minting assertion (the values
+	// themselves belong to other tests, which share the registry).
+	labeledValue(t, "knell_notifications_sent_total", "kind", "history")
+	labeledValue(t, "knell_notifications_failed_total", "kind", "history")
+	// The per-beat outage counter is pre-minted per configured beat, and
+	// this beat id is unique to this test, so its boot value is exactly 0.
+	if got := labeledValue(t, "knell_beat_outages_total", "beat", id); got != "0" {
+		t.Errorf("beat_outages_total at boot = %s, want 0 (pre-minted so increase() has a baseline)", got)
+	}
+
+	// Three outages that all end before any of them can be reported.
+	w.Beat(id)
+	n.setFail(errors.New("discord down"))
+	const outages = 3
+	for range outages {
+		clock.Advance(11 * time.Minute)
+		if !w.Beat(id) {
+			t.Fatalf("Beat(%s) = false", id)
+		}
+	}
+	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), float64(outages); got != want {
+		t.Errorf("beat_outages_total = %v after %d detected outages, want %v (counted at detection, no delivery involved)", got, outages, want)
+	}
+
+	// One collapsed message reports all three: the notification counter
+	// tracks MESSAGES, so it moves by one, while the outage counter above
+	// already tracked the outages.
+	n.setFail(nil)
+	sentBefore := counterValue(t, "knell_notifications_sent_total", "history")
+	missingBefore := counterValue(t, "knell_notifications_sent_total", "missing")
+	recoveredBefore := counterValue(t, "knell_notifications_sent_total", "recovered")
+	w.sweep(context.Background())
+	if got := n.snapshot(); len(got) != 1 || got[0].outages != outages {
+		t.Fatalf("calls = %v, want one history notice covering %d outages", got, outages)
+	}
+	if got, want := counterValue(t, "knell_notifications_sent_total", "history"), sentBefore+1; got != want {
+		t.Errorf("sent{history} = %v after one collapsed notice for %d outages, want %v (one per message)", got, outages, want)
+	}
+	if got := counterValue(t, "knell_notifications_sent_total", "missing"); got != missingBefore {
+		t.Errorf("sent{missing} = %v after a history notice, want unchanged %v (history is its own kind)", got, missingBefore)
+	}
+	if got := counterValue(t, "knell_notifications_sent_total", "recovered"); got != recoveredBefore {
+		t.Errorf("sent{recovered} = %v after a history notice, want unchanged %v (the notice states the outages are over)", got, recoveredBefore)
+	}
+	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), float64(outages); got != want {
+		t.Errorf("beat_outages_total = %v after delivery, want %v (delivery must not move an outage counter)", got, want)
+	}
+}
+
+func TestCanceledHistoryNotificationIsNotFailedAndKeepsRecords(t *testing.T) {
+	// Serial (no t.Parallel): asserts a delta on the package-global failed
+	// counter. A shutdown-abandoned send must not page KnellNotifyFailing,
+	// and it must not consume the outages it was about to report.
+	const id = "history-cancel-probe"
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+	for range 2 {
+		clock.Advance(11 * time.Minute)
+		if !w.Beat(id) {
+			t.Fatalf("Beat(%s) = false", id)
+		}
+	}
+
+	failedBefore := counterValue(t, "knell_notifications_failed_total", "history")
+	n.setFail(context.Canceled)
+	w.sweep(context.Background())
+	if got := counterValue(t, "knell_notifications_failed_total", "history"); got != failedBefore {
+		t.Errorf("failed{history} = %v after a canceled send, want unchanged %v", got, failedBefore)
+	}
+	if got := len(w.beats[id].pendingMissing); got != 2 {
+		t.Errorf("queued records = %d after a canceled history send, want both retained for the next run", got)
+	}
+
+	// Once the notifier heals, the abandoned notice still goes out.
+	n.setFail(nil)
+	w.sweep(context.Background())
+	if got := n.snapshot(); len(got) != 1 || got[0].kind != "history" || got[0].outages != 2 {
+		t.Fatalf("calls = %v, want the abandoned history notice delivered after the notifier healed", got)
 	}
 }
