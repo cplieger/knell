@@ -73,6 +73,12 @@ type beatState struct {
 	// sweep must not send another missing transition until it is
 	// delivered, so transitions reach Discord in chronological order.
 	recovering bool
+	// droppedOutage records that the beat's CURRENT outage was already
+	// accounted as a queue-full drop. Every sweep re-detects that same
+	// still-unrecorded outage, so without this flag one lost outage would
+	// be counted and logged again on every tick. A successful push and the
+	// ping that ends the outage both clear it.
+	droppedOutage bool
 }
 
 // headMissing returns the oldest queued missing transition — the one the
@@ -111,8 +117,8 @@ func (st *beatState) pushMissing(rec overdueBeat) bool {
 
 // popMissing removes and returns the head, promoting the next queued
 // transition. It returns the zero record on an empty queue: only the single
-// sender pops, and only records collectOverdue handed it, so an empty pop
-// cannot happen and the zero record degrades to the pre-queue behaviour.
+// sender pops, and only for a head collectOverdue handed it, so an empty pop
+// cannot happen and the zero record degrades to the pre-queue behavior.
 func (st *beatState) popMissing() overdueBeat {
 	head := st.headMissing()
 	if head == nil {
@@ -127,14 +133,23 @@ func (st *beatState) popMissing() overdueBeat {
 // accounts for the drop when the queue is full. Dropping the newest keeps
 // the queued chronology and the in-flight retry of the head intact, and
 // every drop moves the same failure counter (and log) a dropped recovery
-// does, so a lost outage is never silent. Callers hold w.mu.
+// does, so a lost outage is never silent — once per lost outage, not once
+// per sweep. Callers hold w.mu.
 func recordMissing(st *beatState, rec overdueBeat) {
 	if st.pushMissing(rec) {
+		st.droppedOutage = false
 		return
 	}
+	if st.droppedOutage {
+		// The same outage a previous sweep already accounted for: counting
+		// it every tick would report one lost outage as dozens.
+		return
+	}
+	st.droppedOutage = true
 	metrics.NotificationsFailed.Inc(kindMissing)
 	slog.Warn("pending missing queue full, dropping missing notification",
-		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.String())
+		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.String(),
+		"since", rec.seen)
 }
 
 // recoveryEvent is a queued recovered transition, measured at ping arrival.
@@ -203,7 +218,7 @@ func (w *Watcher) Beat(id string) bool {
 	// notice is undelivered still reaches Discord instead of vanishing.
 	if open := st.openMissing(); open != nil {
 		open.recoveredAt = now
-	} else if !wasAlerted && downFor > st.deadline {
+	} else if !wasAlerted && overdue(downFor, st.deadline) {
 		recordMissing(st, overdueBeat{
 			id:          id,
 			silence:     downFor,
@@ -211,6 +226,9 @@ func (w *Watcher) Beat(id string) bool {
 			recoveredAt: now,
 		})
 	}
+	// This ping ends the beat's outage, so a later queue-full drop belongs
+	// to the NEXT outage and is accounted on its own.
+	st.droppedOutage = false
 	st.lastSeen = now
 	st.alerted = false
 	if wasAlerted {
@@ -287,13 +305,21 @@ func (w *Watcher) refreshFreshness() {
 	}
 }
 
+// overdue reports whether an observed silence has passed the beat's deadline.
+// It is the single home of the freshness boundary: publishFreshness maps it to
+// the quorum gauge and Beat uses it to decide whether a late ping closed an
+// outage no sweep has seen, so the two paths cannot drift apart.
+func overdue(silence, deadline time.Duration) bool {
+	return silence > deadline
+}
+
 // publishFreshness publishes the freshness gauge for id given its observed
 // silence and deadline, reporting whether the beat is still fresh. It is the
-// single home of the freshness boundary and gauge mapping shared by sweep
-// and refreshFreshness, so the quorum ground truth cannot drift between the
-// two writers. Callers hold w.mu.
+// single home of the gauge mapping shared by sweep and refreshFreshness, and
+// it reads the boundary from overdue, so the quorum ground truth cannot drift
+// between the two writers. Callers hold w.mu.
 func publishFreshness(id string, silence, deadline time.Duration) bool {
-	if silence <= deadline {
+	if !overdue(silence, deadline) {
 		metrics.BeatFresh.Set(1, id)
 		return true
 	}
@@ -357,8 +383,10 @@ func (w *Watcher) collectOverdue() []overdueBeat {
 			continue
 		}
 		// Only the still-open current outage refreshes its silence, so a
-		// retry reports how long the beat has been quiet; a closed outage
-		// keeps the interval it actually spanned.
+		// retry reports how long the beat has been quiet. Once a ping seals
+		// the record, its silence freezes at the reading taken when the
+		// outage was detected — the recovered notice carries the full span
+		// (see markDelivered), so the pair stays readable together.
 		if head.recoveredAt.IsZero() && head.seen.Equal(st.lastSeen) {
 			head.silence = silence
 		}
@@ -397,10 +425,11 @@ func (w *Watcher) sendMissing(ctx context.Context, beat overdueBeat) bool {
 // given the lastSeen observed when the sweep decided to notify. It pops the
 // delivered transition, promoting any later queued outage to the head for
 // the next sweep. Normally it marks the beat alerted. When the outage is
-// already over — the popped record carries its recovery point, or a ping
-// raced the send and moved lastSeen — marking alerted would swallow the
-// NEXT outage's missing notice, so the beat stays re-armed and the pending
-// recovered transition is returned for immediate delivery.
+// already over — the popped record carries the recovery point a ping sealed
+// into it, including a ping that raced this very send — marking alerted
+// would swallow the NEXT outage's missing notice, so the beat stays
+// re-armed and the pending recovered transition is returned for immediate
+// delivery.
 func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -411,6 +440,10 @@ func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool)
 		return recoveryEvent{}, false
 	}
 	st.recovering = true
+	// The sealed record is the authoritative recovery point (the FIRST ping
+	// after the outage); st.lastSeen is only a defensive fallback for a
+	// popped record that carries none, since a ping that moves lastSeen
+	// seals the open head in the same critical section.
 	recoveredAt := st.lastSeen
 	if !delivered.recoveredAt.IsZero() {
 		recoveredAt = delivered.recoveredAt

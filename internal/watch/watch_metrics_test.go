@@ -3,6 +3,7 @@ package watch
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/metrics"
+	"github.com/cplieger/slogx/capture"
 )
 
 // labeledValue scrapes the metrics exposition and returns the value token
@@ -212,5 +214,91 @@ func TestFailedMissingNotificationIncrementsFailedCounter(t *testing.T) {
 	}
 	if got := counterValue(t, "knell_notifications_sent_total", "missing"); got != sentBefore {
 		t.Errorf("sent{missing} = %v after failed send, want unchanged %v", got, sentBefore)
+	}
+}
+
+func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, which every other test writes through.
+	const id = "missing-overflow-log-probe"
+	w, clock, _ := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+	for range missingQueueSize {
+		clock.Advance(11 * time.Minute)
+		if !w.Beat(id) {
+			t.Fatalf("Beat(%s) = false", id)
+		}
+	}
+
+	rec := capture.Default(t)
+	clock.Advance(47 * time.Minute)
+	if !w.Beat(id) {
+		t.Fatalf("overflow Beat(%s) = false", id)
+	}
+
+	if got := rec.CountLevel(slog.LevelWarn, "pending missing queue full"); got != 1 {
+		t.Fatalf("queue-full warnings = %d, want exactly 1 (a dropped outage must name itself in the log, not only in a counter): %v", got, rec.Messages())
+	}
+	if !rec.HasAttr("pending missing queue full", "beat", id) {
+		t.Errorf("drop warning does not name the beat: %v", rec.Records())
+	}
+	if !rec.HasAttr("pending missing queue full", "silence", "47m0s") {
+		t.Errorf("drop warning does not report the dropped outage's silence: %v", rec.Records())
+	}
+}
+
+func TestQueueFullDropIsAccountedOncePerLostOutage(t *testing.T) {
+	// Serial (no t.Parallel): asserts deltas on the package-global failed
+	// counter and captures the process-global slog default. A lost outage
+	// must be accounted ONCE, not once per 15s sweep: every sweep re-detects
+	// the same still-unrecorded crossing, and re-counting it would inflate
+	// the series KnellNotifyFailing alerts on for a single lost outage.
+	const id = "missing-drop-cadence-probe"
+	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+	for range missingQueueSize {
+		clock.Advance(11 * time.Minute)
+		if !w.Beat(id) {
+			t.Fatalf("Beat(%s) = false", id)
+		}
+	}
+
+	// The webhook is down, so nothing drains and the beat's current outage
+	// cannot be queued: three sweeps re-detect that one lost outage.
+	n.setFail(errors.New("discord down"))
+	clock.Advance(11 * time.Minute)
+	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
+	rec := capture.Default(t)
+	const sweeps = 3
+	for range sweeps {
+		w.sweep(context.Background())
+	}
+	// One increment per sweep for the head's failed send, plus exactly one
+	// for the dropped outage.
+	if got, want := counterValue(t, "knell_notifications_failed_total", "missing"), failedBefore+sweeps+1; got != want {
+		t.Errorf("failed{missing} = %v after %d sweeps with a full queue, want %v (%d send failures + 1 drop)", got, sweeps, want, sweeps)
+	}
+	if got := rec.CountLevel(slog.LevelWarn, "pending missing queue full"); got != 1 {
+		t.Errorf("queue-full warnings = %d over %d sweeps, want exactly 1 per lost outage: %v", got, sweeps, rec.Messages())
+	}
+
+	// The ping that ends that outage closes the same record the sweeps
+	// already accounted, so it must not count a second time.
+	failedBefore = counterValue(t, "knell_notifications_failed_total", "missing")
+	clock.Advance(11 * time.Minute)
+	if !w.Beat(id) {
+		t.Fatalf("closing Beat(%s) = false", id)
+	}
+	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
+		t.Errorf("failed{missing} = %v after the ping closing an already-accounted outage, want unchanged %v", got, failedBefore)
+	}
+
+	// A genuinely NEW outage is accounted on its own: the accounting mark is
+	// per outage, not a permanent mute.
+	failedBefore = counterValue(t, "knell_notifications_failed_total", "missing")
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	if got, want := counterValue(t, "knell_notifications_failed_total", "missing"), failedBefore+2; got != want {
+		t.Errorf("failed{missing} = %v after a new lost outage, want %v (1 send failure + 1 fresh drop)", got, want)
 	}
 }

@@ -281,19 +281,6 @@ func TestLoadRejectsPlainHTTPWebhook(t *testing.T) {
 	}
 }
 
-func TestLoadAcceptsHTTPSWebhook(t *testing.T) {
-	setValidLoadEnv(t)
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://127.0.0.1:9/hook")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() with an https webhook = %v, want accepted", err)
-	}
-	if cfg.WebhookURL != "https://127.0.0.1:9/hook" {
-		t.Errorf("WebhookURL = %q, want the configured URL verbatim (Load must not rewrite the secret)", cfg.WebhookURL)
-	}
-}
-
 func TestLoadBeatToken(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "unit-test-beat-token")

@@ -872,3 +872,84 @@ func TestRetriedMissingReportsCurrentSilence(t *testing.T) {
 		t.Errorf("missing silence = %s, want exactly 1h (silence refreshed on each retry sweep while the beat stays silent)", got[0].elapsed)
 	}
 }
+
+func TestSweepDetectedCrossingSurvivesAQueueFullDrop(t *testing.T) {
+	t.Parallel()
+
+	const id = "sweep-overflow-probe"
+	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+	for range missingQueueSize {
+		clock.Advance(11 * time.Minute)
+		if !w.Beat(id) {
+			t.Fatalf("Beat(%s) = false", id)
+		}
+	}
+
+	// The beat now goes silent with no ping to end it, so the sweep -- not
+	// Beat -- is the path that detects the crossing while the queue is at
+	// its bound. The drop must not mark the beat alerted: a dead-man switch
+	// that swallows an ongoing outage because its queue was briefly full is
+	// the worst failure it can have.
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+
+	// Draining the queue frees a slot, the ongoing outage is recorded, and
+	// it still gets its own missing notice. A drop that marked the beat
+	// alerted instead would swallow it: 8 pairs and nothing more.
+	for range missingQueueSize {
+		w.sweep(context.Background())
+	}
+	got := n.snapshot()
+	if len(got) != 2*missingQueueSize+1 {
+		t.Fatalf("calls = %v, want %d queued pairs plus the ongoing outage's missing notice", got, missingQueueSize)
+	}
+	if last := got[len(got)-1]; last.kind != "missing" || last.elapsed != 11*time.Minute {
+		t.Errorf("last call = %+v, want the ongoing outage's missing notice at 11m", last)
+	}
+}
+
+func TestQueuedOngoingOutageReportsLiveSilenceWhenPromoted(t *testing.T) {
+	t.Parallel()
+
+	const id = "queued-ongoing-probe"
+	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+	n.setFail(errors.New("discord down"))
+
+	// Outage A: detected, ended by a ping, notice still undelivered.
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	if !w.Beat(id) {
+		t.Fatalf("Beat(%s) = false ending outage A", id)
+	}
+
+	// Outage B starts and never ends. It queues behind A at 13m of
+	// silence, then stays quiet for another 30m while A is undelivered.
+	clock.Advance(13 * time.Minute)
+	w.sweep(context.Background())
+	clock.Advance(30 * time.Minute)
+	w.sweep(context.Background())
+
+	// Once the webhook heals, A drains with the interval it actually
+	// spanned and B -- still ongoing when it reaches the head -- reports
+	// how long the beat has been quiet NOW, not the 13m measured when the
+	// crossing was first detected behind A.
+	n.setFail(nil)
+	w.sweep(context.Background())
+	w.sweep(context.Background())
+	got := n.snapshot()
+	want := []call{
+		{kind: "missing", id: id, elapsed: 11 * time.Minute},
+		{kind: "recovered", id: id, elapsed: 11 * time.Minute},
+		{kind: "missing", id: id, elapsed: 43 * time.Minute},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("calls[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}

@@ -193,12 +193,16 @@ func parseBeatEntry(entry string, seen map[string]struct{}) (Beat, error) {
 	return Beat{ID: id, Deadline: deadline}, nil
 }
 
-// parseWebhookURL checks the webhook is an absolute https URL with a host and
-// returns the parsed URL so callers can inspect the canonical (lowercased)
-// scheme and host instead of re-deriving them from the raw string. The value
-// is operator-supplied config, so this is a shape check against paste
-// accidents, not an SSRF guard — except for the scheme, which is a hard
-// requirement: the URL is a credential and plain http leaks it in transit.
+// parseWebhookURL checks the webhook is an absolute https URL with a host.
+// loadWebhook needs only the error: the scheme decision lives here, so there
+// is nothing left for it to branch on. The parsed URL is returned so the
+// package's own tests can assert the accepted shape (canonical lowercased
+// scheme, non-empty host) without re-parsing a value this function already
+// vetted — FuzzParseWebhookURL checks those accepted-URL invariants through
+// the returned value, so dropping the return would weaken it. The value is
+// operator-supplied config, so this is a shape check against paste accidents,
+// not an SSRF guard — except for the scheme, which is a hard requirement: the
+// URL is a credential and plain http leaks it in transit.
 func parseWebhookURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -211,7 +215,7 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		// like "credentialmaterial:rest" parses with the secret prefix as its
 		// scheme, and this error reaches the startup log. Naming only the
 		// required scheme keeps the message actionable and leak-free.
-		return nil, errors.New("scheme must be https")
+		return nil, errors.New("scheme must be https (the webhook URL's own path is the credential, so plain http would send it in cleartext)")
 	}
 	if u.Host == "" {
 		return nil, errors.New("missing host")

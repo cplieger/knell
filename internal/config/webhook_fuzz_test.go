@@ -1,16 +1,14 @@
 package config
 
 import (
-	"net/url"
-	"strings"
 	"testing"
 )
 
 // FuzzParseWebhookURL pins the webhook validator's safety and secret-hygiene
 // invariants: it never panics, every accepted URL is an absolute https URL
 // with a host (plain http is rejected — the URL's path is a credential), and
-// no rejection error ever embeds the raw URL or its path (the path carries the
-// webhook credential, and startup errors are logged).
+// every rejection message is one of a fixed set of constants, so no error can
+// embed any part of the operator-supplied value (startup errors are logged).
 func FuzzParseWebhookURL(f *testing.F) {
 	f.Add("https://discord.com/api/webhooks/1/abc")
 	f.Add("http://127.0.0.1:9/hook")
@@ -30,17 +28,18 @@ func FuzzParseWebhookURL(f *testing.F) {
 			}
 			return
 		}
-		// Secret hygiene: every current rejection message is "/"-free, so
-		// an error may never contain the slash-bearing raw URL or its
-		// hierarchical path (where the webhook credential lives). Any
-		// future wrap that embeds the URL fails here.
-		if strings.Contains(raw, "/") && strings.Contains(err.Error(), raw) {
-			t.Fatalf("rejection error %q embeds the raw URL", err)
-		}
-		if parsed, perr := url.Parse(raw); perr == nil &&
-			strings.HasPrefix(parsed.Path, "/") && len(parsed.Path) > 1 &&
-			strings.Contains(err.Error(), parsed.Path) {
-			t.Fatalf("rejection error %q embeds the URL path", err)
+		// Secret hygiene: every rejection message is a fixed constant, so no
+		// error can embed ANY part of the operator-supplied value — not just
+		// its slash-bearing path, but also a slash-free secret that url.Parse
+		// reads as a scheme ("credentialmaterial:rest"). Pinning the exact
+		// message set is what a path substring check cannot do: a future wrap
+		// that leaks a slash-free secret fails here too.
+		switch err.Error() {
+		case "not a valid URL",
+			"scheme must be https (the webhook URL's own path is the credential, so plain http would send it in cleartext)",
+			"missing host":
+		default:
+			t.Fatalf("unexpected rejection message %q: a new message must be a fixed constant that cannot embed the operator-supplied URL", err)
 		}
 	})
 }
