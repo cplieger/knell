@@ -8,5 +8,5 @@ require (
 	github.com/cplieger/httpx/v4 v4.0.0
 	github.com/cplieger/metrics/v3 v3.0.1
 	github.com/cplieger/slogx v1.4.0
-	github.com/cplieger/webhttp v1.12.1
+	github.com/cplieger/webhttp v1.15.0
 )

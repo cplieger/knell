@@ -39,7 +39,15 @@ func New(b Beater, token string, healthz, metricsHandler http.Handler) http.Hand
 	mux.Handle("GET /metrics", metricsHandler)
 
 	return webhttp.Chain(mux,
-		webhttp.Logging(webhttp.WithSkipPaths("/healthz", "/metrics")),
+		// /healthz and /metrics are machine probes, so they ride the
+		// fleet-standard ProbeLogLevel rather than a skip list: a HEALTHY
+		// probe logs at Debug (out of the shipped stream at the default
+		// level, visible under LOG_LEVEL=debug), a 4xx at Warn and a 5xx at
+		// Error. Skipping them silenced the failures too — and these are the
+		// two endpoints carrying knell's quorum signal, so a scrape that
+		// stopped landing or a liveness probe answering 503 has to be
+		// greppable. Skip lists stay for streams, of which knell has none.
+		webhttp.Logging(webhttp.ProbeLogLevel("/healthz", "/metrics")),
 		webhttp.Recoverer(),
 		webhttp.SecurityHeaders(),
 	)

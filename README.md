@@ -81,6 +81,8 @@ Request bodies on `/beat/{id}` are ignored, so webhook-shaped senders (an Alertm
 
 Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away from anything that fetches links automatically: a chat client's URL preview, a crawler, an uptime prober. An automated fetch feeds the switch and can mask a dead sender. `HEAD` requests are rejected with 405 and never record a ping, so a HEAD-only prober cannot feed the switch.
 
+`/healthz` and `/metrics` are logged as machine probes: a successful probe or scrape lands at `debug` (out of the log at the default level, visible under `LOG_LEVEL=debug` when the question is whether the prober arrives at all), while one answering 4xx or 5xx lands at `warn`/`error`. So a scrape that stopped landing shows up in the log without raising the level.
+
 ## Notification semantics
 
 A live incident and one that is already over are reported differently: nothing an operator reads should announce a resolved outage as a beat that is down right now.

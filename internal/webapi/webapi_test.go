@@ -2,12 +2,15 @@ package webapi
 
 import (
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/cplieger/knell/internal/metrics"
+	"github.com/cplieger/slogx/capture"
 )
 
 // fakeBeater accepts a fixed id set and records what was recorded.
@@ -24,11 +27,19 @@ func (f *fakeBeater) Beat(id string) bool {
 	return true
 }
 
-// newTestHandler assembles the routed handler around b; token gates the
-// beat endpoint exactly as in production ("" = open).
+// newTestHandler assembles the routed handler around b with a healthy
+// liveness endpoint; token gates the beat endpoint exactly as in production
+// ("" = open).
 func newTestHandler(b *fakeBeater, token string) http.Handler {
+	return newTestHandlerHealthz(b, token, http.StatusOK)
+}
+
+// newTestHandlerHealthz is newTestHandler with the liveness status under test
+// control, so a test can drive a FAILING probe: health.Handler answers 503
+// whenever the liveness marker is absent (boot, or after the pre-drain flip).
+func newTestHandlerHealthz(b *fakeBeater, token string, healthzStatus int) http.Handler {
 	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(healthzStatus)
 	})
 	return New(b, token, healthz, metrics.Registry.Handler())
 }
@@ -109,6 +120,98 @@ func TestMetricsExposition(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("exposition missing %s", want)
 		}
+	}
+}
+
+// TestProbePathAccessLogLevels pins the ProbeLogLevel policy on knell's two
+// machine-probe endpoints. It carries forward the guard the former
+// WithSkipPaths("/healthz", "/metrics") existed for — routine probe traffic
+// must not pollute the log stream at the operating level, so no probe line may
+// land at Info — and adds the direction a skip list could not express: a probe
+// that FAILS has to be visible. /healthz and /metrics are the endpoints
+// carrying knell's quorum signal, so a scrape answering 4xx/5xx or a liveness
+// probe gone 503 must be greppable rather than silently dropped.
+func TestProbePathAccessLogLevels(t *testing.T) {
+	tests := map[string]struct {
+		method        string
+		path          string
+		healthzStatus int
+		wantStatus    int
+		wantLevel     slog.Level
+	}{
+		// A liveness probe every 30s and a scrape every 15s are noise while
+		// they succeed: Debug keeps them out of the shipped stream but
+		// reachable under LOG_LEVEL=debug ("is the probe even arriving?").
+		"healthy healthz probe": {
+			method: http.MethodGet, path: "/healthz", healthzStatus: http.StatusOK,
+			wantStatus: http.StatusOK, wantLevel: slog.LevelDebug,
+		},
+		"healthy metrics scrape": {
+			method: http.MethodGet, path: "/metrics", healthzStatus: http.StatusOK,
+			wantStatus: http.StatusOK, wantLevel: slog.LevelDebug,
+		},
+		// health.Handler answers 503 whenever the liveness marker is absent.
+		// That is the failing dead-man-switch signal, at Error.
+		"failing healthz probe": {
+			method: http.MethodGet, path: "/healthz", healthzStatus: http.StatusServiceUnavailable,
+			wantStatus: http.StatusServiceUnavailable, wantLevel: slog.LevelError,
+		},
+		// A prober or scraper aimed with the wrong method gets 405 from the
+		// mux: the "my scrape never lands" class, now at Warn instead of
+		// silence.
+		"wrong-method healthz probe": {
+			method: http.MethodPost, path: "/healthz", healthzStatus: http.StatusOK,
+			wantStatus: http.StatusMethodNotAllowed, wantLevel: slog.LevelWarn,
+		},
+		"wrong-method metrics scrape": {
+			method: http.MethodPost, path: "/metrics", healthzStatus: http.StatusOK,
+			wantStatus: http.StatusMethodNotAllowed, wantLevel: slog.LevelWarn,
+		},
+		// Everything off the probe list keeps the default Info access line.
+		"beat ping stays at info": {
+			method: http.MethodPost, path: "/beat/api", healthzStatus: http.StatusOK,
+			wantStatus: http.StatusOK, wantLevel: slog.LevelInfo,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Serial (no t.Parallel): capture.Default swaps the process-global
+			// slog default. It must be installed BEFORE New, because
+			// webhttp.Logging resolves slog.Default() when the chain is built.
+			rec := capture.Default(t)
+			h := newTestHandlerHealthz(&fakeBeater{known: map[string]bool{"api": true}}, "", tt.healthzStatus)
+
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != tt.wantStatus {
+				t.Fatalf("%s %s = %d, want %d (body %s)", tt.method, tt.path, w.Code, tt.wantStatus, w.Body.String())
+			}
+
+			if got := rec.CountExact("http"); got != 1 {
+				t.Fatalf("access lines = %d %v, want exactly 1: no path is skipped any more, so every request leaves one line",
+					got, rec.Messages())
+			}
+			for _, lvl := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
+				want := 0
+				if lvl == tt.wantLevel {
+					want = 1
+				}
+				if got := rec.CountLevel(lvl, "http"); got != want {
+					t.Errorf("access lines at %v = %d, want %d (%s %s answered %d)",
+						lvl, got, want, tt.method, tt.path, tt.wantStatus)
+				}
+			}
+			// The line is only useful if it names what happened: an operator
+			// greps the Warn/Error probe line for its status.
+			if !rec.HasAttr("http", "status", strconv.Itoa(tt.wantStatus)) {
+				t.Errorf("access line missing status=%d; records = %v", tt.wantStatus, rec.Records())
+			}
+			if !rec.HasAttr("http", "path", tt.path) {
+				t.Errorf("access line missing path=%s; records = %v", tt.path, rec.Records())
+			}
+		})
 	}
 }
 
