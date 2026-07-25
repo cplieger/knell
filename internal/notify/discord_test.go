@@ -135,8 +135,10 @@ func TestPermanentFailureDoesNotRetry(t *testing.T) {
 func TestUnfollowedRedirectIsNotDelivery(t *testing.T) {
 	t.Parallel()
 
-	// A final 3xx (unfollowed redirect) means the webhook was NOT accepted;
-	// post must report an error so the sweep keeps retrying delivery.
+	// A final 3xx (a redirect the client did not follow, here a bare 300
+	// with no Location) means the webhook was NOT accepted: httpx accepts
+	// only a 2xx as success, so postAttempt reports an error and the sweep
+	// keeps retrying delivery.
 	rec := newWebhookRecorder(http.StatusMultipleChoices)
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
@@ -320,6 +322,12 @@ func TestPlainServerErrorIsTerminalPerAttempt(t *testing.T) {
 func TestMethodChangingRedirectIsNotDelivery(t *testing.T) {
 	t.Parallel()
 
+	// A same-host 302 is a hop net/http would follow as a bodyless GET.
+	// The client's redirect policy must refuse it, surfacing the 302, which
+	// is not a delivery. This is also the only test pinning that New
+	// installs a redirect policy at all: with none, net/http would follow
+	// the hop, /finish would answer 204, and the send would look delivered
+	// even though the payload never reached the webhook.
 	var postHits, redirectedHits atomic.Int64
 	mux := http.NewServeMux()
 	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {

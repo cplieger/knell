@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cplieger/httpx/v3"
+	"github.com/cplieger/httpx/v4"
 )
 
 // attemptTimeout bounds each delivery attempt when the caller's context
@@ -36,27 +36,31 @@ func New(webhookURL, node string) *Discord {
 	// Client timeout above the per-attempt context timeout so the
 	// context is the effective per-attempt bound.
 	client := httpx.NewClient(attemptTimeout + 5*time.Second)
-	client.CheckRedirect = webhookRedirectPolicy
+	// Redirect policy, declaratively: follow only a same-host hop (the
+	// configured webhook URL is the only trusted delivery target; a
+	// cross-host hop would post the notice to an origin the operator never
+	// named, and Go forwards custom headers across hops), never an
+	// https->http downgrade (refused by default, and it matters here
+	// because the URL's own path is the credential), and never a hop
+	// net/http would rewrite to another method — the webhook POST must not
+	// be replayed as a bodyless GET. WithPreserveMethod refuses such a hop
+	// by surfacing its 3xx response, which postAttempt then reports as
+	// non-delivery; TestMethodChangingRedirectIsNotDelivery pins that, and
+	// is also the only test pinning that a policy is installed at all.
+	//
+	// Two deltas from the hand-rolled wrapper this replaced: ANY
+	// method-changing hop is refused, not only one whose original request
+	// was a POST (knell only ever POSTs, so nothing here reaches the
+	// difference), and a call with an empty via chain is refused instead of
+	// allowed — net/http always passes at least the original request, so
+	// that path is unreachable in production, and failing closed is the
+	// safer direction for a credential-bearing POST.
+	client.CheckRedirect = httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
 	return &Discord{
 		client: client,
 		url:    webhookURL,
 		node:   node,
 	}
-}
-
-// webhookRedirectPolicy keeps same-host POST-preserving redirects (httpx's
-// DefaultRedirectPolicy) while refusing any hop net/http would rewrite to a
-// bodyless method: the webhook POST must never be replayed as a GET, so a
-// method-changing redirect surfaces its 3xx response, which post then
-// reports as non-delivery (pinned by TestMethodChangingRedirectIsNotDelivery).
-func webhookRedirectPolicy(req *http.Request, via []*http.Request) error {
-	if err := httpx.DefaultRedirectPolicy(req, via); err != nil {
-		return err
-	}
-	if len(via) > 0 && via[0].Method == http.MethodPost && req.Method != http.MethodPost {
-		return http.ErrUseLastResponse
-	}
-	return nil
 }
 
 // Close releases idle connections. Call once on shutdown.
@@ -121,15 +125,13 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 		return struct{}{}, httpx.LogSafeError(doErr)
 	}
 	defer httpx.DrainClose(resp.Body)
+	// Success is exactly 2xx here: CheckHTTPStatus rejects every other
+	// status, an unfollowed redirect's 3xx included (pinned by
+	// TestUnfollowedRedirectIsNotDelivery), so the sweep keeps retrying a
+	// non-delivery. Its error is typed, which is what lets httpx.Do
+	// classify 502/503/504 as transient and retry within the call.
 	if statusErr := httpx.CheckHTTPStatus(resp); statusErr != nil {
 		return struct{}{}, statusErr
-	}
-	// CheckHTTPStatus treats all of 200-399 as success, so it alone
-	// would count an unfollowed redirect (3xx) as a delivered webhook.
-	// Only a 2xx is an accepted delivery; anything else must error so
-	// the sweep keeps retrying (pinned by TestUnfollowedRedirectIsNotDelivery).
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return struct{}{}, &httpx.HTTPStatusError{Code: resp.StatusCode}
 	}
 	return struct{}{}, nil
 }
