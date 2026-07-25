@@ -143,9 +143,10 @@ type beatState struct {
 	// overflowAccounted records that the current outage has already been
 	// counted as detected (metrics.BeatOutages) and has already reported the
 	// full pending queue, so a sweep that re-detects the same still-unqueued
-	// outage every tick neither counts it twice nor repeats its log line. A
-	// successful push clears it, and so does the ping that ends the outage,
-	// so the next outage is accounted on its own.
+	// outage every tick neither counts it twice nor repeats its log line.
+	// recordOngoingOutage is its only setter: only that path repeats for one
+	// and the same outage. A successful push clears it, and so does the ping
+	// that ends the outage, so the next outage is accounted on its own.
 	overflowAccounted bool
 }
 
@@ -230,61 +231,77 @@ func (st *beatState) closedRun() []Outage {
 	return run
 }
 
-// recordMissing queues a detected missing transition for the beat, or
-// accounts for a queue-full event when the queue is full. Dropping the newest
-// keeps the queued chronology and the in-flight retry of the head intact.
-// Callers hold w.mu.
-//
-// A queue-full event means one of two very different things, and they are
-// accounted differently:
-//
-//   - The record is CLOSED (a ping already ended the outage): the record was
-//     the outage's only remaining trace, so dropping it means no notice for it
-//     will ever arrive. That is a permanent loss, so it moves
-//     metrics.NotificationsDropped and logs a warning, exactly like a dropped
-//     recovery notice. It can only happen once per outage: the ping that
-//     brought the record also re-arms the beat.
-//   - The record is OPEN (the outage is still in progress): nothing is lost.
-//     The beat stays overdue, openMissing stays nil, and the next sweep with a
-//     free slot records the outage and delivers it. Nothing failed and nothing
-//     was dropped, so no notification counter moves; it is logged at debug as
-//     the ordinary back-pressure it is, once per outage rather than once per
-//     15s tick.
+// queueDetectedOutage counts a detected outage and queues its missing
+// transition, reporting whether the queue had room. It is the shared prefix of
+// the two record functions below, which own the rest: what a full queue MEANS.
+// Dropping the newest record keeps the queued chronology and the in-flight
+// retry of the head intact. Callers hold w.mu.
 //
 // The outage counter moves exactly once per detected outage, whether or not
 // the notice found a queue slot: overflowAccounted already means "this same
 // outage was detected and counted by an earlier call", which covers both a
 // re-detection while the queue stays full and the later call that finally
 // queues that outage.
-func recordMissing(st *beatState, rec overdueBeat) {
+//
+// A queue-full event means one of two very different things, which is why the
+// callers below are two functions and not one with a flag:
+//
+//   - recordEndedOutage has a CLOSED record (a ping already ended the outage):
+//     the record was the outage's only remaining trace, so dropping it means no
+//     notice for it will ever arrive. That is a permanent loss, so it moves
+//     metrics.NotificationsDropped and logs a WARNING, exactly like a dropped
+//     recovery notice. The warning is not gated on overflowAccounted: it is
+//     reachable at most once per outage (only a ping brings a closed record,
+//     and the same ping re-arms the beat), and suppressing it would hide the
+//     loss precisely in the sequence where it happens — sweeps reporting
+//     back-pressure for an ongoing outage, then the closing ping finding no
+//     slot for its record.
+//   - recordOngoingOutage has an OPEN record (the outage is still in
+//     progress): nothing is lost. The beat stays overdue, openMissing stays
+//     nil, and the next sweep with a free slot records the outage and delivers
+//     it. Nothing failed and nothing was dropped, so no notification counter
+//     moves; it is logged at DEBUG as the ordinary back-pressure it is, gated
+//     on overflowAccounted so one affected outage reports once rather than
+//     once per 15s tick.
+func queueDetectedOutage(st *beatState, rec overdueBeat) bool {
 	if !st.overflowAccounted {
 		metrics.BeatOutages.Inc(rec.id)
 	}
-	if st.pushMissing(rec) {
-		st.overflowAccounted = false
+	if !st.pushMissing(rec) {
+		return false
+	}
+	st.overflowAccounted = false
+	return true
+}
+
+// recordEndedOutage queues the missing transition of an outage a ping has
+// already ended, the record that is now that outage's only trace: a full queue
+// loses it for good. See queueDetectedOutage for the contrast with the ongoing
+// case. Callers hold w.mu.
+func recordEndedOutage(st *beatState, rec overdueBeat) {
+	if queueDetectedOutage(st, rec) {
 		return
 	}
-	// Whether an earlier call already reported this same outage's overflow.
-	// It gates the debug line only: the permanent-loss branch below is
-	// reachable at most once per outage (only Beat brings a closed record,
-	// and the same ping re-arms the beat), and suppressing it would hide the
-	// loss precisely in the sequence where it happens — sweeps reporting
-	// back-pressure for an ongoing outage, then the closing ping finding no
-	// slot for its record.
-	reported := st.overflowAccounted
-	st.overflowAccounted = true
-	if !rec.recoveredAt.IsZero() {
-		metrics.NotificationsDropped.Inc(kindMissing)
-		slog.Warn("pending missing queue full, ended outage dropped, its notification will never be delivered",
-			"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.String(),
-			"since", rec.seen, "recovered", rec.recoveredAt)
+	metrics.NotificationsDropped.Inc(kindMissing)
+	slog.Warn("pending missing queue full, ended outage dropped, its notification will never be delivered",
+		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.String(),
+		"since", rec.seen, "recovered", rec.recoveredAt)
+}
+
+// recordOngoingOutage queues the missing transition of an outage that is still
+// in progress: a full queue costs nothing but a deferral, since the outage
+// stays detected and the next sweep with a free slot records it. See
+// queueDetectedOutage for the contrast with the ended case. Callers hold w.mu.
+func recordOngoingOutage(st *beatState, rec overdueBeat) {
+	if queueDetectedOutage(st, rec) {
 		return
 	}
-	if reported {
+	if st.overflowAccounted {
 		// The same ongoing outage a previous sweep already reported: logging
 		// it every tick would spam one affected outage as dozens.
 		return
 	}
+	st.overflowAccounted = true
 	slog.Debug("pending missing queue full, ongoing outage stays detected and is queued once a slot frees",
 		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.String(),
 		"since", rec.seen)
@@ -367,7 +384,7 @@ func (w *Watcher) Beat(id string) bool {
 	if open := st.openMissing(); open != nil {
 		open.recoveredAt = now
 	} else if !wasAlerted && overdue(downFor, st.deadline) {
-		recordMissing(st, overdueBeat{
+		recordEndedOutage(st, overdueBeat{
 			id:          id,
 			silence:     downFor,
 			seen:        previousSeen,
@@ -545,7 +562,7 @@ func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
 		// skipping the beat is what keeps a second outage alive while an
 		// earlier notice is still undelivered.
 		if !fresh && !st.alerted && st.openMissing() == nil {
-			recordMissing(st, overdueBeat{id: id, silence: silence, seen: st.lastSeen})
+			recordOngoingOutage(st, overdueBeat{id: id, silence: silence, seen: st.lastSeen})
 		}
 		head := st.headMissing()
 		if head == nil {
