@@ -50,6 +50,19 @@ func run() error {
 	// Install the handler before config parsing so config warnings render
 	// through the configured handler; apply the parsed level after.
 	levelVar := slogx.Setup(slogx.Options{})
+
+	// Clear any stale marker from a previous run BEFORE the first exit path.
+	// config.Load fails fast (a plain-http webhook URL, a malformed BEATS),
+	// and a marker left on the tmpfs by the previous process would report a
+	// crash-looping container healthy for the whole restart loop. The marker
+	// depends on no configuration; it does depend on the installed handler,
+	// since NewMarker warns when the marker directory is not writable — that
+	// warning now renders at the default level, the parsed one not being
+	// known yet.
+	marker := health.NewMarker(health.DefaultPath)
+	marker.Set(false)
+	defer marker.Cleanup()
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
@@ -59,11 +72,6 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	// Clear any stale marker from a previous run before declaring health.
-	marker := health.NewMarker(health.DefaultPath)
-	marker.Set(false)
-	defer marker.Cleanup()
 
 	notifier := notify.New(cfg.WebhookURL, cfg.Node)
 	defer notifier.Close()
@@ -97,11 +105,19 @@ func run() error {
 
 	go watcher.Run(ctx, watch.DefaultTick)
 
-	onShutdown := func(context.Context) {
+	// The marker flip rides the pre-drain phase: webhttp.Run spends ONE
+	// shutdown budget on pre-drain -> srv.Shutdown -> onShutdown, so a flip in
+	// onShutdown lands only after the drain has finished, and the baked
+	// `knell health` probe — which stats the marker FILE, something listener
+	// closure does not cover — would call a draining container healthy for the
+	// whole window. Nothing else needs teardown, so onShutdown is nil. A serve
+	// error returns from Run without invoking either hook; the deferred
+	// marker.Cleanup covers that path.
+	preDrain := webhttp.WithPreDrain(func(context.Context) {
 		slog.Info("shutting down", "cause", context.Cause(ctx))
 		marker.Set(false)
-	}
-	return webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(10*time.Second))
+	})
+	return webhttp.Run(ctx, srv, ln, nil, webhttp.WithShutdownGrace(10*time.Second), preDrain)
 }
 
 // logConfig logs the active configuration at startup. The webhook URL is a

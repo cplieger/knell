@@ -1,12 +1,71 @@
 package main
 
 import (
+	"errors"
+	"io/fs"
+	"log/slog"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/cplieger/health"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/slogx/capture"
 )
+
+// TestRunClearsStaleHealthMarkerBeforeTheConfigGate pins the boot ordering a
+// crash-looping container depends on: the marker is cleared before the first
+// exit path, so a fail-fast config gate cannot leave the previous process's
+// marker on disk reporting the restart loop healthy. Both cases fail config
+// before run() reaches the listener bind, which is what makes run() reachable
+// from a test at all.
+func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
+	cases := map[string]map[string]string{
+		"malformed BEATS": {
+			"BEATS": "api-without-a-deadline",
+		},
+		// The live upgrade case: a deployment whose webhook URL is plain http
+		// now fails the https-only gate at boot. DISCORD_WEBHOOK_URL_FILE is
+		// blanked so an ambient _FILE secret cannot satisfy the gate and let
+		// run() proceed to bind and block.
+		"plain-http webhook": {
+			"BEATS":                    "api:1m",
+			"DISCORD_WEBHOOK_URL_FILE": "",
+			"DISCORD_WEBHOOK_URL":      "http://discord.example/api/webhooks/1234567890/verysecrettoken",
+		},
+	}
+
+	for name, env := range cases {
+		t.Run(name, func(t *testing.T) {
+			// Serial (no t.Parallel): t.Setenv, plus run() installs a
+			// process-global slog default of its own.
+			for k, v := range env {
+				t.Setenv(k, v)
+			}
+			original := slog.Default()
+			t.Cleanup(func() { slog.SetDefault(original) })
+
+			// Plant the marker a previous run would have left behind.
+			if err := os.WriteFile(health.DefaultPath, nil, 0o600); err != nil {
+				t.Skipf("cannot plant a health marker at %s: %v", health.DefaultPath, err)
+			}
+			t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
+
+			err := run()
+			if err == nil {
+				t.Fatal("run() = nil, want a configuration error")
+			}
+			if !strings.Contains(err.Error(), "configuration") {
+				t.Fatalf("run() = %v, want the configuration gate to reject the boot", err)
+			}
+			if _, statErr := os.Stat(health.DefaultPath); !errors.Is(statErr, fs.ErrNotExist) {
+				t.Errorf("marker %s after a rejected boot: stat = %v, want it gone; a stale marker reports a crash-looping container healthy",
+					health.DefaultPath, statErr)
+			}
+		})
+	}
+}
 
 func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global
