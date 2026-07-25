@@ -193,16 +193,10 @@ func parseBeatEntry(entry string, seen map[string]struct{}) (Beat, error) {
 	return Beat{ID: id, Deadline: deadline}, nil
 }
 
-// parseWebhookURL checks the webhook is an absolute https URL with a host.
-// loadWebhook needs only the error: the scheme decision lives here, so there
-// is nothing left for it to branch on. The parsed URL is returned so the
-// package's own tests can assert the accepted shape (canonical lowercased
-// scheme, non-empty host) without re-parsing a value this function already
-// vetted — FuzzParseWebhookURL checks those accepted-URL invariants through
-// the returned value, so dropping the return would weaken it. The value is
-// operator-supplied config, so this is a shape check against paste accidents,
-// not an SSRF guard — except for the scheme, which is a hard requirement: the
-// URL is a credential and plain http leaks it in transit.
+// parseWebhookURL validates that raw is an absolute HTTPS URL with a host.
+// Errors intentionally exclude operator-supplied text because the URL path
+// contains the webhook credential. This is a configuration shape check, not
+// an SSRF guard.
 func parseWebhookURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil {

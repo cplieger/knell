@@ -83,7 +83,7 @@ Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away
 ## Notification semantics
 
 - **Missing**: sent once per outage, when a beat first passes its deadline. A failed delivery (Discord outage, network) is retried on every 15s sweep until one succeeds; the beat is only marked notified after a delivered send.
-- **Queued outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of being collapsed into that earlier one and lost. Each beat queues up to 8 records and drains them oldest first, one notice per beat per sweep, so notices arrive in the order the outages happened. When a beat's queue is full, the newest record is dropped, `knell_notifications_failed_total{kind="missing"}` increments and a warning is logged, so a dropped outage is never silent; the drop is accounted once per lost outage, not once per sweep while the queue stays full.
+- **Queued outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of being collapsed into that earlier one and lost. Each beat queues up to 8 records and drains them oldest first, one notice per beat per sweep, so notices arrive in the order the outages happened. When a beat's queue is full, the newest record is not queued: a closed outage (one a ping already ended) is dropped, while an ongoing outage stays detectable and is queued once a slot opens. Either case increments `knell_notifications_failed_total{kind="missing"}` and logs a warning once for that outage, not once per sweep while the queue stays full, so queue saturation is never silent.
 - **Recovered**: sent on the first accepted ping after a missing notice, best-effort. Delivery uses bounded retries with jittered backoff and honors `Retry-After` on rate limits.
 - The webhook URL is treated as a secret: it is never logged and never appears in error messages.
 
@@ -95,7 +95,7 @@ Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away
 | `knell_beat_last_seen_timestamp_seconds{beat}` | gauge | Unix time of the last accepted ping (process start until the first ping) |
 | `knell_beats_received_total{beat}` | counter | accepted pings; unknown ids are rejected, not counted |
 | `knell_notifications_sent_total{kind}` | counter | delivered webhook notifications (`missing`, `recovered`) |
-| `knell_notifications_failed_total{kind}` | counter | failed delivery attempts after retries, plus transitions dropped because their queue was full |
+| `knell_notifications_failed_total{kind}` | counter | failed delivery attempts after retries, plus transitions their queue was too full to accept |
 
 Plus standard `go_*` / `process_*` runtime metrics.
 
@@ -114,14 +114,16 @@ knell is itself the alert path for the things it watches, so alert rules about k
   annotations:
     summary: "beat {{ $labels.beat }} is overdue on {{ $labels.instance }}"
 
-# knell cannot reach its webhook: if a beat goes missing now, nobody hears it.
+# knell failed to deliver a notification (webhook unreachable after retries)
+# or could not queue a transition because its queue was full: some transitions
+# may not have reached you.
 - alert: KnellNotifyFailing
   expr: increase(knell_notifications_failed_total[15m]) > 0
   for: 0m
   labels:
     severity: warning
   annotations:
-    summary: "knell on {{ $labels.instance }} is failing to deliver notifications"
+    summary: "knell on {{ $labels.instance }} failed to deliver or queue a notification"
 ```
 
 One caveat comes with the boot-armed clock: every restart re-arms each beat's full deadline, so an observer restarting more often than a beat's deadline never fires that beat's alert. The runtime metrics already expose this; alert on restart churn within your longest deadline window:

@@ -68,7 +68,14 @@ func run() error {
 	notifier := notify.New(cfg.WebhookURL, cfg.Node)
 	defer notifier.Close()
 
-	watcher := watch.New(cfg.Beats, notifier, time.Now)
+	// Translate the config DTO into the watch package's own input type: the
+	// composition root owns the boundary, so the state machine never
+	// depends on how configuration was parsed.
+	beats := make([]watch.Beat, len(cfg.Beats))
+	for i, b := range cfg.Beats {
+		beats[i] = watch.Beat{ID: b.ID, Deadline: b.Deadline}
+	}
+	watcher := watch.New(beats, notifier, time.Now)
 
 	handler := webapi.New(watcher, cfg.BeatToken, health.Handler(marker), metrics.Registry.Handler())
 	// No route streams, so whole-request read and write bounds are safe

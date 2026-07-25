@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/slogx/capture"
 )
@@ -40,7 +39,7 @@ func TestBeatFreshGaugeTracksOverdueAndRecovery(t *testing.T) {
 	// value no other test uses keeps this test's series isolated even
 	// under t.Parallel.
 	const id = "metrics-quorum-probe"
-	w, clock, _ := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 
 	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
 		t.Fatalf("beat_fresh at boot = %s, want 1", got)
@@ -68,7 +67,7 @@ func TestCanceledNotificationsAreNotCountedAsFailed(t *testing.T) {
 	// Serial (no t.Parallel): it asserts deltas on the package-global
 	// failure counters, which the parallel tests also increment.
 	const id = "cancel-probe"
-	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
 	clock.Advance(11 * time.Minute)
 
@@ -105,7 +104,7 @@ func TestSweepExactDeadlineBoundaryIsFresh(t *testing.T) {
 	// silence == deadline is still fresh ("within its deadline" is
 	// inclusive); only silence strictly past the deadline is overdue.
 	const id = "boundary-probe"
-	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 
 	clock.Advance(10 * time.Minute)
 	w.sweep(context.Background())
@@ -133,7 +132,7 @@ func TestRefreshFreshnessUpdatesGaugeWithoutNotifying(t *testing.T) {
 	t.Parallel()
 
 	id := "refresh-probe-" + strconv.FormatUint(refreshProbeSequence.Add(1), 10)
-	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 
 	// Construction pre-mints the received counter at zero so increase()
 	// alerts have a baseline sample before the first ping.
@@ -178,7 +177,7 @@ func TestDeliveredNotificationsIncrementSentCounters(t *testing.T) {
 	// Serial (no t.Parallel): asserts deltas on the package-global sent
 	// counters, which the parallel tests also increment.
 	const id = "sent-counter-probe"
-	w, clock, _ := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
 	clock.Advance(11 * time.Minute)
 
@@ -201,7 +200,7 @@ func TestFailedMissingNotificationIncrementsFailedCounter(t *testing.T) {
 	// counter. A real (non-canceled) delivery failure must move it: the
 	// KnellNotifyFailing alert increases() over exactly this series.
 	const id = "failed-counter-probe"
-	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
 	clock.Advance(11 * time.Minute)
 
@@ -221,7 +220,7 @@ func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, which every other test writes through.
 	const id = "missing-overflow-log-probe"
-	w, clock, _ := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
 	for range missingQueueSize {
 		clock.Advance(11 * time.Minute)
@@ -247,14 +246,14 @@ func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
 	}
 }
 
-func TestQueueFullDropIsAccountedOncePerLostOutage(t *testing.T) {
+func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	// Serial (no t.Parallel): asserts deltas on the package-global failed
-	// counter and captures the process-global slog default. A lost outage
-	// must be accounted ONCE, not once per 15s sweep: every sweep re-detects
-	// the same still-unrecorded crossing, and re-counting it would inflate
-	// the series KnellNotifyFailing alerts on for a single lost outage.
-	const id = "missing-drop-cadence-probe"
-	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	// counter and captures the process-global slog default. An affected
+	// outage must be accounted ONCE, not once per 15s sweep: every sweep
+	// re-detects the same still-unqueued crossing, and re-counting it would
+	// inflate the series KnellNotifyFailing alerts on for a single outage.
+	const id = "missing-overflow-cadence-probe"
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
 	for range missingQueueSize {
 		clock.Advance(11 * time.Minute)
@@ -264,7 +263,8 @@ func TestQueueFullDropIsAccountedOncePerLostOutage(t *testing.T) {
 	}
 
 	// The webhook is down, so nothing drains and the beat's current outage
-	// cannot be queued: three sweeps re-detect that one lost outage.
+	// cannot be queued: three sweeps re-detect that one ongoing outage,
+	// which stays detectable and is queued once a slot opens.
 	n.setFail(errors.New("discord down"))
 	clock.Advance(11 * time.Minute)
 	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
@@ -274,12 +274,12 @@ func TestQueueFullDropIsAccountedOncePerLostOutage(t *testing.T) {
 		w.sweep(context.Background())
 	}
 	// One increment per sweep for the head's failed send, plus exactly one
-	// for the dropped outage.
+	// for the queue-full overflow.
 	if got, want := counterValue(t, "knell_notifications_failed_total", "missing"), failedBefore+sweeps+1; got != want {
-		t.Errorf("failed{missing} = %v after %d sweeps with a full queue, want %v (%d send failures + 1 drop)", got, sweeps, want, sweeps)
+		t.Errorf("failed{missing} = %v after %d sweeps with a full queue, want %v (%d send failures + 1 overflow)", got, sweeps, want, sweeps)
 	}
 	if got := rec.CountLevel(slog.LevelWarn, "pending missing queue full"); got != 1 {
-		t.Errorf("queue-full warnings = %d over %d sweeps, want exactly 1 per lost outage: %v", got, sweeps, rec.Messages())
+		t.Errorf("queue-full warnings = %d over %d sweeps, want exactly 1 per affected outage: %v", got, sweeps, rec.Messages())
 	}
 
 	// The ping that ends that outage closes the same record the sweeps
@@ -299,6 +299,6 @@ func TestQueueFullDropIsAccountedOncePerLostOutage(t *testing.T) {
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
 	if got, want := counterValue(t, "knell_notifications_failed_total", "missing"), failedBefore+2; got != want {
-		t.Errorf("failed{missing} = %v after a new lost outage, want %v (1 send failure + 1 fresh drop)", got, want)
+		t.Errorf("failed{missing} = %v after a new affected outage, want %v (1 send failure + 1 fresh overflow)", got, want)
 	}
 }

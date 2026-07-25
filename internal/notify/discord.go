@@ -1,6 +1,6 @@
 // Package notify delivers knell's transition notifications to a Discord
-// webhook. It is the only outbound-network code in the app: one POST per
-// transition, retried on transient failures via httpx.
+// webhook. It is the app's only outbound-network package and retries
+// transient delivery failures via httpx.
 package notify
 
 import (
@@ -91,35 +91,45 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 		return fmt.Errorf("encoding webhook payload: %w", err)
 	}
 	_, err = httpx.Do(ctx, func(ctx context.Context) (struct{}, error) {
-		attemptCtx, cancel := httpx.ContextWithDefaultTimeout(ctx, attemptTimeout)
-		defer cancel()
-		req, reqErr := http.NewRequestWithContext(attemptCtx, http.MethodPost, d.url, bytes.NewReader(body))
-		if reqErr != nil {
-			// The raw error would embed the URL; report the cause only.
-			return struct{}{}, fmt.Errorf("building webhook request: %w", httpx.LogSafeError(reqErr))
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, doErr := d.client.Do(req) //nolint:bodyclose // closed via deferred httpx.DrainClose below
-		if doErr != nil {
-			// *url.Error embeds the full webhook URL; reduce it to its cause
-			// (transient classification survives the reduction).
-			return struct{}{}, httpx.LogSafeError(doErr)
-		}
-		defer httpx.DrainClose(resp.Body)
-		if statusErr := httpx.CheckHTTPStatus(resp); statusErr != nil {
-			return struct{}{}, statusErr
-		}
-		// CheckHTTPStatus treats all of 200-399 as success, so it alone
-		// would count an unfollowed redirect (3xx) as a delivered webhook.
-		// Only a 2xx is an accepted delivery; anything else must error so
-		// the sweep keeps retrying (pinned by TestUnfollowedRedirectIsNotDelivery).
-		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-			return struct{}{}, &httpx.HTTPStatusError{Code: resp.StatusCode}
-		}
-		return struct{}{}, nil
+		return d.postAttempt(ctx, body)
 	}, httpx.WithLabel("discord webhook "+label), httpx.WithMaxAttempts(maxAttempts), httpx.WithRateLimitRetry(30*time.Second))
 	if err != nil {
 		return fmt.Errorf("delivering %s notification: %w", label, httpx.LogSafeError(err))
 	}
 	return nil
+}
+
+// postAttempt performs one delivery attempt of an already-encoded payload:
+// per-attempt deadline, request construction, transport call, response
+// cleanup, and strict delivery validation. It is the retry callback post
+// hands to httpx.Do, which owns the retry policy and terminal wrapping.
+// Every error it returns is URL-free, so the webhook secret cannot reach a
+// log or a returned error.
+func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error) {
+	attemptCtx, cancel := httpx.ContextWithDefaultTimeout(ctx, attemptTimeout)
+	defer cancel()
+	req, reqErr := http.NewRequestWithContext(attemptCtx, http.MethodPost, d.url, bytes.NewReader(body))
+	if reqErr != nil {
+		// The raw error would embed the URL; report the cause only.
+		return struct{}{}, fmt.Errorf("building webhook request: %w", httpx.LogSafeError(reqErr))
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, doErr := d.client.Do(req) //nolint:bodyclose // closed via deferred httpx.DrainClose below
+	if doErr != nil {
+		// *url.Error embeds the full webhook URL; reduce it to its cause
+		// (transient classification survives the reduction).
+		return struct{}{}, httpx.LogSafeError(doErr)
+	}
+	defer httpx.DrainClose(resp.Body)
+	if statusErr := httpx.CheckHTTPStatus(resp); statusErr != nil {
+		return struct{}{}, statusErr
+	}
+	// CheckHTTPStatus treats all of 200-399 as success, so it alone
+	// would count an unfollowed redirect (3xx) as a delivered webhook.
+	// Only a 2xx is an accepted delivery; anything else must error so
+	// the sweep keeps retrying (pinned by TestUnfollowedRedirectIsNotDelivery).
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return struct{}{}, &httpx.HTTPStatusError{Code: resp.StatusCode}
+	}
+	return struct{}{}, nil
 }

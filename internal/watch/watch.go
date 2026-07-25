@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/metrics"
 )
 
@@ -35,10 +34,14 @@ type Notifier interface {
 // hours, so a fixed 15s sweep bounds alert latency without configuration.
 const DefaultTick = 15 * time.Second
 
-// recoveryQueueSize bounds the pending recovered-transition queue. Each
-// configured beat can hold at most one pending recovery, so the config cap
-// is also the queue bound.
-const recoveryQueueSize = config.MaxBeats
+// Beat is one watched beat as the state machine needs it: an id and the
+// silence deadline that declares it missing. It is the watch package's own
+// input type, so the state machine and its tests do not depend on how (or
+// from where) the composition root parsed the configuration.
+type Beat struct {
+	ID       string
+	Deadline time.Duration
+}
 
 // missingQueueSize bounds the per-beat queue of detected-but-undelivered
 // missing transitions. Every queued entry costs a full deadline of silence
@@ -46,8 +49,9 @@ const recoveryQueueSize = config.MaxBeats
 // is retried every tick, so a queue this deep only forms during a sustained
 // webhook outage. It is deliberately small: the oldest notices are the
 // actionable ones, and the bound keeps a stuck webhook from growing state
-// without limit. Overflow drops with accounting, never silently, the same
-// way a full recovery queue does.
+// without limit. Overflow is accounted, never silent, the same way a full
+// recovery queue is: a closed outage is dropped, while an ongoing one is
+// re-detected and queued once a slot opens.
 const missingQueueSize = 8
 
 // Notification kinds are the label values on the sent/failed notification
@@ -73,12 +77,12 @@ type beatState struct {
 	// sweep must not send another missing transition until it is
 	// delivered, so transitions reach Discord in chronological order.
 	recovering bool
-	// droppedOutage records that the beat's CURRENT outage was already
-	// accounted as a queue-full drop. Every sweep re-detects that same
-	// still-unrecorded outage, so without this flag one lost outage would
-	// be counted and logged again on every tick. A successful push and the
-	// ping that ends the outage both clear it.
-	droppedOutage bool
+	// overflowAccounted records that the current outage has already moved
+	// the failure counter and warning for a full pending queue. A closed
+	// outage may be lost, while an ongoing outage remains detectable and is
+	// queued after space opens; either case is accounted only once until a
+	// successful push or the closing ping clears the flag.
+	overflowAccounted bool
 }
 
 // headMissing returns the oldest queued missing transition — the one the
@@ -106,7 +110,7 @@ func (st *beatState) openMissing() *overdueBeat {
 }
 
 // pushMissing appends a detected missing transition, reporting false when
-// the queue is already at its bound (the caller accounts for the drop).
+// the queue is already at its bound (the caller accounts for the overflow).
 func (st *beatState) pushMissing(rec overdueBeat) bool {
 	if len(st.pendingMissing) >= missingQueueSize {
 		return false
@@ -130,24 +134,25 @@ func (st *beatState) popMissing() overdueBeat {
 }
 
 // recordMissing queues a detected missing transition for the beat, or
-// accounts for the drop when the queue is full. Dropping the newest keeps
-// the queued chronology and the in-flight retry of the head intact, and
-// every drop moves the same failure counter (and log) a dropped recovery
-// does, so a lost outage is never silent — once per lost outage, not once
-// per sweep. Callers hold w.mu.
+// accounts for a queue-full event once when the queue is full. Dropping the
+// newest keeps the queued chronology and the in-flight retry of the head
+// intact, and every overflow moves the same failure counter (and log) a
+// dropped recovery does, so saturation is never silent — once per affected
+// outage, not once per sweep. A closed outage that overflows is lost; an
+// ongoing one is re-detected and queued once a slot opens. Callers hold w.mu.
 func recordMissing(st *beatState, rec overdueBeat) {
 	if st.pushMissing(rec) {
-		st.droppedOutage = false
+		st.overflowAccounted = false
 		return
 	}
-	if st.droppedOutage {
+	if st.overflowAccounted {
 		// The same outage a previous sweep already accounted for: counting
-		// it every tick would report one lost outage as dozens.
+		// it every tick would report one affected outage as dozens.
 		return
 	}
-	st.droppedOutage = true
+	st.overflowAccounted = true
 	metrics.NotificationsFailed.Inc(kindMissing)
-	slog.Warn("pending missing queue full, dropping missing notification",
+	slog.Warn("pending missing queue full, missing notification not queued",
 		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.String(),
 		"since", rec.seen)
 }
@@ -169,14 +174,17 @@ type Watcher struct {
 	mu         sync.Mutex
 }
 
-// New builds a Watcher for the configured beats. The deadline clock of every
-// beat starts at now(); pass time.Now in production.
-func New(beats []config.Beat, notifier Notifier, now func() time.Time) *Watcher {
+// New builds a Watcher for the given beats. The deadline clock of every
+// beat starts at now(); pass time.Now in production. The pending
+// recovered-transition queue is sized from the beat count: each beat can
+// hold at most one pending recovery, so that bound is exactly enough for a
+// ping on every beat to queue without blocking.
+func New(beats []Beat, notifier Notifier, now func() time.Time) *Watcher {
 	w := &Watcher{
 		notifier:   notifier,
 		now:        now,
 		beats:      make(map[string]*beatState, len(beats)),
-		recoveries: make(chan recoveryEvent, recoveryQueueSize),
+		recoveries: make(chan recoveryEvent, len(beats)),
 	}
 	start := now()
 	for _, b := range beats {
@@ -226,9 +234,9 @@ func (w *Watcher) Beat(id string) bool {
 			recoveredAt: now,
 		})
 	}
-	// This ping ends the beat's outage, so a later queue-full drop belongs
-	// to the NEXT outage and is accounted on its own.
-	st.droppedOutage = false
+	// This ping ends the beat's outage, so a later queue-full overflow
+	// belongs to the NEXT outage and is accounted on its own.
+	st.overflowAccounted = false
 	st.lastSeen = now
 	st.alerted = false
 	if wasAlerted {
@@ -245,7 +253,7 @@ func (w *Watcher) Beat(id string) bool {
 		select {
 		case w.recoveries <- recoveryEvent{id: id, downFor: downFor}:
 		default:
-			// Cannot happen while the queue bound matches the beat cap
+			// Cannot happen while the queue bound matches the beat count
 			// (one pending recovery per beat), but never block a ping.
 			// The dropped recovery is no longer pending, so un-mark it or
 			// the beat could never alert again.

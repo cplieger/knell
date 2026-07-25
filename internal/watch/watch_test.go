@@ -8,8 +8,6 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
-
-	"github.com/cplieger/knell/internal/config"
 )
 
 // fakeClock is a mutable test clock, safe for concurrent reads.
@@ -88,7 +86,7 @@ func (n *fakeNotifier) snapshot() []call {
 	return out
 }
 
-func newTestWatcher(beats ...config.Beat) (*Watcher, *fakeClock, *fakeNotifier) {
+func newTestWatcher(beats ...Beat) (*Watcher, *fakeClock, *fakeNotifier) {
 	clock := newFakeClock()
 	notifier := &fakeNotifier{}
 	return New(beats, notifier, clock.Now), clock, notifier
@@ -110,7 +108,7 @@ func drainRecoveries(w *Watcher) {
 func TestBeatUnknownID(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	if w.Beat("ghost") {
 		t.Error("Beat(ghost) = true, want false")
 	}
@@ -129,7 +127,7 @@ func TestBeatUnknownID(t *testing.T) {
 func TestFreshBeatNeverNotifies(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	for range 10 {
 		clock.Advance(5 * time.Minute)
 		if !w.Beat("api") {
@@ -145,7 +143,7 @@ func TestFreshBeatNeverNotifies(t *testing.T) {
 func TestMissingFiresOncePerOutage(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	w.Beat("api")
 
 	clock.Advance(11 * time.Minute)
@@ -166,7 +164,7 @@ func TestMissingFiresOncePerOutage(t *testing.T) {
 func TestBootGraceFiresWithoutAnyBeat(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 
 	clock.Advance(9 * time.Minute)
 	w.sweep(context.Background())
@@ -185,7 +183,7 @@ func TestBootGraceFiresWithoutAnyBeat(t *testing.T) {
 func TestRecoveryAfterMissing(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	w.Beat("api")
 
 	clock.Advance(30 * time.Minute)
@@ -216,7 +214,7 @@ func TestRecoveryAfterMissing(t *testing.T) {
 func TestFailedMissingRetriesNextSweep(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	w.Beat("api")
 	clock.Advance(11 * time.Minute)
 
@@ -244,7 +242,7 @@ func TestFailedMissingRetriesNextSweep(t *testing.T) {
 func TestFailedMissingStillDeliversAfterBeatRecovers(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	w.Beat("api")
 	clock.Advance(11 * time.Minute)
 	n.setFail(errors.New("discord down"))
@@ -261,7 +259,7 @@ func TestFailedMissingStillDeliversAfterBeatRecovers(t *testing.T) {
 func TestSecondOutageNotifiesAgain(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	w.Beat("api")
 
 	clock.Advance(11 * time.Minute)
@@ -284,7 +282,7 @@ func TestSecondOutageNotifiesAgain(t *testing.T) {
 func TestPingRacingDeliveredMissingEmitsRecoveryAndRearms(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	w.Beat("api")
 
 	// The ping lands while the missing notification is in flight: Beat sees
@@ -325,8 +323,8 @@ func TestBeatsAreIndependent(t *testing.T) {
 	t.Parallel()
 
 	w, clock, n := newTestWatcher(
-		config.Beat{ID: "fast", Deadline: time.Minute},
-		config.Beat{ID: "slow", Deadline: time.Hour},
+		Beat{ID: "fast", Deadline: time.Minute},
+		Beat{ID: "slow", Deadline: time.Hour},
 	)
 	w.Beat("fast")
 	w.Beat("slow")
@@ -344,7 +342,7 @@ func TestRunLoopDeliversSweepAndRecovery(t *testing.T) {
 	t.Parallel()
 
 	synctest.Test(t, func(t *testing.T) {
-		w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: time.Minute})
+		w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: time.Minute})
 		w.Beat("api")
 		clock.Advance(2 * time.Minute)
 
@@ -383,7 +381,7 @@ func TestRunLoopDeliversSweepAndRecovery(t *testing.T) {
 func TestFailedRecoveredIsBestEffortOnce(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	w.Beat("api")
 
 	// First outage: missing delivered, then the beat pings again while the
@@ -416,7 +414,7 @@ func TestFailedRecoveredIsBestEffortOnce(t *testing.T) {
 func TestPendingRecoveryBlocksNextMissingUntilDelivered(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	w.Beat("api")
 
 	// First outage: missing delivered, then a ping queues the recovery,
@@ -455,15 +453,17 @@ func TestPendingRecoveryBlocksNextMissingUntilDelivered(t *testing.T) {
 func TestRecoveryQueueOverflowDropKeepsBeatArmed(t *testing.T) {
 	t.Parallel()
 
-	// One more beat than the queue bound: watch.New enforces no cap of its
-	// own (config.ParseBeats does), so recoveryQueueSize+1 beats can all
-	// hold a pending recovery at once and the final ping must take the
-	// full-queue drop path.
-	beats := make([]config.Beat, recoveryQueueSize+1)
+	// New sizes the recovery queue from the beat count, so the full-queue
+	// path is defensive-only in production. Shrink the queue to one slot
+	// short of the beat count before anything runs, so the final ping finds
+	// it full and its recovered notification is dropped.
+	const beatCount = 3
+	beats := make([]Beat, beatCount)
 	for i := range beats {
-		beats[i] = config.Beat{ID: fmt.Sprintf("overflow-%02d", i), Deadline: 10 * time.Minute}
+		beats[i] = Beat{ID: fmt.Sprintf("overflow-%02d", i), Deadline: 10 * time.Minute}
 	}
 	w, clock, n := newTestWatcher(beats...)
+	w.recoveries = make(chan recoveryEvent, beatCount-1)
 
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
@@ -471,9 +471,9 @@ func TestRecoveryQueueOverflowDropKeepsBeatArmed(t *testing.T) {
 		t.Fatalf("missing notifications = %d, want %d", got, len(beats))
 	}
 
-	// Ping every beat without draining the queue: the first
-	// recoveryQueueSize pings queue their recovery, the last one finds the
-	// queue full and its recovered notification is dropped.
+	// Ping every beat without draining the queue: the first beatCount-1
+	// pings queue their recovery, the last one finds the queue full and its
+	// recovered notification is dropped.
 	last := beats[len(beats)-1].ID
 	for _, b := range beats {
 		if !w.Beat(b.ID) {
@@ -525,7 +525,7 @@ func TestFreshnessGaugeUpdatesWhileSenderBlocked(t *testing.T) {
 		// Unique beat ids: the metric registry is package-global.
 		clock := newFakeClock()
 		n := &blockingNotifier{entered: make(chan struct{}, 8), release: make(chan struct{})}
-		w := New([]config.Beat{
+		w := New([]Beat{
 			{ID: "blocked-sender-a", Deadline: 10 * time.Minute},
 			{ID: "blocked-sender-b", Deadline: 30 * time.Minute},
 		}, n, clock.Now)
@@ -572,7 +572,7 @@ func TestFreshnessGaugeUpdatesWhileSenderBlocked(t *testing.T) {
 func TestLatePingBeforeSweepPreservesOutage(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	w.Beat("api")
 	clock.Advance(11 * time.Minute)
 
@@ -596,7 +596,7 @@ func TestLatePingBeforeSweepPreservesOutage(t *testing.T) {
 func TestLatePingDuringPendingRecoveryPreservesSecondOutage(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	w.Beat("api")
 
 	// First outage: missing delivered, then a ping queues the recovery,
@@ -643,7 +643,7 @@ func TestLatePingDuringPendingRecoveryPreservesSecondOutage(t *testing.T) {
 func TestSecondOutageDuringUndeliveredMissingIsNotErased(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	w.Beat("api")
 
 	// Outage A: detected at t+11m, but the webhook is down, so its missing
@@ -695,7 +695,7 @@ func TestSecondOutageDuringUndeliveredMissingIsNotErased(t *testing.T) {
 func TestThreeOutagesQueueWhileNoticesAreUndelivered(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "api", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	w.Beat("api")
 	n.setFail(errors.New("discord down"))
 
@@ -753,7 +753,7 @@ func TestPendingMissingQueueOverflowIsAccountedNotSilent(t *testing.T) {
 	// Serial (no t.Parallel): it asserts a delta on the package-global
 	// failed-notification counter, which the parallel tests also move.
 	const id = "missing-overflow-probe"
-	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
 
 	// Fill the queue to its bound: every late ping past the deadline
@@ -811,7 +811,7 @@ func TestPendingMissingQueueOverflowIsAccountedNotSilent(t *testing.T) {
 func TestRecoveredDownForMeasuresToFirstPingAfterOutage(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "downfor-first-ping", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "downfor-first-ping", Deadline: 10 * time.Minute})
 	w.Beat("downfor-first-ping")
 
 	// Outage detected at t+11m but the missing send fails, so the
@@ -849,7 +849,7 @@ func TestRecoveredDownForMeasuresToFirstPingAfterOutage(t *testing.T) {
 func TestRetriedMissingReportsCurrentSilence(t *testing.T) {
 	t.Parallel()
 
-	w, clock, n := newTestWatcher(config.Beat{ID: "silence-refresh", Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: "silence-refresh", Deadline: 10 * time.Minute})
 	w.Beat("silence-refresh")
 
 	// Outage detected at t+11m; the missing send fails and stays pending.
@@ -873,11 +873,11 @@ func TestRetriedMissingReportsCurrentSilence(t *testing.T) {
 	}
 }
 
-func TestSweepDetectedCrossingSurvivesAQueueFullDrop(t *testing.T) {
+func TestSweepDetectedCrossingSurvivesAQueueFullOverflow(t *testing.T) {
 	t.Parallel()
 
 	const id = "sweep-overflow-probe"
-	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
 	for range missingQueueSize {
 		clock.Advance(11 * time.Minute)
@@ -888,14 +888,14 @@ func TestSweepDetectedCrossingSurvivesAQueueFullDrop(t *testing.T) {
 
 	// The beat now goes silent with no ping to end it, so the sweep -- not
 	// Beat -- is the path that detects the crossing while the queue is at
-	// its bound. The drop must not mark the beat alerted: a dead-man switch
-	// that swallows an ongoing outage because its queue was briefly full is
-	// the worst failure it can have.
+	// its bound. The overflow must not mark the beat alerted: a dead-man
+	// switch that swallows an ongoing outage because its queue was briefly
+	// full is the worst failure it can have.
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
 
 	// Draining the queue frees a slot, the ongoing outage is recorded, and
-	// it still gets its own missing notice. A drop that marked the beat
+	// it still gets its own missing notice. An overflow that marked the beat
 	// alerted instead would swallow it: 8 pairs and nothing more.
 	for range missingQueueSize {
 		w.sweep(context.Background())
@@ -913,7 +913,7 @@ func TestQueuedOngoingOutageReportsLiveSilenceWhenPromoted(t *testing.T) {
 	t.Parallel()
 
 	const id = "queued-ongoing-probe"
-	w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: 10 * time.Minute})
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
 	n.setFail(errors.New("discord down"))
 

@@ -3,11 +3,10 @@ package watch
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/cplieger/knell/internal/config"
 )
 
 // checkMissingQueueInvariants asserts the pending-missing queue's structural
@@ -59,8 +58,22 @@ func FuzzMissingQueue(f *testing.F) {
 			id       = "fuzz-queue-probe"
 			deadline = 10 * time.Minute
 		)
-		w, clock, n := newTestWatcher(config.Beat{ID: id, Deadline: deadline})
+		w, clock, n := newTestWatcher(Beat{ID: id, Deadline: deadline})
 		for _, op := range ops {
+			// The structural invariants below hold just as well if the queue
+			// dropped its OLDEST record and kept the incoming one, so they
+			// cannot pin the documented drop-the-newest overflow policy.
+			// Snapshot the full queue before an op that would overflow it, and
+			// require it to come back unchanged: that postcondition fails on a
+			// drop-oldest mutation.
+			st := w.beats[id]
+			beforeQueue := slices.Clone(st.pendingMissing)
+			newestShouldDrop := op == 'p' &&
+				len(beforeQueue) == missingQueueSize &&
+				st.openMissing() == nil &&
+				!st.alerted &&
+				overdue(clock.Now().Sub(st.lastSeen), st.deadline)
+
 			switch op {
 			case 'p': // a ping
 				w.Beat(id)
@@ -80,6 +93,17 @@ func FuzzMissingQueue(f *testing.F) {
 				continue
 			}
 			checkMissingQueueInvariants(t, w, id, deadline, ops)
+			if newestShouldDrop {
+				got := w.beats[id].pendingMissing
+				if len(got) != len(beforeQueue) {
+					t.Fatalf("ops %q: newest-drop changed queue length from %d to %d", ops, len(beforeQueue), len(got))
+				}
+				for i := range beforeQueue {
+					if got[i] != beforeQueue[i] {
+						t.Fatalf("ops %q: newest-drop changed queued record %d from %+v to %+v", ops, i, beforeQueue[i], got[i])
+					}
+				}
+			}
 		}
 	})
 }
