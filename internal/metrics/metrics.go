@@ -54,12 +54,14 @@ var NotificationsSent = metricslib.NewLabeledCounter(
 )
 
 // NotificationsFailed counts unsuccessful webhook delivery attempts after
-// retries and transitions dropped because their queue was full, by kind.
-// A failed missing delivery is retried on the next watch tick; a recovered
-// notification is best-effort.
+// retries and transitions a full queue could not accept, by kind. A closed
+// outage that overflows is lost, while an ongoing one stays detectable and
+// is queued once a slot opens; either case is accounted once per affected
+// outage. A failed missing delivery is retried on the next watch tick; a
+// recovered notification is best-effort.
 var NotificationsFailed = metricslib.NewLabeledCounter(
 	"notifications_failed_total",
-	"Unsuccessful webhook delivery attempts after retries and transitions dropped because their queue was full, by kind (missing, recovered).",
+	"Unsuccessful webhook delivery attempts after retries and transitions a full queue could not accept, by kind (missing, recovered).",
 	[]string{kindLabel},
 )
 
