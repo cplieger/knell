@@ -359,15 +359,16 @@ func (w *Watcher) sweep(ctx context.Context) {
 
 // collectOverdue publishes every beat's freshness gauge and returns, per
 // beat, the one missing notification due now: the head of its pending queue
-// (a newly detected deadline crossing, or an earlier crossing whose send
-// failed and is being retried). Detection is independent of delivery, so a
+// (a newly detected deadline crossing, an earlier crossing whose send failed
+// and is being retried, or an earlier crossing still waiting its turn behind
+// the notices queued before it). Detection is independent of delivery, so a
 // crossing is recorded even while earlier notices are still queued; only
 // beats mid-recovery are held back, keeping transitions chronological.
 func (w *Watcher) collectOverdue() []overdueBeat {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	now := w.now()
-	var overdue []overdueBeat
+	var due []overdueBeat
 	for id, st := range w.beats {
 		silence := now.Sub(st.lastSeen)
 		fresh := publishFreshness(id, silence, st.deadline)
@@ -395,9 +396,9 @@ func (w *Watcher) collectOverdue() []overdueBeat {
 		if st.recovering {
 			continue
 		}
-		overdue = append(overdue, *head)
+		due = append(due, *head)
 	}
-	return overdue
+	return due
 }
 
 // sendMissing delivers one due missing transition and reports whether

@@ -66,7 +66,7 @@ Silence past the deadline rings the bell:
 
 knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext. Put a TLS reverse proxy in front, or keep pings on a trusted network.
 
-A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling back, and so does a webhook URL on any scheme other than `https`. A `_FILE` secret that cannot be read, because the path is missing or the file is empty, fails startup too instead of falling back to the plain variable. A dead-man switch running with the wrong config is worse than one that refuses to start.
+A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling back, and so does a webhook URL on any scheme other than `https`. When a `_FILE` variable is set but its file cannot be read, because it is missing, unreadable, or empty, startup fails instead of falling back to the plain variable; only an unset `_FILE` variable falls back. A dead-man switch running with the wrong config is worse than one that refuses to start.
 
 ## Endpoints
 
@@ -83,7 +83,7 @@ Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away
 ## Notification semantics
 
 - **Missing**: sent once per outage, when a beat first passes its deadline. A failed delivery (Discord outage, network) is retried on every 15s sweep until one succeeds; the beat is only marked notified after a delivered send.
-- **Queued outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of being collapsed into that earlier one and lost. Each beat queues up to 8 records and drains them oldest first, one notice per beat per sweep, so notices arrive in the order the outages happened. When a beat's queue is full, the newest record is dropped, `knell_notifications_failed_total{kind="missing"}` increments and a warning is logged, so a dropped outage is never silent.
+- **Queued outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of being collapsed into that earlier one and lost. Each beat queues up to 8 records and drains them oldest first, one notice per beat per sweep, so notices arrive in the order the outages happened. When a beat's queue is full, the newest record is dropped, `knell_notifications_failed_total{kind="missing"}` increments and a warning is logged, so a dropped outage is never silent; the drop is accounted once per lost outage, not once per sweep while the queue stays full.
 - **Recovered**: sent on the first accepted ping after a missing notice, best-effort. Delivery uses bounded retries with jittered backoff and honors `Retry-After` on rate limits.
 - The webhook URL is treated as a secret: it is never logged and never appears in error messages.
 
@@ -95,7 +95,7 @@ Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away
 | `knell_beat_last_seen_timestamp_seconds{beat}` | gauge | Unix time of the last accepted ping (process start until the first ping) |
 | `knell_beats_received_total{beat}` | counter | accepted pings; unknown ids are rejected, not counted |
 | `knell_notifications_sent_total{kind}` | counter | delivered webhook notifications (`missing`, `recovered`) |
-| `knell_notifications_failed_total{kind}` | counter | notifications that never reached Discord: a delivery that failed after retries, or a transition dropped because its queue was full |
+| `knell_notifications_failed_total{kind}` | counter | failed delivery attempts after retries, plus transitions dropped because their queue was full |
 
 Plus standard `go_*` / `process_*` runtime metrics.
 

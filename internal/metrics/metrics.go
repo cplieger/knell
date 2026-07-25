@@ -53,13 +53,13 @@ var NotificationsSent = metricslib.NewLabeledCounter(
 	[]string{kindLabel},
 )
 
-// NotificationsFailed counts webhook notifications that never reached
-// Discord, by kind: a delivery that failed after retries, or a transition
-// dropped because its queue was full. A missing notification that fails is
-// retried on the next watch tick; a recovered notification is best-effort.
+// NotificationsFailed counts unsuccessful webhook delivery attempts after
+// retries and transitions dropped because their queue was full, by kind.
+// A failed missing delivery is retried on the next watch tick; a recovered
+// notification is best-effort.
 var NotificationsFailed = metricslib.NewLabeledCounter(
 	"notifications_failed_total",
-	"Webhook notifications not delivered, by kind (missing, recovered): a delivery that failed after retries, or a transition dropped because its queue was full.",
+	"Unsuccessful webhook delivery attempts after retries and transitions dropped because their queue was full, by kind (missing, recovered).",
 	[]string{kindLabel},
 )
 
