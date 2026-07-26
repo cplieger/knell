@@ -3,10 +3,14 @@ package watch
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cplieger/knell/internal/metrics"
 )
 
 // checkMissingQueueInvariants asserts the pending-missing queue's structural
@@ -34,6 +38,14 @@ func checkMissingQueueInvariants(t *testing.T, w *Watcher, id string, deadline t
 		}
 		if i > 0 && q[i-1].seen.After(rec.seen) {
 			t.Fatalf("ops %q: record %d was last seen before record %d, so the queue is out of chronological order", ops, i, i-1)
+		}
+		// Chronological order alone still allows two queued records to cover
+		// overlapping intervals, which a collapsed history notice would report
+		// as an outage that started before the previous one ended. A record's
+		// outage must begin at or after the previous record's recovery point.
+		if i > 0 && !q[i-1].recoveredAt.IsZero() && q[i-1].recoveredAt.After(rec.seen) {
+			t.Fatalf("ops %q: record %d starts at %s, inside record %d which recovered at %s: a history notice would report overlapping outages",
+				ops, i, rec.seen, i-1, q[i-1].recoveredAt)
 		}
 	}
 }
@@ -131,6 +143,54 @@ func FuzzMissingQueue(f *testing.F) {
 					}
 				}
 			}
+		}
+	})
+}
+
+// beatFreshSeriesCount counts the beat_fresh series currently in the
+// exposition. It is the label-cardinality ground truth: a series minted for an
+// id nobody configured is permanent, unbounded cardinality in knell and in
+// every observer scraping it, so the count must not move for an unknown id.
+func beatFreshSeriesCount() int {
+	rec := httptest.NewRecorder()
+	metrics.Registry.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	n := 0
+	for line := range strings.Lines(rec.Body.String()) {
+		if strings.HasPrefix(line, "knell_beat_fresh{") {
+			n++
+		}
+	}
+	return n
+}
+
+// FuzzBeatIDMintsNoSeriesForUnconfiguredID fuzzes the untrusted boundary the
+// beat id arrives on. webapi hands Beat the decoded URL path segment verbatim,
+// so an escaped slash, a NUL, a newline, a quote or a 300-byte segment all
+// reach this function as an id. That id then becomes a Prometheus label value,
+// which makes the configured-id map the only thing between an arbitrary
+// request path and permanent label cardinality -- and a raw newline or quote
+// in a label value corrupts the exposition carrying the quorum signal. Both
+// invariants are independent of the map itself: acceptance matches the
+// configured set exactly, and no call for any other id changes the series
+// count.
+func FuzzBeatIDMintsNoSeriesForUnconfiguredID(f *testing.F) {
+	const probe = "fuzz-id-boundary-probe"
+	f.Add(probe)
+	f.Add("")
+	f.Add("a/b")
+	f.Add("api\nx")
+	f.Add(`api"x`)
+	f.Add("api\x00")
+	f.Add(strings.Repeat("x", 300))
+	f.Add(`knell_beat_fresh{beat="injected"} 1`)
+	f.Fuzz(func(t *testing.T, id string) {
+		w, _, _ := newTestWatcher(Beat{ID: probe, Deadline: 10 * time.Minute})
+		before := beatFreshSeriesCount()
+		if got, want := w.Beat(id), id == probe; got != want {
+			t.Fatalf("Beat(%q) = %v, want %v (only a configured id may be accepted)", id, got, want)
+		}
+		if after := beatFreshSeriesCount(); after != before {
+			t.Fatalf("Beat(%q) moved the beat_fresh series count from %d to %d: an unconfigured id minted a label series", id, before, after)
 		}
 	})
 }

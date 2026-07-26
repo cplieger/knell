@@ -13,9 +13,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/cplieger/httpx/v4"
@@ -30,6 +33,18 @@ const attemptTimeout = 10 * time.Second
 // semantics: total, including the first).
 const maxAttempts = 3
 
+// maxErrorBodyBytes caps how much of a rejected response's body is carried
+// into the delivery error. Discord names the cause there (a deleted webhook
+// vs a rejected payload); a few hundred bytes is the whole explanation and
+// keeps a hostile or chatty body out of the log.
+const maxErrorBodyBytes = 512
+
+// userAgent identifies this client to Discord's edge. Discord's HTTP API
+// reference requires a User-Agent naming the client library and version;
+// Go sends "Go-http-client/1.1" when the header is unset, and a refusal
+// would arrive as a non-transient 4xx the sweep re-posts forever.
+const userAgent = "knell (https://github.com/cplieger/knell)"
+
 // Discord posts plain-content messages to one Discord-compatible webhook.
 type Discord struct {
 	client *http.Client
@@ -39,6 +54,10 @@ type Discord struct {
 	// message can carry (see redactionCandidates); logSafe scrubs all of
 	// them, not only the raw configured string.
 	redact []string
+	// attemptTimeout bounds one delivery attempt. It is a field rather than
+	// a direct use of the constant only so a test can shorten it on its own
+	// notifier; New always sets it to attemptTimeout.
+	attemptTimeout time.Duration
 }
 
 // Discord implements the transition contract the state machine consumes;
@@ -64,20 +83,13 @@ func New(webhookURL, node string) *Discord {
 	// by surfacing its 3xx response, which postAttempt then reports as
 	// non-delivery; TestMethodChangingRedirectIsNotDelivery pins that, and
 	// is also the only test pinning that a policy is installed at all.
-	//
-	// Two deltas from the hand-rolled wrapper this replaced: ANY
-	// method-changing hop is refused, not only one whose original request
-	// was a POST (knell only ever POSTs, so nothing here reaches the
-	// difference), and a call with an empty via chain is refused instead of
-	// allowed — net/http always passes at least the original request, so
-	// that path is unreachable in production, and failing closed is the
-	// safer direction for a credential-bearing POST.
 	client.CheckRedirect = httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
 	return &Discord{
-		client: client,
-		url:    webhookURL,
-		node:   node,
-		redact: redactionCandidates(webhookURL),
+		client:         client,
+		url:            webhookURL,
+		node:           node,
+		redact:         redactionCandidates(webhookURL),
+		attemptTimeout: attemptTimeout,
 	}
 }
 
@@ -168,8 +180,9 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 }
 
 // post delivers one message, retrying transient failures. The webhook URL
-// never appears in returned errors or logs (httpx redacts transport errors;
-// status failures are rebuilt without the URL).
+// never appears in returned errors or logs: transport errors are reduced by
+// logSafe, and a status failure is httpx.CheckHTTPStatus's error, which
+// carries the status code only (no URL to strip).
 func (d *Discord) post(ctx context.Context, label, content string) error {
 	body, err := json.Marshal(map[string]string{"content": content})
 	if err != nil {
@@ -177,7 +190,14 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 	}
 	_, err = httpx.Do(ctx, func(ctx context.Context) (struct{}, error) {
 		return d.postAttempt(ctx, body)
-	}, httpx.WithLabel("discord webhook "+label), httpx.WithMaxAttempts(maxAttempts), httpx.WithRateLimitRetry(30*time.Second))
+	}, httpx.WithLabel("discord webhook "+label), httpx.WithMaxAttempts(maxAttempts),
+		httpx.WithRateLimitRetry(30*time.Second),
+		// watch publishes the terminal verdict for every failed delivery
+		// (sendMissing/sendHistory/sendRecovered log at Error with the beat,
+		// the silence and the retry plan), so httpx's own exhaustion WARN is a
+		// second, thinner line for one event. Debug keeps it for diagnosis
+		// without the alarm, which is what WithExhaustedLevel is for.
+		httpx.WithExhaustedLevel(slog.LevelDebug))
 	if err != nil {
 		return fmt.Errorf("delivering %s notification: %w", label, d.logSafe(err))
 	}
@@ -199,7 +219,15 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 func (d *Discord) logSafe(err error) error {
 	safe := httpx.LogSafeError(err)
 	if safe == nil {
-		return nil
+		if err == nil {
+			return nil
+		}
+		// LogSafeError returns urlErr.Err verbatim, so a *url.Error whose
+		// own Err is nil would reduce a real failure to nil. postAttempt's
+		// return IS httpx.Do's success signal, so a nil there would report
+		// an undelivered notification as delivered and suppress the alert;
+		// fail closed instead.
+		return errors.New("webhook delivery failed")
 	}
 	// Candidates are never empty (config rejects an empty/non-https webhook
 	// URL before New is called), and RedactSecretString is a no-op on an
@@ -243,7 +271,7 @@ func (attemptTimeoutError) IsTransient() bool { return true }
 // Every error it returns is URL-free, so the webhook secret cannot reach a
 // log or a returned error.
 func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error) {
-	attemptCtx, cancel := httpx.ContextWithDefaultTimeout(ctx, attemptTimeout)
+	attemptCtx, cancel := httpx.ContextWithDefaultTimeout(ctx, d.attemptTimeout)
 	defer cancel()
 	req, reqErr := http.NewRequestWithContext(attemptCtx, http.MethodPost, d.url, bytes.NewReader(body))
 	if reqErr != nil {
@@ -251,6 +279,7 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 		return struct{}{}, fmt.Errorf("building webhook request: %w", d.logSafe(reqErr))
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", userAgent)
 	resp, doErr := d.client.Do(req) //nolint:bodyclose // closed via deferred httpx.DrainClose below
 	if doErr != nil {
 		// A child attempt deadline is retryable while the caller's budget is
@@ -271,6 +300,16 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 	// non-delivery. Its error is typed, which is what lets httpx.Do
 	// classify 502/503/504 as transient and retry within the call.
 	if statusErr := httpx.CheckHTTPStatus(resp); statusErr != nil {
+		// The code alone cannot tell a deleted webhook from a rejected
+		// payload; Discord names the cause in the body. Wrapping keeps the
+		// typed error in the chain (httpx.Do still classifies 502/503/504 as
+		// transient and still finds *RateLimitError for the 429 wait), post's
+		// logSafe scrubs the URL candidates from this text too, and Quote
+		// neutralizes control characters before it reaches a log line.
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		if len(detail) > 0 {
+			return struct{}{}, fmt.Errorf("%w: %s", statusErr, strconv.Quote(string(detail)))
+		}
 		return struct{}{}, statusErr
 	}
 	return struct{}{}, nil

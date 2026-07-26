@@ -3,10 +3,10 @@ package main
 import (
 	"errors"
 	"io/fs"
-	"log/slog"
 	"net"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -60,12 +60,21 @@ func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
 			// fails startup, and this only needs the ambient secret gone so
 			// it cannot satisfy the webhook gate.
 			unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
-			original := slog.Default()
-			t.Cleanup(func() { slog.SetDefault(original) })
+			// Installs a fresh recorder and restores the previous default at
+			// test end; run() replaces the default with its own handler.
+			capture.Default(t)
 
 			// Plant the marker a previous run would have left behind.
-			if err := os.WriteFile(health.DefaultPath, nil, 0o600); err != nil {
-				t.Skipf("cannot plant a health marker at %s: %v", health.DefaultPath, err)
+			// O_EXCL|O_NOFOLLOW: health.DefaultPath is a fixed path in a
+			// world-writable directory, so a plain os.WriteFile would follow a
+			// pre-planted symlink and truncate its target as the test user.
+			f, plantErr := os.OpenFile(health.DefaultPath,
+				os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+			if plantErr != nil {
+				t.Skipf("cannot plant a health marker at %s: %v", health.DefaultPath, plantErr)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatalf("closing planted marker: %v", err)
 			}
 			t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
 
@@ -150,8 +159,7 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 	t.Setenv("LISTEN_ADDR", occupied.Addr().String())
-	original := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(original) })
+	capture.Default(t)
 
 	err = run()
 	if err == nil {

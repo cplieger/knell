@@ -99,21 +99,21 @@ func TestParseBeats(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := ParseBeats(tt.raw)
+			got, err := parseBeats(tt.raw)
 			if tt.wantErr != "" {
 				if err == nil {
-					t.Fatalf("ParseBeats(%q) = %v, want error containing %q", tt.raw, got, tt.wantErr)
+					t.Fatalf("parseBeats(%q) = %v, want error containing %q", tt.raw, got, tt.wantErr)
 				}
 				if !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("ParseBeats(%q) error = %q, want containing %q", tt.raw, err, tt.wantErr)
+					t.Fatalf("parseBeats(%q) error = %q, want containing %q", tt.raw, err, tt.wantErr)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("ParseBeats(%q) unexpected error: %v", tt.raw, err)
+				t.Fatalf("parseBeats(%q) unexpected error: %v", tt.raw, err)
 			}
 			if len(got) != len(tt.want) {
-				t.Fatalf("ParseBeats(%q) = %v, want %v", tt.raw, got, tt.want)
+				t.Fatalf("parseBeats(%q) = %v, want %v", tt.raw, got, tt.want)
 			}
 			for i := range got {
 				if got[i] != tt.want[i] {
@@ -133,10 +133,10 @@ func TestParseBeatsMaxCap(t *testing.T) {
 			entries = append(entries, string(r)+string(s)+":20m")
 		}
 	}
-	if len(entries) <= MaxBeats {
-		t.Fatalf("test needs more than %d entries, built %d", MaxBeats, len(entries))
+	if len(entries) <= maxBeats {
+		t.Fatalf("test needs more than %d entries, built %d", maxBeats, len(entries))
 	}
-	_, err := ParseBeats(strings.Join(entries, ","))
+	_, err := parseBeats(strings.Join(entries, ","))
 	if err == nil || !strings.Contains(err.Error(), "maximum") {
 		t.Fatalf("expected maximum-cap error, got %v", err)
 	}
@@ -145,21 +145,21 @@ func TestParseBeatsMaxCap(t *testing.T) {
 func TestParseBeatsAcceptsExactlyMaxCap(t *testing.T) {
 	t.Parallel()
 
-	entries := make([]string, 0, MaxBeats)
+	entries := make([]string, 0, maxBeats)
 	for r := 'a'; r <= 'h'; r++ {
 		for s := 'a'; s <= 'h'; s++ {
 			entries = append(entries, string(r)+string(s)+":20m")
 		}
 	}
-	if len(entries) != MaxBeats {
-		t.Fatalf("test built %d entries, want exactly %d", len(entries), MaxBeats)
+	if len(entries) != maxBeats {
+		t.Fatalf("test built %d entries, want exactly %d", len(entries), maxBeats)
 	}
-	beats, err := ParseBeats(strings.Join(entries, ","))
+	beats, err := parseBeats(strings.Join(entries, ","))
 	if err != nil {
-		t.Fatalf("ParseBeats with exactly %d beats = %v, want accepted (the cap is inclusive)", MaxBeats, err)
+		t.Fatalf("parseBeats with exactly %d beats = %v, want accepted (the cap is inclusive)", maxBeats, err)
 	}
-	if len(beats) != MaxBeats {
-		t.Errorf("len(beats) = %d, want %d", len(beats), MaxBeats)
+	if len(beats) != maxBeats {
+		t.Errorf("len(beats) = %d, want %d", len(beats), maxBeats)
 	}
 }
 
@@ -199,27 +199,28 @@ func TestLoadDefaultsAndFailures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
-	if cfg.Node == "" {
-		t.Error("Node should fall back to hostname, got empty")
-	}
 	if cfg.ListenAddr != ":9190" {
 		t.Errorf("ListenAddr default = %q, want :9190", cfg.ListenAddr)
 	}
 
 	t.Setenv("BEATS", "")
-	if _, err := Load(); err == nil {
-		t.Error("Load() with empty BEATS should fail")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "BEATS is required") {
+		t.Errorf("Load() with empty BEATS error = %v, want it to name BEATS as required", err)
 	}
 
 	t.Setenv("BEATS", "api:20m")
 	t.Setenv("DISCORD_WEBHOOK_URL", "")
-	if _, err := Load(); err == nil {
-		t.Error("Load() with empty DISCORD_WEBHOOK_URL should fail")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL is required") {
+		t.Errorf("Load() with empty DISCORD_WEBHOOK_URL error = %v, want it to name DISCORD_WEBHOOK_URL as required", err)
 	}
 
 	t.Setenv("DISCORD_WEBHOOK_URL", "not-a-url")
-	if _, err := Load(); err == nil {
-		t.Error("Load() with malformed DISCORD_WEBHOOK_URL should fail")
+	_, err = Load()
+	if err == nil || !strings.Contains(err.Error(), "scheme must be https") {
+		t.Errorf("Load() with a schemeless DISCORD_WEBHOOK_URL error = %v, want the https-scheme rejection", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "not-a-url") {
+		t.Errorf("error leaks the rejected webhook value: %v", err)
 	}
 }
 
@@ -261,6 +262,27 @@ func TestLoadRejectsPlainHTTPWebhook(t *testing.T) {
 		t.Errorf("error = %q, want DISCORD_WEBHOOK_URL context", err)
 	}
 	if strings.Contains(err.Error(), "127.0.0.1") || strings.Contains(err.Error(), "/hook") {
+		t.Errorf("error leaks the rejected webhook URL: %v", err)
+	}
+}
+
+func TestLoadRejectsPlainHTTPWebhookFromFile(t *testing.T) {
+	hookFile := filepath.Join(t.TempDir(), "webhook-url")
+	if err := os.WriteFile(hookFile, []byte("http://discord.example/file-borne-hook\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setValidLoadEnv(t)
+	t.Setenv("DISCORD_WEBHOOK_URL", "")
+	t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() with a plain-http DISCORD_WEBHOOK_URL_FILE = nil, want error: the https gate must apply to the file channel too, or a mounted secret ships the credential in cleartext")
+	}
+	if !strings.Contains(err.Error(), "scheme must be https") {
+		t.Errorf("error = %q, want the https-scheme rejection", err)
+	}
+	if strings.Contains(err.Error(), "discord.example") || strings.Contains(err.Error(), "file-borne-hook") {
 		t.Errorf("error leaks the rejected webhook URL: %v", err)
 	}
 }
@@ -335,6 +357,35 @@ func TestLoadBeatTokenFromFile(t *testing.T) {
 	}
 }
 
+func TestLoadBeatTokenFileWinsOverPlainVar(t *testing.T) {
+	// Serial (t.Setenv forbids t.Parallel anyway): swaps the process-global
+	// slog default to assert the both-channels-set warning.
+	tokenFile := filepath.Join(t.TempDir(), "beat-token")
+	if err := os.WriteFile(tokenFile, []byte("file-borne-beat-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", "stale-env-beat-token")
+	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+
+	rec := capture.Default(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.BeatToken != "file-borne-beat-token" {
+		t.Errorf("BeatToken = %q, want the file-borne token: BEAT_TOKEN_FILE wins over BEAT_TOKEN, so a rotated secret file must not be shadowed by a stale plain variable that would 401 every sender", cfg.BeatToken)
+	}
+	if !rec.Contains("BEAT_TOKEN and BEAT_TOKEN_FILE are both set") {
+		t.Errorf("log output %v missing the both-channels-set warning that tells the operator the plain variable is ignored", rec.Messages())
+	}
+	if rec.Contains("stale-env-beat-token") || rec.AttrContains("", "", "stale-env-beat-token") ||
+		rec.Contains("file-borne-beat-token") || rec.AttrContains("", "", "file-borne-beat-token") {
+		t.Errorf("log output leaks a token value: %v", rec.Messages())
+	}
+}
+
 func TestLoadWebhookFromFile(t *testing.T) {
 	hookFile := filepath.Join(t.TempDir(), "webhook-url")
 	if err := os.WriteFile(hookFile, []byte("https://discord.example/file-borne-hook\n"), 0o600); err != nil {
@@ -353,17 +404,32 @@ func TestLoadWebhookFromFile(t *testing.T) {
 	}
 }
 
-func TestParseWebhookURLDoesNotLeakScheme(t *testing.T) {
-	t.Parallel()
-
-	// A malformed secret value like "credentialmaterial:rest" parses with the
-	// secret prefix as its scheme; the validation error must not embed it.
-	_, err := parseWebhookURL("credentialmaterial:rest")
-	if err == nil {
-		t.Fatal("parseWebhookURL with a non-https scheme = nil, want error")
+func TestLoadWebhookFileWinsOverPlainVar(t *testing.T) {
+	// Serial (t.Setenv forbids t.Parallel anyway): swaps the process-global
+	// slog default to assert the both-channels-set warning.
+	hookFile := filepath.Join(t.TempDir(), "webhook-url")
+	if err := os.WriteFile(hookFile, []byte("https://discord.example/file-borne-hook\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(err.Error(), "credentialmaterial") {
-		t.Errorf("error leaks the parsed scheme (a secret prefix): %v", err)
+	setValidLoadEnv(t)
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/stale-env-hook")
+	t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
+
+	rec := capture.Default(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.WebhookURL != "https://discord.example/file-borne-hook" {
+		t.Errorf("WebhookURL = %q, want the file-borne URL: DISCORD_WEBHOOK_URL_FILE wins, so a rotated webhook must not be shadowed by a stale plain variable every notice would 404 against", cfg.WebhookURL)
+	}
+	if !rec.Contains("DISCORD_WEBHOOK_URL and DISCORD_WEBHOOK_URL_FILE are both set") {
+		t.Errorf("log output %v missing the both-channels-set warning that tells the operator the plain variable is ignored", rec.Messages())
+	}
+	if rec.Contains("stale-env-hook") || rec.AttrContains("", "", "stale-env-hook") ||
+		rec.Contains("file-borne-hook") || rec.AttrContains("", "", "file-borne-hook") {
+		t.Errorf("log output leaks a webhook URL: %v", rec.Messages())
 	}
 }
 

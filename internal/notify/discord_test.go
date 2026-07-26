@@ -1,11 +1,14 @@
 package notify
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -282,24 +285,6 @@ func TestErrorsNeverLeakWebhookURL(t *testing.T) {
 	if strings.Contains(err.Error(), "verysecrettoken") {
 		t.Errorf("status error leaks webhook secret: %v", err)
 	}
-
-	// Value-based backstop: an error whose TEXT embeds the URL without
-	// being a *url.Error passes httpx.LogSafeError unchanged (that
-	// reduction is type-based), so logSafe must scrub the secret from the
-	// message while keeping the original error in the errors.Is chain —
-	// the sweep matches context.Canceled on post's error and httpx.Do
-	// classifies transience through it.
-	raw := fmt.Errorf("some future transport error for %s: %w", d.url, context.Canceled)
-	got := d.logSafe(raw)
-	if strings.Contains(got.Error(), "verysecrettoken") {
-		t.Errorf("logSafe leaks webhook secret: %v", got)
-	}
-	if !strings.Contains(got.Error(), "REDACTED") {
-		t.Errorf("logSafe = %q, want the secret replaced by REDACTED", got)
-	}
-	if !errors.Is(got, context.Canceled) {
-		t.Errorf("logSafe broke the errors.Is chain: %v", got)
-	}
 }
 
 func TestLogSafeRedactsCanonicalWebhookURLForms(t *testing.T) {
@@ -353,6 +338,39 @@ func TestLogSafeRedactsCanonicalWebhookURLForms(t *testing.T) {
 	}
 }
 
+func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
+	// Deliberately NOT t.Parallel: slog.Default() is process-global.
+	//
+	// The returned-error assertions cannot cover the LOG surface. post
+	// applies logSafe a SECOND time to whatever httpx.Do returns, so an
+	// attempt-level error that embeds the URL is scrubbed in the error every
+	// other test reads, while httpx.Do's per-attempt retry and exhausted
+	// lines (both Debug here, via WithExhaustedLevel) log the RAW attempt
+	// error through the type-based LogSafeError only. This pins that surface
+	// end to end.
+	const secret = "verysecretlogtoken"
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	// Connection refused is transient, so all maxAttempts run and both the
+	// per-attempt and exhausted lines are emitted.
+	d := New("http://127.0.0.1:9/api/webhooks/1234567890/"+secret, "node-1")
+	t.Cleanup(d.Close)
+
+	if err := d.BeatMissing(context.Background(), "api", time.Hour); err == nil {
+		t.Fatal("BeatMissing against a refused connection = nil, want error")
+	}
+	if buf.Len() == 0 {
+		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
+	}
+	if got := buf.String(); strings.Contains(got, secret) {
+		t.Errorf("delivery logs leak the webhook credential: %s", got)
+	}
+}
+
 func TestAttemptTimeoutIsRetried(t *testing.T) {
 	t.Parallel()
 
@@ -367,16 +385,16 @@ func TestAttemptTimeoutIsRetried(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if hits.Add(1) == 1 {
-			// Outlast the first attempt's deadline. The body is drained
-			// first and the wait carries a hard bound because the request
-			// context is NOT a reliable client-disconnect signal here (with
-			// an unread body the server never notices the closed
+			// Outlast the first attempt's (shortened) deadline. The body is
+			// drained first and the wait carries a hard bound because the
+			// request context is NOT a reliable client-disconnect signal here
+			// (with an unread body the server never notices the closed
 			// connection), and an unbounded wait hangs the test binary
 			// rather than failing it.
 			_, _ = io.Copy(io.Discard, r.Body)
 			select {
 			case <-r.Context().Done():
-			case <-time.After(attemptTimeout + 2*time.Second):
+			case <-time.After(2 * time.Second):
 			}
 			return
 		}
@@ -386,12 +404,22 @@ func TestAttemptTimeoutIsRetried(t *testing.T) {
 
 	d := New(srv.URL, "node-1")
 	t.Cleanup(d.Close)
+	// Shorten only this notifier's per-attempt deadline: the branch under
+	// test cares that a CHILD deadline fired while the caller's budget is
+	// still live, not how long it took to fire.
+	d.attemptTimeout = 100 * time.Millisecond
 
 	if err := d.post(context.Background(), "missing probe", "body"); err != nil {
 		t.Fatalf("post() after a retried attempt timeout = %v, want nil", err)
 	}
 	if got := hits.Load(); got != 2 {
 		t.Errorf("delivery attempts = %d, want 2 (an attempt timeout must be retried)", got)
+	}
+	// The production constants must keep the attempt context as the effective
+	// bound: a Client.Timeout error does not unwrap to context.DeadlineExceeded,
+	// so an inverted ordering would silently disable the translation above.
+	if d.client.Timeout <= attemptTimeout {
+		t.Errorf("client timeout %s <= per-attempt timeout %s: the transport bound would preempt the attempt context", d.client.Timeout, attemptTimeout)
 	}
 }
 
@@ -579,5 +607,91 @@ func TestMethodChangingRedirectIsNotDelivery(t *testing.T) {
 	}
 	if got := redirectedHits.Load(); got != 0 {
 		t.Errorf("redirect target hits = %d, want 0 (the webhook POST must not become GET)", got)
+	}
+}
+
+func TestCrossHostRedirectIsNotDelivery(t *testing.T) {
+	t.Parallel()
+
+	// A 307 preserves the method, so WithPreserveMethod does not refuse it:
+	// the same-host rule is the only thing standing between a hijacked
+	// Location header and posting the notice to an origin the operator never
+	// named. The target listens on a different HOSTNAME, not just a
+	// different port, because httpx compares URL.Hostname() (a second
+	// 127.0.0.1 listener is the same host by design).
+	var targetHits atomic.Int64
+	ln, lnErr := net.Listen("tcp", "127.0.0.2:0")
+	if lnErr != nil {
+		t.Skipf("no second loopback address available: %v", lnErr)
+	}
+	target := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetHits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	target.Listener.Close()
+	target.Listener = ln
+	target.Start()
+	defer target.Close()
+
+	const secretPath = "/api/webhooks/1234567890/verysecrettoken"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/relay", http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	d := New(origin.URL+secretPath, "node-1")
+	defer d.Close()
+
+	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	if err == nil {
+		t.Fatal("BeatMissing through a cross-host 307 = nil, want a delivery error")
+	}
+	if got := targetHits.Load(); got != 0 {
+		t.Errorf("cross-host redirect target hits = %d, want 0 (the notice must not reach another origin)", got)
+	}
+	if strings.Contains(err.Error(), "verysecrettoken") {
+		t.Errorf("refused-redirect error leaks the webhook credential: %v", err)
+	}
+}
+
+func TestSameHostRedirectIsFollowedAndDelivers(t *testing.T) {
+	t.Parallel()
+
+	// The other half of the redirect contract: the policy must still FOLLOW
+	// the webhook's own same-host, method-preserving hop. Nothing else in
+	// this package pins that -- dropping WithSameHost turns the policy into
+	// "refuse every redirect" (httpx returns a refuse-all policy when no host
+	// is allowed), which every other test here passes while a redirecting
+	// webhook silently stops receiving notices.
+	var finishHits atomic.Int64
+	var finishBody atomic.Value
+	mux := http.NewServeMux()
+	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/finish", http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("/finish", func(w http.ResponseWriter, r *http.Request) {
+		finishHits.Add(1)
+		if r.Method != http.MethodPost {
+			t.Errorf("followed hop method = %s, want POST (body must survive the hop)", r.Method)
+		}
+		buf := make([]byte, 4096)
+		n, _ := r.Body.Read(buf)
+		finishBody.Store(string(buf[:n]))
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	d := New(srv.URL+"/start", "node-1")
+	defer d.Close()
+
+	if err := d.BeatMissing(context.Background(), "api", time.Hour); err != nil {
+		t.Fatalf("BeatMissing through a same-host 307 = %v, want delivery", err)
+	}
+	if got := finishHits.Load(); got != 1 {
+		t.Errorf("redirect target hits = %d, want 1 (a same-host hop must be followed)", got)
+	}
+	if body, _ := finishBody.Load().(string); !strings.Contains(body, "MISSING") {
+		t.Errorf("followed hop body = %q, want the notification payload", body)
 	}
 }

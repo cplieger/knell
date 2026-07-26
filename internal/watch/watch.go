@@ -339,12 +339,12 @@ func New(beats []Beat, notifier Notifier, now func() time.Time) *Watcher {
 		w.beats[b.ID] = &beatState{lastSeen: start, deadline: b.Deadline}
 		metrics.BeatFresh.Set(1, b.ID)
 		metrics.BeatLastSeen.Set(float64(start.Unix()), b.ID)
-		// Pre-mint the per-beat counters at zero for the same reason as the
-		// notification counters below: increase() needs an earlier sample.
+		// Pre-mint the per-beat counters at zero for the same reason metrics
+		// pre-mints the notification counters: increase() needs an earlier
+		// sample.
 		metrics.BeatsReceived.Add(0, b.ID)
 		metrics.BeatOutages.Add(0, b.ID)
 	}
-	metrics.MintNotificationKinds()
 	return w
 }
 
@@ -465,7 +465,8 @@ func (w *Watcher) refreshFreshness() {
 // logUndelivered reports the notices this process will never deliver, on the
 // way out. Both queues die with the process: a pendingMissing record whose
 // outage already ended is that outage's only trace (the boot-armed clock
-// re-detects an ONGOING outage after the restart, but never a closed one), and
+// re-detects an ONGOING outage after the restart only if it outlasts one full
+// post-restart deadline, and never a closed one), and
 // a queued recovered transition is gone with the channel. This is the one
 // permanent-loss path no delivery counter can show — notifications_dropped_total
 // means "discarded by a full queue" (metrics.go, README) — so the log line is
@@ -500,10 +501,17 @@ func (w *Watcher) logUndelivered() {
 	queuedRecoveries := len(w.recoveries)
 	slog.Info("watch loop stopped",
 		"undelivered_records", total, "permanent_loss", lostTotal,
+		"ongoing_records", total-lostTotal,
 		"queued_recoveries", queuedRecoveries)
 	for _, p := range beats {
 		if p.lost == 0 {
-			// An ongoing outage only: re-detected after the restart.
+			// Only a still-open record. The boot-armed clock re-detects the
+			// outage after the restart ONLY if it outlives the beat's full
+			// deadline again; a beat that returns inside that grace window
+			// ends the outage with no notice ever sent (README "Alerting",
+			// KnellRestartChurn). Name the beat instead of staying silent.
+			slog.Info("shutting down with an ongoing outage, its notice arrives only if the outage outlives the post-restart deadline",
+				"beat", p.id, "still_ongoing", p.records)
 			continue
 		}
 		slog.Warn("shutting down with undelivered ended-outage records, no notice for them will ever arrive",

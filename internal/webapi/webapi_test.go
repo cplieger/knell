@@ -60,6 +60,17 @@ func TestBeatEndpoint(t *testing.T) {
 		{name: "head rejected without recording", method: http.MethodHead, path: "/beat/api", wantStatus: 405},
 		{name: "delete rejected", method: http.MethodDelete, path: "/beat/api", wantStatus: 405},
 		{name: "nested path rejected", method: http.MethodPost, path: "/beat/api/extra", wantStatus: 404},
+		// The decoded path segment reaches the state machine verbatim, so these
+		// pin what an arbitrary request path can do to a metric label. An escaped
+		// slash stays inside the {id} segment (it does not span routes), and a
+		// control character or quote is rejected by the configured-id lookup
+		// rather than sanitized here. A percent-encoded spelling of a configured
+		// id is the same id, so it records normally.
+		{name: "escaped slash in id rejected", method: http.MethodPost, path: "/beat/a%2Fb", wantStatus: 404},
+		{name: "nul byte in id rejected", method: http.MethodPost, path: "/beat/api%00", wantStatus: 404},
+		{name: "newline in id rejected", method: http.MethodPost, path: "/beat/api%0Ax", wantStatus: 404},
+		{name: "quote in id rejected", method: http.MethodPost, path: "/beat/api%22x", wantStatus: 404},
+		{name: "percent-encoded known id recorded", method: http.MethodPost, path: "/beat/%61pi", wantStatus: 200, wantSeen: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

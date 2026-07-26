@@ -19,10 +19,10 @@ import (
 	"github.com/cplieger/slogx"
 )
 
-// MaxBeats caps how many beats one instance will watch. The cap keeps the
+// maxBeats caps how many beats one instance will watch. The cap keeps the
 // metric label space and the notification fan-out operator-bounded; a config
 // past it is almost certainly a generator bug.
-const MaxBeats = 64
+const maxBeats = 64
 
 // minDeadline is the smallest accepted beat deadline. Anything shorter turns
 // transient sender hiccups into alert spam; a sender that beats more often
@@ -65,7 +65,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("BEATS is required (e.g. \"api:20m,backup:26h\"): %w", err)
 	}
-	beats, err := ParseBeats(rawBeats)
+	beats, err := parseBeats(rawBeats)
 	if err != nil {
 		return cfg, fmt.Errorf("parsing BEATS: %w", err)
 	}
@@ -79,7 +79,16 @@ func Load() (Config, error) {
 
 	cfg.Node = nodeName()
 
-	cfg.ListenAddr = envx.String("LISTEN_ADDR", ":9190")
+	// A padded LISTEN_ADDR copied from a deployment file is not a usable
+	// address (net.Listen resolves " :9190" as a hostname lookup and fails), and
+	// the padding is invisible in the resulting crash-loop log line. Trim it for
+	// the same reason the plain webhook and token values are trimmed; a value
+	// that is entirely whitespace falls back to the default rather than to "",
+	// which would bind an ephemeral port and hide the listener from scrapes.
+	cfg.ListenAddr = ":9190"
+	if addr := strings.TrimSpace(envx.String("LISTEN_ADDR", "")); addr != "" {
+		cfg.ListenAddr = addr
+	}
 
 	beatToken, err := loadBeatToken()
 	if err != nil {
@@ -100,12 +109,16 @@ func Load() (Config, error) {
 // nodeName resolves the observer name: NODE_NAME when set, else the
 // hostname, else "unknown".
 func nodeName() string {
-	if node := envx.String("NODE_NAME", ""); node != "" {
+	if node := strings.TrimSpace(envx.String("NODE_NAME", "")); node != "" {
 		return node
 	}
 	host, err := os.Hostname()
 	if err != nil {
 		slog.Warn("failed to determine hostname, using fallback node name", "node", "unknown", "error", err)
+		return "unknown"
+	}
+	if host = strings.TrimSpace(host); host == "" {
+		slog.Warn("hostname is blank, using fallback node name", "node", "unknown")
 		return "unknown"
 	}
 	return host
@@ -124,6 +137,18 @@ func rejectBlankFileVar(key string) error {
 	return nil
 }
 
+// warnPlainVarIgnored reports that KEY_FILE supplied the secret while the
+// plain KEY was also set, so the plain variable was ignored. envx documents
+// this composition as the caller's policy (SecretWithSource reports the
+// source on its error paths too); subject names the credential in the
+// operator's own vocabulary.
+func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
+	if src != envx.SourceFile || os.Getenv(key) == "" {
+		return
+	}
+	slog.Warn(key + " and " + key + "_FILE are both set; the file wins and the plain variable is ignored, so unset it to keep " + subject + " out of the process environment")
+}
+
 // loadBeatToken reads the optional BEAT_TOKEN bearer gate for
 // POST/GET /beat/{id}; an empty return disables the check. BEAT_TOKEN_FILE
 // points at a mounted secret file instead (the same convention
@@ -134,9 +159,7 @@ func loadBeatToken() (string, error) {
 		return "", blankErr
 	}
 	token, tokenSrc, err := envx.SecretWithSource("BEAT_TOKEN")
-	if tokenSrc == envx.SourceFile && os.Getenv("BEAT_TOKEN") != "" {
-		slog.Warn("BEAT_TOKEN and BEAT_TOKEN_FILE are both set; the file wins and the plain variable is ignored, so unset it to keep the token out of the process environment")
-	}
+	warnPlainVarIgnored("BEAT_TOKEN", "the token", tokenSrc)
 	switch {
 	case err == nil:
 		// Same reason as the webhook: a padded token makes every sender 401
@@ -151,7 +174,16 @@ func loadBeatToken() (string, error) {
 	case errors.As(err, new(*envx.MissingError)):
 		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE is set: the documented
 		// open-endpoint case, so the empty token stands and webapi's gate
-		// never arms.
+		// never arms. A PRESENT-but-empty BEAT_TOKEN lands here too (envx
+		// Require cannot tell it from unset) and that is exactly the shape
+		// compose interpolation of an unset variable produces — the accident
+		// rejectBlankFileVar already refuses on the _FILE channel. Acceptance
+		// is deliberately unchanged (the endpoint stays open); the WARN is
+		// what separates the accident from a deliberately open endpoint,
+		// which the INFO beat_auth=open line cannot.
+		if v, ok := os.LookupEnv("BEAT_TOKEN"); ok && v == "" {
+			slog.Warn("BEAT_TOKEN is set but empty, so /beat/{id} is served ungated; unset the variable if an open endpoint is intended, or set a long random token")
+		}
 		token = ""
 	default:
 		// Any other error means the variable WAS provided and could not be
@@ -174,15 +206,20 @@ func loadWebhook() (string, error) {
 		return "", err
 	}
 	webhook, src, err := envx.SecretWithSource("DISCORD_WEBHOOK_URL")
-	if src == envx.SourceFile && os.Getenv("DISCORD_WEBHOOK_URL") != "" {
-		slog.Warn("DISCORD_WEBHOOK_URL and DISCORD_WEBHOOK_URL_FILE are both set; the file wins and the plain variable is ignored, so unset it to keep the webhook URL out of the process environment")
-	}
+	warnPlainVarIgnored("DISCORD_WEBHOOK_URL", "the webhook URL", src)
 	if err == nil {
 		// envx trims the _FILE branch only; a plain variable copied from a
 		// deployment file can carry padding. A trailing space survives
 		// url.Parse and is escaped as %20 on every POST, so Discord answers
 		// 404 forever and the switch can never ring.
 		webhook = strings.TrimSpace(webhook)
+		if webhook == "" {
+			// Whitespace-only: the variable WAS provided, so this is a broken
+			// secret pipeline, not a missing setting. Reported as such instead
+			// of falling through to the shape check, which would answer
+			// "scheme must be https" for a value that carries no scheme.
+			return "", errors.New("DISCORD_WEBHOOK_URL is set but empty (whitespace only): point it at the https webhook URL, or use DISCORD_WEBHOOK_URL_FILE")
+		}
 	}
 	if err != nil {
 		if errors.As(err, new(*envx.MissingError)) {
@@ -197,11 +234,11 @@ func loadWebhook() (string, error) {
 	return webhook, nil
 }
 
-// ParseBeats parses the BEATS spec list: comma-separated "id:deadline"
+// parseBeats parses the BEATS spec list: comma-separated "id:deadline"
 // entries, e.g. "watchdog-mimir:20m,watchdog-loki:20m". IDs must match
 // [A-Za-z0-9][A-Za-z0-9_-]{0,63} and be unique; deadlines are Go durations
 // of at least minDeadline.
-func ParseBeats(raw string) ([]Beat, error) {
+func parseBeats(raw string) ([]Beat, error) {
 	entries := strings.Split(raw, ",")
 	beats := make([]Beat, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
@@ -219,8 +256,8 @@ func ParseBeats(raw string) ([]Beat, error) {
 	if len(beats) == 0 {
 		return nil, errors.New("no beats configured")
 	}
-	if len(beats) > MaxBeats {
-		return nil, fmt.Errorf("%d beats configured, maximum is %d", len(beats), MaxBeats)
+	if len(beats) > maxBeats {
+		return nil, fmt.Errorf("%d beats configured, maximum is %d", len(beats), maxBeats)
 	}
 	return beats, nil
 }

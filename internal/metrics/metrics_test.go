@@ -1,12 +1,10 @@
-package metrics_test
+package metrics
 
 import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/cplieger/knell/internal/metrics"
 )
 
 // TestMintNotificationKindsPremintsEveryCounterAndKind pins the whole
@@ -15,17 +13,17 @@ import (
 // failure, drop or delivery, so a counter or kind missing from the minting
 // loop is an alert that stays silent through the first event it exists for.
 func TestMintNotificationKindsPremintsEveryCounterAndKind(t *testing.T) {
-	kinds := []string{metrics.KindMissing, metrics.KindRecovered, metrics.KindHistory}
+	kinds := []string{KindMissing, KindRecovered, KindHistory}
 	for _, kind := range kinds {
-		metrics.NotificationsSent.Delete(kind)
-		metrics.NotificationsFailed.Delete(kind)
-		metrics.NotificationsDropped.Delete(kind)
+		NotificationsSent.Delete(kind)
+		NotificationsFailed.Delete(kind)
+		NotificationsDropped.Delete(kind)
 	}
 
-	metrics.MintNotificationKinds()
+	mintNotificationKinds()
 
 	rec := httptest.NewRecorder()
-	metrics.Registry.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	Registry.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	exposition := rec.Body.String()
 	want := []string{
 		`knell_notifications_sent_total{kind="missing"} 0`,

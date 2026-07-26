@@ -36,14 +36,16 @@ var notificationKinds = []string{KindMissing, KindRecovered, KindHistory}
 // notificationKindsText renders notificationKinds for HELP strings.
 var notificationKindsText = strings.Join(notificationKinds, ", ")
 
-// MintNotificationKinds pre-mints every notification counter series at zero
+// mintNotificationKinds pre-mints every notification counter series at zero
 // for every kind, so an increase() alert sees the very first failure or drop:
 // a counter series born at a nonzero value has no earlier sample to diff
-// against. Called once at startup. Dropped is minted for all three kinds like
+// against. Dropped is minted for all three kinds like
 // its siblings, so the alert's selector covers the whole set from a cold start
 // (only missing and recovered have a drop path today; a failed history send
-// keeps its records and retries).
-func MintNotificationKinds() {
+// keeps its records and retries). Called from init() below, after the
+// registrations, so the guarantee cannot be lost by a path that serves
+// /metrics without building a Watcher.
+func mintNotificationKinds() {
 	for _, kind := range notificationKinds {
 		NotificationsSent.Add(0, kind)
 		NotificationsFailed.Add(0, kind)
@@ -141,4 +143,5 @@ func init() {
 	Registry.RegisterLabeledCounter(NotificationsSent)
 	Registry.RegisterLabeledCounter(NotificationsFailed)
 	Registry.RegisterLabeledCounter(NotificationsDropped)
+	mintNotificationKinds()
 }

@@ -26,6 +26,15 @@ import (
 	"github.com/cplieger/webhttp"
 )
 
+// shutdownGrace bounds the whole stop sequence: pre-drain, the request
+// drain, and the watch-loop teardown share this single budget.
+//
+// 8s, not 10s: Docker's default stop timeout is 10s, so a budget of 10s puts
+// the end of the teardown phase at the same instant as SIGKILL and the
+// "watch loop still running" WARN never flushes. 8s leaves the process room
+// to finish and exit under its own power.
+const shutdownGrace = 8 * time.Second
+
 func main() {
 	// CLI liveness probe for the Docker healthcheck (scratch image: no
 	// shell, no curl). The marker is level-based boot state — set once the
@@ -142,7 +151,21 @@ func run() error {
 			slog.Warn("watch loop still running at the end of the shutdown grace")
 		}
 	}
-	return webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(10*time.Second), preDrain)
+	err = webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(shutdownGrace), preDrain)
+	if err != nil {
+		// A fatal serve error returns from Run without invoking either hook, so
+		// the marker still reads healthy and the watch loop has not logged the
+		// notices this process will never deliver -- the operator's only trace of
+		// them. Flip the marker, cancel the loop and wait for it, bounded by the
+		// same grace. On the graceful path both already happened, so the marker
+		// flip is a no-op edge and watcherDone is already closed.
+		marker.Set(false)
+		stop()
+		teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancelTeardown()
+		onShutdown(teardownCtx)
+	}
+	return err
 }
 
 // logConfig logs the active configuration at startup. The webhook URL is a

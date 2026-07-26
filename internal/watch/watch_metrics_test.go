@@ -510,39 +510,6 @@ func TestRecoveryQueueDropIsCountedAsDroppedNotFailed(t *testing.T) {
 	}
 }
 
-func TestColdStartExposesFailedAndDroppedSeriesAtZero(t *testing.T) {
-	// Serial (no t.Parallel): it deletes and re-mints series on the
-	// package-global counters, which every other test reads. Only a serial
-	// test has the registry to itself, and this is the one place a cold start
-	// is observable at all -- every other test shares whatever the earlier
-	// ones counted. increase() needs an earlier sample, so a rule over these
-	// counters is blind to the very first failure or drop unless New mints
-	// both series at zero.
-	kinds := []string{metrics.KindMissing, metrics.KindRecovered, metrics.KindHistory}
-	counters := []string{"knell_notifications_failed_total", "knell_notifications_dropped_total"}
-	for _, kind := range kinds {
-		metrics.NotificationsFailed.Delete(kind)
-		metrics.NotificationsDropped.Delete(kind)
-	}
-	for _, name := range counters {
-		for _, kind := range kinds {
-			if got, ok := findLabeledValue(name, "kind", kind); ok {
-				t.Fatalf("%s{kind=%q} = %s before the cold start, want the series absent (the test's own precondition)", name, kind, got)
-			}
-		}
-	}
-
-	newTestWatcher(Beat{ID: "cold-start-probe", Deadline: 10 * time.Minute})
-
-	for _, name := range counters {
-		for _, kind := range kinds {
-			if got := labeledValue(t, name, "kind", kind); got != "0" {
-				t.Errorf("%s{kind=%q} at boot = %s, want 0 (pre-minted so increase() has a baseline sample)", name, kind, got)
-			}
-		}
-	}
-}
-
 func TestHistoryNoticeCountsOncePerMessageWhileOutagesCountEach(t *testing.T) {
 	// Serial (no t.Parallel): asserts deltas on the package-global
 	// notification counters, which the parallel tests also move.
@@ -702,5 +669,48 @@ func TestLogUndeliveredStaysQuietForAnOngoingOutageOnly(t *testing.T) {
 	}
 	if got := rec.CountLevel(slog.LevelWarn, "shutting down with undelivered ended-outage records"); got != 0 {
 		t.Errorf("ended-outage loss warnings = %d, want 0 for an ongoing outage: %v", got, rec.Messages())
+	}
+}
+
+func TestShutdownWarnsAboutQueuedRecoveredNotifications(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default. A queued recovered transition dies with the channel at
+	// shutdown and no delivery counter can show it (dropped means "discarded
+	// by a full queue"), so this WARN is the operator's only trace of it.
+	// Both directions are asserted: an empty queue must stay quiet, or the
+	// line becomes shutdown noise that trains operators to ignore it.
+	const id = "shutdown-queued-recovery-probe"
+	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+
+	quiet := capture.Default(t)
+	w.logUndelivered()
+	if got := quiet.CountLevel(slog.LevelWarn, "shutting down with queued recovered notifications"); got != 0 {
+		t.Fatalf("queued-recovery warnings with an empty queue = %d, want 0: %v", got, quiet.Messages())
+	}
+	if !quiet.HasAttr("watch loop stopped", "queued_recoveries", "0") {
+		t.Errorf("shutdown summary does not report queued_recoveries=0 for an empty queue: %v", quiet.Records())
+	}
+
+	// Alert the beat, then ping it: the recovered transition is queued and
+	// never drained, exactly as it sits when cancellation arrives.
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	if !w.Beat(id) {
+		t.Fatalf("Beat(%s) = false", id)
+	}
+	if got := len(w.recoveries); got != 1 {
+		t.Fatalf("queued recoveries = %d, want 1 (the test's own precondition)", got)
+	}
+
+	rec := capture.Default(t)
+	w.logUndelivered()
+	if !rec.HasAttr("watch loop stopped", "queued_recoveries", "1") {
+		t.Errorf("shutdown summary does not count the queued recovery: %v", rec.Records())
+	}
+	if got := rec.CountLevel(slog.LevelWarn, "shutting down with queued recovered notifications"); got != 1 {
+		t.Errorf("queued-recovery warnings = %d, want exactly 1 (that notice will never be delivered): %v", got, rec.Messages())
+	}
+	if !rec.HasAttr("shutting down with queued recovered notifications", "queued", "1") {
+		t.Errorf("queued-recovery warning does not report how many notices are lost: %v", rec.Records())
 	}
 }
