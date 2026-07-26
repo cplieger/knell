@@ -85,11 +85,26 @@ func Load() (Config, error) {
 	// check. BEAT_TOKEN_FILE points at a mounted secret file instead (the
 	// same convention DISCORD_WEBHOOK_URL uses), keeping the credential out
 	// of `docker inspect` output.
-	token, err := envx.Secret("BEAT_TOKEN")
+	if blankErr := rejectBlankFileVar("BEAT_TOKEN"); blankErr != nil {
+		return cfg, blankErr
+	}
+	token, tokenSrc, err := envx.SecretWithSource("BEAT_TOKEN")
+	if tokenSrc == envx.SourceFile && os.Getenv("BEAT_TOKEN") != "" {
+		slog.Warn("BEAT_TOKEN and BEAT_TOKEN_FILE are both set; the file wins and the plain variable is ignored, so unset it to keep the token out of the process environment")
+	}
 	switch {
 	case err == nil:
-		cfg.BeatToken = token
-	case !errors.As(err, new(*envx.MissingError)):
+		// Same reason as the webhook: a padded token makes every sender 401
+		// and every beat cross its deadline.
+		cfg.BeatToken = strings.TrimSpace(token)
+	case errors.As(err, new(*envx.MissingError)):
+		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE is set: the documented
+		// open-endpoint case, so the empty token stands and webapi's gate
+		// never arms.
+	default:
+		// Any other error means the variable WAS provided and could not be
+		// used (unreadable or blank _FILE): fail closed rather than serving
+		// an open endpoint the operator meant to gate.
 		return cfg, fmt.Errorf("BEAT_TOKEN: %w", err)
 	}
 	if cfg.BeatToken != "" && len(cfg.BeatToken) < minTokenLength {
@@ -120,12 +135,38 @@ func nodeName() string {
 	return host
 }
 
+// rejectBlankFileVar fails startup when a `_FILE` variable is PRESENT but
+// empty. envx gates its file channel on a non-empty value, so an empty
+// `_FILE` is indistinguishable from unset and silently falls back to the
+// plain variable — which for BEAT_TOKEN is fail-OPEN (an unauthenticated
+// /beat/{id}). Compose interpolation of an unset variable produces exactly
+// this shape, so it is checked here rather than delegated to envx.
+func rejectBlankFileVar(key string) error {
+	if path, ok := os.LookupEnv(key + "_FILE"); ok && strings.TrimSpace(path) == "" {
+		return fmt.Errorf("%s_FILE is set but empty: unset it to configure %s directly, or point it at a secret file", key, key)
+	}
+	return nil
+}
+
 // loadWebhook reads and shape-checks DISCORD_WEBHOOK_URL. The URL is a
 // secret: errors never embed it, and only https is accepted — the URL's own
 // path carries the webhook credential, so a plain-http webhook would put the
 // secret on the wire in cleartext on every notification.
 func loadWebhook() (string, error) {
-	webhook, err := envx.Secret("DISCORD_WEBHOOK_URL")
+	if err := rejectBlankFileVar("DISCORD_WEBHOOK_URL"); err != nil {
+		return "", err
+	}
+	webhook, src, err := envx.SecretWithSource("DISCORD_WEBHOOK_URL")
+	if src == envx.SourceFile && os.Getenv("DISCORD_WEBHOOK_URL") != "" {
+		slog.Warn("DISCORD_WEBHOOK_URL and DISCORD_WEBHOOK_URL_FILE are both set; the file wins and the plain variable is ignored, so unset it to keep the webhook URL out of the process environment")
+	}
+	if err == nil {
+		// envx trims the _FILE branch only; a plain variable copied from a
+		// deployment file can carry padding. A trailing space survives
+		// url.Parse and is escaped as %20 on every POST, so Discord answers
+		// 404 forever and the switch can never ring.
+		webhook = strings.TrimSpace(webhook)
+	}
 	if err != nil {
 		if errors.As(err, new(*envx.MissingError)) {
 			return "", fmt.Errorf("DISCORD_WEBHOOK_URL is required: %w", err)

@@ -15,6 +15,31 @@ const (
 	kindLabel = "kind"
 )
 
+// Notification kinds are the legal values of kindLabel on the sent, failed
+// and dropped notification counters; dashboards and the KnellNotifyFailing
+// alert key on them. They count MESSAGES, so KindHistory moves by one for a
+// notice covering any number of ended outages; BeatOutages counts outages.
+const (
+	KindMissing   = "missing"
+	KindRecovered = "recovered"
+	KindHistory   = "history"
+)
+
+// MintNotificationKinds pre-mints every notification counter series at zero
+// for every kind, so an increase() alert sees the very first failure or drop:
+// a counter series born at a nonzero value has no earlier sample to diff
+// against. Called once at startup. Dropped is minted for all three kinds like
+// its siblings, so the alert's selector covers the whole set from a cold start
+// (only missing and recovered have a drop path today; a failed history send
+// keeps its records and retries).
+func MintNotificationKinds() {
+	for _, kind := range []string{KindMissing, KindRecovered, KindHistory} {
+		NotificationsSent.Add(0, kind)
+		NotificationsFailed.Add(0, kind)
+		NotificationsDropped.Add(0, kind)
+	}
+}
+
 // Registry serves every registered metric plus process metrics on /metrics.
 var Registry = metricslib.NewRegistry("knell")
 

@@ -553,6 +553,55 @@ func TestRecoveryQueueOverflowDropKeepsBeatArmed(t *testing.T) {
 	}
 }
 
+// perBeatFailNotifier delivers every notification except BeatMissing for
+// failFor, so a test can observe whether one beat's failing send blocks the
+// rest of the sweep. Only the test goroutine drives it (sweep is called
+// synchronously), so it needs no lock.
+type perBeatFailNotifier struct {
+	failFor string
+	missing []string
+}
+
+func (n *perBeatFailNotifier) BeatMissing(_ context.Context, id string, _ time.Duration) error {
+	if id == n.failFor {
+		return errors.New("discord down")
+	}
+	n.missing = append(n.missing, id)
+	return nil
+}
+
+func (n *perBeatFailNotifier) BeatRecovered(context.Context, string, time.Duration) error {
+	return nil
+}
+
+func (n *perBeatFailNotifier) BeatOutageHistory(context.Context, string, []Outage) error {
+	return nil
+}
+
+func TestOneBeatsFailedSendDoesNotStarveTheOthers(t *testing.T) {
+	t.Parallel()
+
+	// A failed send is per-beat: it is retried on the next sweep for THAT
+	// beat, and the sweep must still deliver every other beat's notice in the
+	// same pass. Abandoning the sweep on a plain failure would let one
+	// permanently failing beat starve the rest for as long as it keeps
+	// failing -- the observers would go quiet about beats that are down.
+	clock := newFakeClock()
+	n := &perBeatFailNotifier{failFor: "starve-probe-a"}
+	w := New([]Beat{
+		{ID: "starve-probe-a", Deadline: 10 * time.Minute},
+		{ID: "starve-probe-b", Deadline: 10 * time.Minute},
+		{ID: "starve-probe-c", Deadline: 10 * time.Minute},
+	}, n, clock.Now)
+
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+
+	if len(n.missing) != 2 {
+		t.Fatalf("delivered missing notices = %v, want both healthy beats notified in the same sweep as the failing one", n.missing)
+	}
+}
+
 // blockingNotifier blocks every BeatMissing until released, simulating a
 // send stuck on a slow or unreachable webhook.
 type blockingNotifier struct {

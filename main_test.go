@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -13,6 +14,19 @@ import (
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/slogx/capture"
 )
+
+// unsetEnv removes key for the duration of the test. t.Setenv registers the
+// restore of the original value, so the following os.Unsetenv leaves the
+// variable absent inside the test and restored afterwards. A plain
+// t.Setenv(key, "") would leave a PRESENT-but-empty variable, which
+// config.Load rejects for `_FILE` keys.
+func unsetEnv(t *testing.T, key string) {
+	t.Helper()
+	t.Setenv(key, "")
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("unsetting %s: %v", key, err)
+	}
+}
 
 // TestRunClearsStaleHealthMarkerBeforeTheConfigGate pins the boot ordering a
 // crash-looping container depends on: the marker is cleared before the first
@@ -27,12 +41,11 @@ func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
 		},
 		// The live upgrade case: a deployment whose webhook URL is plain http
 		// now fails the https-only gate at boot. DISCORD_WEBHOOK_URL_FILE is
-		// blanked so an ambient _FILE secret cannot satisfy the gate and let
-		// run() proceed to bind and block.
+		// unset in the subtest so an ambient _FILE secret cannot satisfy the
+		// gate and let run() proceed to bind and block.
 		"plain-http webhook": {
-			"BEATS":                    "api:1m",
-			"DISCORD_WEBHOOK_URL_FILE": "",
-			"DISCORD_WEBHOOK_URL":      "http://discord.example/api/webhooks/1234567890/verysecrettoken",
+			"BEATS":               "api:1m",
+			"DISCORD_WEBHOOK_URL": "http://discord.example/api/webhooks/1234567890/verysecrettoken",
 		},
 	}
 
@@ -43,6 +56,10 @@ func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
 			for k, v := range env {
 				t.Setenv(k, v)
 			}
+			// Unset, not blanked: a present-but-empty _FILE variable now
+			// fails startup, and this only needs the ambient secret gone so
+			// it cannot satisfy the webhook gate.
+			unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
 			original := slog.Default()
 			t.Cleanup(func() { slog.SetDefault(original) })
 
@@ -115,5 +132,35 @@ func TestLogConfigReportsBeatAuthRequiredWithoutLeakingToken(t *testing.T) {
 	}
 	if rec.Contains("unit-test-beat-token") || rec.AttrContains("", "", "unit-test-beat-token") {
 		t.Errorf("startup log leaks the beat token: %v", rec.Messages())
+	}
+}
+
+func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, plus run() installs a process-global
+	// slog default and touches the shared health-marker path.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot bind a probe listener: %v", err)
+	}
+	t.Cleanup(func() { _ = occupied.Close() })
+
+	t.Setenv("BEATS", "api:20m")
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/api/webhooks/1234567890/verysecrettoken")
+	t.Setenv("BEAT_TOKEN", "")
+	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
+	t.Setenv("LISTEN_ADDR", occupied.Addr().String())
+	original := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(original) })
+
+	err = run()
+	if err == nil {
+		t.Fatal("run() = nil, want a bind error; an address already in use must fail the boot instead of leaving the watcher alerting behind a listener nothing can reach")
+	}
+	if !strings.Contains(err.Error(), "binding") {
+		t.Fatalf("run() = %v, want the bind failure surfaced to the caller", err)
+	}
+	if strings.Contains(err.Error(), "verysecrettoken") {
+		t.Errorf("bind error leaks the webhook URL: %v", err)
 	}
 }

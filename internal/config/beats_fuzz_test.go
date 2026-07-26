@@ -1,13 +1,21 @@
 package config
 
 import (
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // FuzzParseBeats pins the parser's safety invariants: it never panics, and
 // every accepted result respects the documented grammar and caps.
+//
+// The invariants are stated independently of beatIDPattern and minDeadline on
+// purpose. They describe what an id and a deadline are USED for — a /beat/{id}
+// path element, a Prometheus label, an alert cadence — so widening the
+// production pattern or lowering the production constant fails here instead of
+// relaxing the assertion along with the code.
 func FuzzParseBeats(f *testing.F) {
 	f.Add("api:20m")
 	f.Add("a:30s,b:26h")
@@ -31,19 +39,29 @@ func FuzzParseBeats(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if len(beats) == 0 || len(beats) > MaxBeats {
-			t.Fatalf("accepted result has %d beats", len(beats))
+		if len(beats) == 0 || len(beats) > 64 {
+			t.Fatalf("accepted result has %d beats, want 1..64 (the documented cap)", len(beats))
 		}
 		seen := make(map[string]struct{}, len(beats))
 		for _, b := range beats {
-			if !beatIDPattern.MatchString(b.ID) {
-				t.Fatalf("accepted id %q violates grammar", b.ID)
+			if len(b.ID) == 0 || len(b.ID) > 64 {
+				t.Fatalf("accepted id %q has byte length %d, want 1..64", b.ID, len(b.ID))
 			}
-			if b.Deadline < minDeadline {
-				t.Fatalf("accepted deadline %s below minimum", b.Deadline)
+			for i, r := range b.ID {
+				alnum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+				safe := alnum || (i > 0 && (r == '_' || r == '-'))
+				if !safe {
+					t.Fatalf("accepted id %q: rune at byte %d (%q) is not URL-path and metric-label safe", b.ID, i, r)
+				}
+			}
+			if url.PathEscape(b.ID) != b.ID {
+				t.Fatalf("accepted id %q needs escaping to sit in the /beat/{id} route", b.ID)
+			}
+			if b.Deadline < 30*time.Second {
+				t.Fatalf("accepted deadline %s is below the documented 30s floor (a shorter deadline turns sender hiccups into alert spam)", b.Deadline)
 			}
 			if _, dup := seen[b.ID]; dup {
-				t.Fatalf("accepted duplicate id %q", b.ID)
+				t.Fatalf("accepted duplicate id %q (duplicate ids collapse two beats onto one metric series)", b.ID)
 			}
 			seen[b.ID] = struct{}{}
 		}

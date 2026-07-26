@@ -32,6 +32,19 @@ func setValidLoadEnv(t *testing.T) {
 	t.Setenv("NODE_NAME", "node-1")
 }
 
+// unsetEnv removes key for the duration of the test. t.Setenv registers the
+// restore of the original value, so the following os.Unsetenv leaves the
+// variable absent inside the test and restored afterwards. A plain
+// t.Setenv(key, "") would leave a PRESENT-but-empty variable, which Load
+// rejects for `_FILE` keys (an empty _FILE is a broken mount, not a fallback).
+func unsetEnv(t *testing.T, key string) {
+	t.Helper()
+	t.Setenv(key, "")
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("unsetting %s: %v", key, err)
+	}
+}
+
 func TestParseBeats(t *testing.T) {
 	t.Parallel()
 
@@ -150,35 +163,6 @@ func TestParseBeatsAcceptsExactlyMaxCap(t *testing.T) {
 	}
 }
 
-func TestParseWebhookURL(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		raw  string
-		ok   bool
-		name string
-	}{
-		{name: "https", raw: "https://discord.com/api/webhooks/1/abc", ok: true},
-		{name: "plain http rejected", raw: "http://127.0.0.1:9/hook", ok: false},
-		{name: "no scheme", raw: "discord.com/api/webhooks/1/abc", ok: false},
-		{name: "wrong scheme", raw: "ftp://discord.com/hook", ok: false},
-		{name: "no host", raw: "https:///hook", ok: false},
-		{name: "garbage", raw: "://", ok: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			_, err := parseWebhookURL(tt.raw)
-			if tt.ok && err != nil {
-				t.Fatalf("parseWebhookURL(%q) = %v, want nil", tt.raw, err)
-			}
-			if !tt.ok && err == nil {
-				t.Fatalf("parseWebhookURL(%q) = nil, want error", tt.raw)
-			}
-		})
-	}
-}
-
 func TestLoad(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("LISTEN_ADDR", ":9999")
@@ -284,7 +268,7 @@ func TestLoadRejectsPlainHTTPWebhook(t *testing.T) {
 func TestLoadBeatToken(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "unit-test-beat-token")
-	t.Setenv("BEAT_TOKEN_FILE", "")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
 
 	cfg, err := Load()
 	if err != nil {
@@ -298,7 +282,7 @@ func TestLoadBeatToken(t *testing.T) {
 func TestLoadBeatTokenDefaultsEmpty(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "")
-	t.Setenv("BEAT_TOKEN_FILE", "")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
 
 	cfg, err := Load()
 	if err != nil {
@@ -314,7 +298,7 @@ func TestLoadShortBeatTokenWarnsWithoutLeakingIt(t *testing.T) {
 	// slog default to capture the short-token warning.
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "shorty")
-	t.Setenv("BEAT_TOKEN_FILE", "")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
 
 	rec := capture.Default(t)
 
@@ -442,12 +426,63 @@ func TestLoadRejectsEmptyBeatTokenFile(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsBlankBeatTokenFileVar(t *testing.T) {
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", "env-fallback-token")
+	t.Setenv("BEAT_TOKEN_FILE", "")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() with a present-but-empty BEAT_TOKEN_FILE = nil, want error; envx cannot tell it from unset, so falling back would serve an unauthenticated /beat/{id} the operator meant to gate")
+	}
+	if !strings.Contains(err.Error(), "BEAT_TOKEN_FILE") {
+		t.Errorf("error = %q, want BEAT_TOKEN_FILE context", err)
+	}
+	if strings.Contains(err.Error(), "env-fallback-token") {
+		t.Errorf("error leaks the fallback token value: %v", err)
+	}
+}
+
+func TestLoadRejectsBlankWebhookFileVar(t *testing.T) {
+	setValidLoadEnv(t)
+	t.Setenv("DISCORD_WEBHOOK_URL_FILE", "   ")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() with a present-but-empty DISCORD_WEBHOOK_URL_FILE = nil, want error rather than a silent fallback to the plain variable")
+	}
+	if !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL_FILE") {
+		t.Errorf("error = %q, want DISCORD_WEBHOOK_URL_FILE context", err)
+	}
+}
+
+func TestLoadTrimsPaddedPlainSecrets(t *testing.T) {
+	setValidLoadEnv(t)
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook ")
+	t.Setenv("BEAT_TOKEN", "  unit-test-beat-token  ")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	// A trailing space survives url.Parse and is escaped as %20 on every
+	// POST, so an untrimmed webhook 404s forever; a padded token 401s every
+	// sender. envx trims only its _FILE branch, so both are trimmed here.
+	if cfg.WebhookURL != "https://discord.example/hook" {
+		t.Errorf("WebhookURL = %q, want the padding trimmed", cfg.WebhookURL)
+	}
+	if cfg.BeatToken != "unit-test-beat-token" {
+		t.Errorf("BeatToken = %q, want the padding trimmed", cfg.BeatToken)
+	}
+}
+
 func TestLoadBeatTokenAtWarnBoundaryDoesNotWarn(t *testing.T) {
 	// Serial (t.Setenv forbids t.Parallel): swaps the process-global slog
 	// default to assert the absence of the short-token warning.
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", strings.Repeat("x", 16))
-	t.Setenv("BEAT_TOKEN_FILE", "")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
 
 	rec := capture.Default(t)
 
@@ -460,5 +495,22 @@ func TestLoadBeatTokenAtWarnBoundaryDoesNotWarn(t *testing.T) {
 	}
 	if rec.Contains("BEAT_TOKEN is shorter") {
 		t.Errorf("16-byte token triggered the short-token warning (warn only below 16 bytes): %v", rec.Messages())
+	}
+}
+
+func TestLoadFallsBackToTheHostnameWhenNodeNameIsUnset(t *testing.T) {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		t.Skipf("cannot determine the hostname: %v", err)
+	}
+	setValidLoadEnv(t)
+	t.Setenv("NODE_NAME", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Node != host {
+		t.Errorf("Node = %q, want the hostname %q; the node name prefixes every Discord notice, so a fallback that reports a constant makes a three-observer set unattributable", cfg.Node, host)
 	}
 }

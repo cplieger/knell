@@ -38,6 +38,26 @@ func checkMissingQueueInvariants(t *testing.T, w *Watcher, id string, deadline t
 	}
 }
 
+// checkSwitchStaysArmed asserts the dead-man switch's liveness property after
+// a sweep: an overdue beat is never left with nothing pending. Either it is
+// alerted (its live notice went out), or its current outage is still queued as
+// the open record, or the outage is detected and waiting for a queue slot
+// (overflowAccounted). Anything else means the sweep saw the beat overdue and
+// silently dropped its outage -- the worst failure a dead-man switch can have,
+// and the one the queue's structural invariants cannot catch, because a queue
+// that never recorded the outage at all satisfies every one of them.
+func checkSwitchStaysArmed(t *testing.T, w *Watcher, id string, now time.Time, ops string) {
+	t.Helper()
+	st := w.beats[id]
+	if !overdue(now.Sub(st.lastSeen), st.deadline) || st.recovering {
+		return
+	}
+	if st.alerted || st.openMissing() != nil || st.overflowAccounted {
+		return
+	}
+	t.Fatalf("ops %q: beat is overdue after a sweep but is not alerted, has no queued open record and is not marked as awaiting a queue slot: its outage was swallowed", ops)
+}
+
 // FuzzMissingQueue drives the state machine with a fuzzed stream of pings,
 // sweeps, clock advances and webhook outages, and pins the pending-missing
 // queue's structural invariants after every operation (checkMissingQueue-
@@ -89,6 +109,7 @@ func FuzzMissingQueue(f *testing.F) {
 				clock.Advance(deadline / 3)
 			case 's': // a watch sweep
 				w.sweep(context.Background())
+				checkSwitchStaysArmed(t, w, id, clock.Now(), ops)
 			case 'r': // the Run loop draining queued recoveries
 				drainRecoveries(w)
 			case 'f': // the webhook goes down

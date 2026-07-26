@@ -7,8 +7,10 @@ services:
 
     environment:
       BEATS: "cron-backup:26h,pipeline-watchdog:20m"  # id:deadline list, see README
-      DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/..."  # where the bell rings
+      DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/..."  # https only; the URL path is the credential
       NODE_NAME: "server-1"  # names this observer in notifications
 
     ports:
+      # published to every host interface: anyone who can reach this port can ping a beat and
+      # keep the switch armed. Set BEAT_TOKEN (see README) or keep pings on a trusted network.
       - "9190:9190"

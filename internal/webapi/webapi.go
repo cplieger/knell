@@ -21,22 +21,41 @@ type Beater interface {
 	Beat(id string) bool
 }
 
+// Routes carries the pre-built handlers webapi serves beside the beat
+// endpoint. They are named rather than positional because both are plain
+// http.Handler values: a transposed pair would compile and quietly serve
+// the metrics exposition at /healthz.
+type Routes struct {
+	// Healthz answers liveness.
+	Healthz http.Handler
+	// Metrics serves the Prometheus exposition.
+	Metrics http.Handler
+}
+
 // New assembles the routed and middleware-wrapped root handler.
-// token optionally gates the beat endpoint (empty = open); healthz answers
-// liveness; metricsHandler serves the Prometheus exposition.
-func New(b Beater, token string, healthz, metricsHandler http.Handler) http.Handler {
+// token optionally gates the beat endpoint (empty = open).
+func New(b Beater, token string, routes Routes) http.Handler {
 	mux := http.NewServeMux()
 	// POST is the canonical ping; GET is accepted too so ad-hoc senders
 	// (curl without flags, simple healthcheck hooks) can participate.
 	beat := beatHandler(b, token)
 	mux.HandleFunc("POST /beat/{id}", beat)
 	mux.HandleFunc("GET /beat/{id}", beat)
-	mux.HandleFunc("HEAD /beat/{id}", func(w http.ResponseWriter, _ *http.Request) {
+	// HEAD is registered explicitly ONLY to override net/http's rule that a
+	// GET pattern also matches HEAD: without this route a HEAD probe would
+	// reach beat and RECORD a ping, so any monitoring HEAD check pointed at
+	// /beat/{id} would keep the switch armed forever with no real heartbeat
+	// behind it. Do not delete it as redundant boilerplate.
+	mux.HandleFunc("HEAD /beat/{id}", func(w http.ResponseWriter, r *http.Request) {
+		// Two methods are permitted, so Allow is set here rather than by
+		// webhttp.RequireMethod (single-method Allow); the 405 body itself is
+		// the library's standard coded envelope, like every other error here.
 		w.Header().Set("Allow", "GET, POST")
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		webhttp.WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed",
+			"use GET or POST to record a beat")
 	})
-	mux.Handle("GET /healthz", healthz)
-	mux.Handle("GET /metrics", metricsHandler)
+	mux.Handle("GET /healthz", routes.Healthz)
+	mux.Handle("GET /metrics", routes.Metrics)
 
 	return webhttp.Chain(mux,
 		// /healthz and /metrics are machine probes, so they ride the
@@ -50,7 +69,21 @@ func New(b Beater, token string, healthz, metricsHandler http.Handler) http.Hand
 		webhttp.Logging(webhttp.ProbeLogLevel("/healthz", "/metrics")),
 		webhttp.Recoverer(),
 		webhttp.SecurityHeaders(),
+		noStore,
 	)
+}
+
+// noStore marks every response uncacheable. Every route knell serves is
+// dynamic state: a ping acknowledgement, a liveness verdict, and the
+// freshness exposition that IS the quorum ground truth. None of it may be
+// answered from a cache, and a GET ping is a documented sender mode, so the
+// header goes on the whole surface rather than one route. It is listed last
+// in Chain (innermost) so it lands before any handler writes a status.
+func noStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // beatHandler records a ping and answers {"ok":true}, or 404 for an id that

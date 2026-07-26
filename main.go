@@ -31,11 +31,19 @@ func main() {
 	// shell, no curl). The marker is level-based boot state — set once the
 	// listener is bound, removed on shutdown — so no freshness deadline.
 	if len(os.Args) > 1 {
-		if os.Args[1] == "health" {
+		switch os.Args[1] {
+		case "health":
+			// RunProbe exits with the probe's verdict (0 healthy, 1 not) and
+			// never returns. The explicit exit keeps this case terminal: a
+			// future health release that returned instead of exiting would
+			// otherwise fall through to the unknown-command exit below and
+			// report every probe as failed, restarting a healthy container.
 			health.RunProbe(health.DefaultPath)
+			os.Exit(1)
+		default:
+			fmt.Fprintf(os.Stderr, "unknown command %q (the only subcommand is \"health\")\n", os.Args[1])
+			os.Exit(2)
 		}
-		fmt.Fprintf(os.Stderr, "unknown command %q (the only subcommand is \"health\")\n", os.Args[1])
-		os.Exit(2)
 	}
 
 	if err := run(); err != nil {
@@ -85,7 +93,10 @@ func run() error {
 	}
 	watcher := watch.New(beats, notifier, time.Now)
 
-	handler := webapi.New(watcher, cfg.BeatToken, health.Handler(marker), metrics.Registry.Handler())
+	handler := webapi.New(watcher, cfg.BeatToken, webapi.Routes{
+		Healthz: health.Handler(marker),
+		Metrics: metrics.Registry.Handler(),
+	})
 	// No route streams, so whole-request read and write bounds are safe
 	// here: the read bound stops a slow-trickled body from holding a
 	// handler goroutine forever (the 1 MiB drain cap bounds bytes, not
@@ -103,21 +114,35 @@ func run() error {
 	slog.Info("listening", "addr", ln.Addr().String())
 	marker.Set(true)
 
-	go watcher.Run(ctx, watch.DefaultTick)
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		watcher.Run(ctx, watch.DefaultTick)
+	}()
 
 	// The marker flip rides the pre-drain phase: webhttp.Run spends ONE
 	// shutdown budget on pre-drain -> srv.Shutdown -> onShutdown, so a flip in
 	// onShutdown lands only after the drain has finished, and the baked
 	// `knell health` probe — which stats the marker FILE, something listener
 	// closure does not cover — would call a draining container healthy for the
-	// whole window. Nothing else needs teardown, so onShutdown is nil. A serve
-	// error returns from Run without invoking either hook; the deferred
-	// marker.Cleanup covers that path.
+	// whole window. A serve error returns from Run without invoking either
+	// hook; the deferred marker.Cleanup covers that path.
 	preDrain := webhttp.WithPreDrain(func(context.Context) {
 		slog.Info("shutting down", "cause", context.Cause(ctx))
 		marker.Set(false)
 	})
-	return webhttp.Run(ctx, srv, ln, nil, webhttp.WithShutdownGrace(10*time.Second), preDrain)
+	// Wait for the single sender to finish abandoning its in-flight
+	// delivery, so its "abandoned, shutting down" log lines actually land
+	// instead of racing process exit. Bounded by the shutdown grace: the
+	// teardown context webhttp.Run passes shares that deadline.
+	onShutdown := func(teardownCtx context.Context) {
+		select {
+		case <-watcherDone:
+		case <-teardownCtx.Done():
+			slog.Warn("watch loop still running at the end of the shutdown grace")
+		}
+	}
+	return webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(10*time.Second), preDrain)
 }
 
 // logConfig logs the active configuration at startup. The webhook URL is a

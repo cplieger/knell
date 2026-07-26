@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -278,6 +279,24 @@ func TestErrorsNeverLeakWebhookURL(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "verysecrettoken") {
 		t.Errorf("status error leaks webhook secret: %v", err)
+	}
+
+	// Value-based backstop: an error whose TEXT embeds the URL without
+	// being a *url.Error passes httpx.LogSafeError unchanged (that
+	// reduction is type-based), so logSafe must scrub the secret from the
+	// message while keeping the original error in the errors.Is chain —
+	// the sweep matches context.Canceled on post's error and httpx.Do
+	// classifies transience through it.
+	raw := fmt.Errorf("some future transport error for %s: %w", d.url, context.Canceled)
+	got := d.logSafe(raw)
+	if strings.Contains(got.Error(), "verysecrettoken") {
+		t.Errorf("logSafe leaks webhook secret: %v", got)
+	}
+	if !strings.Contains(got.Error(), "REDACTED") {
+		t.Errorf("logSafe = %q, want the secret replaced by REDACTED", got)
+	}
+	if !errors.Is(got, context.Canceled) {
+		t.Errorf("logSafe broke the errors.Is chain: %v", got)
 	}
 }
 

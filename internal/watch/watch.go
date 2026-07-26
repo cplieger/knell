@@ -103,24 +103,22 @@ type Beat struct {
 // is retried every tick, so a queue this deep only forms during a sustained
 // webhook outage. It is deliberately small: the oldest notices are the
 // actionable ones, and the bound keeps a stuck webhook from growing state
-// without limit. Overflow drops the NEWEST record, and the two cases it can
-// hit differ in consequence: a CLOSED outage's record is the only trace of
-// it, so dropping it means no notice for that outage will ever arrive
-// (metrics.NotificationsDropped + a warning, exactly like a full recovery
-// queue), while an ONGOING outage loses nothing — it stays detected and is
-// queued once a slot opens, which is ordinary back-pressure rather than news.
+// without limit. Overflow drops the NEWEST record; queueDetectedOutage owns
+// what a full queue MEANS for a closed vs an ongoing outage.
 const missingQueueSize = 8
 
-// Notification kinds are the label values on the sent, failed and dropped
-// notification counters; dashboards and the KnellNotifyFailing alert key on
-// them. They count MESSAGES, so kindHistory moves by one for a notice
-// covering any number of ended outages; metrics.BeatOutages is what counts
-// outages.
-const (
-	kindMissing   = "missing"
-	kindRecovered = "recovered"
-	kindHistory   = "history"
-)
+// overdueBeat is one detected missing transition: a beat past its deadline,
+// captured with the lastSeen observed when the crossing was detected. It
+// stays queued on the beat until its notification is delivered.
+// recoveredAt is set once a ping ends the outage (zero while it is still
+// ongoing), so the ended outage's span survives the wait and its notice can
+// report it in the past tense instead of as a live failure.
+type overdueBeat struct {
+	seen        time.Time
+	recoveredAt time.Time
+	id          string
+	silence     time.Duration
+}
 
 // beatState is the per-beat tracking record.
 type beatState struct {
@@ -282,7 +280,7 @@ func recordEndedOutage(st *beatState, rec overdueBeat) {
 	if queueDetectedOutage(st, rec) {
 		return
 	}
-	metrics.NotificationsDropped.Inc(kindMissing)
+	metrics.NotificationsDropped.Inc(metrics.KindMissing)
 	slog.Warn("pending missing queue full, ended outage dropped, its notification will never be delivered",
 		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.String(),
 		"since", rec.seen, "recovered", rec.recoveredAt)
@@ -346,17 +344,7 @@ func New(beats []Beat, notifier Notifier, now func() time.Time) *Watcher {
 		metrics.BeatsReceived.Add(0, b.ID)
 		metrics.BeatOutages.Add(0, b.ID)
 	}
-	// Pre-mint the notification counter series at zero so an increase()
-	// alert sees the very first failure or drop: a counter series born at a
-	// nonzero value has no earlier sample to diff against. Dropped is minted
-	// for all three kinds like its siblings, so the alert's selector covers
-	// the whole set from a cold start (only missing and recovered have a drop
-	// path today; a failed history send keeps its records and retries).
-	for _, kind := range []string{kindMissing, kindRecovered, kindHistory} {
-		metrics.NotificationsSent.Add(0, kind)
-		metrics.NotificationsFailed.Add(0, kind)
-		metrics.NotificationsDropped.Add(0, kind)
-	}
+	metrics.MintNotificationKinds()
 	return w
 }
 
@@ -419,8 +407,9 @@ func (w *Watcher) Beat(id string) bool {
 			w.mu.Lock()
 			st.recovering = false
 			w.mu.Unlock()
-			metrics.NotificationsDropped.Inc(kindRecovered)
-			slog.Warn("recovery queue full, dropping recovered notification", "beat", id)
+			metrics.NotificationsDropped.Inc(metrics.KindRecovered)
+			slog.Warn("recovery queue full, dropping recovered notification",
+				"beat", id, "down_for", downFor.String())
 		}
 	}
 	return true
@@ -451,6 +440,7 @@ func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
 	for {
 		select {
 		case <-ctx.Done():
+			w.logUndelivered()
 			return
 		case ev := <-w.recoveries:
 			w.sendRecovered(ctx, ev)
@@ -469,6 +459,42 @@ func (w *Watcher) refreshFreshness() {
 	now := w.now()
 	for id, st := range w.beats {
 		publishFreshness(id, now.Sub(st.lastSeen), st.deadline)
+	}
+}
+
+// logUndelivered reports the notices this process will never deliver, on the
+// way out. Both queues die with the process: a pendingMissing record whose
+// outage already ended is that outage's only trace (the boot-armed clock
+// re-detects an ONGOING outage after the restart, but never a closed one), and
+// a queued recovered transition is gone with the channel. This is the one
+// permanent-loss path no delivery counter can show — notifications_dropped_total
+// means "discarded by a full queue" (metrics.go, README) — so the log line is
+// the operator's only trace of it.
+func (w *Watcher) logUndelivered() {
+	type pending struct {
+		id      string
+		records int
+	}
+	var beats []pending
+	total := 0
+	w.mu.Lock()
+	for id, st := range w.beats {
+		if n := len(st.pendingMissing); n > 0 {
+			beats = append(beats, pending{id: id, records: n})
+			total += n
+		}
+	}
+	w.mu.Unlock()
+	queuedRecoveries := len(w.recoveries)
+	slog.Info("watch loop stopped",
+		"undelivered_records", total, "queued_recoveries", queuedRecoveries)
+	for _, p := range beats {
+		slog.Warn("shutting down with undelivered outage records, no notice for them will ever arrive",
+			"beat", p.id, "records", p.records)
+	}
+	if queuedRecoveries > 0 {
+		slog.Warn("shutting down with queued recovered notifications, they will never be delivered",
+			"queued", queuedRecoveries)
 	}
 }
 
@@ -492,19 +518,6 @@ func publishFreshness(id string, silence, deadline time.Duration) bool {
 	}
 	metrics.BeatFresh.Set(0, id)
 	return false
-}
-
-// overdueBeat is one detected missing transition: a beat past its deadline,
-// captured with the lastSeen observed when the crossing was detected. It
-// stays queued on the beat until its notification is delivered.
-// recoveredAt is set once a ping ends the outage (zero while it is still
-// ongoing), so the ended outage's span survives the wait and its notice can
-// report it in the past tense instead of as a live failure.
-type overdueBeat struct {
-	seen        time.Time
-	recoveredAt time.Time
-	id          string
-	silence     time.Duration
 }
 
 // sweep checks every beat against its deadline and sends the one
@@ -574,6 +587,12 @@ func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
 		// outage was detected — a history notice reports the outage's full
 		// span (Outage.DownFor) instead, so the frozen reading is only
 		// supplementary detail.
+		// The lastSeen match is a defensive second guard, the twin of
+		// markDelivered's: an open head is always the tail (openMissing), and
+		// a ping seals the open tail in the same critical section that moves
+		// lastSeen, so today it cannot disagree with recoveredAt. Keep it, so
+		// a record whose start no longer matches lastSeen can never have a
+		// later beat's silence written over its own reading.
 		if head.recoveredAt.IsZero() && head.seen.Equal(st.lastSeen) {
 			head.silence = silence
 		}
@@ -601,12 +620,12 @@ func (w *Watcher) sendMissing(ctx context.Context, beat overdueBeat) bool {
 			slog.Info("missing notification abandoned, shutting down", "beat", beat.id)
 			return true
 		}
-		metrics.NotificationsFailed.Inc(kindMissing)
+		metrics.NotificationsFailed.Inc(metrics.KindMissing)
 		slog.Error("missing notification failed, will retry next sweep",
 			"beat", beat.id, "silence", beat.silence.String(), "error", err)
 		return false
 	}
-	metrics.NotificationsSent.Inc(kindMissing)
+	metrics.NotificationsSent.Inc(metrics.KindMissing)
 	slog.Info("beat missing, notified", "beat", beat.id, "silence", beat.silence.String())
 	if event, raced := w.markDelivered(beat.id, beat.seen); raced {
 		w.sendRecovered(ctx, event)
@@ -629,12 +648,12 @@ func (w *Watcher) sendHistory(ctx context.Context, past beatOutages) bool {
 			slog.Info("outage history notification abandoned, shutting down", "beat", past.id)
 			return true
 		}
-		metrics.NotificationsFailed.Inc(kindHistory)
+		metrics.NotificationsFailed.Inc(metrics.KindHistory)
 		slog.Error("outage history notification failed, will retry next sweep",
 			"beat", past.id, "outages", len(past.outages), "error", err)
 		return false
 	}
-	metrics.NotificationsSent.Inc(kindHistory)
+	metrics.NotificationsSent.Inc(metrics.KindHistory)
 	slog.Info("ended outages notified as history",
 		"beat", past.id, "outages", len(past.outages),
 		"longest", LongestOutage(past.outages).String())
@@ -701,11 +720,11 @@ func (w *Watcher) sendRecovered(ctx context.Context, ev recoveryEvent) {
 			slog.Info("recovered notification abandoned, shutting down", "beat", ev.id)
 			return
 		}
-		metrics.NotificationsFailed.Inc(kindRecovered)
+		metrics.NotificationsFailed.Inc(metrics.KindRecovered)
 		slog.Error("recovered notification failed",
 			"beat", ev.id, "down_for", ev.downFor.String(), "error", err)
 		return
 	}
-	metrics.NotificationsSent.Inc(kindRecovered)
+	metrics.NotificationsSent.Inc(metrics.KindRecovered)
 	slog.Info("beat recovered, notified", "beat", ev.id, "down_for", ev.downFor.String())
 }

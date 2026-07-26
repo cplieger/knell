@@ -17,6 +17,7 @@ func FuzzParseWebhookURL(f *testing.F) {
 	f.Add("https:///hook")
 	f.Add("://")
 	f.Add("https://host/secret\x00token")
+	f.Add("credentialmaterial:rest")
 	f.Fuzz(func(t *testing.T, raw string) {
 		u, err := parseWebhookURL(raw)
 		if err == nil {

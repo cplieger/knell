@@ -41,7 +41,7 @@ func newTestHandlerHealthz(b *fakeBeater, token string, healthzStatus int) http.
 	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(healthzStatus)
 	})
-	return New(b, token, healthz, metrics.Registry.Handler())
+	return New(b, token, Routes{Healthz: healthz, Metrics: metrics.Registry.Handler()})
 }
 
 func TestBeatEndpoint(t *testing.T) {
@@ -82,16 +82,6 @@ func TestBeatEndpoint(t *testing.T) {
 				t.Errorf("404 body = %s, want unknown_beat code", rec.Body.String())
 			}
 		})
-	}
-}
-
-func TestHealthzRouted(t *testing.T) {
-	h := newTestHandler(&fakeBeater{}, "")
-	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /healthz = %d", rec.Code)
 	}
 }
 
@@ -222,6 +212,61 @@ func TestSecurityHeadersPresent(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
 		t.Errorf("X-Content-Type-Options = %q", got)
+	}
+}
+
+// TestNoStoreOnEveryRoute pins that no response knell serves is cacheable: a
+// cached GET ping would never reach the observer (false MISSING notice) and a
+// cached /metrics exposition would report a stale beat_fresh=1 to the scraper,
+// which is the direction that masks the quorum alert.
+func TestNoStoreOnEveryRoute(t *testing.T) {
+	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
+	for _, path := range []string{"/beat/api", "/healthz", "/metrics"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+				t.Errorf("Cache-Control on GET %s = %q, want %q", path, got, "no-store")
+			}
+		})
+	}
+}
+
+// panicBeater panics on every ping, standing in for a bug anywhere below the
+// beat handler.
+type panicBeater struct{}
+
+func (panicBeater) Beat(string) bool { panic("beat exploded") }
+
+func TestPanicUnderBeatHandlerAnswers500AndIsLogged(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and it must be installed BEFORE New, because webhttp resolves
+	// slog.Default() when the chain is built.
+	//
+	// Without the chain's Recoverer, a panic under the beat handler unwinds to
+	// net/http: the sender sees a reset connection rather than a 500, and the
+	// access log never reports a status for the endpoint that feeds the switch.
+	rec := capture.Default(t)
+	h := New(panicBeater{}, "", Routes{
+		Healthz: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+		Metrics: metrics.Registry.Handler(),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("panicking beat handler = %d, want 500 (Recoverer must convert the panic into a response)", w.Code)
+	}
+	if got := rec.CountLevel(slog.LevelError, "recovered from panic"); got != 1 {
+		t.Errorf("panic log lines at Error = %d, want exactly 1: %v", got, rec.Messages())
+	}
+	if !rec.HasAttr("http", "status", "500") {
+		t.Errorf("access line does not report the 500; records = %v", rec.Records())
 	}
 }
 

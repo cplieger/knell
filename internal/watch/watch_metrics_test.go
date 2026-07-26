@@ -172,6 +172,32 @@ func TestRefreshFreshnessUpdatesGaugeWithoutNotifying(t *testing.T) {
 	}
 }
 
+func TestUnknownBeatMintsNoMetricSeries(t *testing.T) {
+	t.Parallel()
+
+	// The beat id is a metric label, so a ping for an id that is not
+	// configured must record nothing at all: minting a series on an unknown id
+	// turns arbitrary /beat/<anything> request paths into unbounded, permanent
+	// label cardinality in knell and in every observer scraping it. Beat's
+	// false return is asserted elsewhere; this pins the half that has no
+	// symptom at all until the series count explodes.
+	const unknown = "unknown-cardinality-probe"
+	w, _, _ := newTestWatcher(Beat{ID: "known-cardinality-probe", Deadline: 10 * time.Minute})
+	if w.Beat(unknown) {
+		t.Fatalf("Beat(%s) = true, want false for an unconfigured id", unknown)
+	}
+	for _, name := range []string{
+		"knell_beats_received_total",
+		"knell_beat_fresh",
+		"knell_beat_last_seen_timestamp_seconds",
+		"knell_beat_outages_total",
+	} {
+		if got, ok := findLabeledValue(name, "beat", unknown); ok {
+			t.Errorf("%s{beat=%q} = %s after a ping for an unconfigured id, want the series absent (the id is a label)", name, unknown, got)
+		}
+	}
+}
+
 // counterValue parses the exposition value of name{kind="<kind>"} as a float.
 func counterValue(t *testing.T, name, kind string) float64 {
 	t.Helper()
@@ -492,7 +518,7 @@ func TestColdStartExposesFailedAndDroppedSeriesAtZero(t *testing.T) {
 	// ones counted. increase() needs an earlier sample, so a rule over these
 	// counters is blind to the very first failure or drop unless New mints
 	// both series at zero.
-	kinds := []string{kindMissing, kindRecovered, kindHistory}
+	kinds := []string{metrics.KindMissing, metrics.KindRecovered, metrics.KindHistory}
 	counters := []string{"knell_notifications_failed_total", "knell_notifications_dropped_total"}
 	for _, kind := range kinds {
 		metrics.NotificationsFailed.Delete(kind)

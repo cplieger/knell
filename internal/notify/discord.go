@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/cplieger/httpx/v4"
@@ -34,6 +35,11 @@ type Discord struct {
 	url    string
 	node   string
 }
+
+// Discord implements the transition contract the state machine consumes;
+// the assertion keeps a signature drift a notify-local compile error
+// instead of one that first appears in main's wiring.
+var _ watch.Notifier = (*Discord)(nil)
 
 // New builds a Discord notifier for the given webhook URL. node names this
 // observer instance in every message so multi-node deployments read as
@@ -141,10 +147,43 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 		return d.postAttempt(ctx, body)
 	}, httpx.WithLabel("discord webhook "+label), httpx.WithMaxAttempts(maxAttempts), httpx.WithRateLimitRetry(30*time.Second))
 	if err != nil {
-		return fmt.Errorf("delivering %s notification: %w", label, httpx.LogSafeError(err))
+		return fmt.Errorf("delivering %s notification: %w", label, d.logSafe(err))
 	}
 	return nil
 }
+
+// logSafe reduces err to a form that cannot carry the webhook URL.
+// httpx.LogSafeError strips the *url.Error wrapper that embeds it; the
+// substring check is the value-based backstop for any error type whose text
+// carries the URL without being a *url.Error (LogSafeError passes those
+// through unchanged, so the type-based reduction alone is only as complete as
+// httpx's error taxonomy). Wrapping preserves errors.Is/As, which the sweep
+// relies on for context.Canceled and httpx.Do for transient classification —
+// httpx.RedactSecret cannot be used here because it returns a bare
+// errors.New and would break both.
+func (d *Discord) logSafe(err error) error {
+	safe := httpx.LogSafeError(err)
+	if safe == nil {
+		return nil
+	}
+	// d.url is never empty (config rejects an empty/non-https webhook URL
+	// before New is called), and RedactSecretString is a no-op on an empty
+	// secret, so the guard cannot mask an error into an empty message.
+	if msg := safe.Error(); strings.Contains(msg, d.url) {
+		return &redactedError{msg: httpx.RedactSecretString(msg, d.url), err: safe}
+	}
+	return safe
+}
+
+// redactedError carries a scrubbed message while keeping the original error in
+// the chain for errors.Is/As.
+type redactedError struct {
+	err error
+	msg string
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.err }
 
 // postAttempt performs one delivery attempt of an already-encoded payload:
 // per-attempt deadline, request construction, transport call, response
@@ -158,14 +197,14 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 	req, reqErr := http.NewRequestWithContext(attemptCtx, http.MethodPost, d.url, bytes.NewReader(body))
 	if reqErr != nil {
 		// The raw error would embed the URL; report the cause only.
-		return struct{}{}, fmt.Errorf("building webhook request: %w", httpx.LogSafeError(reqErr))
+		return struct{}{}, fmt.Errorf("building webhook request: %w", d.logSafe(reqErr))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, doErr := d.client.Do(req) //nolint:bodyclose // closed via deferred httpx.DrainClose below
 	if doErr != nil {
 		// *url.Error embeds the full webhook URL; reduce it to its cause
 		// (transient classification survives the reduction).
-		return struct{}{}, httpx.LogSafeError(doErr)
+		return struct{}{}, d.logSafe(doErr)
 	}
 	defer httpx.DrainClose(resp.Body)
 	// Success is exactly 2xx here: CheckHTTPStatus rejects every other
