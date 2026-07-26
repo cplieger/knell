@@ -36,8 +36,8 @@ func main() {
 			// RunProbe exits with the probe's verdict (0 healthy, 1 not) and
 			// never returns. The explicit exit keeps this case terminal: a
 			// future health release that returned instead of exiting would
-			// otherwise fall through to the unknown-command exit below and
-			// report every probe as failed, restarting a healthy container.
+			// otherwise leave the switch and boot the server from a probe
+			// invocation; exiting 1 instead fails the probe closed.
 			health.RunProbe(health.DefaultPath)
 			os.Exit(1)
 		default:

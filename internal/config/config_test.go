@@ -472,8 +472,27 @@ func TestLoadTrimsPaddedPlainSecrets(t *testing.T) {
 	if cfg.WebhookURL != "https://discord.example/hook" {
 		t.Errorf("WebhookURL = %q, want the padding trimmed", cfg.WebhookURL)
 	}
-	if cfg.BeatToken != "unit-test-beat-token" {
-		t.Errorf("BeatToken = %q, want the padding trimmed", cfg.BeatToken)
+}
+
+func TestLoadKeepsAWhitespaceOnlyBeatTokenArmed(t *testing.T) {
+	// A whitespace-only BEAT_TOKEN is a misconfigured credential, but an
+	// EMPTY BeatToken is webapi's open-endpoint sentinel: trimming this
+	// value to "" would silently disarm the /beat/{id} gate the operator
+	// set (and skip the short-token warning too), while the same value via
+	// BEAT_TOKEN_FILE fails startup. Keep it non-empty so the gate arms.
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", "   ")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.BeatToken == "" {
+		t.Fatal("BeatToken is empty for a present whitespace-only BEAT_TOKEN: webapi would serve /beat/{id} ungated (fail-open)")
+	}
+	if cfg.BeatToken != "   " {
+		t.Errorf("BeatToken = %q, want the value preserved verbatim", cfg.BeatToken)
 	}
 }
 

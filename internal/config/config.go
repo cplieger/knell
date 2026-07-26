@@ -95,8 +95,15 @@ func Load() (Config, error) {
 	switch {
 	case err == nil:
 		// Same reason as the webhook: a padded token makes every sender 401
-		// and every beat cross its deadline.
-		cfg.BeatToken = strings.TrimSpace(token)
+		// and every beat cross its deadline. A value that is ENTIRELY
+		// whitespace is kept verbatim instead: an empty token is the
+		// documented open-endpoint sentinel (webapi builds no verifier for
+		// it), so trimming would silently disarm the gate the operator did
+		// set — while the same value via BEAT_TOKEN_FILE fails startup.
+		cfg.BeatToken = token
+		if trimmed := strings.TrimSpace(token); trimmed != "" {
+			cfg.BeatToken = trimmed
+		}
 	case errors.As(err, new(*envx.MissingError)):
 		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE is set: the documented
 		// open-endpoint case, so the empty token stands and webapi's gate

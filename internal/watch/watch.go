@@ -474,23 +474,40 @@ func (w *Watcher) logUndelivered() {
 	type pending struct {
 		id      string
 		records int
+		lost    int
 	}
 	var beats []pending
-	total := 0
+	total, lostTotal := 0, 0
 	w.mu.Lock()
 	for id, st := range w.beats {
-		if n := len(st.pendingMissing); n > 0 {
-			beats = append(beats, pending{id: id, records: n})
-			total += n
+		n := len(st.pendingMissing)
+		if n == 0 {
+			continue
 		}
+		// Only a CLOSED record is a permanent loss. The one record that can
+		// still be open (openMissing: always the tail) is an outage that is
+		// STILL ongoing, and the boot-armed clock re-detects it after the
+		// restart, so its notice is delayed rather than lost.
+		lost := n
+		if st.openMissing() != nil {
+			lost--
+		}
+		beats = append(beats, pending{id: id, records: n, lost: lost})
+		total += n
+		lostTotal += lost
 	}
 	w.mu.Unlock()
 	queuedRecoveries := len(w.recoveries)
 	slog.Info("watch loop stopped",
-		"undelivered_records", total, "queued_recoveries", queuedRecoveries)
+		"undelivered_records", total, "permanent_loss", lostTotal,
+		"queued_recoveries", queuedRecoveries)
 	for _, p := range beats {
-		slog.Warn("shutting down with undelivered outage records, no notice for them will ever arrive",
-			"beat", p.id, "records", p.records)
+		if p.lost == 0 {
+			// An ongoing outage only: re-detected after the restart.
+			continue
+		}
+		slog.Warn("shutting down with undelivered ended-outage records, no notice for them will ever arrive",
+			"beat", p.id, "records", p.lost, "still_ongoing", p.records-p.lost)
 	}
 	if queuedRecoveries > 0 {
 		slog.Warn("shutting down with queued recovered notifications, they will never be delivered",

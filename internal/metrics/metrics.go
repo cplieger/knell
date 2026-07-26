@@ -5,6 +5,8 @@
 package metrics
 
 import (
+	"strings"
+
 	metricslib "github.com/cplieger/metrics/v3"
 )
 
@@ -25,6 +27,15 @@ const (
 	KindHistory   = "history"
 )
 
+// notificationKinds is the single enumeration of the legal kindLabel values:
+// it drives both the zero-minting below and the rendered kind list in the
+// three counters' HELP text, so a new kind cannot be minted while the
+// exposition metadata still advertises the old set.
+var notificationKinds = []string{KindMissing, KindRecovered, KindHistory}
+
+// notificationKindsText renders notificationKinds for HELP strings.
+var notificationKindsText = strings.Join(notificationKinds, ", ")
+
 // MintNotificationKinds pre-mints every notification counter series at zero
 // for every kind, so an increase() alert sees the very first failure or drop:
 // a counter series born at a nonzero value has no earlier sample to diff
@@ -33,7 +44,7 @@ const (
 // (only missing and recovered have a drop path today; a failed history send
 // keeps its records and retries).
 func MintNotificationKinds() {
-	for _, kind := range []string{KindMissing, KindRecovered, KindHistory} {
+	for _, kind := range notificationKinds {
 		NotificationsSent.Add(0, kind)
 		NotificationsFailed.Add(0, kind)
 		NotificationsDropped.Add(0, kind)
@@ -89,7 +100,7 @@ var BeatOutages = metricslib.NewLabeledCounter(
 // with BeatOutages to reason about outages rather than messages.
 var NotificationsSent = metricslib.NewLabeledCounter(
 	"notifications_sent_total",
-	"Webhook notifications delivered, by kind (missing, recovered, history); one per delivered message.",
+	"Webhook notifications delivered, by kind ("+notificationKindsText+"); one per delivered message.",
 	[]string{kindLabel},
 )
 
@@ -103,7 +114,7 @@ var NotificationsSent = metricslib.NewLabeledCounter(
 // failed and nothing will retry): see NotificationsDropped.
 var NotificationsFailed = metricslib.NewLabeledCounter(
 	"notifications_failed_total",
-	"Webhook delivery attempts that failed after retries, by kind (missing, recovered, history); one per failed message.",
+	"Webhook delivery attempts that failed after retries, by kind ("+notificationKindsText+"); one per failed message.",
 	[]string{kindLabel},
 )
 
@@ -118,7 +129,7 @@ var NotificationsFailed = metricslib.NewLabeledCounter(
 // either, because nothing was dropped.
 var NotificationsDropped = metricslib.NewLabeledCounter(
 	"notifications_dropped_total",
-	"Notifications that will never be delivered because their record was discarded when the per-beat queue was full, by kind (missing, recovered, history); distinct from a delivery that failed and will retry.",
+	"Notifications that will never be delivered because their record was discarded when the per-beat queue was full, by kind ("+notificationKindsText+"); distinct from a delivery that failed and will retry.",
 	[]string{kindLabel},
 )
 
