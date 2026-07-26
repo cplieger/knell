@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -297,6 +298,57 @@ func TestErrorsNeverLeakWebhookURL(t *testing.T) {
 	}
 	if !errors.Is(got, context.Canceled) {
 		t.Errorf("logSafe broke the errors.Is chain: %v", got)
+	}
+}
+
+func TestLogSafeRedactsCanonicalWebhookURLForms(t *testing.T) {
+	t.Parallel()
+
+	// A webhook path carrying non-ASCII bytes is accepted by net/url, but
+	// url.Parse CANONICALIZES it: req.URL.String() renders the credential
+	// percent-escaped, so the canonical rendering does not contain the raw
+	// configured string. httpx.LogSafeError's reduction is type-based and
+	// passes an unrecognized error type through unchanged, so an error that
+	// formats req.URL.String() (or just its path) would leak the credential
+	// if logSafe scrubbed only the configured string. post's error and the
+	// httpx retry log both carry exactly logSafe's output, so asserting on
+	// it covers both surfaces.
+	const secret = "vérysecrettoken"
+	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
+	d := New(rawURL, "node-1")
+	defer d.Close()
+
+	u, parseErr := url.Parse(rawURL)
+	if parseErr != nil {
+		t.Fatalf("url.Parse(%q) = %v", rawURL, parseErr)
+	}
+	escapedSecret := url.PathEscape(secret)
+	if escapedSecret == secret || !strings.Contains(u.String(), escapedSecret) {
+		t.Fatalf("setup: canonical URL %q does not percent-escape the credential, nothing to catch", u.String())
+	}
+
+	for name, msg := range map[string]string{
+		"raw url":        fmt.Sprintf("some future transport error for %s: giving up", rawURL),
+		"canonical url":  fmt.Sprintf("some future transport error for %s: giving up", u.String()),
+		"canonical path": fmt.Sprintf("some future transport error for POST %s: giving up", u.EscapedPath()),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got := d.logSafe(fmt.Errorf("%s: %w", msg, context.Canceled))
+			if strings.Contains(got.Error(), secret) {
+				t.Errorf("logSafe leaks the raw webhook credential: %v", got)
+			}
+			if strings.Contains(got.Error(), escapedSecret) {
+				t.Errorf("logSafe leaks the percent-encoded webhook credential: %v", got)
+			}
+			if !strings.Contains(got.Error(), "REDACTED") {
+				t.Errorf("logSafe = %q, want the credential replaced by REDACTED", got)
+			}
+			if !errors.Is(got, context.Canceled) {
+				t.Errorf("logSafe broke the errors.Is chain: %v", got)
+			}
+		})
 	}
 }
 

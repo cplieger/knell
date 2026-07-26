@@ -553,28 +553,28 @@ func TestRecoveryQueueOverflowDropKeepsBeatArmed(t *testing.T) {
 	}
 }
 
-// perBeatFailNotifier delivers every notification except BeatMissing for
-// failFor, so a test can observe whether one beat's failing send blocks the
-// rest of the sweep. Only the test goroutine drives it (sweep is called
-// synchronously), so it needs no lock.
-type perBeatFailNotifier struct {
-	failFor string
-	missing []string
+// failFirstNotifier fails the FIRST attempted missing send whichever beat it
+// is for, and counts every attempt. Which beat comes first is deliberately
+// irrelevant: Watcher stores beats in a map and therefore promises no
+// iteration order, so a notifier keyed on a named beat would let an
+// early-return regression pass whenever map order put the failing beat last.
+type failFirstNotifier struct {
+	attempts int
 }
 
-func (n *perBeatFailNotifier) BeatMissing(_ context.Context, id string, _ time.Duration) error {
-	if id == n.failFor {
+func (n *failFirstNotifier) BeatMissing(context.Context, string, time.Duration) error {
+	n.attempts++
+	if n.attempts == 1 {
 		return errors.New("discord down")
 	}
-	n.missing = append(n.missing, id)
 	return nil
 }
 
-func (n *perBeatFailNotifier) BeatRecovered(context.Context, string, time.Duration) error {
+func (*failFirstNotifier) BeatRecovered(context.Context, string, time.Duration) error {
 	return nil
 }
 
-func (n *perBeatFailNotifier) BeatOutageHistory(context.Context, string, []Outage) error {
+func (*failFirstNotifier) BeatOutageHistory(context.Context, string, []Outage) error {
 	return nil
 }
 
@@ -587,7 +587,7 @@ func TestOneBeatsFailedSendDoesNotStarveTheOthers(t *testing.T) {
 	// permanently failing beat starve the rest for as long as it keeps
 	// failing -- the observers would go quiet about beats that are down.
 	clock := newFakeClock()
-	n := &perBeatFailNotifier{failFor: "starve-probe-a"}
+	n := &failFirstNotifier{}
 	w := New([]Beat{
 		{ID: "starve-probe-a", Deadline: 10 * time.Minute},
 		{ID: "starve-probe-b", Deadline: 10 * time.Minute},
@@ -597,8 +597,8 @@ func TestOneBeatsFailedSendDoesNotStarveTheOthers(t *testing.T) {
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
 
-	if len(n.missing) != 2 {
-		t.Fatalf("delivered missing notices = %v, want both healthy beats notified in the same sweep as the failing one", n.missing)
+	if n.attempts != 3 {
+		t.Errorf("missing delivery attempts = %d, want 3 (one failed beat must not starve the others)", n.attempts)
 	}
 }
 

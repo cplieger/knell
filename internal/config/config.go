@@ -81,42 +81,11 @@ func Load() (Config, error) {
 
 	cfg.ListenAddr = envx.String("LISTEN_ADDR", ":9190")
 
-	// BEAT_TOKEN optionally gates POST/GET /beat/{id}; empty disables the
-	// check. BEAT_TOKEN_FILE points at a mounted secret file instead (the
-	// same convention DISCORD_WEBHOOK_URL uses), keeping the credential out
-	// of `docker inspect` output.
-	if blankErr := rejectBlankFileVar("BEAT_TOKEN"); blankErr != nil {
-		return cfg, blankErr
+	beatToken, err := loadBeatToken()
+	if err != nil {
+		return cfg, err
 	}
-	token, tokenSrc, err := envx.SecretWithSource("BEAT_TOKEN")
-	if tokenSrc == envx.SourceFile && os.Getenv("BEAT_TOKEN") != "" {
-		slog.Warn("BEAT_TOKEN and BEAT_TOKEN_FILE are both set; the file wins and the plain variable is ignored, so unset it to keep the token out of the process environment")
-	}
-	switch {
-	case err == nil:
-		// Same reason as the webhook: a padded token makes every sender 401
-		// and every beat cross its deadline. A value that is ENTIRELY
-		// whitespace is kept verbatim instead: an empty token is the
-		// documented open-endpoint sentinel (webapi builds no verifier for
-		// it), so trimming would silently disarm the gate the operator did
-		// set — while the same value via BEAT_TOKEN_FILE fails startup.
-		cfg.BeatToken = token
-		if trimmed := strings.TrimSpace(token); trimmed != "" {
-			cfg.BeatToken = trimmed
-		}
-	case errors.As(err, new(*envx.MissingError)):
-		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE is set: the documented
-		// open-endpoint case, so the empty token stands and webapi's gate
-		// never arms.
-	default:
-		// Any other error means the variable WAS provided and could not be
-		// used (unreadable or blank _FILE): fail closed rather than serving
-		// an open endpoint the operator meant to gate.
-		return cfg, fmt.Errorf("BEAT_TOKEN: %w", err)
-	}
-	if cfg.BeatToken != "" && len(cfg.BeatToken) < minTokenLength {
-		slog.Warn("BEAT_TOKEN is shorter than the recommended minimum; a short token is guessable, prefer a long random value", "length", len(cfg.BeatToken), "minimum", minTokenLength)
-	}
+	cfg.BeatToken = beatToken
 
 	rawLevel := envx.String("LOG_LEVEL", "")
 	level, ok := slogx.ParseLevel(rawLevel, slog.LevelInfo)
@@ -153,6 +122,47 @@ func rejectBlankFileVar(key string) error {
 		return fmt.Errorf("%s_FILE is set but empty: unset it to configure %s directly, or point it at a secret file", key, key)
 	}
 	return nil
+}
+
+// loadBeatToken reads the optional BEAT_TOKEN bearer gate for
+// POST/GET /beat/{id}; an empty return disables the check. BEAT_TOKEN_FILE
+// points at a mounted secret file instead (the same convention
+// DISCORD_WEBHOOK_URL uses), keeping the credential out of `docker inspect`
+// output.
+func loadBeatToken() (string, error) {
+	if blankErr := rejectBlankFileVar("BEAT_TOKEN"); blankErr != nil {
+		return "", blankErr
+	}
+	token, tokenSrc, err := envx.SecretWithSource("BEAT_TOKEN")
+	if tokenSrc == envx.SourceFile && os.Getenv("BEAT_TOKEN") != "" {
+		slog.Warn("BEAT_TOKEN and BEAT_TOKEN_FILE are both set; the file wins and the plain variable is ignored, so unset it to keep the token out of the process environment")
+	}
+	switch {
+	case err == nil:
+		// Same reason as the webhook: a padded token makes every sender 401
+		// and every beat cross its deadline. A value that is ENTIRELY
+		// whitespace is kept verbatim instead: an empty token is the
+		// documented open-endpoint sentinel (webapi builds no verifier for
+		// it), so trimming would silently disarm the gate the operator did
+		// set — while the same value via BEAT_TOKEN_FILE fails startup.
+		if trimmed := strings.TrimSpace(token); trimmed != "" {
+			token = trimmed
+		}
+	case errors.As(err, new(*envx.MissingError)):
+		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE is set: the documented
+		// open-endpoint case, so the empty token stands and webapi's gate
+		// never arms.
+		token = ""
+	default:
+		// Any other error means the variable WAS provided and could not be
+		// used (unreadable or blank _FILE): fail closed rather than serving
+		// an open endpoint the operator meant to gate.
+		return "", fmt.Errorf("BEAT_TOKEN: %w", err)
+	}
+	if token != "" && len(token) < minTokenLength {
+		slog.Warn("BEAT_TOKEN is shorter than the recommended minimum; a short token is guessable, prefer a long random value", "length", len(token), "minimum", minTokenLength)
+	}
+	return token, nil
 }
 
 // loadWebhook reads and shape-checks DISCORD_WEBHOOK_URL. The URL is a

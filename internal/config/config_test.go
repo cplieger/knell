@@ -472,6 +472,9 @@ func TestLoadTrimsPaddedPlainSecrets(t *testing.T) {
 	if cfg.WebhookURL != "https://discord.example/hook" {
 		t.Errorf("WebhookURL = %q, want the padding trimmed", cfg.WebhookURL)
 	}
+	if cfg.BeatToken != "unit-test-beat-token" {
+		t.Errorf("BeatToken = %q, want the padding trimmed", cfg.BeatToken)
+	}
 }
 
 func TestLoadKeepsAWhitespaceOnlyBeatTokenArmed(t *testing.T) {

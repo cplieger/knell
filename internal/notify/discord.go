@@ -14,7 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
+	"net/url"
+	"slices"
 	"time"
 
 	"github.com/cplieger/httpx/v4"
@@ -34,6 +35,10 @@ type Discord struct {
 	client *http.Client
 	url    string
 	node   string
+	// redact holds every rendering of the webhook URL that an error
+	// message can carry (see redactionCandidates); logSafe scrubs all of
+	// them, not only the raw configured string.
+	redact []string
 }
 
 // Discord implements the transition contract the state machine consumes;
@@ -72,7 +77,34 @@ func New(webhookURL, node string) *Discord {
 		client: client,
 		url:    webhookURL,
 		node:   node,
+		redact: redactionCandidates(webhookURL),
 	}
+}
+
+// redactionCandidates lists every rendering of the webhook URL whose presence
+// in an error message would leak the credential (a Discord webhook carries it
+// in the URL path). The raw configured string is only one of them:
+// http.NewRequestWithContext parses the URL and HTTP code renders
+// req.URL.String(), which net/url canonicalizes — non-ASCII path bytes come
+// back percent-escaped — so the canonical form can carry the credential
+// without containing the configured string. The bare path forms cover an
+// error that quotes only the path. Duplicates, the empty path and a bare "/"
+// are dropped ("/" appears in nearly every message and redacting it would
+// mangle unrelated text without hiding a secret). An unparseable URL yields
+// the raw value alone, which is exactly the text such an error embeds.
+func redactionCandidates(webhookURL string) []string {
+	candidates := []string{webhookURL}
+	u, parseErr := url.Parse(webhookURL)
+	if parseErr != nil {
+		return candidates
+	}
+	for _, c := range []string{u.String(), u.Path, u.EscapedPath()} {
+		if c == "" || c == "/" || slices.Contains(candidates, c) {
+			continue
+		}
+		candidates = append(candidates, c)
+	}
+	return candidates
 }
 
 // Close releases idle connections. Call once on shutdown.
@@ -154,10 +186,13 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 
 // logSafe reduces err to a form that cannot carry the webhook URL.
 // httpx.LogSafeError strips the *url.Error wrapper that embeds it; the
-// substring check is the value-based backstop for any error type whose text
+// value-based redaction below is the backstop for any error type whose text
 // carries the URL without being a *url.Error (LogSafeError passes those
 // through unchanged, so the type-based reduction alone is only as complete as
-// httpx's error taxonomy). Wrapping preserves errors.Is/As, which the sweep
+// httpx's error taxonomy). Every candidate rendering is scrubbed, not just the
+// raw configured string, because an unrecognized error commonly formats
+// req.URL.String() — net/url's canonical form, which may percent-escape the
+// credential-bearing path. Wrapping preserves errors.Is/As, which the sweep
 // relies on for context.Canceled and httpx.Do for transient classification —
 // httpx.RedactSecret cannot be used here because it returns a bare
 // errors.New and would break both.
@@ -166,11 +201,16 @@ func (d *Discord) logSafe(err error) error {
 	if safe == nil {
 		return nil
 	}
-	// d.url is never empty (config rejects an empty/non-https webhook URL
-	// before New is called), and RedactSecretString is a no-op on an empty
-	// secret, so the guard cannot mask an error into an empty message.
-	if msg := safe.Error(); strings.Contains(msg, d.url) {
-		return &redactedError{msg: httpx.RedactSecretString(msg, d.url), err: safe}
+	// Candidates are never empty (config rejects an empty/non-https webhook
+	// URL before New is called), and RedactSecretString is a no-op on an
+	// empty secret, so this cannot mask an error into an empty message.
+	msg := safe.Error()
+	scrubbed := msg
+	for _, candidate := range d.redact {
+		scrubbed = httpx.RedactSecretString(scrubbed, candidate)
+	}
+	if scrubbed != msg {
+		return &redactedError{msg: scrubbed, err: safe}
 	}
 	return safe
 }
@@ -184,6 +224,17 @@ type redactedError struct {
 
 func (e *redactedError) Error() string { return e.msg }
 func (e *redactedError) Unwrap() error { return e.err }
+
+// attemptTimeoutError reports that a single delivery attempt exceeded
+// postAttempt's private per-attempt deadline while the caller's context was
+// still live, which is a retryable condition. It intentionally has no Unwrap
+// method: exposing context.DeadlineExceeded would make httpx.Do treat it as a
+// terminal caller-cancellation decision before consulting IsTransient. Its
+// message carries no URL.
+type attemptTimeoutError struct{}
+
+func (attemptTimeoutError) Error() string     { return "webhook attempt timed out" }
+func (attemptTimeoutError) IsTransient() bool { return true }
 
 // postAttempt performs one delivery attempt of an already-encoded payload:
 // per-attempt deadline, request construction, transport call, response
@@ -202,6 +253,13 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 	req.Header.Set("Content-Type", "application/json")
 	resp, doErr := d.client.Do(req) //nolint:bodyclose // closed via deferred httpx.DrainClose below
 	if doErr != nil {
+		// A child attempt deadline is retryable while the caller's budget is
+		// still live. httpx deliberately treats context deadline errors as
+		// terminal, so translate only this per-attempt timeout into its
+		// Transient contract; caller cancellation/deadlines stay terminal.
+		if errors.Is(doErr, context.DeadlineExceeded) && ctx.Err() == nil {
+			return struct{}{}, attemptTimeoutError{}
+		}
 		// *url.Error embeds the full webhook URL; reduce it to its cause
 		// (transient classification survives the reduction).
 		return struct{}{}, d.logSafe(doErr)

@@ -632,3 +632,44 @@ func TestCanceledHistoryNotificationIsNotFailedAndKeepsRecords(t *testing.T) {
 		t.Fatalf("calls = %v, want the abandoned history notice delivered after the notifier healed", got)
 	}
 }
+
+func TestLogUndeliveredClassifiesOnlyEndedRecordsAsPermanentLoss(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default. The shutdown log is the ONLY trace of a notice this process
+	// will never deliver, and it must separate the two queue shapes: a
+	// CLOSED record is a permanent loss (its outage already ended, so the
+	// record was its last trace), while the OPEN tail loses nothing (the
+	// boot-armed clock re-detects an ongoing outage after the restart).
+	// Inverting that classification either pages for an outage that will be
+	// re-detected or stays quiet about one that is gone for good.
+	const id = "shutdown-loss-probe"
+	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+
+	// The first late ping creates an already-ended record. A second silence
+	// then creates an ongoing outage behind it without delivering either.
+	clock.Advance(11 * time.Minute)
+	if !w.Beat(id) {
+		t.Fatalf("Beat(%s) = false", id)
+	}
+	clock.Advance(11 * time.Minute)
+	w.collectDue()
+
+	rec := capture.Default(t)
+	w.logUndelivered()
+
+	if !rec.HasAttr("watch loop stopped", "undelivered_records", "2") {
+		t.Errorf("shutdown summary does not count both queued records: %v", rec.Records())
+	}
+	if !rec.HasAttr("watch loop stopped", "permanent_loss", "1") {
+		t.Errorf("shutdown summary does not classify only the ended record as permanently lost: %v", rec.Records())
+	}
+	if got := rec.CountLevel(slog.LevelWarn, "shutting down with undelivered ended-outage records"); got != 1 {
+		t.Errorf("ended-outage loss warnings = %d, want 1: %v", got, rec.Messages())
+	}
+	if !rec.HasAttr("shutting down with undelivered ended-outage records", "records", "1") {
+		t.Errorf("loss warning does not count the one ended record: %v", rec.Records())
+	}
+	if !rec.HasAttr("shutting down with undelivered ended-outage records", "still_ongoing", "1") {
+		t.Errorf("loss warning does not distinguish the re-detectable ongoing outage: %v", rec.Records())
+	}
+}
