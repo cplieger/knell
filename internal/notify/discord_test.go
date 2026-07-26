@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/httpx/v4"
 	"github.com/cplieger/knell/internal/watch"
 )
 
@@ -349,6 +350,65 @@ func TestLogSafeRedactsCanonicalWebhookURLForms(t *testing.T) {
 				t.Errorf("logSafe broke the errors.Is chain: %v", got)
 			}
 		})
+	}
+}
+
+func TestAttemptTimeoutIsRetried(t *testing.T) {
+	t.Parallel()
+
+	// A per-attempt child deadline is a retryable condition, but
+	// httpx.IsTransient rejects anything that unwraps to
+	// context.DeadlineExceeded before it consults the Transient
+	// interface, so postAttempt translates the timeout into a
+	// dedicated no-Unwrap error. Giving that type an Unwrap method
+	// makes httpx treat it as terminal again and silently reduces
+	// every notification to one attempt; a recovered notice is
+	// best-effort-once and would be lost outright.
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			// Outlast the first attempt's deadline. The body is drained
+			// first and the wait carries a hard bound because the request
+			// context is NOT a reliable client-disconnect signal here (with
+			// an unread body the server never notices the closed
+			// connection), and an unbounded wait hangs the test binary
+			// rather than failing it.
+			_, _ = io.Copy(io.Discard, r.Body)
+			select {
+			case <-r.Context().Done():
+			case <-time.After(attemptTimeout + 2*time.Second):
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := New(srv.URL, "node-1")
+	t.Cleanup(d.Close)
+
+	if err := d.post(context.Background(), "missing probe", "body"); err != nil {
+		t.Fatalf("post() after a retried attempt timeout = %v, want nil", err)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Errorf("delivery attempts = %d, want 2 (an attempt timeout must be retried)", got)
+	}
+}
+
+func TestAttemptTimeoutErrorIsRetryableAndOpaque(t *testing.T) {
+	t.Parallel()
+
+	// postAttempt translates a fired per-attempt deadline into
+	// attemptTimeoutError so httpx.Do retries it. Two properties keep that
+	// working: httpx must classify it transient, and it must NOT unwrap to
+	// context.DeadlineExceeded -- httpx rejects context errors as terminal
+	// BEFORE consulting IsTransient, so adding an Unwrap would silently
+	// restore the single-attempt loss this type exists to fix.
+	if errors.Is(attemptTimeoutError{}, context.DeadlineExceeded) {
+		t.Error("attemptTimeoutError unwraps to context.DeadlineExceeded: httpx.Do would treat it as terminal before consulting IsTransient")
+	}
+	if !httpx.IsTransient(attemptTimeoutError{}) {
+		t.Error("httpx.IsTransient(attemptTimeoutError{}) = false: a timed-out attempt would not be retried")
 	}
 }
 

@@ -673,3 +673,34 @@ func TestLogUndeliveredClassifiesOnlyEndedRecordsAsPermanentLoss(t *testing.T) {
 		t.Errorf("loss warning does not distinguish the re-detectable ongoing outage: %v", rec.Records())
 	}
 }
+
+func TestLogUndeliveredStaysQuietForAnOngoingOutageOnly(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default. The mixed-queue test cannot see this branch -- its beat has an
+	// ended record, so the WARN fires for it either way. Only a queue holding
+	// nothing but the open tail proves logUndelivered stays quiet about an
+	// outage the boot-armed clock re-detects after the restart; without this
+	// assertion, dropping the `p.lost == 0` guard pages the operator that
+	// "no notice will ever arrive" for an outage that will in fact be
+	// re-detected -- the exact false alarm the classification exists to avoid.
+	const id = "shutdown-ongoing-only-probe"
+	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+
+	// One silence, never closed by a ping and never delivered: the queue holds
+	// exactly the open tail.
+	clock.Advance(11 * time.Minute)
+	w.collectDue()
+
+	rec := capture.Default(t)
+	w.logUndelivered()
+
+	if !rec.HasAttr("watch loop stopped", "undelivered_records", "1") {
+		t.Errorf("shutdown summary does not count the queued record: %v", rec.Records())
+	}
+	if !rec.HasAttr("watch loop stopped", "permanent_loss", "0") {
+		t.Errorf("an ongoing outage must not be reported as permanently lost: %v", rec.Records())
+	}
+	if got := rec.CountLevel(slog.LevelWarn, "shutting down with undelivered ended-outage records"); got != 0 {
+		t.Errorf("ended-outage loss warnings = %d, want 0 for an ongoing outage: %v", got, rec.Messages())
+	}
+}
