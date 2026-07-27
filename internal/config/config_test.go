@@ -505,6 +505,53 @@ func TestLoadRejectsUnreadableWebhookFile(t *testing.T) {
 	}
 }
 
+// TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileReadFails pins the
+// POSITION of warnPlainVarIgnored's two call sites: both must sit PAST their
+// loader's error gate. envx reports SourceFile together with its error on a
+// failed file read, so a call made before the gate warns "the file wins and
+// the plain variable is ignored" on a startup that is aborting because the
+// file supplied nothing — and its "unset it" advice then deletes the one
+// credential still present in the environment. Both loaders are pinned here:
+// they are structurally identical uses of the same helper, and the fatal-path
+// warning is invisible to every other test in this file (the two
+// FileWinsOverPlainVar tests supply a readable file, and the
+// RejectsUnreadable* tests capture no log).
+func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileReadFails(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	t.Run("webhook file unreadable", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "missing-webhook")
+		setValidLoadEnv(t)
+		t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/fallback")
+		t.Setenv("DISCORD_WEBHOOK_URL_FILE", missing)
+
+		rec := capture.Default(t)
+
+		if _, err := Load(); err == nil {
+			t.Fatal("Load() with an unreadable DISCORD_WEBHOOK_URL_FILE = nil, want error")
+		}
+		if rec.Contains("the plain variable is ignored") {
+			t.Errorf("a failed webhook file read warned that the plain variable is ignored: %v; the file supplied nothing, and following the advice deletes the only webhook URL left in the environment", rec.Messages())
+		}
+	})
+
+	t.Run("beat token file unreadable", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "missing-beat-token")
+		setValidLoadEnv(t)
+		t.Setenv("BEAT_TOKEN", "fallback-beat-token")
+		t.Setenv("BEAT_TOKEN_FILE", missing)
+
+		rec := capture.Default(t)
+
+		if _, err := Load(); err == nil {
+			t.Fatal("Load() with an unreadable BEAT_TOKEN_FILE = nil, want error")
+		}
+		if rec.Contains("the plain variable is ignored") {
+			t.Errorf("a failed beat-token file read warned that the plain variable is ignored: %v; it reads as \"the gate is armed from the file\" while the process is refusing to start", rec.Messages())
+		}
+	})
+}
+
 func TestLoadRejectsUnreadableBeatTokenFile(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing-beat-token")
 	setValidLoadEnv(t)

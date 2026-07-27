@@ -940,10 +940,12 @@ func TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError(t *testing.T)
 		}
 	}
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	// Captured after the control probe above, so only the delivery below can
+	// contribute lines. requireLogged is deliberately NOT used: a delivery
+	// that succeeds on the first attempt logs nothing, and this test's
+	// non-vacuity comes from the control read of the malformed trailer
+	// instead.
+	buf := captureDeliveryLogs(t)
 
 	d := New(srv.URL+secretPath, "node-1")
 	t.Cleanup(d.Close)
@@ -958,6 +960,72 @@ func TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError(t *testing.T)
 		if got := buf.String(); strings.Contains(got, leak) {
 			t.Errorf("delivery logs carry %q from the body drain's read error: %s", leak, got)
 		}
+	}
+}
+
+// countingBody is an io.ReadCloser that reports how many bytes were read from
+// it and how many times it was closed. It stands in for a response body
+// because the drain contract is about read VOLUME, which no httptest server
+// can report: the bytes are discarded, and the only observable difference
+// between draining and not draining on a real socket is connection reuse,
+// a timing experiment.
+type countingBody struct {
+	remaining int
+	read      int
+	closed    int
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	if b.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := min(len(p), b.remaining)
+	b.remaining -= n
+	b.read += n
+	return n, nil
+}
+
+func (b *countingBody) Close() error {
+	b.closed++
+	return nil
+}
+
+// TestDrainCloseReadsUpToTheDrainLimitThenCloses pins that drainClose actually
+// DRAINS, not just closes. Its sibling
+// TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError pins the other
+// half of the contract (a drain read error never reaches a logger, because its
+// text is remote-authored) and cannot pin this one: with the CopyN deleted the
+// response is still a delivered 2xx and no read error is produced, so every
+// assertion there still passes while keep-alive reuse is silently forfeited for
+// every successful response carrying a body. Byte counts are the oracle, and
+// the local helper exists to preserve httpx.DrainClose's read-then-close
+// behavior verbatim (drainClose replaces it only to keep the read error away
+// from slog.Default()).
+func TestDrainCloseReadsUpToTheDrainLimitThenCloses(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		size     int
+		wantRead int
+	}{
+		"shorter than the limit is read through EOF": {size: 1024, wantRead: 1024},
+		"exactly the limit is read whole":            {size: drainBytes, wantRead: drainBytes},
+		"longer than the limit stops at it":          {size: drainBytes + 4096, wantRead: drainBytes},
+		"empty body reads nothing and still closes":  {size: 0, wantRead: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			body := &countingBody{remaining: tc.size}
+			drainClose(body)
+
+			if body.read != tc.wantRead {
+				t.Errorf("drainClose read %d bytes of a %d-byte body, want %d: an undrained connection cannot be reused, so every notice pays a fresh TLS handshake", body.read, tc.size, tc.wantRead)
+			}
+			if body.closed != 1 {
+				t.Errorf("drainClose closed the body %d times, want exactly 1: an unclosed body leaks the connection outright", body.closed)
+			}
+		})
 	}
 }
 
@@ -1066,6 +1134,63 @@ func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 			for _, notWant := range tc.notWant {
 				if strings.Contains(err.Error(), notWant) {
 					t.Errorf("err = %v, must not report %q", err, notWant)
+				}
+			}
+		})
+	}
+}
+
+func TestAuthRejectionsNameTheWebhookURLNotAnAPIKey(t *testing.T) {
+	t.Parallel()
+
+	// CheckHTTPStatus renders 401/403 as "invalid API key (401)" / "access
+	// denied (403)" - wording for a keyed API. knell sends no API key
+	// (DISCORD_WEBHOOK_URL's own path and token ARE the credential), and
+	// BEAT_TOKEN, the only key-shaped setting it has, gates the INBOUND /beat
+	// endpoint. So both statuses must name DISCORD_WEBHOOK_URL themselves,
+	// INCLUDING on the paths where statusDetail contributes no Discord code: an
+	// edge or WAF in front of the webhook answers 401/403 with its own HTML or
+	// an empty body, never Discord's error object, and that is precisely when
+	// the operator has nothing else to go on. Asserting the credential is named
+	// rather than the exact sentence, so the wording stays free to change.
+	for name, tc := range map[string]struct {
+		status int
+		body   string
+	}{
+		"401 with Discord's code":    {status: http.StatusUnauthorized, body: `{"code": 50027}`},
+		"401 from an edge with none": {status: http.StatusUnauthorized, body: "<html>Forbidden</html>"},
+		"401 with no body at all":    {status: http.StatusUnauthorized, body: ""},
+		"403 with Discord's code":    {status: http.StatusForbidden, body: `{"code": 10015}`},
+		"403 from an edge with none": {status: http.StatusForbidden, body: "<html>Forbidden</html>"},
+		"403 with no body at all":    {status: http.StatusForbidden, body: ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			d := New(srv.URL+"/api/webhooks/1234567890/plainsegment", "node-1")
+			defer d.Close()
+
+			err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
+			if err == nil {
+				t.Fatalf("BeatMissing against a %d = nil, want error", tc.status)
+			}
+			// The verdict must stand on its own, so it is asserted on every
+			// body shape and not only the one carrying Discord's code.
+			for _, want := range []string{"DISCORD_WEBHOOK_URL", "knell sends no API key"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err = %v, want it to name %q", err, want)
+				}
+			}
+			// Neither the body's own words nor the credential itself.
+			for _, leak := range []string{"plainsegment", "<html>"} {
+				if strings.Contains(err.Error(), leak) {
+					t.Errorf("err = %v, kept %q", err, leak)
 				}
 			}
 		})

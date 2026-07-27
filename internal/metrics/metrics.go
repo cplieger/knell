@@ -30,12 +30,12 @@
 //   - internal/webapi answers 404 for an unknown id, so an arbitrary request
 //     path never reaches watch.Beat at all.
 //
-// The only packages that may call the four id-taking functions are
-// internal/watch (production), internal/webapi's own tests and this package's
-// own tests (both fixed literal ids). If you are adding a call from anywhere
-// else, you have just inherited
-// that contract: pass only an id internal/config validated and capped, or
-// route through internal/watch, or validate the id yourself before the call.
+// The only PRODUCTION caller of the four id-taking functions is
+// internal/watch; test code in this module may also call them, with fixed
+// literal ids only. If you are adding any other production call, you have
+// just inherited that contract: pass only an id internal/config validated and
+// capped, or route through internal/watch, or validate the id yourself before
+// the call.
 // A raw id from a request path, a filename, a log line or a remote payload
 // makes Mimir's label set grow without bound, and the growth is not
 // recoverable by fixing the caller afterwards.
@@ -231,9 +231,14 @@ var httpRequests = metricslib.NewLabeledCounter(
 )
 
 // httpDuration observes served-request latency across the whole surface. It
-// is deliberately unlabelled: knell serves three routes and the per-route
-// split is already available by pairing httpRequests with it, so a labelled
-// histogram would multiply bucket series for no operator question.
+// is deliberately unlabelled: a labelled histogram would multiply bucket
+// series per route for no operator question on a three-route surface, and
+// the aggregate still surfaces the one signal that matters here (a slow
+// request — e.g. a body drain riding out the 30s read timeout — lands past
+// the 1.0s top default bucket). httpRequests carries the per-route
+// request/status split; per-route LATENCY is deliberately not derivable from
+// this pair, and a route label should be added here if that question ever
+// becomes real.
 var httpDuration = metricslib.NewHistogram(
 	"http_request_duration_seconds",
 	"Served HTTP request duration in seconds.",

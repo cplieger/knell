@@ -164,7 +164,7 @@ func noStore(next http.Handler) http.Handler {
 const unmatchedLabel = "unmatched"
 
 // otherMethodLabel is the method recorded for a request that matched the
-// method-agnostic /beat/{id} route (the 405 catch-all registered below). That
+// method-agnostic /beat/{id} route (the 405 catch-all New registers above). That
 // pattern names no method, so r.Method there is whatever token the caller put
 // on the request line, and net/http accepts any RFC 9110 token — measured over
 // a real socket, both "XYZZY" and "M!#$%&'*+-.^_`|~" route to that pattern and

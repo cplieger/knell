@@ -155,3 +155,57 @@ func TestNotificationCountersAdvertiseTheKindListInTheirHelpText(t *testing.T) {
 		}
 	}
 }
+
+// TestRecordHTTPRecordsBothTheCounterAndTheDuration pins that RecordHTTP wires
+// BOTH of its collectors. internal/webapi's routed tests pin the counter and
+// its label derivation, but nothing observes the histogram: with httpDuration
+// dropped from the call, knell_http_request_duration_seconds stays at its
+// registered zero forever and the whole test suite still passes, so the
+// latency view an operator uses to tell a slow webhook from a slow scrape can
+// be silently unwired. Asserted from inside the package because the histogram
+// is unlabelled — there is no series a routed test could attribute to its own
+// request.
+func TestRecordHTTPRecordsBothTheCounterAndTheDuration(t *testing.T) {
+	const (
+		method = "POST"
+		path   = "/record-http-probe/{id}"
+		status = 418
+	)
+	counter := `knell_http_requests_total{method="` + method + `",path="` + path + `",status="418"} `
+
+	countBefore, _ := rawSeriesValue(t, "knell_http_request_duration_seconds_count")
+	sumBefore, _ := rawSeriesValue(t, "knell_http_request_duration_seconds_sum")
+	if _, ok := rawSeriesValue(t, counter); ok {
+		t.Fatalf("%s is already present: the probe route is not unique to this test", counter)
+	}
+
+	RecordHTTP(method, path, status, 250*time.Millisecond)
+
+	if got, ok := rawSeriesValue(t, counter); !ok || got != "1" {
+		t.Errorf("%s = %q (present=%v), want 1: the counter is the only view of a refused ping", counter, got, ok)
+	}
+	countAfter, ok := rawSeriesValue(t, "knell_http_request_duration_seconds_count")
+	if !ok || countAfter == countBefore {
+		t.Errorf("knell_http_request_duration_seconds_count = %q, was %q: RecordHTTP observed no duration, so the latency view is unwired", countAfter, countBefore)
+	}
+	sumAfter, _ := rawSeriesValue(t, "knell_http_request_duration_seconds_sum")
+	if sumAfter == sumBefore {
+		t.Errorf("knell_http_request_duration_seconds_sum = %q, was %q: the observation carried no elapsed time", sumAfter, sumBefore)
+	}
+}
+
+// rawSeriesValue returns the rendered value of the first exposition line
+// starting with prefix, and whether one was present. The beat-labelled sibling
+// beatSeriesValue cannot serve the http series: one is unlabelled and the
+// other is keyed on method/path/status.
+func rawSeriesValue(t *testing.T, prefix string) (string, bool) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	for line := range strings.Lines(rec.Body.String()) {
+		if v, ok := strings.CutPrefix(line, prefix); ok {
+			return strings.TrimSpace(v), true
+		}
+	}
+	return "", false
+}

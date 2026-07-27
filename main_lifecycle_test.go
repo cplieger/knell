@@ -394,6 +394,30 @@ func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() { done <- run() }()
+	// Stop run() even when a t.Fatalf below skips the explicit SIGTERM: a
+	// surviving run goroutine keeps the listener, the signal registration and
+	// the shared marker alive into later tests, and would consume a later
+	// test's process-wide SIGTERM.
+	runStopped := false
+	t.Cleanup(func() {
+		if runStopped {
+			return
+		}
+		select {
+		case <-done:
+			return
+		default:
+		}
+		if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+			t.Errorf("cleanup signal: %v", err)
+			return
+		}
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("run() did not stop during cleanup")
+		}
+	})
 	waitForMarkerWithin(t, true, 10*time.Second)
 
 	url := "http://" + addr + "/beat/" + beat
@@ -424,6 +448,7 @@ func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 	}
 	select {
 	case err := <-done:
+		runStopped = true
 		if err != nil {
 			t.Fatalf("run() = %v, want nil after a shutdown signal", err)
 		}
@@ -474,7 +499,7 @@ func postBeat(t *testing.T, url, auth string) beatResponse {
 // abandoned deliveries went unlogged, so a false one sends the operator hunting
 // for lost notices that were never lost.
 //
-// The repetition is the oracle: collapsing the three selects into one is
+// The repetition is the oracle: collapsing the two selects into one is
 // detected by a single call only half the time, so one call cannot pin the
 // guard at all; 200 calls make the collapse practically certain to show up and
 // still finish in microseconds.
@@ -532,9 +557,10 @@ func TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace(t *testing.T) {
 	stopping := make(chan struct{})
 	teardownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	time.AfterFunc(stopAfter, func() { close(stopping) })
-
 	start := time.Now()
+	timer := time.AfterFunc(stopAfter, func() { close(stopping) })
+	defer timer.Stop()
+
 	awaitWatchLoop(teardownCtx, stopping)
 	waited := time.Since(start)
 

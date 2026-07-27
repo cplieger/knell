@@ -221,7 +221,7 @@ func run() error {
 		// in-flight requests outlived the single grace budget. Name that, so
 		// the one ERROR line points at the drain and at the constant that
 		// bounds it instead of at an anonymous expired context.
-		return fmt.Errorf("in-flight requests did not drain within the %s shutdown grace: %w", shutdownGrace, err)
+		return fmt.Errorf("the shutdown sequence outlived the %s shutdown grace (in-flight requests still draining, or a stalled pre-drain hook): %w", shutdownGrace, err)
 	}
 	return err
 }
@@ -235,7 +235,7 @@ func awaitWatchLoop(teardownCtx context.Context, watcherDone <-chan struct{}) {
 	case <-watcherDone:
 	case <-teardownCtx.Done():
 		// webhttp.Run derives teardownCtx from the SAME deadline srv.Shutdown
-		// just spent, so a drain that used the whole grace hands this hook an
+		// just spent, so a drain that used the whole grace hands this function an
 		// already-expired context, and a select with both cases ready picks
 		// pseudo-randomly. Re-check before declaring the loop still running,
 		// or a watch loop that DID stop is reported as hung half the time.

@@ -1025,7 +1025,7 @@ func (w *Watcher) finishRecovery(id string) {
 // Cancellation is exempt from both counters: a shutdown is not a delivery
 // failure. It is NOT covered by logUndelivered's tally either, though — the
 // event was already taken off w.recoveries by Run's select, so the drain
-// there cannot see it and queued_recoveries excludes it. The line above is
+// there cannot see it and queued_recoveries excludes it. The Info line below is
 // this loss's ONLY trace, which is why it names the beat and its span.
 // The failure log below stays at Error rather than the Warn the queue-full
 // drops use, because unlike them something WAS attempted and the webhook is

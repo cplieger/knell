@@ -243,13 +243,18 @@ func FuzzRedirectResponsesNeverCarryLocationText(f *testing.F) {
 		// no-usable-Location path.
 		status := 300 + int(statusSeed%9)
 		const rawURL = "https://discord.example/api/webhooks/1234567890/plainsegment"
-		// A fixed control Location isolates knell's own message template: a
-		// fuzzed header that happens to contain a phrase like "nothing was
-		// delivered" cannot masquerade as a leak.
+		// The control attempt differs in BOTH the webhook URL and the
+		// Location, which is what makes the skip below mean "this text came
+		// from knell's own message template". A control sharing rawURL would
+		// carry a leaked webhook URL too, and would then skip every
+		// webhookNeedles entry — silently disarming that half of the oracle on
+		// the one target whose whole status band is the 3xx branch (the sibling
+		// target's controlURL exists for the same reason).
+		const controlURL = "https://control.example/hooks/controlsegment"
 		const controlLocation = "/control-hop"
 
 		gotErr := attemptAgainstRedirectStub(t, rawURL, status, location)
-		controlErr := attemptAgainstRedirectStub(t, rawURL, status, controlLocation)
+		controlErr := attemptAgainstRedirectStub(t, controlURL, status, controlLocation)
 		if gotErr == nil {
 			// Every status here is a non-2xx, so a nil would report an
 			// undelivered notification as delivered.
