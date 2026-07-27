@@ -9,9 +9,12 @@
 //
 // Notifications are split by whether the incident is still open. A live
 // outage gets the present-tense missing notice and, when the beat returns,
-// its recovered notice. Outages that had already ended before their notice
-// could be delivered (a webhook outage held them back) are reported once as
-// history, so a resolved incident is never announced as a new live failure.
+// its recovered notice. Outages that were already over by the time anything
+// about them could be sent are reported once as history, so a resolved
+// incident is never announced as a new live failure. A notice is late for one
+// of two reasons — a webhook outage held its alert back, or the outage ended
+// between two sweeps and no alert was ever due — and each record carries
+// which one (LateReason), because the operator's next step differs.
 package watch
 
 import (
@@ -30,7 +33,7 @@ import (
 //
 // The first two methods report a LIVE incident as it happens; the third
 // reports outages that were already over by the time their notice could be
-// delivered, so an implementation must render it in the past tense. Nothing
+// sent, so an implementation must render it in the past tense. Nothing
 // else distinguishes the two: a live outage never reaches
 // BeatOutageHistory, and a history notice is never followed by
 // BeatRecovered calls for the outages it covers.
@@ -41,13 +44,43 @@ type Notifier interface {
 	// BeatRecovered reports that id pinged again after having been declared
 	// missing, downFor after its last accepted ping.
 	BeatRecovered(ctx context.Context, id string, downFor time.Duration) error
-	// BeatOutageHistory reports outages of id that had already ended before
-	// their notice could be delivered, collapsed into a single past-tense
-	// notice. outages is chronological and never empty, and every entry
-	// carries its own recovery point, so the implementation must not
-	// present them as ongoing.
+	// BeatOutageHistory reports outages of id that were already over by the
+	// time anything about them could be sent, collapsed into a single
+	// past-tense notice. outages is chronological and never empty, and every
+	// entry carries its own recovery point, so the implementation must not
+	// present them as ongoing. Each entry also carries its own LateReason,
+	// which the implementation must report rather than assume: one batch can
+	// hold both.
 	BeatOutageHistory(ctx context.Context, id string, outages []Outage) error
 }
+
+// LateReason names WHY an outage was already over by the time anything about
+// it could be sent — why its notice is past tense rather than a live alarm.
+// Both values route identically (see collectDue) and both render in the past
+// tense; they differ in what the operator should DO, which is the one thing a
+// past-tense notice cannot state correctly without being told.
+type LateReason uint8
+
+const (
+	// LateUndelivered means a sweep detected the outage while it was still
+	// open, so a live missing notice WAS due for it, and that notice had not
+	// been delivered when the ping ended the outage. Every way that happens is
+	// a delivery that did not complete in time — the send failed, the beat was
+	// held behind an earlier recovery, or sweepSendBudget deferred it to a
+	// later sweep — so the notice points the operator at the webhook.
+	//
+	// It is the zero value deliberately: a future producer that queues a
+	// record without naming a reason then points at delivery instead of
+	// vouching for it, and a delivery path that is quietly behind is the one
+	// thing a dead-man switch must never claim is healthy.
+	LateUndelivered LateReason = iota
+	// LateEndedBeforeDetection means no sweep ever saw this outage. It crossed
+	// its deadline and was ended by a ping inside the gap between two sweeps
+	// (DefaultTick), so no live notice was ever due and delivery was never
+	// involved. Reporting it as a delivery problem would send an operator
+	// hunting through a webhook that was working.
+	LateEndedBeforeDetection
+)
 
 // Outage is one already-ended outage as the state machine observed it, the
 // unit BeatOutageHistory reports. It is the watch package's own output type,
@@ -64,6 +97,10 @@ type Outage struct {
 	// was detected. It is a reading taken during the outage, so it is at or
 	// below the outage's full span; DownFor is the span itself.
 	Silence time.Duration
+	// LateReason says why this outage is reported after the fact instead of
+	// as a live incident. The renderer must not guess it: the two reasons
+	// lead an operator to opposite next steps.
+	LateReason LateReason
 }
 
 // DownFor is the outage's full span: from the last ping before it to the
@@ -138,12 +175,15 @@ const missingQueueSize = 8
 // stays queued on the beat until its notification is delivered.
 // recoveredAt is set once a ping ends the outage (zero while it is still
 // ongoing), so the ended outage's span survives the wait and its notice can
-// report it in the past tense instead of as a live failure.
+// report it in the past tense instead of as a live failure. late says WHY
+// that past-tense notice is late, which only the code that records the
+// crossing knows (see LateReason).
 type overdueBeat struct {
 	seen        time.Time
 	recoveredAt time.Time
 	id          string
 	silence     time.Duration
+	late        LateReason
 }
 
 // beatState is the per-beat tracking record.
@@ -202,11 +242,13 @@ func (st *beatState) openMissing() *overdueBeat {
 
 // pushMissing appends a detected missing transition, reporting false when
 // the queue is already at its bound (the caller accounts for the overflow).
-func (st *beatState) pushMissing(rec overdueBeat) bool {
+// rec is taken by pointer only to avoid copying the record (gocritic
+// hugeParam); the record is COPIED into the queue, never aliased.
+func (st *beatState) pushMissing(rec *overdueBeat) bool {
 	if len(st.pendingMissing) >= missingQueueSize {
 		return false
 	}
-	st.pendingMissing = append(st.pendingMissing, rec)
+	st.pendingMissing = append(st.pendingMissing, *rec)
 	return true
 }
 
@@ -247,9 +289,10 @@ func (st *beatState) closedRun() []Outage {
 			break
 		}
 		run = append(run, Outage{
-			Started:   rec.seen,
-			Recovered: rec.recoveredAt,
-			Silence:   rec.silence,
+			Started:    rec.seen,
+			Recovered:  rec.recoveredAt,
+			Silence:    rec.silence,
+			LateReason: rec.late,
 		})
 	}
 	return run
@@ -266,7 +309,10 @@ func (st *beatState) closedRun() []Outage {
 // outage was detected and counted by an earlier call", which covers both a
 // re-detection while the queue stays full and the later call that finally
 // queues that outage.
-func queueDetectedOutage(st *beatState, rec overdueBeat) bool {
+//
+// rec travels by pointer through this trio only to avoid copying the record at
+// every hop (gocritic hugeParam); nothing here retains the pointer.
+func queueDetectedOutage(st *beatState, rec *overdueBeat) bool {
 	if !st.overflowAccounted {
 		metrics.RecordOutage(rec.id)
 	}
@@ -284,7 +330,7 @@ func queueDetectedOutage(st *beatState, rec overdueBeat) bool {
 // closed record, and the same ping re-arms the beat), so gating it would hide
 // the loss in exactly the sequence that produces it. Contrast
 // recordOngoingOutage. Callers hold w.mu.
-func recordEndedOutage(st *beatState, rec overdueBeat) {
+func recordEndedOutage(st *beatState, rec *overdueBeat) {
 	if queueDetectedOutage(st, rec) {
 		return
 	}
@@ -301,7 +347,7 @@ func recordEndedOutage(st *beatState, rec overdueBeat) {
 // moves, and the back-pressure is logged at DEBUG once per affected outage via
 // overflowAccounted rather than once per tick. Contrast recordEndedOutage.
 // Callers hold w.mu.
-func recordOngoingOutage(st *beatState, rec overdueBeat) {
+func recordOngoingOutage(st *beatState, rec *overdueBeat) {
 	if queueDetectedOutage(st, rec) {
 		return
 	}
@@ -314,6 +360,26 @@ func recordOngoingOutage(st *beatState, rec overdueBeat) {
 	slog.Debug("pending missing queue full, ongoing outage stays detected and is queued once a slot frees",
 		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.String(),
 		"since", rec.seen)
+}
+
+// lateReasonForUnqueuedOutage names why the notice for an outage that has NO
+// queued record of its own will be late, for the ping that is about to record
+// the whole closed outage. Reaching that arm means no sweep left an open
+// record for this outage, which is normally because no sweep ran while it was
+// open: it crossed its deadline and ended between two ticks, so no live notice
+// was ever due and delivery was never involved (LateEndedBeforeDetection).
+//
+// The exception is overflowAccounted: a sweep DID detect this same outage and
+// could not queue it because the queue was full, which only happens while a
+// sustained delivery failure keeps eight records undelivered. That outage's
+// notice is late because delivery was not keeping up, so it reports
+// LateUndelivered — calling it undetected would vouch for a webhook that is
+// demonstrably behind. Callers hold w.mu.
+func lateReasonForUnqueuedOutage(st *beatState) LateReason {
+	if st.overflowAccounted {
+		return LateUndelivered
+	}
+	return LateEndedBeforeDetection
 }
 
 // recoveryEvent is a queued recovered transition, measured at ping arrival.
@@ -378,14 +444,22 @@ func (w *Watcher) Beat(id string) bool {
 	// this ping cannot erase it. Recording no longer depends on the queue
 	// being empty, so an outage that both begins AND ends while an earlier
 	// notice is undelivered still reaches Discord instead of vanishing.
+	//
+	// The two arms are the two reasons a history notice is late, and they are
+	// only distinguishable here: sealing an open record leaves the reason the
+	// sweep recorded (LateUndelivered — a live notice was due and had not been
+	// delivered), while recording a closed outage names the reason from what
+	// the sweep managed to see of it (lateReasonForUnqueuedOutage). Read
+	// overflowAccounted before the reset below clears it.
 	if open := st.openMissing(); open != nil {
 		open.recoveredAt = now
 	} else if !wasAlerted && overdue(downFor, st.deadline) {
-		recordEndedOutage(st, overdueBeat{
+		recordEndedOutage(st, &overdueBeat{
 			id:          id,
 			silence:     downFor,
 			seen:        previousSeen,
 			recoveredAt: now,
+			late:        lateReasonForUnqueuedOutage(st),
 		})
 	}
 	// This ping ends the beat's outage, so a later queue-full overflow
@@ -610,11 +684,11 @@ func (w *Watcher) sweep(ctx context.Context) {
 			return
 		}
 	}
-	for i, beat := range live {
+	for i := range live {
 		if w.budgetSpent(budget, len(live)-i) {
 			return
 		}
-		if w.sendMissing(ctx, beat) {
+		if w.sendMissing(ctx, &live[i]) {
 			return
 		}
 	}
@@ -633,6 +707,14 @@ func (w *Watcher) sweep(ctx context.Context) {
 // why a cut can never swallow an outage. DEBUG matches recordOngoingOutage:
 // like a full pending queue during a webhook outage, this is back-pressure
 // that costs a tick, not a fault.
+//
+// A deferral is also a third way a notice becomes late: if the beat pings
+// before the next sweep reaches it, its queued open record is sealed and the
+// outage is reported as history. That record was queued by collectDue, so it
+// reports LateUndelivered, which is the true reason — the alert that was due
+// was not delivered before the beat returned — and pointing at the webhook
+// fits: this budget only bites when sends are slow enough to spend 5s, which a
+// healthy webhook never is (TestFastSendsDeliverEveryDueBeatInOneSweep).
 func (w *Watcher) budgetSpent(budget time.Time, deferred int) bool {
 	if !w.now().After(budget) {
 		return false
@@ -669,8 +751,18 @@ func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
 		// a fresh crossing to record. Recording it here rather than
 		// skipping the beat is what keeps a second outage alive while an
 		// earlier notice is still undelivered.
+		//
+		// A record this path queues is OPEN, so it can only ever become
+		// history if a ping ends the outage before its live notice was
+		// delivered: the send failed, st.recovering held the beat behind an
+		// earlier recovery, or sweepSendBudget deferred it to a later sweep.
+		// All three are one fact — the alert that was due had not been
+		// delivered — so the reason is LateUndelivered for every one of them,
+		// stated here rather than left to the zero value.
 		if !fresh && !st.alerted && st.openMissing() == nil {
-			recordOngoingOutage(st, overdueBeat{id: id, silence: silence, seen: st.lastSeen})
+			recordOngoingOutage(st, &overdueBeat{
+				id: id, silence: silence, seen: st.lastSeen, late: LateUndelivered,
+			})
 		}
 		head := st.headMissing()
 		if head == nil {
@@ -708,8 +800,11 @@ func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
 }
 
 // sendMissing delivers one due missing transition and reports whether
-// shutdown cancellation should stop the sweep.
-func (w *Watcher) sendMissing(ctx context.Context, beat overdueBeat) bool {
+// shutdown cancellation should stop the sweep. beat points into the sweep's
+// OWN slice of records collectDue copied out under the lock — never at a
+// queued record — so reading it here without the lock is safe; the pointer
+// only avoids copying the record again (gocritic hugeParam).
+func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 	if err := w.notifier.BeatMissing(ctx, beat.id, beat.silence); err != nil {
 		if errors.Is(err, context.Canceled) {
 			slog.Info("missing notification abandoned, shutting down", "beat", beat.id)

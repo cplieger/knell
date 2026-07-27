@@ -116,6 +116,10 @@ func TestBeatOutageHistoryReportsOneEndedOutageInThePastTense(t *testing.T) {
 		Started:   recovered.Add(-12 * time.Minute),
 		Recovered: recovered,
 		Silence:   11 * time.Minute,
+		// The case the history path was built for: a sweep raised the alert
+		// and the webhook was unreachable, so the notice arrives after the
+		// outage it reports.
+		LateReason: watch.LateUndelivered,
 	}}
 	if err := d.BeatOutageHistory(context.Background(), "api", outages); err != nil {
 		t.Fatalf("BeatOutageHistory: %v", err)
@@ -125,7 +129,10 @@ func TestBeatOutageHistoryReportsOneEndedOutageInThePastTense(t *testing.T) {
 	// cannot satisfy this string, so dropping the date fails here rather
 	// than shipping a recovery point that could be any day (the notice is
 	// late by construction — see historyTimeFormat).
-	for _, want := range []string{"node-1", "api", "was missing for 12m0s", "recovered at 2026-07-23 14:07 UTC"} {
+	for _, want := range []string{
+		"node-1", "api", "was missing for 12m0s", "recovered at 2026-07-23 14:07 UTC",
+		"still undelivered", "check the webhook",
+	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("content %q missing %q", content, want)
 		}
@@ -164,10 +171,13 @@ func TestBeatOutageHistorySummarizesSeveralEndedOutages(t *testing.T) {
 	content := <-rec.contents
 	for _, want := range []string{
 		"node-1", "api",
-		"had 3 outages while notifications were failing",
+		"had 3 outages",
 		"longest 47m0s",
 		// Whole timestamp, date included: see the singular test.
 		"last recovered at 2026-07-23 14:07 UTC",
+		// Every entry above carries the zero LateReason (LateUndelivered),
+		// which is also what a producer that names no reason gets.
+		"still undelivered", "check the webhook",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("content %q missing %q", content, want)
@@ -175,6 +185,118 @@ func TestBeatOutageHistorySummarizesSeveralEndedOutages(t *testing.T) {
 	}
 	if strings.Contains(content, "MISSING") {
 		t.Errorf("content %q reports ended outages with the live-alarm wording", content)
+	}
+}
+
+// TestBeatOutageHistoryStatesTheTrueReasonForALateNotice pins the mapping from
+// watch.LateReason to the clause an operator acts on, for every shape of batch.
+// Each case asserts BOTH the wording that belongs to its reason and the wording
+// that belongs to the OTHER one: a want-only assertion still passes if the two
+// clauses are swapped (both mention the outage and a duration), and swapping
+// them is precisely the bug this fixes — telling an operator to inspect a
+// webhook that delivered this message on its first attempt.
+func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
+	t.Parallel()
+
+	recovered := time.Date(2026, 7, 23, 14, 7, 0, 0, time.UTC)
+	// outage builds one ended outage of span with the given late reason; the
+	// spans differ per entry only so the summary's "longest" is unambiguous.
+	outage := func(span time.Duration, reason watch.LateReason) watch.Outage {
+		return watch.Outage{
+			Started:    recovered.Add(-span),
+			Recovered:  recovered,
+			Silence:    span - time.Minute,
+			LateReason: reason,
+		}
+	}
+	const (
+		webhookClause = "check the webhook"
+		undelivered   = "undelivered"
+		selfResolved  = "ended before a sweep detected it"
+		deliveryFine  = "nothing was wrong with delivery"
+	)
+	cases := map[string]struct {
+		outages []watch.Outage
+		want    []string
+		forbid  []string
+	}{
+		"one outage that ended before any sweep saw it": {
+			outages: []watch.Outage{outage(12*time.Minute, watch.LateEndedBeforeDetection)},
+			want:    []string{"was missing for 12m0s", selfResolved, deliveryFine},
+			forbid:  []string{webhookClause, undelivered, "notifications were failing"},
+		},
+		"one outage whose alert the webhook never took": {
+			outages: []watch.Outage{outage(12*time.Minute, watch.LateUndelivered)},
+			want:    []string{"was missing for 12m0s", undelivered, webhookClause},
+			forbid:  []string{selfResolved, deliveryFine},
+		},
+		"a batch of outages that all ended before a sweep saw them": {
+			outages: []watch.Outage{
+				outage(12*time.Minute, watch.LateEndedBeforeDetection),
+				outage(47*time.Minute, watch.LateEndedBeforeDetection),
+			},
+			want:   []string{"had 2 outages", "longest 47m0s", selfResolved, deliveryFine},
+			forbid: []string{webhookClause, undelivered},
+		},
+		"a batch of outages whose alerts were all undelivered": {
+			outages: []watch.Outage{
+				outage(12*time.Minute, watch.LateUndelivered),
+				outage(47*time.Minute, watch.LateUndelivered),
+			},
+			want:   []string{"had 2 outages", "longest 47m0s", undelivered, webhookClause},
+			forbid: []string{selfResolved, deliveryFine},
+		},
+		// The batch a real webhook outage produces on a flapping beat: some
+		// alerts held back, some outages over before a sweep could see them.
+		// Both counts must be stated; picking one reason for the batch says
+		// something false about the other outages.
+		"a batch that mixes both reasons": {
+			outages: []watch.Outage{
+				outage(12*time.Minute, watch.LateUndelivered),
+				outage(47*time.Minute, watch.LateUndelivered),
+				outage(9*time.Minute, watch.LateEndedBeforeDetection),
+			},
+			want: []string{
+				"had 3 outages", "longest 47m0s",
+				"2 had an undelivered alert", "1 ended before a sweep detected it", webhookClause,
+			},
+			forbid: []string{
+				// Neither single-reason clause may stand in for a mixed batch.
+				"Their alerts were still undelivered", "Each " + selfResolved,
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := newWebhookRecorder(http.StatusNoContent)
+			srv := httptest.NewServer(rec.handler(t))
+			defer srv.Close()
+
+			d := New(srv.URL, "node-1")
+			defer d.Close()
+
+			if err := d.BeatOutageHistory(context.Background(), "api", tc.outages); err != nil {
+				t.Fatalf("BeatOutageHistory: %v", err)
+			}
+			content := <-rec.contents
+			for _, want := range tc.want {
+				if !strings.Contains(content, want) {
+					t.Errorf("content %q missing %q", content, want)
+				}
+			}
+			for _, forbidden := range tc.forbid {
+				if strings.Contains(content, forbidden) {
+					t.Errorf("content %q states %q, which belongs to the other late reason", content, forbidden)
+				}
+			}
+			// Past tense and the recovery point are the same for both reasons;
+			// only the explanation differs.
+			if !strings.Contains(content, "recovered at 2026-07-23 14:07 UTC") {
+				t.Errorf("content %q does not report the recovery point", content)
+			}
+		})
 	}
 }
 

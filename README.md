@@ -20,7 +20,7 @@ You configure named beats, each with a deadline. Anything that can send an HTTP 
 - One binary on a `scratch` base: no shell, no libc, no dependencies to patch
 - Deadline clock starts at boot: a beat that never pings at all still alerts one deadline after start, so a restart never silently disarms the switch (the flip side: each restart re-arms full deadlines; see the restart-churn rule under Alerting)
 - One missing notice per live outage (delivery is retried every sweep until it succeeds), one recovered notice when the beat returns
-- Outages that ended while notifications were failing are reported once, in the past tense, instead of arriving as apparent new failures
+- Outages that were already over before anything could be sent are reported once, in the past tense, with the reason the notice is late, instead of arriving as apparent new failures
 - Unknown beat ids are rejected with 404 and never create metric series
 
 ## Quick start
@@ -89,13 +89,17 @@ A live incident and one that is already over are reported differently: nothing a
 
 - **Missing**: sent once per live outage, when a beat first passes its deadline. A failed delivery (Discord outage, network) is retried on every 15s sweep until one succeeds; the beat is only marked notified after a delivered send.
 - **Recovered**: sent on the first accepted ping after a missing notice, best-effort. Delivery uses bounded retries with jittered backoff and honors `Retry-After` on rate limits. It is fire-once: the queued transition is consumed before the send, so a delivery that still fails has nothing left to retry from and that recovery notice will never arrive. It therefore counts as `knell_notifications_dropped_total{kind="recovered"}`, not as a failure you can wait out.
-- **Ended outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of being collapsed into that earlier one and lost. Records whose outage has already ended by the time they can be delivered are reported once in the past tense. One ended outage reads as a single sentence:
+- **Ended outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of being collapsed into that earlier one and lost. Records whose outage has already ended by the time they can be delivered are reported once in the past tense, and the notice says why it is late, because the two reasons ask for different things. An outage whose alert was still undelivered when the beat came back points at the webhook:
 
-  > 🕓 [knell server-1] beat **cron-backup** was missing for 12m0s, recovered at 2026-07-23 14:07 UTC. This notice is late: notifications were failing while the outage happened.
+  > 🕓 [knell server-1] beat **cron-backup** was missing for 12m0s, recovered at 2026-07-23 14:07 UTC. This notice is late: its alert was still undelivered when the beat returned - check the webhook.
 
-  Several become one summary:
+  An outage that ended before a sweep detected it never had an alert to deliver, so there is nothing to check:
 
-  > 🕓 [knell server-1] beat **cron-backup** had 3 outages while notifications were failing: longest 47m0s, last recovered at 2026-07-23 14:07 UTC.
+  > 🕓 [knell server-1] beat **cron-backup** was missing for 12m0s, recovered at 2026-07-23 14:07 UTC. This notice is late only because the outage ended before a sweep detected it - nothing was wrong with delivery.
+
+  Several become one summary. When the batch mixes the two reasons, it reports both counts rather than blaming one for all of them:
+
+  > 🕓 [knell server-1] beat **cron-backup** had 3 outages: longest 47m0s, last recovered at 2026-07-23 14:07 UTC. 2 had an undelivered alert (check the webhook), 1 ended before a sweep detected it.
 
   The whole run of ended outages goes out in a single sweep, so a genuinely live outage queued behind it waits one sweep rather than one sweep per stale record. Because the notice states the outages are over, no recovered notice follows for them.
 - **Queued outages**: each beat queues up to 8 records and reports them oldest first. When a beat's queue is full, the newest record is not queued, and the two cases that can arise differ in consequence:

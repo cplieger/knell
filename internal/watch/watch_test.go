@@ -137,6 +137,48 @@ func checkSpans(t *testing.T, outages []Outage, want ...time.Duration) {
 	}
 }
 
+// reasonName names a late reason for a failure message; the numeric value of
+// an enum tells a reader nothing about which clause the operator would read.
+func reasonName(r LateReason) string {
+	switch r {
+	case LateUndelivered:
+		return "LateUndelivered"
+	case LateEndedBeforeDetection:
+		return "LateEndedBeforeDetection"
+	}
+	return fmt.Sprintf("LateReason(%d)", uint8(r))
+}
+
+// checkLateReasons asserts the reported outages' late reasons in order. The
+// reason is what the notice tells an operator to DO about a notice that
+// arrived after the fact -- inspect the webhook, or nothing at all -- and a
+// swapped reason passes every span, order and count assertion in this file
+// while sending that operator to a webhook that was working (or vouching for
+// one that was not).
+func checkLateReasons(t *testing.T, outages []Outage, want ...LateReason) {
+	t.Helper()
+	if len(outages) != len(want) {
+		t.Fatalf("reported outages = %d (%+v), want %d", len(outages), outages, len(want))
+	}
+	for i, wantReason := range want {
+		if got := outages[i].LateReason; got != wantReason {
+			t.Errorf("outage %d late reason = %s, want %s", i, reasonName(got), reasonName(wantReason))
+		}
+	}
+}
+
+// historyPayloads returns every history payload the notifier received, in
+// delivery order.
+func historyPayloads(n *fakeNotifier) [][]Outage {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make([][]Outage, 0, len(n.histories))
+	for _, h := range n.histories {
+		out = append(out, slices.Clone(h))
+	}
+	return out
+}
+
 func newTestWatcher(beats ...Beat) (*Watcher, *fakeClock, *fakeNotifier) {
 	clock := newFakeClock()
 	notifier := &fakeNotifier{}
@@ -337,7 +379,11 @@ func TestFailedMissingStillDeliversAfterBeatRecovers(t *testing.T) {
 	if len(got) != 1 || got[0].kind != "history" || got[0].outages != 1 {
 		t.Fatalf("calls = %v, want the pending outage delivered as one history notice", got)
 	}
-	checkSpans(t, onlyHistory(t, n), 11*time.Minute)
+	outages := onlyHistory(t, n)
+	checkSpans(t, outages, 11*time.Minute)
+	// A sweep raised this outage and the send failed, so its notice really is
+	// late because delivery could not complete.
+	checkLateReasons(t, outages, LateUndelivered)
 }
 
 func TestSecondOutageNotifiesAgain(t *testing.T) {
@@ -742,6 +788,9 @@ func TestLatePingBeforeSweepPreservesOutage(t *testing.T) {
 	if outages[0].Silence != 11*time.Minute {
 		t.Errorf("detected silence = %s, want the full overdue interval 11m", outages[0].Silence)
 	}
+	// No sweep ever saw this outage, so its notice is late for the cadence,
+	// not for the webhook: the notice must not blame delivery.
+	checkLateReasons(t, outages, LateEndedBeforeDetection)
 }
 
 func TestLatePingDuringPendingRecoveryPreservesSecondOutage(t *testing.T) {
@@ -833,7 +882,12 @@ func TestSecondOutageDuringUndeliveredMissingIsNotErased(t *testing.T) {
 	if got := n.snapshot(); len(got) != 1 {
 		t.Fatalf("calls = %v, want nothing left to send after the collapsed history notice", got)
 	}
-	checkSpans(t, onlyHistory(t, n), 11*time.Minute, 11*time.Minute)
+	outages := onlyHistory(t, n)
+	checkSpans(t, outages, 11*time.Minute, 11*time.Minute)
+	// One batch, two reasons: A's live notice was raised by a sweep and held
+	// back by the dead webhook, while B was over before any sweep saw it. The
+	// summary reports both rather than blaming the webhook for both.
+	checkLateReasons(t, outages, LateUndelivered, LateEndedBeforeDetection)
 }
 
 func TestThreeOutagesQueueWhileNoticesAreUndelivered(t *testing.T) {
@@ -880,6 +934,10 @@ func TestThreeOutagesQueueWhileNoticesAreUndelivered(t *testing.T) {
 	}
 	outages := onlyHistory(t, n)
 	checkSpans(t, outages, 11*time.Minute, 13*time.Minute, 17*time.Minute)
+	// A and B were detected by a sweep whose send failed; C began and ended
+	// with no sweep in between. The batch mixes the two reasons, so the
+	// summary must state both instead of picking one.
+	checkLateReasons(t, outages, LateUndelivered, LateUndelivered, LateEndedBeforeDetection)
 	wantSilence := []time.Duration{11 * time.Minute, 13 * time.Minute, 17 * time.Minute}
 	for i, want := range wantSilence {
 		if outages[i].Silence != want {
@@ -1170,6 +1228,63 @@ func TestSweepDetectedCrossingSurvivesAQueueFullOverflow(t *testing.T) {
 	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
 		t.Errorf("dropped{missing} = %v after a sweep-path queue-full event, want unchanged %v (nothing was dropped: the record was queued once a slot freed)", got, droppedBefore)
 	}
+}
+
+func TestOutageDetectedWhileTheQueueWasFullBlamesDeliveryNotTheSweep(t *testing.T) {
+	t.Parallel()
+
+	// The one path where a CLOSED record recorded by a PING is nevertheless an
+	// outage a sweep already saw: the sweep detected it while the queue was at
+	// its bound, so nothing could be queued for it (overflowAccounted), and the
+	// same sweep then drained the ended backlog and freed the slots. A ping now
+	// records the whole closed outage. Reporting that as "ended before a sweep
+	// detected it" would vouch for a delivery path that was eight records
+	// behind, so lateReasonForUnqueuedOutage reads overflowAccounted and blames
+	// delivery instead.
+	const id = "overflow-reason-probe"
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+
+	// Fill the queue with outages no sweep ever sees.
+	for range missingQueueSize {
+		clock.Advance(11 * time.Minute)
+		if !w.Beat(id) {
+			t.Fatalf("Beat(%s) = false", id)
+		}
+	}
+	if got := len(w.beats[id].pendingMissing); got != missingQueueSize {
+		t.Fatalf("queued records = %d, want the full bound %d", got, missingQueueSize)
+	}
+
+	// A new outage begins with the queue full: this sweep detects it and
+	// cannot queue it, then delivers the whole ended run as one notice.
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	if !w.beats[id].overflowAccounted {
+		t.Fatal("the sweep did not mark the ongoing outage as detected-but-unqueued; this test no longer covers the overflow path")
+	}
+	if got := len(w.beats[id].pendingMissing); got != 0 {
+		t.Fatalf("queued records = %d after the history notice drained the run, want 0", got)
+	}
+
+	// The ping that ends it records the whole closed outage, and the next
+	// sweep reports it.
+	if !w.Beat(id) {
+		t.Fatalf("Beat(%s) = false ending the overflowed outage", id)
+	}
+	w.sweep(context.Background())
+
+	payloads := historyPayloads(n)
+	if len(payloads) != 2 {
+		t.Fatalf("history notices = %d, want 2 (the drained backlog, then the overflowed outage)", len(payloads))
+	}
+	backlog := make([]LateReason, missingQueueSize)
+	for i := range backlog {
+		backlog[i] = LateEndedBeforeDetection
+	}
+	checkLateReasons(t, payloads[0], backlog...)
+	checkSpans(t, payloads[1], 11*time.Minute)
+	checkLateReasons(t, payloads[1], LateUndelivered)
 }
 
 func TestQueuedOngoingOutageReportsLiveSilenceWhenPromoted(t *testing.T) {

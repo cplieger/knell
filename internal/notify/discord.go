@@ -118,14 +118,17 @@ func (d *Discord) BeatRecovered(ctx context.Context, id string, downFor time.Dur
 }
 
 // historyTimeFormat renders the recovery point in the HISTORY notice, and it
-// carries the DATE because that notice exists precisely because it could not
-// be delivered when the outage ended: the record waited in watch's per-beat
+// carries the DATE because that notice can be arbitrarily old: an outage whose
+// alert went undelivered (watch.LateUndelivered) waited in watch's per-beat
 // queue for a webhook that was unreachable, and beat deadlines are measured in
 // hours, so the recovery point being reported is commonly a different day than
 // the message an operator is reading. Discord's own message timestamp only
 // bounds it from above, which leaves a bare "14:07" ambiguous between today,
 // yesterday and Monday — and reconstructing the missed window is the whole
-// point of a late notice.
+// point of a late notice. The other late reason (an outage that ended before a
+// sweep saw it) reports a recovery point at most one sweep old, but it uses the
+// same format: two shapes of the same notice would only invite reading the
+// difference as meaning something.
 //
 // The live notices have no absolute timestamp to widen, deliberately:
 // BeatMissing and BeatRecovered arrive as the transition happens, so their
@@ -138,8 +141,8 @@ func (d *Discord) BeatRecovered(ctx context.Context, id string, downFor time.Dur
 // whole record.
 const historyTimeFormat = "2006-01-02 15:04 MST"
 
-// BeatOutageHistory announces outages that had already ended before this
-// observer could deliver their notices, in one past-tense message so a
+// BeatOutageHistory announces outages that were already over by the time this
+// observer could send anything about them, in one past-tense message so a
 // resolved incident never reads as a new live failure. One outage is reported
 // on its own; several are summarized, because the point of the message is
 // that they are over, not to replay each of them.
@@ -155,19 +158,64 @@ func (d *Discord) BeatOutageHistory(ctx context.Context, id string, outages []wa
 // historyMessage renders the history notice for id. outages is chronological
 // and non-empty (BeatOutageHistory's contract), so the last entry is the most
 // recent recovery.
+//
+// Every notice is two parts: WHAT happened, then why it is being read after
+// the fact. The second part comes from watch's LateReason and is never guessed
+// here, because the two reasons send an operator to opposite places: one is a
+// webhook to fix, the other is a beat that came back faster than the sweep
+// could see it, where a webhook check finds nothing wrong.
 func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 	last := outages[len(outages)-1]
+	recovered := last.Recovered.Format(historyTimeFormat)
 	if len(outages) == 1 {
 		return fmt.Sprintf(
-			"🕓 [knell %s] beat **%s** was missing for %s, recovered at %s. This notice is late: notifications were failing while the outage happened.",
-			d.node, id, last.DownFor().Truncate(time.Second), last.Recovered.Format(historyTimeFormat),
+			"🕓 [knell %s] beat **%s** was missing for %s, recovered at %s. %s",
+			d.node, id, last.DownFor().Truncate(time.Second), recovered, lateClause(last.LateReason),
 		)
 	}
 	return fmt.Sprintf(
-		"🕓 [knell %s] beat **%s** had %d outages while notifications were failing: longest %s, last recovered at %s.",
+		"🕓 [knell %s] beat **%s** had %d outages: longest %s, last recovered at %s. %s",
 		d.node, id, len(outages),
-		watch.LongestOutage(outages).Truncate(time.Second), last.Recovered.Format(historyTimeFormat),
+		watch.LongestOutage(outages).Truncate(time.Second), recovered, batchLateClause(outages),
 	)
+}
+
+// lateClause explains why ONE ended outage is reported after the fact, and
+// what the operator should do about it. The undelivered case names the webhook,
+// because delivery is what lagged; the other case says delivery was fine, so
+// nobody spends an evening on a webhook that posted this very message on its
+// first try.
+func lateClause(reason watch.LateReason) string {
+	if reason == watch.LateUndelivered {
+		return "This notice is late: its alert was still undelivered when the beat returned - check the webhook."
+	}
+	return "This notice is late only because the outage ended before a sweep detected it - nothing was wrong with delivery."
+}
+
+// batchLateClause explains why a whole run of ended outages is reported after
+// the fact. A batch can MIX the two reasons — a webhook outage holds alerts
+// back while short outages keep ending between sweeps, which is exactly how a
+// flapping beat behaves during a Discord outage — so a mixed batch reports
+// BOTH counts instead of picking the majority reason and stating something
+// false about the rest. It keeps the webhook pointer: one undelivered alert is
+// reason enough to look at delivery, while naming the outages that ended before
+// a sweep saw them stops the count from reading as that many webhook failures.
+func batchLateClause(outages []watch.Outage) string {
+	undelivered := 0
+	for _, o := range outages {
+		if o.LateReason == watch.LateUndelivered {
+			undelivered++
+		}
+	}
+	switch undelivered {
+	case len(outages):
+		return "Their alerts were still undelivered when it returned - check the webhook."
+	case 0:
+		return "Each ended before a sweep detected it - nothing was wrong with delivery."
+	default:
+		return fmt.Sprintf("%d had an undelivered alert (check the webhook), %d ended before a sweep detected it.",
+			undelivered, len(outages)-undelivered)
+	}
 }
 
 // post delivers one message, retrying transient failures. The webhook URL
