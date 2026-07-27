@@ -75,16 +75,26 @@ func TestBeatFreshGaugeTracksOverdueAndRecovery(t *testing.T) {
 func TestCanceledNotificationsAreNotCountedAsFailed(t *testing.T) {
 	// Serial (no t.Parallel): it asserts deltas on the package-global
 	// failure counters, which the parallel tests also increment.
+	//
+	// A shutdown is not a delivery outcome, so it must move NEITHER delivery
+	// counter on any kind: not failed (which would page KnellNotifyFailing)
+	// and not dropped (which would tell the operator to go reconstruct a
+	// window by hand). That holds even for recovered, whose non-cancellation
+	// failures DO count as dropped.
 	const id = "cancel-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
 	clock.Advance(11 * time.Minute)
 
 	failedBefore := labeledValue(t, "knell_notifications_failed_total", "kind", "missing")
+	droppedBefore := labeledValue(t, "knell_notifications_dropped_total", "kind", "missing")
 	n.setFail(context.Canceled)
 	w.sweep(context.Background())
 	if got := labeledValue(t, "knell_notifications_failed_total", "kind", "missing"); got != failedBefore {
 		t.Errorf("failed{missing} = %s after canceled send, want unchanged %s (a shutdown must not page KnellNotifyFailing)", got, failedBefore)
+	}
+	if got := labeledValue(t, "knell_notifications_dropped_total", "kind", "missing"); got != droppedBefore {
+		t.Errorf("dropped{missing} = %s after canceled send, want unchanged %s (the record is retained and retried, nothing was lost)", got, droppedBefore)
 	}
 
 	// The abandoned send did not mark the beat alerted: once the notifier
@@ -96,14 +106,19 @@ func TestCanceledNotificationsAreNotCountedAsFailed(t *testing.T) {
 		t.Fatalf("calls = %v, want the missing notice retried after a shutdown-abandoned send", got)
 	}
 
-	// Recovered direction: queue a recovery, cancel its delivery; the
-	// failed counter must not move either.
+	// Recovered direction: queue a recovery, cancel its delivery. Neither
+	// counter may move -- this is the one recovered-send failure that is not
+	// a permanent loss to report, because no attempt was made at all.
 	w.Beat(id)
 	failedBefore = labeledValue(t, "knell_notifications_failed_total", "kind", "recovered")
+	droppedBefore = labeledValue(t, "knell_notifications_dropped_total", "kind", "recovered")
 	n.setFail(context.Canceled)
 	drainRecoveries(w)
 	if got := labeledValue(t, "knell_notifications_failed_total", "kind", "recovered"); got != failedBefore {
 		t.Errorf("failed{recovered} = %s after canceled send, want unchanged %s", got, failedBefore)
+	}
+	if got := labeledValue(t, "knell_notifications_dropped_total", "kind", "recovered"); got != droppedBefore {
+		t.Errorf("dropped{recovered} = %s after canceled send, want unchanged %s (a shutdown is not a lost notice)", got, droppedBefore)
 	}
 }
 
@@ -248,21 +263,36 @@ func TestDeliveredNotificationsIncrementSentCounters(t *testing.T) {
 func TestFailedMissingNotificationIncrementsFailedCounter(t *testing.T) {
 	// Serial (no t.Parallel): asserts deltas on the package-global failed
 	// counter. A real (non-canceled) delivery failure must move it: the
-	// KnellNotifyFailing alert increases() over exactly this series.
+	// KnellNotifyFailing alert increases() over exactly this series. It must
+	// NOT move dropped: unlike a recovered send, the missing record stays
+	// queued and the next 15s sweep retries it, so the notice is late rather
+	// than lost and the operator has nothing to reconstruct.
 	const id = "failed-counter-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
 	clock.Advance(11 * time.Minute)
 
 	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
+	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "missing")
 	sentBefore := counterValue(t, "knell_notifications_sent_total", "missing")
 	n.setFail(errors.New("discord down"))
 	w.sweep(context.Background())
 	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore+1 {
 		t.Errorf("failed{missing} = %v after failed send, want %v (KnellNotifyFailing increases() over this counter)", got, failedBefore+1)
 	}
+	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
+		t.Errorf("dropped{missing} = %v after failed send, want unchanged %v (a retryable kind is never a permanent loss)", got, droppedBefore)
+	}
 	if got := counterValue(t, "knell_notifications_sent_total", "missing"); got != sentBefore {
 		t.Errorf("sent{missing} = %v after failed send, want unchanged %v", got, sentBefore)
+	}
+
+	// The record survived, which is what makes failed (not dropped) the right
+	// counter: the very next sweep delivers the same notice.
+	n.setFail(nil)
+	w.sweep(context.Background())
+	if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" {
+		t.Fatalf("calls = %v, want the missing notice retried on the next sweep", got)
 	}
 }
 
@@ -330,6 +360,7 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
 	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "missing")
 	historyBefore := counterValue(t, "knell_notifications_failed_total", "history")
+	historyDroppedBefore := counterValue(t, "knell_notifications_dropped_total", "history")
 	outagesBefore := beatCounterValue(t, "knell_beat_outages_total", id)
 	rec := capture.Default(t)
 	const sweeps = 3
@@ -348,6 +379,12 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	}
 	if got, want := counterValue(t, "knell_notifications_failed_total", "history"), historyBefore+sweeps; got != want {
 		t.Errorf("failed{history} = %v after %d failed history sends, want %v (one per failed message)", got, sweeps, want)
+	}
+	// History is retryable like missing: a failed history send keeps its
+	// records queued, so it never becomes a permanent loss. Only the
+	// fire-once recovered kind moves dropped on a failed send.
+	if got := counterValue(t, "knell_notifications_dropped_total", "history"); got != historyDroppedBefore {
+		t.Errorf("dropped{history} = %v after %d failed history sends, want unchanged %v (the records stay queued and retry)", got, sweeps, historyDroppedBefore)
 	}
 	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), outagesBefore+1; got != want {
 		t.Errorf("beat_outages_total = %v after %d re-detections of one outage, want %v (one increment per outage, even when its notice is not queued yet)", got, sweeps, want)
@@ -511,6 +548,70 @@ func TestRecoveryQueueDropIsCountedAsDroppedNotFailed(t *testing.T) {
 	}
 	if got := rec.CountLevel(slog.LevelWarn, "recovery queue full"); got != 1 {
 		t.Errorf("recovery-drop warnings = %d, want exactly 1 (a lost notice is news): %v", got, rec.Messages())
+	}
+}
+
+func TestFailedRecoveredSendIsCountedAsDroppedNotFailed(t *testing.T) {
+	// Serial (no t.Parallel): asserts deltas on the package-global
+	// notification counters and captures the process-global slog default.
+	//
+	// A recovered send is FIRE-ONCE: sendRecovered consumes the queued event
+	// and calls finishRecovery unconditionally, so a failed attempt leaves
+	// nothing to retry from and that recovery notice will never arrive. That
+	// is the dropped counter's meaning, so the failure must land there and
+	// NOT on failed, which promises the operator "wait, it retries". The
+	// second half proves the premise rather than assuming it: after the
+	// notifier heals, nothing re-sends.
+	const id = "recovered-send-failure-probe"
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+
+	// Deliver the missing notice so the beat is alerted and the next ping
+	// queues a real recovered transition.
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" {
+		t.Fatalf("calls = %v, want the missing notice delivered before the recovery", got)
+	}
+
+	n.setFail(errors.New("discord down"))
+	if !w.Beat(id) {
+		t.Fatalf("Beat(%s) = false", id)
+	}
+	failedBefore := counterValue(t, "knell_notifications_failed_total", "recovered")
+	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "recovered")
+	sentBefore := counterValue(t, "knell_notifications_sent_total", "recovered")
+	rec := capture.Default(t)
+	drainRecoveries(w)
+
+	if got, want := counterValue(t, "knell_notifications_dropped_total", "recovered"), droppedBefore+1; got != want {
+		t.Errorf("dropped{recovered} = %v after a failed recovered send, want %v (nothing retries it, so that notice will never arrive)", got, want)
+	}
+	if got := counterValue(t, "knell_notifications_failed_total", "recovered"); got != failedBefore {
+		t.Errorf("failed{recovered} = %v after a failed recovered send, want unchanged %v (failed means the record is still queued and retries; this one is gone)", got, failedBefore)
+	}
+	if got := counterValue(t, "knell_notifications_sent_total", "recovered"); got != sentBefore {
+		t.Errorf("sent{recovered} = %v after a failed recovered send, want unchanged %v", got, sentBefore)
+	}
+	// The log line is the operator's only per-beat trace of the loss, so it
+	// must say the notice is gone rather than merely that a send failed.
+	if got := rec.CountLevel(slog.LevelError, "recovered notification failed"); got != 1 {
+		t.Errorf("recovered-failure error lines = %d, want exactly 1: %v", got, rec.Messages())
+	}
+	if !rec.Contains("will ever arrive") {
+		t.Errorf("recovered-failure log does not say the notice is lost for good: %v", rec.Messages())
+	}
+	if !rec.HasAttr("recovered notification failed", "beat", id) {
+		t.Errorf("recovered-failure log does not name the beat: %v", rec.Records())
+	}
+
+	// The premise behind counting it as dropped: nothing is queued or resent
+	// once the notifier heals. If a retry existed, failed would be right.
+	n.setFail(nil)
+	drainRecoveries(w)
+	w.sweep(context.Background())
+	if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" {
+		t.Fatalf("calls = %v, want only the original missing: a dropped recovery must never be retried", got)
 	}
 }
 

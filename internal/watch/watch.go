@@ -449,9 +449,12 @@ func (w *Watcher) refreshFreshness() {
 // re-detects an ONGOING outage after the restart only if it outlasts one full
 // post-restart deadline, and never a closed one), and a queued recovered
 // transition is gone with the channel. This is the one
-// permanent-loss path no delivery counter can show — notifications_dropped_total
-// means "discarded by a full queue" (metrics.go, README) — so the log line is
-// the operator's only trace of it.
+// permanent-loss path no delivery counter can show: notifications_dropped_total
+// counts a notice that is lost for good once its delivery was ATTEMPTED and
+// failed (sendRecovered) or its record was discarded by a full queue
+// (recordEndedOutage, Beat), while a record still sitting in a queue here was
+// never attempted and never discarded, so the log line is the operator's only
+// trace of it.
 //
 // The tally below is complete by construction: acceptance closes at the same
 // cancellation that brings Run here. webapi.New gates /beat/{id} on the shared
@@ -741,6 +744,21 @@ func (w *Watcher) finishRecovery(id string) {
 // design: the critical direction of a dead-man switch is missing, which has
 // sweep-level retry; a lost recovery notice self-explains once the next
 // missing alert arrives.
+//
+// Recovered is FIRE-ONCE, which is what makes a failed send terminal here.
+// The event is dequeued before the send and finishRecovery runs
+// unconditionally on the way out, so nothing holds a record to retry from: a
+// failed attempt means no recovered notice for that outage will ever arrive.
+// That is the dropped counter's meaning, not the failed counter's, so a
+// non-cancellation failure counts as DROPPED — the same accounting a
+// recovery discarded by a full queue gets in Beat. Contrast sendMissing and
+// sendHistory, whose records stay queued: their failures are genuinely
+// retried on the next sweep and belong on failed.
+//
+// Cancellation is exempt from both counters: a shutdown is not a delivery
+// failure, and logUndelivered names the beats whose notice dies with the
+// process. The log stays at Error rather than the Warn the queue-full drops
+// use, because unlike them something WAS attempted and the webhook is broken.
 func (w *Watcher) sendRecovered(ctx context.Context, ev recoveryEvent) {
 	defer w.finishRecovery(ev.id)
 	if err := w.notifier.BeatRecovered(ctx, ev.id, ev.downFor); err != nil {
@@ -748,8 +766,8 @@ func (w *Watcher) sendRecovered(ctx context.Context, ev recoveryEvent) {
 			slog.Info("recovered notification abandoned, shutting down", "beat", ev.id)
 			return
 		}
-		metrics.RecordNotificationFailed(metrics.KindRecovered)
-		slog.Error("recovered notification failed",
+		metrics.RecordNotificationDropped(metrics.KindRecovered)
+		slog.Error("recovered notification failed, nothing retries it and no notice for this recovery will ever arrive",
 			"beat", ev.id, "down_for", ev.downFor.String(), "error", err)
 		return
 	}

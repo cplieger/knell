@@ -153,18 +153,21 @@ var notificationsFailed = metricslib.NewLabeledCounter(
 	[]string{kindLabel},
 )
 
-// notificationsDropped counts notifications that will never be delivered
-// because their record was discarded when the per-beat queue was full, by
-// kind. It is distinct from notificationsFailed: a failed delivery still has
-// its record and retries, while a dropped one has nothing left to retry from,
-// so no notice for that transition will ever arrive. Reconstruct the missed
-// window from beatLastSeen; beatOutages already counted the outage itself at
-// detection. A queue-full event that loses nothing — an ongoing outage that
-// stays detected and is queued once a slot frees — is not counted here
-// either, because nothing was dropped.
+// notificationsDropped counts notifications that will never be delivered, by
+// kind. Two causes reach it: a record discarded when the per-beat queue was
+// full, and a recovered send that FAILED — recovered is dequeued before the
+// send and finishRecovery runs unconditionally, so nothing holds a record to
+// retry from. That is the line against notificationsFailed, which is drawn by
+// what SURVIVES rather than by whether a send was attempted: a notification
+// counted failed still has its record and retries, while a dropped one has
+// nothing left to retry from, so no notice for that transition will ever
+// arrive. Reconstruct the missed window from beatLastSeen; beatOutages
+// already counted the outage itself at detection. A queue-full event that
+// loses nothing — an ongoing outage that stays detected and is queued once a
+// slot frees — is not counted here either, because nothing was dropped.
 var notificationsDropped = metricslib.NewLabeledCounter(
 	"notifications_dropped_total",
-	"Notifications that will never be delivered because their record was discarded when the per-beat queue was full, by kind ("+notificationKindsText+"); distinct from a delivery that failed and will retry.",
+	"Notifications that will never be delivered, by kind ("+notificationKindsText+"); a record discarded when the per-beat queue was full, or a recovered send that failed with nothing left to retry from; distinct from a delivery that failed and will retry.",
 	[]string{kindLabel},
 )
 
@@ -243,8 +246,9 @@ func RecordNotificationFailed(kind Kind) {
 }
 
 // RecordNotificationDropped counts one notification message of kind that will
-// never be delivered because the record it would have been built from was
-// discarded by a full queue. Nothing retries it.
+// never be delivered, for either cause: the record it would have been built
+// from was discarded by a full queue, or it was a recovered send that failed
+// and left no record behind. Nothing retries it.
 func RecordNotificationDropped(kind Kind) {
 	notificationsDropped.Inc(string(kind))
 }

@@ -88,7 +88,7 @@ Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away
 A live incident and one that is already over are reported differently: nothing an operator reads should announce a resolved outage as a beat that is down right now.
 
 - **Missing**: sent once per live outage, when a beat first passes its deadline. A failed delivery (Discord outage, network) is retried on every 15s sweep until one succeeds; the beat is only marked notified after a delivered send.
-- **Recovered**: sent on the first accepted ping after a missing notice, best-effort. Delivery uses bounded retries with jittered backoff and honors `Retry-After` on rate limits.
+- **Recovered**: sent on the first accepted ping after a missing notice, best-effort. Delivery uses bounded retries with jittered backoff and honors `Retry-After` on rate limits. It is fire-once: the queued transition is consumed before the send, so a delivery that still fails has nothing left to retry from and that recovery notice will never arrive. It therefore counts as `knell_notifications_dropped_total{kind="recovered"}`, not as a failure you can wait out.
 - **Ended outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of being collapsed into that earlier one and lost. Records whose outage has already ended by the time they can be delivered are reported once in the past tense. One ended outage reads as a single sentence:
 
   > 🕓 [knell server-1] beat **cron-backup** was missing for 12m0s, recovered at 14:07 UTC. This notice is late: notifications were failing while the outage happened.
@@ -112,8 +112,8 @@ A live incident and one that is already over are reported differently: nothing a
 | `knell_beats_received_total{beat}` | counter | accepted pings; unknown ids are rejected, not counted |
 | `knell_beat_outages_total{beat}` | counter | outages detected per beat, counted when the deadline is crossed and independent of any delivery. Count outages with this one, not with the notification counters |
 | `knell_notifications_sent_total{kind}` | counter | delivered webhook notifications (`missing`, `recovered`, `history`), one per delivered message: a `history` message covering several ended outages counts once |
-| `knell_notifications_failed_total{kind}` | counter | delivery attempts that failed after retries (`missing`, `recovered`, `history`), one per failed message. This counter means exactly that: something was sent and did not get through. A `missing` or `history` failure is retried on the next sweep |
-| `knell_notifications_dropped_total{kind}` | counter | notifications that will never be delivered, because their record was discarded when the per-beat queue was full. Nothing retries a drop: reconstruct the missed window from `knell_beat_last_seen_timestamp_seconds` |
+| `knell_notifications_failed_total{kind}` | counter | delivery attempts that failed after retries and will be retried, one per failed message. This counter means exactly that: something was sent, did not get through, and its record is still queued. In practice that is `missing` and `history`, which the next sweep tries again |
+| `knell_notifications_dropped_total{kind}` | counter | notifications that will never be delivered, either because a fire-once `recovered` send failed or because a record was discarded when the per-beat queue was full. Nothing retries a drop: reconstruct the missed window from `knell_beat_last_seen_timestamp_seconds` |
 
 Plus standard `go_*` / `process_*` runtime metrics.
 
@@ -135,10 +135,11 @@ knell is itself the alert path for the things it watches, so alert rules about k
 # knell could not get a notification through, for one of two reasons the
 # counters keep apart:
 #   failed  = a delivery attempt failed after retries (the webhook is
-#             unreachable). The record is still queued and retried every 15s
-#             sweep, so the notice is late, not lost: wait for it.
-#   dropped = a record was discarded because its queue was full, so that
-#             notice will never arrive. Reconstruct the missed window from
+#             unreachable) and its record is still queued, so it is retried
+#             every 15s sweep. The notice is late, not lost: wait for it.
+#   dropped = the notice will never arrive, either because a fire-once
+#             recovered send failed or because a record was discarded when
+#             its queue was full. Reconstruct the missed window from
 #             knell_beat_last_seen_timestamp_seconds.
 - alert: KnellNotifyFailing
   expr: >
