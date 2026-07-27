@@ -5,11 +5,11 @@
 //
 // The registry and the collectors are unexported: the package's edge is
 // Handler plus the knell-semantic recording functions below (InitBeat,
-// RecordBeat, SetBeatFresh, RecordOutage and the three RecordNotification*
-// functions). Callers therefore cannot register, rename or delete a series,
-// nor write a raw label position, which is what keeps the metric names, label
-// sets and cold-start zero samples the quorum and delivery alerts read in one
-// place.
+// RecordBeat, SetBeatFresh, RecordOutage, RecordHTTP and the three
+// RecordNotification* functions). Callers therefore cannot register, rename or
+// delete a series, nor write a raw label position, which is what keeps the
+// metric names, label sets and cold-start zero samples the quorum and delivery
+// alerts read in one place.
 //
 // # Label-cardinality contract (read this before adding a caller)
 //
@@ -31,13 +31,25 @@
 //     path never reaches watch.Beat at all.
 //
 // The only packages that may call the four id-taking functions are
-// internal/watch (production) and internal/webapi's own tests (fixed literal
-// ids). If you are adding a call from anywhere else, you have just inherited
+// internal/watch (production), internal/webapi's own tests and this package's
+// own tests (both fixed literal ids). If you are adding a call from anywhere
+// else, you have just inherited
 // that contract: pass only an id internal/config validated and capped, or
 // route through internal/watch, or validate the id yourself before the call.
 // A raw id from a request path, a filename, a log line or a remote payload
 // makes Mimir's label set grow without bound, and the growth is not
 // recoverable by fixing the caller afterwards.
+//
+// RecordHTTP is the one recording function reached from internal/webapi in
+// PRODUCTION, and it is deliberately not id-taking: it carries no beat label,
+// so it is outside the contract above and adding it did not widen the set of
+// packages allowed to mint a per-beat series. It has its own bounded-label
+// contract instead, and the same reasoning drives it — its method and path
+// labels must be derived from the MATCHED ROUTE, never from the request line,
+// because /beat/{id} is served to unauthenticated callers (webhttp.Logging is
+// the outermost middleware, so its hook fires before the BEAT_TOKEN gate
+// runs). internal/webapi.recordHTTPMetric is the single place that derivation
+// lives; read its comment before changing either label.
 //
 // Runtime enforcement inside this package is deliberately NOT the answer: it
 // would add state plus an init-order dependency on config to defend against a
@@ -47,6 +59,7 @@ package metrics
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,9 +68,13 @@ import (
 
 // beatLabel names the watched beat on per-beat metrics; kindLabel names the
 // notification kind (missing, recovered, history) on the delivery counters.
+// The remaining three label the served-request counter.
 const (
-	beatLabel = "beat"
-	kindLabel = "kind"
+	beatLabel   = "beat"
+	kindLabel   = "kind"
+	methodLabel = "method"
+	pathLabel   = "path"
+	statusLabel = "status"
 )
 
 // Kind distinguishes notification label values from runtime strings. String
@@ -198,6 +215,30 @@ var notificationsDropped = metricslib.NewLabeledCounter(
 	[]string{kindLabel},
 )
 
+// httpRequests counts every served HTTP request by matched route template,
+// method and status. It is the ONLY view of a REFUSED ping: an unauthorized
+// (401), unknown-id (404), shutting-down (503) or disallowed-method (405)
+// beat request never reaches beatsReceived, so without this series a sender
+// whose token was rotated or whose beat id is misspelled stays invisible
+// until the beat goes missing a full deadline later — on an app whose whole
+// job is being alertable. Labels are bounded by the CALLER, which must pass a
+// route template and a routed method rather than anything off the request
+// line (see the package doc's RecordHTTP contract).
+var httpRequests = metricslib.NewLabeledCounter(
+	"http_requests_total",
+	"Served HTTP requests by matched route template, method and status.",
+	[]string{methodLabel, pathLabel, statusLabel},
+)
+
+// httpDuration observes served-request latency across the whole surface. It
+// is deliberately unlabelled: knell serves three routes and the per-route
+// split is already available by pairing httpRequests with it, so a labelled
+// histogram would multiply bucket series for no operator question.
+var httpDuration = metricslib.NewHistogram(
+	"http_request_duration_seconds",
+	"Served HTTP request duration in seconds.",
+)
+
 func init() {
 	registry.RegisterLabeledGauge(beatFresh)
 	registry.RegisterLabeledGauge(beatLastSeen)
@@ -206,6 +247,8 @@ func init() {
 	registry.RegisterLabeledCounter(notificationsSent)
 	registry.RegisterLabeledCounter(notificationsFailed)
 	registry.RegisterLabeledCounter(notificationsDropped)
+	registry.RegisterLabeledCounter(httpRequests)
+	registry.RegisterHistogram(httpDuration)
 	mintNotificationKinds()
 }
 
@@ -261,6 +304,17 @@ func SetBeatFresh(id string, fresh bool) {
 // package doc's label-cardinality contract.
 func RecordOutage(id string) {
 	beatOutages.Inc(id)
+}
+
+// RecordHTTP records one served HTTP request: its latency, and one increment
+// on the method/path/status combination. method and path must be derived from
+// the MATCHED ROUTE, not from the request line — see the package doc's
+// RecordHTTP contract and internal/webapi.recordHTTPMetric, which is the only
+// production caller. Unlike the beat counters this series is not pre-minted:
+// an HTTP counter has no known-in-advance status set, so alerts on it should
+// sum over the label set rather than select a single status.
+func RecordHTTP(method, path string, status int, d time.Duration) {
+	metricslib.RecordHTTP(httpRequests, httpDuration, d, method, path, strconv.Itoa(status))
 }
 
 // RecordNotificationSent counts one delivered notification message of kind.

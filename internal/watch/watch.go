@@ -346,7 +346,7 @@ func (st *beatState) dropMissing(n int) {
 // can only get safer, and a record whose reason is already LateUndelivered is
 // unchanged. The same clamp as dropMissing keeps a future caller in range.
 func (st *beatState) blameDelivery(n int) {
-	for i := range st.pendingMissing[:min(n, len(st.pendingMissing))] {
+	for i := range min(n, len(st.pendingMissing)) {
 		st.pendingMissing[i].late = LateUndelivered
 	}
 }
@@ -957,10 +957,9 @@ func (w *Watcher) dropDelivered(id string, n int) {
 // markHistoryUndelivered blames delivery for the n head records a FAILED
 // history notice left queued, so the retry reports the true reason it is late
 // (see beatState.blameDelivery). The n records it rewrites are exactly the ones
-// the failed notice covered, by the same reasoning dropDelivered relies on:
-// only the sender pops, and a concurrent ping appends at the tail or seals the
-// open tail, so the head run cannot shift under it. A record queued after the
-// failed send keeps its own reason — this notice never tried to deliver it.
+// the failed notice covered, for the reason dropDelivered gives. A record
+// queued after the failed send keeps its own reason — this notice never tried
+// to deliver it.
 func (w *Watcher) markHistoryUndelivered(id string, n int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1024,14 +1023,19 @@ func (w *Watcher) finishRecovery(id string) {
 // retried on the next sweep and belong on failed.
 //
 // Cancellation is exempt from both counters: a shutdown is not a delivery
-// failure, and logUndelivered names the beats whose notice dies with the
-// process. The log stays at Error rather than the Warn the queue-full drops
-// use, because unlike them something WAS attempted and the webhook is broken.
+// failure. It is NOT covered by logUndelivered's tally either, though — the
+// event was already taken off w.recoveries by Run's select, so the drain
+// there cannot see it and queued_recoveries excludes it. The line above is
+// this loss's ONLY trace, which is why it names the beat and its span.
+// The failure log below stays at Error rather than the Warn the queue-full
+// drops use, because unlike them something WAS attempted and the webhook is
+// broken.
 func (w *Watcher) sendRecovered(ctx context.Context, ev recoveryEvent) {
 	defer w.finishRecovery(ev.id)
 	if err := w.notifier.BeatRecovered(ctx, ev.id, ev.silence); err != nil {
 		if errors.Is(err, context.Canceled) {
-			slog.Info("recovered notification abandoned, shutting down", "beat", ev.id)
+			slog.Info("recovered notification abandoned, shutting down, nothing retries it so no notice for this recovery will ever arrive",
+				"beat", ev.id, "down_for", ev.silence.DownFor().String())
 			return
 		}
 		metrics.RecordNotificationDropped(metrics.KindRecovered)

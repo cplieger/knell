@@ -60,6 +60,28 @@ func (rec *webhookRecorder) handler(t *testing.T) http.HandlerFunc {
 	}
 }
 
+// captureDeliveryLogs redirects slog.Default() into a buffer at Debug for the
+// duration of the test and restores it afterwards, so a test can assert on
+// httpx.Do's per-attempt and exhausted lines. slog.Default() is process-global,
+// so a caller must NOT use t.Parallel.
+func captureDeliveryLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// requireLogged fails the test when no delivery log line was captured: every
+// absence assertion against the log surface is vacuous if nothing was logged.
+func requireLogged(t *testing.T, buf *bytes.Buffer) {
+	t.Helper()
+	if buf.Len() == 0 {
+		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
+	}
+}
+
 // liveSilence builds the value a live notice carries for a beat that has been
 // unseen for d: the two instants watch measures the silence between. It exists
 // so these tests construct the new watch.Transition parameter; the figure the
@@ -502,6 +524,64 @@ func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 	}
 }
 
+// TestNestedURLErrorsAreFullyReducedBeforeClassification pins the loop in
+// safeTransportError that reduces until no *url.Error is left ANYWHERE in the
+// chain, not just at the top. httpx.LogSafeError SEARCHES a chain with
+// errors.As and RETURNS what it finds, so one *url.Error still nested under
+// the cause lets it unwrap PAST transportError and render that error's own
+// text instead of knell's phrase — in post's returned error and in httpx.Do's
+// per-attempt lines. net/http produces exactly this shape when a redirected
+// request fails: the *url.Error for the hop carries the *url.Error of the
+// inner request, whose cause is written from the response's Location header,
+// so the text that surfaces is remote-authored and can echo the webhook path
+// (which IS the credential).
+func TestNestedURLErrorsAreFullyReducedBeforeClassification(t *testing.T) {
+	t.Parallel()
+
+	const secret = "verysecretnestedtoken"
+	remote := errors.New(`failed to parse Location header "/api/webhooks/1234567890/` + secret + `%zz"`)
+	nested := &url.Error{
+		Op:  "Post",
+		URL: "https://discord.example/api/webhooks/1234567890/" + secret,
+		Err: &url.Error{
+			Op:  "Get",
+			URL: "https://redirect.example/api/webhooks/1234567890/" + secret,
+			Err: remote,
+		},
+	}
+	if !strings.Contains(nested.Error(), secret) {
+		t.Fatal("setup: the input does not carry the credential, the assertion would be vacuous")
+	}
+
+	got := safeTransportError(nested)
+	if got.Error() != "webhook transport failed" {
+		t.Errorf("safeTransportError(nested *url.Error).Error() = %q, want knell's own phrase", got.Error())
+	}
+	// The three surfaces the reduction has to hold for: the error itself, the
+	// reduction httpx.Do logs every attempt through, and post's own logSafe of
+	// what httpx.Do returns. They fail independently.
+	for surface, rendered := range map[string]error{
+		"transport error":                got,
+		"attempt error as httpx logs it": httpx.LogSafeError(got),
+		"post's reduction":               logSafe(got),
+	} {
+		if rendered == nil {
+			t.Errorf("%s = nil, want an error (a nil reports an undelivered notification as delivered)", surface)
+			continue
+		}
+		for _, leak := range []string{secret, "/api/webhooks/", "discord.example", "redirect.example", "Location header"} {
+			if strings.Contains(rendered.Error(), leak) {
+				t.Errorf("%s kept %q from a nested *url.Error: %v", surface, leak, rendered)
+			}
+		}
+	}
+	// The reduction must not cost the chain: watch keys its shutdown exemption
+	// and httpx keys transient classification on errors.Is/As.
+	if !errors.Is(got, remote) {
+		t.Errorf("safeTransportError dropped the cause from the chain: %v", got)
+	}
+}
+
 func TestLogSafeFailsClosedWhenReductionYieldsNoError(t *testing.T) {
 	t.Parallel()
 
@@ -622,10 +702,7 @@ func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 	// end to end.
 	const secret = "verysecretlogtoken"
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	buf := captureDeliveryLogs(t)
 
 	// Connection refused is transient, so all maxAttempts run and both the
 	// per-attempt and exhausted lines are emitted.
@@ -635,9 +712,7 @@ func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 	if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err == nil {
 		t.Fatal("BeatMissing against a refused connection = nil, want error")
 	}
-	if buf.Len() == 0 {
-		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
-	}
+	requireLogged(t, buf)
 	if got := buf.String(); strings.Contains(got, secret) {
 		t.Errorf("delivery logs leak the webhook credential: %s", got)
 	}
@@ -670,10 +745,7 @@ func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	buf := captureDeliveryLogs(t)
 
 	d := New(srv.URL+secretPath, "node-1")
 	t.Cleanup(d.Close)
@@ -682,9 +754,7 @@ func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
 	if err == nil {
 		t.Fatal("BeatMissing against a persistent 503 = nil, want error")
 	}
-	if buf.Len() == 0 {
-		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
-	}
+	requireLogged(t, buf)
 	// The body is not Discord's error object, so the status branch reports it
 	// as a measurement. Pinning that keeps the absence assertions below
 	// meaningful: a run that failed before the body was read would satisfy
@@ -728,10 +798,7 @@ func TestOversizedStatusBodyDropsTheDetail(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	buf := captureDeliveryLogs(t)
 
 	d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
 	t.Cleanup(d.Close)
@@ -740,9 +807,7 @@ func TestOversizedStatusBodyDropsTheDetail(t *testing.T) {
 	if err == nil {
 		t.Fatal("BeatMissing against a persistent 503 = nil, want error")
 	}
-	if buf.Len() == 0 {
-		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
-	}
+	requireLogged(t, buf)
 	if want := fmt.Sprintf("response body over %d bytes, detail dropped", maxErrorBodyBytes); !strings.Contains(err.Error(), want) {
 		t.Errorf("err = %v, want it to report %q", err, want)
 	}
@@ -786,10 +851,7 @@ func TestPartiallyReadStatusBodyReportsOnlyTheReadFailure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	buf := captureDeliveryLogs(t)
 
 	d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
 	t.Cleanup(d.Close)
@@ -798,9 +860,7 @@ func TestPartiallyReadStatusBodyReportsOnlyTheReadFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("BeatMissing against a truncated 503 response = nil, want error")
 	}
-	if buf.Len() == 0 {
-		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
-	}
+	requireLogged(t, buf)
 	// The absence assertions below only mean something if the STATUS branch
 	// ran and dropped its detail. A setup that failed earlier (a transport
 	// error before the headers are read) would satisfy them with no body text
@@ -821,6 +881,82 @@ func TestPartiallyReadStatusBodyReportsOnlyTheReadFailure(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), leak) {
 			t.Errorf("delivery error carries %q from a partially read body: %v", leak, err)
+		}
+	}
+}
+
+func TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError(t *testing.T) {
+	// Deliberately NOT t.Parallel: slog.Default() is process-global.
+	//
+	// The third path remote-authored text can reach the logs by, and the only
+	// one no status-side guard covers: the drain of a SUCCESSFUL response.
+	// httpx.DrainClose logs its read error at Debug through the PACKAGE-level
+	// slog.Default() (loop.go's WithLogger cannot redirect it), and that
+	// error's text is written by the other end — net/http renders a malformed
+	// chunked trailer as `malformed MIME header line: <remote bytes>`, the
+	// same class readFailure classifies structurally on the status path. A 2xx
+	// reaches the drain with no other error in play, so statusDetail never
+	// sees it. drainClose closes the path by never handing the error to a
+	// logger, pinned here at the Debug level an operator raises precisely
+	// while diagnosing failing deliveries.
+	const secret = "verysecrettrailertoken"
+	const secretPath = "/api/webhooks/1234567890/" + secret
+	malformedTrailer := "this-is-not-a-header" + secretPath
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, connBuf, hijackErr := w.(http.Hijacker).Hijack()
+		if hijackErr != nil {
+			t.Errorf("hijack: %v", hijackErr)
+			return
+		}
+		defer conn.Close()
+		// A well-formed 200 with chunked framing whose trailer section
+		// carries a header line with no colon: the status says delivered, and
+		// the read fails only once the drain reaches the trailer.
+		_, _ = fmt.Fprintf(connBuf,
+			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Knell-Check\r\n\r\n2\r\n{}\r\n0\r\n%s\r\n\r\n",
+			malformedTrailer)
+		_ = connBuf.Flush()
+	}))
+	defer srv.Close()
+
+	// Non-vacuity, measured rather than assumed: reading this exact response
+	// really does produce an error whose text carries the credential, so an
+	// implementation that logged it WOULD leak. Without this, the absence
+	// assertions below would pass just as well against a body that reads
+	// cleanly.
+	probe, probeErr := http.Get(srv.URL + secretPath)
+	if probeErr != nil {
+		t.Fatalf("control request: %v", probeErr)
+	}
+	_, readErr := io.ReadAll(probe.Body)
+	probe.Body.Close()
+	if readErr == nil {
+		t.Fatal("setup: the control read of the malformed trailer succeeded, the leak assertions would be vacuous")
+	}
+	for _, want := range []string{secret, "MIME"} {
+		if !strings.Contains(readErr.Error(), want) {
+			t.Fatalf("setup: control read error %q carries no %q, the leak assertions would be vacuous", readErr, want)
+		}
+	}
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	d := New(srv.URL+secretPath, "node-1")
+	t.Cleanup(d.Close)
+
+	// A 2xx is a delivery, malformed trailer or not: the drain exists for
+	// connection reuse alone, and forfeiting it must not turn a delivered
+	// notice into a retry (watch flips alerted only on a delivered send).
+	if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err != nil {
+		t.Fatalf("BeatMissing against a 200 with a malformed trailer = %v, want nil (a 2xx is delivered)", err)
+	}
+	for _, leak := range []string{secret, "/api/webhook", "MIME", "this-is-not-a-header", "drain"} {
+		if got := buf.String(); strings.Contains(got, leak) {
+			t.Errorf("delivery logs carry %q from the body drain's read error: %s", leak, got)
 		}
 	}
 }
@@ -1034,6 +1170,14 @@ func TestTransportPhraseClassifiesStructurally(t *testing.T) {
 		"reset": {
 			cause: &net.OpError{Op: "read", Err: fmt.Errorf("%s: %w", remote, syscall.ECONNRESET)},
 			want:  "the connection to the webhook was reset",
+		},
+		"no route": {
+			cause: &net.OpError{Op: "dial", Err: fmt.Errorf("%s: %w", remote, syscall.EHOSTUNREACH)},
+			want:  "no network route to the webhook host",
+		},
+		"network unreachable": {
+			cause: &net.OpError{Op: "dial", Err: fmt.Errorf("%s: %w", remote, syscall.ENETUNREACH)},
+			want:  "no network route to the webhook host",
 		},
 		"tls": {
 			cause: &tls.CertificateVerificationError{Err: errors.New(remote)},
@@ -1273,8 +1417,10 @@ func TestCanceledDeliveryErrorIsCanceled(t *testing.T) {
 	// watch.sweep and watch.sendRecovered key their shutdown handling on
 	// errors.Is(err, context.Canceled): an abandoned send must not count
 	// as failed (KnellNotifyFailing would page on every shutdown). That
-	// contract crosses post's whole wrap chain (client error -> httpx
-	// LogSafeError -> %w wrap), so pin it against the real notifier.
+	// contract crosses post's whole wrap chain (client error -> safeTransportError,
+	// whose Error() renders only knell's phrase and whose Unwrap is the only thing
+	// carrying the cause -> logSafe -> %w wrap), so pin it against the real
+	// notifier: dropping transportError.Unwrap fails here, not in watch.
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {

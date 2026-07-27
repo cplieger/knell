@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/knell/internal/watch"
@@ -492,6 +493,146 @@ func TestHeadRejectionSetsAllowHeader(t *testing.T) {
 	}
 }
 
+// TestEveryRejectedMethodAnswersTheSameRefusal pins that the Allow header is
+// TRUE for every rejected method, not just for HEAD. Without the
+// method-agnostic /beat/{id} route, PUT/DELETE/PATCH/OPTIONS fall to
+// net/http's built-in 405, which assembles Allow from the registered patterns
+// and so answers "GET, HEAD, POST" — advertising as permitted the one method
+// this file registers a route for in order to REFUSE (a HEAD that recorded a
+// ping would keep the switch armed with no heartbeat behind it). A prober that
+// discovers methods from Allow would be steered straight at it.
+func TestEveryRejectedMethodAnswersTheSameRefusal(t *testing.T) {
+	for _, method := range []string{
+		http.MethodHead, http.MethodPut, http.MethodDelete,
+		http.MethodPatch, http.MethodOptions, "WHATEVER",
+	} {
+		t.Run(method, func(t *testing.T) {
+			b := &fakeBeater{known: map[string]bool{"api": true}}
+			h := newTestHandler(b, "")
+			req := httptest.NewRequest(method, "/beat/api", nil)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Errorf("%s /beat/api = %d, want 405", method, rec.Code)
+			}
+			if got := rec.Header().Get("Allow"); got != "GET, POST" {
+				t.Errorf("%s /beat/api Allow = %q, want \"GET, POST\": a rejected method must not be told that a method which does not record a beat is permitted", method, got)
+			}
+			// The coded JSON envelope, not net/http's plain "Method Not
+			// Allowed\n": every other refusal on this surface (401, 404, 405,
+			// 503) is the same shape, so a sender parsing it must not hit
+			// unparseable text on exactly these methods.
+			if !strings.Contains(rec.Body.String(), `"method_not_allowed"`) {
+				t.Errorf("%s /beat/api body = %q, want the coded method_not_allowed envelope", method, rec.Body.String())
+			}
+			// Nothing may be recorded on a refused method: the id feeds a
+			// metric label, and a recorded ping would re-arm the switch.
+			if len(b.seen) != 0 {
+				t.Errorf("%s /beat/api recorded %v, want nothing recorded on a refused method", method, b.seen)
+			}
+		})
+	}
+}
+
+// TestAccessLogPathIsBounded pins the access log's path policy. r.URL.Path is
+// attacker-controlled and reaches the log line BEFORE the token gate runs
+// (webhttp.Logging is outermost), so an unauthenticated caller would otherwise
+// size knell's log lines at will and could push the undelivered-notice
+// warnings — the only trace of a permanently lost notice, which has no counter
+// behind it — out of the retained log window. Two halves: every legitimate
+// path is logged UNCHANGED (the fix must not cost an operator the beat id), and
+// an over-long one is truncated on a rune boundary (never mid-rune, which
+// would put invalid UTF-8 into the log stream).
+func TestAccessLogPathIsBounded(t *testing.T) {
+	// A 3-byte rune after a 6-byte prefix guarantees the byte at the cap
+	// lands MID-RUNE (6 + 3k never equals 128), which is exactly the case a
+	// naive p[:128] would corrupt.
+	longMultibyte := "/beat/" + strings.Repeat("€", 200)
+
+	tests := map[string]struct {
+		path      string
+		wantExact string // "" = expect truncation instead
+	}{
+		"healthz unchanged":   {path: "/healthz", wantExact: "/healthz"},
+		"metrics unchanged":   {path: "/metrics", wantExact: "/metrics"},
+		"beat ping unchanged": {path: "/beat/api", wantExact: "/beat/api"},
+		// The longest id internal/config accepts (64 chars) is still well
+		// under the cap, so a real deployment never sees truncation.
+		"longest configurable id unchanged": {
+			path:      "/beat/" + strings.Repeat("a", 64),
+			wantExact: "/beat/" + strings.Repeat("a", 64),
+		},
+		// Exactly at the cap: still verbatim (the bound is inclusive).
+		"path exactly at the cap unchanged": {
+			path:      "/beat/" + strings.Repeat("a", maxLoggedPath-6),
+			wantExact: "/beat/" + strings.Repeat("a", maxLoggedPath-6),
+		},
+		"one byte over the cap is truncated": {
+			path: "/beat/" + strings.Repeat("a", maxLoggedPath-5),
+		},
+		"megabyte path is truncated":  {path: "/beat/" + strings.Repeat("a", 1<<20)},
+		"multibyte path is truncated": {path: longMultibyte},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Serial (no t.Parallel): capture.Default swaps the process-global
+			// slog default, and it must be installed BEFORE New because
+			// webhttp.Logging resolves slog.Default() when the chain is built.
+			rec := capture.Default(t)
+			h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
+
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			h.ServeHTTP(httptest.NewRecorder(), req)
+
+			logged, ok := rec.AttrValue("http", "path")
+			if !ok {
+				t.Fatalf("no path attribute on the access line; records = %v", rec.Records())
+			}
+			// Fail-closed placeholder: webhttp substitutes it when the
+			// transform returns "" or panics. Seeing it means the policy
+			// broke, and the raw path is then lost to the operator entirely.
+			if logged == "(path-redaction-failed)" {
+				t.Fatalf("path = %q: the path policy failed instead of truncating", logged)
+			}
+			if tt.wantExact != "" {
+				if logged != tt.wantExact {
+					t.Errorf("path = %q, want the legitimate path logged verbatim (%q)", logged, tt.wantExact)
+				}
+				return
+			}
+			if len(logged) > maxLoggedPath+len("...(truncated)") {
+				t.Errorf("logged path is %d bytes, want it bounded by the %d-byte cap plus the marker: an unauthenticated caller must not size log lines",
+					len(logged), maxLoggedPath)
+			}
+			if !strings.HasSuffix(logged, "...(truncated)") {
+				t.Errorf("path = %q, want a truncation marker so an operator can tell a bounded path from a real one", logged)
+			}
+			if !utf8.ValidString(logged) {
+				t.Errorf("path = %q is not valid UTF-8: truncation must land on a rune boundary", logged)
+			}
+			// The kept prefix must be a genuine prefix of the request path,
+			// so the beat id an operator needs is still readable.
+			if !strings.HasPrefix(tt.path, strings.TrimSuffix(logged, "...(truncated)")) {
+				t.Errorf("path = %q is not a prefix of the request path: truncation must not alter what it keeps", logged)
+			}
+		})
+	}
+}
+
+// TestLoggedPathMapsTheEmptyPathToRoot covers the one case an
+// httptest.NewRequest cannot express: r.URL.Path == "". The transform must not
+// return "", because webhttp reads an empty return as a FAILED redaction and
+// records its placeholder instead, losing the access record's path entirely.
+func TestLoggedPathMapsTheEmptyPathToRoot(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	req.URL.Path = ""
+	if got := loggedPath(req); got != "/" {
+		t.Errorf("loggedPath(empty) = %q, want \"/\": an empty return degrades to webhttp's redaction-failure placeholder", got)
+	}
+}
+
 // fakeClock is a manual clock for the shutdown tests. watch.Run reads it from
 // its sweep and gauge goroutines while the test advances it, so the mutex is
 // what keeps these tests race-clean.
@@ -767,5 +908,237 @@ func TestBeatRefusedWhenCancellationHappensDuringBodyDrain(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "shutting_down") {
 		t.Errorf("503 body = %s, want the shutting_down code", rec.Body.String())
+	}
+}
+
+// httpRequestSeries returns every knell_http_requests_total label-set present in
+// the exposition, keyed by its raw "{...}" text. Used to assert what the metric
+// CAN grow into, not just what one request recorded.
+func httpRequestSeries(exposition string) map[string]bool {
+	out := map[string]bool{}
+	for line := range strings.SplitSeq(exposition, "\n") {
+		if !strings.HasPrefix(line, "knell_http_requests_total{") {
+			continue
+		}
+		labels, _, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		out[labels] = true
+	}
+	return out
+}
+
+// TestRefusedPingIsVisibleInTheRequestCounter is the whole point of the request
+// metric: knell_beats_received_total counts ACCEPTED pings only, so before this
+// counter existed every refusal — a rotated BEAT_TOKEN (401), a misspelled beat
+// id (404), a disallowed method (405), a ping during the drain (503) — was
+// invisible to a scrape and could only be found by reading access logs. knell's
+// own README points alert rules at a second vantage point scraping /metrics, so
+// a refusal class with no series behind it cannot be alerted on at all: the
+// operator's first hard signal would be the missing notice a full deadline
+// later. Each case pins that the refusal lands on its own method/path/status
+// series AND that it still records no beat.
+func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
+	const id = "api"
+
+	// cancelledCtx is the drain state: the shared application context is
+	// cancelled, so beat acceptance is closed for the rest of the process.
+	cancelledCtx := func() context.Context {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
+	}
+
+	tests := map[string]struct {
+		token      string
+		ctx        context.Context
+		method     string
+		path       string
+		wantStatus int
+		wantSeries string
+		wantSeen   int
+	}{
+		// The accepted path first: it proves the counter is not simply
+		// counting everything as a refusal, and it is the denominator an
+		// operator compares a refusal rate against.
+		"accepted ping": {
+			ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id,
+			wantStatus: http.StatusOK, wantSeen: 1,
+			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="200"}`,
+		},
+		// A rotated or mistyped BEAT_TOKEN. The gate is outermost, so this is
+		// the refusal an unauthenticated caller reaches first.
+		"unauthorized ping": {
+			token: "s3cret", ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id,
+			wantStatus: http.StatusUnauthorized,
+			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="401"}`,
+		},
+		// A typo in a sender's URL: the beat stays silent while the sender
+		// believes it is pinging.
+		"unknown beat id": {
+			ctx: context.Background(), method: http.MethodPost, path: "/beat/ghost",
+			wantStatus: http.StatusNotFound,
+			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="404"}`,
+		},
+		// HEAD has its own registered route (so a HEAD probe cannot record a
+		// ping), and that route NAMES the method, so the label is truthful.
+		"head refused": {
+			ctx: context.Background(), method: http.MethodHead, path: "/beat/" + id,
+			wantStatus: http.StatusMethodNotAllowed,
+			wantSeries: `knell_http_requests_total{method="HEAD",path="/beat/{id}",status="405"}`,
+		},
+		// PUT falls to the method-AGNOSTIC /beat/{id} route, which names no
+		// method — so the method label collapses to "other" rather than
+		// echoing a caller-chosen token. See recordHTTPMetric.
+		"disallowed method refused": {
+			ctx: context.Background(), method: http.MethodPut, path: "/beat/" + id,
+			wantStatus: http.StatusMethodNotAllowed,
+			wantSeries: `knell_http_requests_total{method="other",path="/beat/{id}",status="405"}`,
+		},
+		// A ping arriving during the drain, after watch.Run already took its
+		// undelivered-work snapshot.
+		"ping during drain": {
+			ctx: cancelledCtx(), method: http.MethodPost, path: "/beat/" + id,
+			wantStatus: http.StatusServiceUnavailable,
+			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="503"}`,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			b := &fakeBeater{known: map[string]bool{id: true}}
+			h := newTestHandlerCtx(tt.ctx, b, tt.token)
+
+			// Deltas, not absolutes: the registry is a package-level singleton
+			// shared by the whole test binary (and by a -count=2 rerun).
+			before, _ := seriesValue(t, scrapeExposition(t, h), tt.wantSeries)
+
+			rec := beatRequest(t, h, tt.method, tt.path)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("%s %s = %d, want %d (body %s)", tt.method, tt.path, rec.Code, tt.wantStatus, rec.Body.String())
+			}
+
+			exposition := scrapeExposition(t, h)
+			got, ok := seriesValue(t, exposition, tt.wantSeries)
+			if !ok {
+				t.Fatalf("%s missing from the exposition after %s %s answered %d: this refusal class is unalertable without it\n%s",
+					tt.wantSeries, tt.method, tt.path, tt.wantStatus, exposition)
+			}
+			if got != before+1 {
+				t.Errorf("%s = %v, want %v (one request, one increment)", tt.wantSeries, got, before+1)
+			}
+			if len(b.seen) != tt.wantSeen {
+				t.Errorf("recorded beats = %v, want %d: the request counter must not change what gets recorded", b.seen, tt.wantSeen)
+			}
+		})
+	}
+}
+
+// TestRequestMetricLabelsBoundedByTheRouteTable is the cardinality guard on the
+// new counter, and the reason recordHTTPMetric derives BOTH labels from the
+// matched route instead of from the request. webhttp.Logging is outermost, so
+// this hook fires before beatHandler's token gate: the inputs below arrive from
+// an UNAUTHENTICATED caller, and a Prometheus series once minted is permanent
+// for the process lifetime here and in every observer scraping knell. So the
+// label set must be bounded by the ROUTE TABLE and by nothing the caller sends.
+//
+// Two attack shapes, and knell is uniquely exposed to the second. The path is
+// the obvious one. The METHOD is the one the fleet siblings do not face:
+// registry-stats and subflux register only method-bearing patterns, so their
+// r.Method is bounded by the mux, while knell deliberately registers a
+// method-agnostic /beat/{id} catch-all (so a 405 can carry a truthful Allow),
+// and net/http routes ANY valid token there — "XYZZY" and friends reach it and
+// answer 405. Recording r.Method there would hand a scanner an unbounded label.
+func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
+	// The complete label vocabulary knell's route table can produce. Anything
+	// outside this is a caller-controlled value that reached a label.
+	allowedMethods := map[string]bool{
+		"GET": true, "POST": true, "HEAD": true,
+		otherMethodLabel: true, unmatchedLabel: true,
+	}
+	allowedPaths := map[string]bool{
+		"/beat/{id}": true, "/healthz": true, "/metrics": true,
+		unmatchedLabel: true,
+	}
+
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	h := newTestHandlerCtx(context.Background(), b, "")
+	before := httpRequestSeries(scrapeExposition(t, h))
+
+	// Every hostile token below is distinct, so a naive implementation mints a
+	// new series per request and the assertions fail loudly rather than subtly.
+	var hostile []struct{ method, path string }
+	add := func(method, path string) {
+		hostile = append(hostile, struct{ method, path string }{method, path})
+	}
+	for i := range 12 {
+		suffix := strconv.Itoa(i)
+		// Distinct beat ids: all must collapse onto the /beat/{id} TEMPLATE,
+		// known and unknown alike (an unknown id answers 404 and must mint
+		// nothing, the same rule that protects the per-beat series).
+		add(http.MethodPost, "/beat/ghost"+suffix)
+		// Distinct method tokens on the method-agnostic route.
+		add("XYZZY"+suffix, "/beat/api")
+		// Distinct unmatched paths: scanner traffic.
+		add(http.MethodGet, "/wp-admin/"+suffix+"/setup.php")
+		// A distinct method AND a distinct unmatched path at once.
+		add("BLARG"+suffix, "/nope/"+suffix)
+	}
+	// Percent-encoded and traversal-shaped spellings of a real route: r.URL.Path
+	// varies without bound while the pattern does not.
+	add(http.MethodPost, "/beat/%61pi")
+	add(http.MethodGet, "/beat/a%2Fb")
+	add(http.MethodGet, "//healthz")
+	add(http.MethodGet, "/./metrics")
+
+	for _, req := range hostile {
+		beatRequest(t, h, req.method, req.path)
+	}
+
+	exposition := scrapeExposition(t, h)
+	after := httpRequestSeries(exposition)
+
+	// Nothing a caller sent may appear anywhere in the exposition. This catches
+	// a label leak even if the membership checks below were relaxed.
+	for _, req := range hostile {
+		for _, token := range []string{req.method, req.path} {
+			if !allowedMethods[token] && !allowedPaths[token] && strings.Contains(exposition, token) {
+				t.Errorf("exposition contains the caller-supplied token %q: a request value reached a metric label\n%s", token, exposition)
+			}
+		}
+	}
+
+	// Every series, pre-existing or new, must be spelled from the route table.
+	for series := range after {
+		labels := strings.TrimSuffix(strings.TrimPrefix(series, "knell_http_requests_total{"), "}")
+		for pair := range strings.SplitSeq(labels, ",") {
+			name, value, ok := strings.Cut(pair, "=")
+			if !ok {
+				t.Errorf("unparseable label pair %q in %q", pair, series)
+				continue
+			}
+			value = strings.Trim(value, `"`)
+			switch name {
+			case "method":
+				if !allowedMethods[value] {
+					t.Errorf("series %s carries method=%q, which is not one the route table can produce: an unauthenticated caller can mint series without bound", series, value)
+				}
+			case "path":
+				if !allowedPaths[value] {
+					t.Errorf("series %s carries path=%q, which is not a registered route template", series, value)
+				}
+			}
+		}
+	}
+
+	// The route table can produce at most 5 methods x 4 paths x the handful of
+	// statuses knell answers; 52 hostile requests must land inside that, not
+	// grow it. The bound is deliberately loose — the membership checks above are
+	// the precise guard, this catches unbounded GROWTH regardless of spelling.
+	const maxNewSeries = 8
+	if grew := len(after) - len(before); grew > maxNewSeries {
+		t.Errorf("%d hostile requests added %d new series (want at most %d): the label set must be bounded by the route table, not by the caller\n%s",
+			len(hostile), grew, maxNewSeries, exposition)
 	}
 }

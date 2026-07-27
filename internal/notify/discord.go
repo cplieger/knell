@@ -47,6 +47,10 @@ const maxAttempts = 3
 // reported as the fact it is and the detail is dropped.
 const maxErrorBodyBytes = 512
 
+// drainBytes caps how much of a response body is read purely so the
+// connection can be reused. It matches httpx's own drain bound.
+const drainBytes = 64 << 10
+
 // userAgent identifies this client to Discord's edge. Go sends
 // "Go-http-client/1.1" when the header is unset, which an edge or WAF in
 // front of a webhook commonly refuses; that refusal would arrive as a
@@ -240,9 +244,7 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 // that embeds the full request URL, and returns everything else untouched.
 // There is deliberately no string search-and-replace backstop: text-matching
 // redaction can only defend text knell chose to publish, and this package
-// publishes none — every message is authored here (never interpolating d.url)
-// and a rejected response contributes a number, not its own words (see
-// statusDetail).
+// publishes none (see post for that invariant).
 //
 // Stripping the wrapper leaves the CAUSE's text, which for two of net/http's
 // redirect causes is written from a response header, so postAttempt's
@@ -344,6 +346,12 @@ func transportPhrase(err error) string {
 		return "the webhook host refused the connection"
 	case errors.Is(err, syscall.ECONNRESET):
 		return "the connection to the webhook was reset"
+	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
+		// No route, not a refusal: the packet never left this host's
+		// network. Named separately because the operator action is the
+		// node's egress (routing, firewall, a missing IPv6 route), not
+		// Discord and not DNS.
+		return "no network route to the webhook host"
 	case errors.As(err, &certErr):
 		return "the webhook's TLS certificate could not be verified"
 	case errors.As(err, &netErr) && netErr.Timeout():
@@ -356,10 +364,17 @@ func transportPhrase(err error) string {
 
 // transportStage names WHICH stage of the attempt failed, from net.OpError's
 // Op field. That field is one of net's own fixed verbs ("dial", "read",
-// "write"), so it is safe to print where the surrounding error text is not,
-// and it carries the distinction that matters most during an outage: a stalled
-// dial points at egress or DNS, while a stalled read means the webhook host
-// accepted the connection and then went quiet.
+// "write", or "proxyconnect" for a proxied attempt), so it is safe to print
+// where the surrounding error text is not, and it carries the distinction that
+// matters most during an outage: a stalled dial points at egress or DNS, while a
+// stalled read means the webhook host accepted the connection and then went
+// quiet.
+//
+// "proxyconnect" reaches here even though transportPhrase has a branch for it:
+// a proxy dial that TIMES OUT (rather than being refused) matches the deadline
+// branch first, which appends this suffix, so that failure reads "a deadline
+// expired during proxyconnect" — the stage still names the proxy, which is why
+// the order is left alone.
 func transportStage(err error) string {
 	var opErr *net.OpError
 	if errors.As(err, &opErr) && opErr.Op != "" {
@@ -437,7 +452,7 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", userAgent)
-	resp, doErr := d.client.Do(req) //nolint:bodyclose // closed via deferred httpx.DrainClose below
+	resp, doErr := d.client.Do(req) //nolint:bodyclose // closed via the deferred drainClose below
 	if doErr != nil {
 		// A child attempt deadline is retryable while the caller's budget is
 		// still live. httpx deliberately treats context deadline errors as
@@ -459,7 +474,7 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 		// (transient classification survives through Unwrap).
 		return struct{}{}, safeTransportError(doErr)
 	}
-	defer httpx.DrainClose(resp.Body)
+	defer drainClose(resp.Body)
 	return struct{}{}, deliveryError(resp)
 }
 
@@ -506,10 +521,42 @@ func deliveryError(resp *http.Response) error {
 	// The code alone cannot tell a deleted webhook from a rejected payload;
 	// Discord names that difference in the body as a numeric code, and
 	// statusDetail reports the code plus knell's own wording for it.
-	if detail := statusDetail(resp.Body); detail != "" {
+	detail := statusDetail(resp.Body)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// CheckHTTPStatus renders these two as "invalid API key (401)" and
+		// "access denied (403)" — wording for a keyed API. knell sends no API
+		// key: DISCORD_WEBHOOK_URL's own path and token ARE the credential,
+		// which is why config refuses a non-https URL. Discord answers a
+		// rotated webhook token with 401 + code 50027, but that code reaches
+		// the operator only when the body arrives whole and under
+		// maxErrorBodyBytes, so name the credential knell actually has and
+		// the verdict stands on its own when the body contributes nothing.
+		return fmt.Errorf(
+			"%w%s (knell sends no API key - DISCORD_WEBHOOK_URL's own path and token are the credential: recreate the webhook and update the config)",
+			statusErr, detail)
+	}
+	if detail != "" {
 		return fmt.Errorf("%w%s", statusErr, detail)
 	}
 	return statusErr
+}
+
+// drainClose discards up to drainBytes of what is left of a response body so
+// the connection can be reused, then closes it. It stands in for
+// httpx.DrainClose for one reason: that helper LOGS its read error
+// (slog.Debug "failed to drain response body", through the package-level
+// slog.Default(), so no httpx option can redirect or silence it), and a
+// body-read error's TEXT is remote-authored — net/http renders a malformed
+// chunked trailer as `malformed MIME header: missing colon: "<remote bytes>"`,
+// and for a webhook edge that echoes the request URI those bytes are the path
+// that IS the credential. Every other remote-text path in this package is
+// reduced structurally (safeTransportError, statusDetail, readFailure); this
+// one is closed by never giving the error to a logger. Dropping it costs
+// nothing knell reports: a failed drain only forfeits connection reuse, and
+// everything said about a rejected body comes from statusDetail.
+func drainClose(body io.ReadCloser) {
+	_, _ = io.CopyN(io.Discard, body, drainBytes)
+	_ = body.Close()
 }
 
 // statusDetail renders what a rejected response adds to its status code,

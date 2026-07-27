@@ -67,6 +67,8 @@ Silence past the deadline rings the bell:
 
 knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext. Put a TLS reverse proxy in front, or keep pings on a trusted network.
 
+`BEAT_TOKEN` gates `/beat/{id}` only: `/healthz` and `/metrics` stay open on the same port so probes and scrapes keep working. `/metrics` publishes every configured beat id plus each beat's last-seen timestamp and freshness, so anyone who can reach the port can enumerate the beats and see which one is about to fire, even with a token set. Publish the port to a trusted network only (the compose example maps it on every host interface), or put an authenticating proxy in front of `/metrics`.
+
 A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling back, and so does a webhook URL on any scheme other than `https` or a `NODE_NAME` over 256 bytes. When a `_FILE` variable is set but its file cannot be read, because it is missing, unreadable, or empty, startup fails instead of falling back to the plain variable; only an unset `_FILE` variable falls back. A dead-man switch running with the wrong config is worse than one that refuses to start.
 
 ## Endpoints

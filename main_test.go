@@ -68,42 +68,30 @@ func plantHealthMarker(t *testing.T) {
 // from a test at all. The https-scheme rejection itself is pinned end to end
 // by TestRejectedConfigExitsOneWithoutLeakingTheWebhook (main_cli_test.go).
 func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
-	cases := map[string]map[string]string{
-		"malformed BEATS": {
-			"BEATS": "api-without-a-deadline",
-		},
+	// Serial (no t.Parallel): t.Setenv, plus run() installs a
+	// process-global slog default of its own.
+	t.Setenv("BEATS", "api-without-a-deadline")
+	// Unset, not blanked: a present-but-empty _FILE variable now
+	// fails startup, and this only needs the ambient secret gone so
+	// it cannot satisfy the webhook gate.
+	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
+	// Installs a fresh recorder and restores the previous default at
+	// test end; run() replaces the default with its own handler.
+	capture.Default(t)
+
+	// Plant the marker a previous run would have left behind.
+	plantHealthMarker(t)
+
+	err := run()
+	if err == nil {
+		t.Fatal("run() = nil, want a configuration error")
 	}
-
-	for name, env := range cases {
-		t.Run(name, func(t *testing.T) {
-			// Serial (no t.Parallel): t.Setenv, plus run() installs a
-			// process-global slog default of its own.
-			for k, v := range env {
-				t.Setenv(k, v)
-			}
-			// Unset, not blanked: a present-but-empty _FILE variable now
-			// fails startup, and this only needs the ambient secret gone so
-			// it cannot satisfy the webhook gate.
-			unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
-			// Installs a fresh recorder and restores the previous default at
-			// test end; run() replaces the default with its own handler.
-			capture.Default(t)
-
-			// Plant the marker a previous run would have left behind.
-			plantHealthMarker(t)
-
-			err := run()
-			if err == nil {
-				t.Fatal("run() = nil, want a configuration error")
-			}
-			if !strings.Contains(err.Error(), "configuration") {
-				t.Fatalf("run() = %v, want the configuration gate to reject the boot", err)
-			}
-			if _, statErr := os.Stat(health.DefaultPath); !errors.Is(statErr, fs.ErrNotExist) {
-				t.Errorf("marker %s after a rejected boot: stat = %v, want it gone; a stale marker reports a crash-looping container healthy",
-					health.DefaultPath, statErr)
-			}
-		})
+	if !strings.Contains(err.Error(), "configuration") {
+		t.Fatalf("run() = %v, want the configuration gate to reject the boot", err)
+	}
+	if _, statErr := os.Stat(health.DefaultPath); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("marker %s after a rejected boot: stat = %v, want it gone; a stale marker reports a crash-looping container healthy",
+			health.DefaultPath, statErr)
 	}
 }
 

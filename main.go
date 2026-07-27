@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -83,7 +84,12 @@ func run() error {
 	// warning now renders at the default level, the parsed one not being
 	// known yet.
 	marker := health.NewMarker(health.DefaultPath)
-	marker.Set(false)
+	// Cleanup, not Set(false): both remove the marker (and both are no-ops in
+	// degraded mode), but Set treats the first call as a health TRANSITION and
+	// logs a WARN on every boot for a state that is only 'not booted yet'.
+	// Cleanup logs only when the remove itself fails, which is the outcome
+	// worth a warn here.
+	marker.Cleanup()
 	defer marker.Cleanup()
 
 	cfg, err := config.Load()
@@ -140,6 +146,14 @@ func run() error {
 	// Bind up front so a port-in-use error surfaces synchronously.
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ListenAddr)
 	if err != nil {
+		// A signal that arrives before the bind cancels the Listen itself, so
+		// this error IS the shutdown, not a port conflict. Report the stop and
+		// return nil (run's contract for a clean signal-driven shutdown)
+		// instead of an Error line naming the address.
+		if ctx.Err() != nil {
+			slog.Info("shutting down before the listener was bound")
+			return nil
+		}
 		return fmt.Errorf("binding %s: %w", cfg.ListenAddr, err)
 	}
 	slog.Info("listening", "addr", ln.Addr().String())
@@ -151,24 +165,23 @@ func run() error {
 		watcher.Run(ctx, watch.DefaultTick)
 	}()
 
-	// The marker flip rides the pre-drain phase: webhttp.Run spends ONE
-	// shutdown budget on pre-drain -> srv.Shutdown -> onShutdown, so a flip in
-	// onShutdown lands only after the drain has finished, and the baked
-	// `knell health` probe — which stats the marker FILE, something listener
-	// closure does not cover — would call a draining container healthy for the
-	// whole window. A serve error returns from Run without invoking either
-	// hook; the deferred marker.Cleanup covers that path.
-	// The flip goes FIRST inside the hook: slogx installs a synchronous
-	// stderr handler, so a blocked container log driver can stall inside
-	// slog.Info, and webhttp cannot enforce the shutdown budget on an inline
-	// callback. Flipping before logging makes the probe fail closed even if
-	// either shutdown log then blocks.
 	// shutdownHooksRan separates "Run never reached the shutdown sequence"
 	// (a fatal serve error) from "the sequence ran and Shutdown reported an
 	// error" (a drain that outlived the grace). webhttp calls preDrain
 	// inline on Run's own goroutine, and only after ctx is cancelled, so
 	// this is a plain same-goroutine write.
 	shutdownHooksRan := false
+	// The marker flip rides the PRE-DRAIN phase, not onShutdown: webhttp.Run
+	// spends ONE shutdown budget on pre-drain -> srv.Shutdown -> onShutdown, so
+	// a flip in onShutdown lands only after the drain has finished, and the
+	// baked `knell health` probe — which stats the marker FILE, something
+	// listener closure does not cover — would call a draining container healthy
+	// for the whole window.
+	// The flip goes FIRST inside the hook: slogx installs a synchronous stderr
+	// handler, so a blocked container log driver can stall inside slog.Info,
+	// and webhttp cannot enforce the shutdown budget on an inline callback.
+	// Flipping before logging makes the probe fail closed even if either
+	// shutdown log then blocks.
 	preDrain := webhttp.WithPreDrain(func(context.Context) {
 		shutdownHooksRan = true
 		marker.Set(false)
@@ -185,28 +198,7 @@ func run() error {
 	// instead of racing process exit. Bounded by the shutdown grace: the
 	// teardown context webhttp.Run passes shares that deadline.
 	onShutdown := func(teardownCtx context.Context) {
-		// Check the loop first, on its own: webhttp.Run derives teardownCtx from
-		// the SAME deadline srv.Shutdown just spent, so a drain that used the
-		// whole grace hands this hook an already-expired context. With both
-		// cases ready a single select picks pseudo-randomly, so a watch loop
-		// that DID stop would warn that it is still running half the time.
-		select {
-		case <-watcherDone:
-			return
-		default:
-		}
-		select {
-		case <-watcherDone:
-		case <-teardownCtx.Done():
-			// The watcher may have closed after the preliminary check while
-			// this already-expired context was competing in the select, so
-			// re-check before declaring the loop still running.
-			select {
-			case <-watcherDone:
-			default:
-				slog.Warn("watch loop still running at the end of the shutdown grace")
-			}
-		}
+		awaitWatchLoop(teardownCtx, watcherDone)
 	}
 	err = webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(shutdownGrace), preDrain)
 	if err != nil && !shutdownHooksRan {
@@ -224,7 +216,35 @@ func run() error {
 		defer cancelTeardown()
 		onShutdown(teardownCtx)
 	}
+	if err != nil && shutdownHooksRan && errors.Is(err, context.DeadlineExceeded) {
+		// The shutdown sequence ran and Shutdown reported its own deadline:
+		// in-flight requests outlived the single grace budget. Name that, so
+		// the one ERROR line points at the drain and at the constant that
+		// bounds it instead of at an anonymous expired context.
+		return fmt.Errorf("in-flight requests did not drain within the %s shutdown grace: %w", shutdownGrace, err)
+	}
 	return err
+}
+
+// awaitWatchLoop blocks until the watch loop has finished, or until the
+// teardown budget runs out — at which point it says so, since the loop's
+// abandoned deliveries are then the operator's only trace of the notices this
+// process will never send.
+func awaitWatchLoop(teardownCtx context.Context, watcherDone <-chan struct{}) {
+	select {
+	case <-watcherDone:
+	case <-teardownCtx.Done():
+		// webhttp.Run derives teardownCtx from the SAME deadline srv.Shutdown
+		// just spent, so a drain that used the whole grace hands this hook an
+		// already-expired context, and a select with both cases ready picks
+		// pseudo-randomly. Re-check before declaring the loop still running,
+		// or a watch loop that DID stop is reported as hung half the time.
+		select {
+		case <-watcherDone:
+		default:
+			slog.Warn("watch loop still running at the end of the shutdown grace")
+		}
+	}
 }
 
 // logConfig logs the active configuration at startup. The webhook URL is a

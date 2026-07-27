@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/cplieger/slogx/capture"
 )
 
 // fakeClock is a mutable test clock, safe for concurrent reads.
@@ -52,6 +56,7 @@ type fakeNotifier struct {
 	histories [][]Outage
 	fail      error
 	onMissing func()
+	onHistory func()
 }
 
 func (n *fakeNotifier) BeatMissing(_ context.Context, id string, live Transition) error {
@@ -82,6 +87,9 @@ func (n *fakeNotifier) BeatOutageHistory(_ context.Context, id string, outages [
 	defer n.mu.Unlock()
 	if n.fail != nil {
 		return n.fail
+	}
+	if n.onHistory != nil {
+		n.onHistory()
 	}
 	n.histories = append(n.histories, slices.Clone(outages))
 	n.calls = append(n.calls, call{kind: "history", id: id, outages: len(outages)})
@@ -1433,6 +1441,62 @@ func budgetProbeBeats(prefix string, n int, deadline time.Duration) []Beat {
 	return beats
 }
 
+// TestEveryBeatCanQueueItsRecoveryWithoutADrop pins the size New gives the
+// recovered-transition queue. It is sized from the beat count because each beat
+// can hold at most one pending recovery, which is what makes the drop path in
+// Beat unreachable in production; the whole fleet pinging at once (the fan-out
+// source coming back) is the ordinary case that would otherwise hit it and lose
+// recovered notices for good, since nothing retries one.
+// TestRecoveryQueueOverflowDropKeepsBeatArmed deliberately SHRINKS the channel
+// to exercise that drop path, so it asserts the other side of this boundary,
+// and every other recovery test uses a single beat, where a capacity of 1 is
+// indistinguishable from len(beats).
+func TestEveryBeatCanQueueItsRecoveryWithoutADrop(t *testing.T) {
+	// Serial (no t.Parallel): asserts a delta on the package-global
+	// notification counters, which the parallel tests also move.
+	const (
+		total    = 5
+		deadline = 10 * time.Minute
+	)
+	beats := budgetProbeBeats("recovery-queue-size-probe", total, deadline)
+	clock := newFakeClock()
+	n := &fakeNotifier{}
+	w := New(beats, n, clock.Now, clock.Now())
+
+	// Alert every beat, so every ping below queues a recovered transition.
+	clock.Advance(deadline + time.Minute)
+	w.sweep(context.Background())
+	if got := len(n.snapshot()); got != total {
+		t.Fatalf("missing notices = %d, want one per beat (%d)", got, total)
+	}
+
+	// The whole fleet pings before the Run loop services anything: every one of
+	// those recoveries must find a slot.
+	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "recovered")
+	for _, b := range beats {
+		if !w.Beat(b.ID) {
+			t.Fatalf("Beat(%s) = false", b.ID)
+		}
+	}
+	if got := counterValue(t, "knell_notifications_dropped_total", "recovered"); got != droppedBefore {
+		t.Errorf("dropped{recovered} = %v after the whole fleet pinged, want unchanged %v: the queue must hold one recovery per beat, and nothing retries a dropped recovered notice",
+			got, droppedBefore)
+	}
+
+	drainRecoveries(w)
+	recovered := make(map[string]int, total)
+	for _, c := range n.snapshot() {
+		if c.kind == "recovered" {
+			recovered[c.id]++
+		}
+	}
+	for _, b := range beats {
+		if got := recovered[b.ID]; got != 1 {
+			t.Errorf("beat %s got %d recovered notices, want exactly 1: its queued recovery was dropped for want of a slot", b.ID, got)
+		}
+	}
+}
+
 // sendsBeforeBudgetCut is how many sends one sweep starts when every send
 // burns perSend of the budget: the first starts with the budget untouched,
 // and each further one starts while the elapsed time is still within it (the
@@ -1448,6 +1512,143 @@ func sendsBeforeBudgetCut(perSend time.Duration) int {
 // starting any Run loop: the hook is read from the sender goroutine.
 func slowSends(n *fakeNotifier, clock *fakeClock, perSend time.Duration) {
 	n.onMissing = func() { clock.Advance(perSend) }
+}
+
+// slowHistorySends makes every history send burn perSend of the sweep's
+// budget, the past-tense twin of slowSends. Set it before starting any Run
+// loop: the hook is read from the sender goroutine.
+func slowHistorySends(n *fakeNotifier, clock *fakeClock, perSend time.Duration) {
+	n.onHistory = func() { clock.Advance(perSend) }
+}
+
+// TestHistorySendsAreBoundedByTheSweepBudget pins the send budget on the
+// history half of a sweep. History is delivered FIRST, so a backlog of ended
+// outages -- the shape a webhook outage leaves behind -- is what actually
+// spends the budget in production; without a cut there, one sweep pushes every
+// queued beat's past-tense notice through a slow webhook back to back while
+// Run's select (and every queued recovery) waits out the whole storm, which is
+// the exact failure sweepSendBudget exists to prevent. The deferred count must
+// also cover the LIVE notices this cut defers, not only the remaining history
+// ones: a cut in the history loop defers both orderings, and that term appears
+// nowhere else.
+func TestHistorySendsAreBoundedByTheSweepBudget(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and this asserts deltas on the package-global counters.
+	const (
+		historyDue = 6
+		liveDue    = 4
+		perSend    = 2 * time.Second
+		deadline   = 10 * time.Minute
+	)
+	histBeats := budgetProbeBeats("budget-history-probe-h", historyDue, deadline)
+	liveBeats := budgetProbeBeats("budget-history-probe-l", liveDue, deadline)
+	clock := newFakeClock()
+	n := &fakeNotifier{}
+	w := New(slices.Concat(histBeats, liveBeats), n, clock.Now, clock.Now())
+
+	wantSent := sendsBeforeBudgetCut(perSend)
+	if wantSent >= historyDue {
+		t.Fatalf("test precondition: %d sends fit in the %s budget at %s each, want fewer than the %d due history notices",
+			wantSent, sweepSendBudget, perSend, historyDue)
+	}
+
+	// Give every history beat one outage that is already over when the sweep
+	// runs (ping, a full deadline of silence, late ping), while the live beats
+	// stay on their boot-armed baseline and are simply overdue.
+	for _, b := range histBeats {
+		if !w.Beat(b.ID) {
+			t.Fatalf("Beat(%s) = false", b.ID)
+		}
+	}
+	clock.Advance(deadline + time.Minute)
+	for _, b := range histBeats {
+		if !w.Beat(b.ID) {
+			t.Fatalf("late Beat(%s) = false", b.ID)
+		}
+	}
+	slowSends(n, clock, perSend)
+	slowHistorySends(n, clock, perSend)
+
+	sentBefore := counterValue(t, "knell_notifications_sent_total", "history")
+	failedBefore := counterValue(t, "knell_notifications_failed_total", "history")
+	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "missing")
+
+	rec := capture.Default(t)
+	w.sweep(context.Background())
+
+	got := n.snapshot()
+	if len(got) != wantSent {
+		t.Fatalf("notices in the budget-limited sweep = %d (%v), want %d history notices: the sweep must stop starting sends once its %s budget is spent",
+			len(got), got, wantSent, sweepSendBudget)
+	}
+	delivered := make(map[string]bool, len(got))
+	for i, c := range got {
+		if c.kind != "history" {
+			t.Errorf("calls[%d] = %+v, want a history notice: the cut must return from the sweep, not fall through to the live notices", i, c)
+		}
+		delivered[c.id] = true
+	}
+
+	// Every beat the cut deferred is untouched: its record is still queued for
+	// the next sweep, and nothing about it was counted.
+	for _, b := range histBeats {
+		st := w.beats[b.ID]
+		if delivered[b.ID] {
+			if len(st.pendingMissing) != 0 {
+				t.Errorf("beat %s was notified but still holds %d record(s)", b.ID, len(st.pendingMissing))
+			}
+			continue
+		}
+		if len(st.pendingMissing) != 1 {
+			t.Errorf("beat %s was deferred but holds %d record(s), want its ended-outage record retained for the next sweep", b.ID, len(st.pendingMissing))
+		}
+	}
+	for _, b := range liveBeats {
+		st := w.beats[b.ID]
+		if st.alerted {
+			t.Errorf("live beat %s is marked alerted, but the sweep was cut before the live notices: its outage would never be announced", b.ID)
+		}
+		if st.openMissing() == nil {
+			t.Errorf("live beat %s has no queued open record, so the next sweep has nothing to send", b.ID)
+		}
+	}
+
+	const msg = "sweep send budget spent"
+	wantDeferred := historyDue - wantSent + liveDue
+	if !rec.HasAttr(msg, "deferred_beats", strconv.Itoa(wantDeferred)) {
+		t.Errorf("budget-cut line does not report the %d beats deferred (%d history + %d live): %v",
+			wantDeferred, historyDue-wantSent, liveDue, rec.Records())
+	}
+	if got := rec.CountLevel(slog.LevelDebug, msg); got != 1 {
+		t.Errorf("budget-cut debug lines = %d, want exactly 1 for the sweep: %v", got, rec.Messages())
+	}
+
+	if got, want := counterValue(t, "knell_notifications_sent_total", "history"), sentBefore+float64(wantSent); got != want {
+		t.Errorf("sent{history} = %v, want %v (one per delivered message)", got, want)
+	}
+	if got := counterValue(t, "knell_notifications_failed_total", "history"); got != failedBefore {
+		t.Errorf("failed{history} = %v after a budget-limited sweep, want unchanged %v (a deferred notice had no delivery attempt to fail)", got, failedBefore)
+	}
+	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
+		t.Errorf("dropped{missing} = %v after a budget-limited sweep, want unchanged %v (a deferred record is not lost)", got, droppedBefore)
+	}
+
+	// The deferral is a deferral: once sends are quick, the remaining history
+	// notices go out, exactly one per beat.
+	n.onMissing = nil
+	n.onHistory = nil
+	w.sweep(context.Background())
+	perBeat := make(map[string]int, historyDue)
+	for _, c := range n.snapshot() {
+		if c.kind == "history" {
+			perBeat[c.id]++
+		}
+	}
+	for _, b := range histBeats {
+		if got := perBeat[b.ID]; got != 1 {
+			t.Errorf("beat %s received %d history notices across both sweeps, want exactly 1", b.ID, got)
+		}
+	}
 }
 
 func TestSweepStopsAtItsSendBudgetAndDefersTheRest(t *testing.T) {

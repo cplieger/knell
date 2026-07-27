@@ -195,3 +195,124 @@ func webhookNeedles(rawURL string) []string {
 	}
 	return needles
 }
+
+// FuzzRedirectResponsesNeverCarryLocationText fuzzes the third channel remote
+// text can enter a delivery error by: a response HEADER. net/http writes two
+// of its transport causes from the Location header (a malformed one as `failed
+// to parse Location header "<header>"`, a policy refusal as httpx's `refusing
+// redirect to <host>`), so an endpoint answering a webhook POST with a
+// redirect that echoes the request URI would put the credential into the
+// returned error and into httpx.Do's attempt lines without ever sending a
+// body. TestRedirectDerivedTransportErrorsCarryNoRemoteText pins two
+// hand-picked shapes; this target explores the whole header space and the
+// whole 3xx band, so the seed corpus committed here is the durable coverage of
+// the class (the weekly run's generated corpus is discarded).
+func FuzzRedirectResponsesNeverCarryLocationText(f *testing.F) {
+	// Seed Locations cover the shapes that reach a different cause: an
+	// unparseable header, a cross-host method-preserving hop (refused by
+	// policy, and the shape whose refusal text names the remote host), a
+	// scheme downgrade, a followed same-host hop, a host past any sane
+	// length, a non-HTTP scheme, a query-borne credential, and an empty
+	// header (a 3xx net/http cannot follow). They avoid secret-shaped
+	// keywords: a literal that looks like a credential trips the repo's
+	// secret scan even as fuzz seed data.
+	for _, seed := range []struct {
+		location string
+		status   uint8
+	}{
+		{"/api/webhooks/1234567890/plainsegment%zz", 2},
+		{"https://plainsegment.redirect.example/hooks/1", 7},
+		{"", 0},
+		{"/finish", 7},
+		{`\/api\/webhooks\/1234567890\/plainsegment`, 1},
+		{"http://discord.example/api/webhooks/1234567890/plainsegment", 2},
+		{"https://discord.example:99999/hooks", 8},
+		{"//" + strings.Repeat("p", 600) + ".example/hooks", 7},
+		{"h ttp://plainsegment.example/\x7f\x01", 3},
+		{"/hooks/v\u00e9rylongsegment", 4},
+		{"mailto:plainsegment@example.test", 2},
+		{"?key=queryborneexample", 7},
+	} {
+		f.Add(seed.location, seed.status)
+	}
+
+	f.Fuzz(func(t *testing.T, location string, statusSeed uint8) {
+		// The whole redirect band: 301/302/303 are the method-changing hops
+		// the policy surfaces as a 3xx, 307/308 the method-preserving ones it
+		// refuses with an error, and 300/304/305/306 reach net/http's
+		// no-usable-Location path.
+		status := 300 + int(statusSeed%9)
+		const rawURL = "https://discord.example/api/webhooks/1234567890/plainsegment"
+		// A fixed control Location isolates knell's own message template: a
+		// fuzzed header that happens to contain a phrase like "nothing was
+		// delivered" cannot masquerade as a leak.
+		const controlLocation = "/control-hop"
+
+		gotErr := attemptAgainstRedirectStub(t, rawURL, status, location)
+		controlErr := attemptAgainstRedirectStub(t, rawURL, status, controlLocation)
+		if gotErr == nil {
+			// Every status here is a non-2xx, so a nil would report an
+			// undelivered notification as delivered.
+			t.Fatalf("postAttempt against a %d response returned nil, want a non-delivery error", status)
+		}
+		needles := append(webhookNeedles(rawURL), locationNeedles(location)...)
+		for _, needle := range needles {
+			// A handful of bytes can occur in the surrounding message text,
+			// where its presence proves nothing.
+			if len(needle) < 8 {
+				continue
+			}
+			if controlErr != nil && strings.Contains(controlErr.Error(), needle) {
+				continue
+			}
+			if strings.Contains(gotErr.Error(), needle) {
+				t.Errorf("delivery error for Location %q (status %d) kept %q: %v", location, status, needle, gotErr)
+			}
+		}
+	})
+}
+
+// locationNeedles lists every text whose presence in a delivery error would
+// mean the Location header reached it: the header whole, its slash-escaped
+// rendering (a JSON error body commonly escapes "/" as "\/"), and each part a
+// parse of it exposes, since net/http's causes are built from parsed pieces as
+// well as from the raw header.
+func locationNeedles(location string) []string {
+	needles := []string{location, strings.ReplaceAll(location, "/", `\/`)}
+	if u, err := url.Parse(location); err == nil {
+		needles = append(needles, u.Host, u.Hostname(), u.Path, u.EscapedPath(), u.RawQuery)
+	}
+	if i := strings.LastIndex(location, "/"); i >= 0 {
+		needles = append(needles, location[i+1:])
+	}
+	return needles
+}
+
+// attemptAgainstRedirectStub performs one postAttempt against a stub transport
+// that answers every request with status and the given Location header,
+// reporting the resulting error. A stub rather than a listener because the
+// redirect machinery lives in http.Client, above the transport: this exercises
+// the real policy and the real Location parsing with no socket, no dial and no
+// clock in the oracle.
+func attemptAgainstRedirectStub(t *testing.T, rawURL string, status int, location string) error {
+	t.Helper()
+
+	d := New(rawURL, "node-1")
+	defer d.Close()
+	d.client.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if _, copyErr := io.Copy(io.Discard, r.Body); copyErr != nil {
+			t.Errorf("reading request body: %v", copyErr)
+		}
+		header := make(http.Header)
+		header.Set("Location", location)
+		return &http.Response{
+			StatusCode: status,
+			Status:     fmt.Sprintf("%d Fuzzed", status),
+			Header:     header,
+			Body:       http.NoBody,
+			Request:    r,
+		}, nil
+	})
+	_, err := d.postAttempt(context.Background(), []byte(`{"content":"fuzz"}`))
+	return err
+}

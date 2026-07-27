@@ -7,7 +7,11 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
+	"time"
+	"unicode/utf8"
 
+	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/webhttp"
 )
 
@@ -15,6 +19,34 @@ import (
 // an Alertmanager webhook attach JSON payloads knell ignores; draining keeps
 // connections reusable, the cap keeps a hostile body from tying the handler.
 const maxBeatBody = 1 << 20
+
+// maxLoggedPath bounds the path attribute of an access-log line. Every path
+// knell legitimately serves is short (/healthz, /metrics, /beat/{id} with an
+// id capped at 64 chars by internal/config), while r.URL.Path is
+// attacker-controlled and net/http accepts a megabyte of it, so the raw
+// value is logged truncated: the concrete beat id an operator needs stays
+// intact, and a flood cannot push knell's own undelivered-notice warnings
+// out of the retained log window.
+const maxLoggedPath = 128
+
+// loggedPath is the access log's path policy: the request path, truncated on
+// a rune boundary. The empty case is mapped to "/" rather than left empty,
+// because webhttp coerces an empty return to its redaction-failure
+// placeholder (a path this transform never actually fails on).
+func loggedPath(r *http.Request) string {
+	p := r.URL.Path
+	if p == "" {
+		return "/"
+	}
+	if len(p) <= maxLoggedPath {
+		return p
+	}
+	cut := maxLoggedPath
+	for cut > 0 && !utf8.RuneStart(p[cut]) {
+		cut--
+	}
+	return p[:cut] + "...(truncated)"
+}
 
 // Beater records pings. Implemented by watch.Watcher.
 type Beater interface {
@@ -68,14 +100,15 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 	// reach beat and RECORD a ping, so any monitoring HEAD check pointed at
 	// /beat/{id} would keep the switch armed forever with no real heartbeat
 	// behind it. Do not delete it as redundant boilerplate.
-	mux.HandleFunc("HEAD /beat/{id}", func(w http.ResponseWriter, r *http.Request) {
-		// Two methods are permitted, so Allow is set here rather than by
-		// webhttp.RequireMethod (single-method Allow); the 405 body itself is
-		// the library's standard coded envelope, like every other error here.
-		w.Header().Set("Allow", "GET, POST")
-		webhttp.WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed",
-			"use GET or POST to record a beat")
-	})
+	mux.HandleFunc("HEAD /beat/{id}", writeMethodNotAllowed)
+	// Every OTHER method (PUT, DELETE, PATCH, OPTIONS, an unknown verb) would
+	// otherwise fall to net/http's built-in 405, which assembles Allow from the
+	// registered patterns and so answers "GET, HEAD, POST" -- advertising as
+	// permitted the very method the route above exists to refuse -- with a
+	// plain-text body instead of this file's coded envelope. The
+	// method-agnostic pattern is less specific than the three method-bearing
+	// ones, so GET, POST and HEAD still route above.
+	mux.HandleFunc("/beat/{id}", writeMethodNotAllowed)
 	mux.Handle("GET /healthz", routes.Healthz)
 	mux.Handle("GET /metrics", routes.Metrics)
 
@@ -88,7 +121,23 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 		// two endpoints carrying knell's quorum signal, so a scrape that
 		// stopped landing or a liveness probe answering 503 has to be
 		// greppable. Skip lists stay for streams, of which knell has none.
-		webhttp.Logging(webhttp.ProbeLogLevel("/healthz", "/metrics")),
+		//
+		// WithPathFunc bounds the logged path: Logging is FIRST here and
+		// Chain applies its list in reverse, so this line is emitted for
+		// every request BEFORE beatHandler's token gate runs, which is why
+		// BEAT_TOKEN does not bound it and the policy has to.
+		//
+		// WithRecordMetricRequest is the same story for the exposition: it is
+		// the only place a REFUSED ping (401, 404, 405, 503) becomes visible
+		// to a scrape, since none of them reach beatsReceived. It gets the
+		// request-aware hook rather than the legacy WithRecordMetric because
+		// the labels must key on the matched route, which only the request
+		// carries (r.Pattern); recordHTTPMetric owns that derivation.
+		webhttp.Logging(
+			webhttp.ProbeLogLevel("/healthz", "/metrics"),
+			webhttp.WithPathFunc(loggedPath),
+			webhttp.WithRecordMetricRequest(recordHTTPMetric),
+		),
 		webhttp.Recoverer(),
 		webhttp.SecurityHeaders(),
 		noStore,
@@ -106,6 +155,68 @@ func noStore(next http.Handler) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// unmatchedLabel is the method AND path recorded for a request that matched no
+// route. They collapse together deliberately: such a request has nothing
+// route-derived to report and both of its real values are caller-chosen, so a
+// single series absorbs every scanner probe instead of one per probe.
+const unmatchedLabel = "unmatched"
+
+// otherMethodLabel is the method recorded for a request that matched the
+// method-agnostic /beat/{id} route (the 405 catch-all registered below). That
+// pattern names no method, so r.Method there is whatever token the caller put
+// on the request line, and net/http accepts any RFC 9110 token — measured over
+// a real socket, both "XYZZY" and "M!#$%&'*+-.^_`|~" route to that pattern and
+// answer 405. Recording r.Method there would therefore let one unauthenticated
+// caller mint series without bound, so the metric records only that SOME
+// disallowed method was refused; the real method is still in the access line.
+const otherMethodLabel = "other"
+
+// recordHTTPMetric feeds webhttp.Logging's request-aware metric hook and is the
+// single home of knell's http_requests_total label derivation. Both labels come
+// from the MATCHED ROUTE, never from the request line: Logging is outermost, so
+// this hook fires for every request BEFORE beatHandler's token gate, meaning an
+// unauthenticated caller chooses the input. A series once minted is permanent
+// for the process lifetime — here and in every observer scraping knell — so the
+// label set must stay bounded by the ROUTE TABLE. Three cases:
+//
+//   - Nothing matched (r.Pattern == ""): net/http's own 404, and its own 405
+//     for a method that missed a method-bearing route (POST /healthz). Both
+//     labels collapse to unmatchedLabel.
+//   - A method-BEARING pattern matched ("GET /beat/{id}"): r.Method is recorded
+//     as-is and is provably bounded, because ServeMux routes there only for
+//     that pattern's method or for HEAD against a GET pattern — so a HEAD
+//     /healthz probe records method HEAD while matching "GET /healthz", which
+//     is the truthful reading. The path is the pattern's TEMPLATE, so every
+//     beat id records as "/beat/{id}" and an unknown id mints no new series.
+//   - The method-AGNOSTIC "/beat/{id}" pattern matched: method collapses to
+//     otherMethodLabel. This is why knell cannot simply pass r.Method the way
+//     the fleet siblings do — registry-stats and subflux register only
+//     method-bearing patterns, so r.Method is bounded there and is not here.
+func recordHTTPMetric(r *http.Request, status int, d time.Duration) {
+	method, path := unmatchedLabel, unmatchedLabel
+	if r.Pattern != "" {
+		method, path = r.Method, r.Pattern
+		if _, template, ok := strings.Cut(r.Pattern, " "); ok {
+			path = template
+		} else {
+			method = otherMethodLabel
+		}
+	}
+	metrics.RecordHTTP(method, path, status, d)
+}
+
+// writeMethodNotAllowed refuses a beat request whose method is not GET or
+// POST: 405 in this file's standard coded envelope. Two methods are permitted,
+// so Allow is set here rather than by webhttp.RequireMethod (single-method
+// Allow), and it is the single home of the refusal EVERY rejected method
+// answers with -- HEAD included -- so no response can tell a sender that a
+// method which does not record a beat is allowed to.
+func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Allow", "GET, POST")
+	webhttp.WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed",
+		"use GET or POST to record a beat")
 }
 
 // writeShuttingDown refuses a beat because acceptance is closed: 503 in this

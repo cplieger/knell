@@ -328,6 +328,37 @@ func TestLoadBeatTokenDefaultsEmpty(t *testing.T) {
 	}
 }
 
+// TestLoadDoesNotWarnAboutTokenLengthWhenNoTokenIsSet pins the non-empty
+// guard on the short-token warning. An absent BEAT_TOKEN is the documented
+// open-endpoint case, and the length warning must not speak for it: without
+// the token != "" guard, every ungated deployment logs "BEAT_TOKEN is shorter
+// than the recommended minimum" at startup, which reads as "a weak token is
+// armed" for a configuration that has no gate at all — so the one line an
+// operator would act on describes a token that does not exist while the real
+// state, an unauthenticated /beat/{id}, goes unnamed.
+// TestLoadBeatTokenDefaultsEmpty pins the returned value for this case but
+// captures no log, so the warning is free to fire.
+func TestLoadDoesNotWarnAboutTokenLengthWhenNoTokenIsSet(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	setValidLoadEnv(t)
+	unsetEnv(t, "BEAT_TOKEN")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
+
+	rec := capture.Default(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.BeatToken != "" {
+		t.Fatalf("BeatToken = %q, want empty: an absent BEAT_TOKEN is the documented open-endpoint case", cfg.BeatToken)
+	}
+	if rec.Contains("BEAT_TOKEN is shorter") {
+		t.Errorf("an absent BEAT_TOKEN drew the short-token warning: %v; it reads as \"a weak token is armed\" for a configuration that has no gate at all", rec.Messages())
+	}
+}
+
 func TestLoadShortBeatTokenWarnsWithoutLeakingIt(t *testing.T) {
 	// Serial (t.Setenv forbids t.Parallel anyway): swaps the process-global
 	// slog default to capture the short-token warning.
@@ -346,6 +377,16 @@ func TestLoadShortBeatTokenWarnsWithoutLeakingIt(t *testing.T) {
 	}
 	if !rec.Contains("BEAT_TOKEN is shorter") {
 		t.Errorf("log output %v missing the short-token warning", rec.Messages())
+	}
+	// The actionable content is the recommended minimum, and it is the ONLY
+	// number the warning may carry: the token's own length is an attribute of a
+	// live credential, and this line is shipped to a log store whose audience is
+	// far wider than the encrypted file the token lives in.
+	if !rec.HasAttr("BEAT_TOKEN is shorter", "minimum", strconv.Itoa(minTokenLength)) {
+		t.Errorf("short-token warning does not report the recommended minimum %d: %v", minTokenLength, rec.Messages())
+	}
+	if _, found := rec.AttrValue("BEAT_TOKEN is shorter", "length"); found {
+		t.Errorf("short-token warning publishes the token's exact length: it bounds the guess space of an already-weak credential on an unrate-limited POST /beat/{id} for every reader of the log store")
 	}
 	if rec.Contains("shorty") || rec.AttrContains("", "", "shorty") {
 		t.Errorf("log output leaks the token value: %v", rec.Messages())
@@ -390,8 +431,8 @@ func TestLoadBeatTokenFileWinsOverPlainVar(t *testing.T) {
 	if cfg.BeatToken != "file-borne-beat-token" {
 		t.Errorf("BeatToken = %q, want the file-borne token: BEAT_TOKEN_FILE wins over BEAT_TOKEN, so a rotated secret file must not be shadowed by a stale plain variable that would 401 every sender", cfg.BeatToken)
 	}
-	if !rec.Contains("BEAT_TOKEN and BEAT_TOKEN_FILE are both set") {
-		t.Errorf("log output %v missing the both-channels-set warning that tells the operator the plain variable is ignored", rec.Messages())
+	if !rec.Contains("the plain variable is ignored") || !rec.HasAttr("", "variable", "BEAT_TOKEN") {
+		t.Errorf("log output %v missing the both-channels-set warning that tells the operator the plain variable is ignored, carrying the ignored variable as a queryable attribute", rec.Messages())
 	}
 	if rec.Contains("stale-env-beat-token") || rec.AttrContains("", "", "stale-env-beat-token") ||
 		rec.Contains("file-borne-beat-token") || rec.AttrContains("", "", "file-borne-beat-token") {
@@ -437,8 +478,8 @@ func TestLoadWebhookFileWinsOverPlainVar(t *testing.T) {
 	if cfg.WebhookURL != "https://discord.example/file-borne-hook" {
 		t.Errorf("WebhookURL = %q, want the file-borne URL: DISCORD_WEBHOOK_URL_FILE wins, so a rotated webhook must not be shadowed by a stale plain variable every notice would 404 against", cfg.WebhookURL)
 	}
-	if !rec.Contains("DISCORD_WEBHOOK_URL and DISCORD_WEBHOOK_URL_FILE are both set") {
-		t.Errorf("log output %v missing the both-channels-set warning that tells the operator the plain variable is ignored", rec.Messages())
+	if !rec.Contains("the plain variable is ignored") || !rec.HasAttr("", "variable", "DISCORD_WEBHOOK_URL") {
+		t.Errorf("log output %v missing the both-channels-set warning that tells the operator the plain variable is ignored, carrying the ignored variable as a queryable attribute", rec.Messages())
 	}
 	if rec.Contains("stale-env-hook") || rec.AttrContains("", "", "stale-env-hook") ||
 		rec.Contains("file-borne-hook") || rec.AttrContains("", "", "file-borne-hook") {
@@ -579,9 +620,9 @@ func TestLoadKeepsAWhitespaceOnlyBeatTokenArmed(t *testing.T) {
 		t.Errorf("BeatToken = %q, want the value preserved verbatim", cfg.BeatToken)
 	}
 	// The shape, not just the length: the generic short-token warning fires
-	// for "   " too (length=3), so without this assertion the one warning
-	// that names the actual misconfiguration can be dropped and the log
-	// still looks populated.
+	// for "   " too (it is 3 bytes), so without this assertion the one
+	// warning that names the actual misconfiguration can be dropped and the
+	// log still looks populated.
 	if !rec.Contains("whitespace only") {
 		t.Errorf("log output %v never says the token is whitespace only; the only other signal is the length hint, which reads as \"your token is short\" while every sender 401s", rec.Messages())
 	}
@@ -614,7 +655,12 @@ func TestLoadFallsBackToTheHostnameWhenNodeNameIsUnset(t *testing.T) {
 		t.Skipf("cannot determine the hostname: %v", err)
 	}
 	setValidLoadEnv(t)
-	t.Setenv("NODE_NAME", "")
+	// ABSENT, not present-but-empty: an unset NODE_NAME is what every
+	// deployment ships (the compose example sets BEATS and the webhook only),
+	// and this package already treats the two states differently elsewhere
+	// (loadBeatToken refuses a present-but-empty BEAT_TOKEN while an absent one
+	// serves /beat/{id} open).
+	unsetEnv(t, "NODE_NAME")
 
 	cfg, err := Load()
 	if err != nil {
@@ -794,8 +840,40 @@ func TestLoadDoesNotWarnWhenOnlyTheSecretFilesAreSet(t *testing.T) {
 	if cfg.BeatToken != "file-borne-beat-token" || cfg.WebhookURL != "https://discord.example/file-borne-hook" {
 		t.Fatalf("BeatToken = %q, WebhookURL = %q, want both from their _FILE channels", cfg.BeatToken, cfg.WebhookURL)
 	}
-	if rec.Contains("both set") {
+	if rec.Contains("the plain variable is ignored") {
 		t.Errorf("_FILE-only configuration warned that the plain variable is ignored: %v", rec.Messages())
+	}
+}
+
+// TestLoadDoesNotWarnWhenOnlyThePlainVarsAreSet pins the plain-only half of
+// warnPlainVarIgnored's source guard. The warning means "a _FILE channel
+// supplied this secret, so the plain variable you also set was ignored" — it
+// is only true when src is envx.SourceFile. TestLoadBeatTokenFileWinsOverPlainVar
+// and TestLoadWebhookFileWinsOverPlainVar pin the positive case, and
+// TestLoadDoesNotWarnWhenOnlyTheSecretFilesAreSet pins the _FILE-only case;
+// neither exercises the ordinary plain-variable-only deployment, so dropping
+// the src check tells that operator, on every startup, to unset the variable
+// that is actually supplying the credential — advice that leaves /beat/{id}
+// ungated and the next start failing on a missing webhook.
+func TestLoadDoesNotWarnWhenOnlyThePlainVarsAreSet(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", "plain-only-beat-token")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
+	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
+
+	rec := capture.Default(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.BeatToken != "plain-only-beat-token" || cfg.WebhookURL != "https://discord.example/hook" {
+		t.Fatalf("BeatToken = %q, WebhookURL = %q, want both read from their plain variables", cfg.BeatToken, cfg.WebhookURL)
+	}
+	if rec.Contains("the plain variable is ignored") {
+		t.Errorf("plain-variable-only configuration was told its plain variable is ignored: %v; following that advice unsets the variable that is actually supplying the credential", rec.Messages())
 	}
 }
 
@@ -841,5 +919,51 @@ func TestConfigLogValueReportsBothSecretsByPresenceOnly(t *testing.T) {
 	}
 	if got["webhook"] != "unset" || got["beat_auth"] != "open" {
 		t.Errorf("unconfigured: webhook = %q, beat_auth = %q, want \"unset\" and \"open\"; beat_auth must not read \"required\" for an ungated endpoint", got["webhook"], got["beat_auth"])
+	}
+}
+
+// TestConfigLogValueReportsEveryNonSecretField pins the accuracy half of
+// LogValue's contract; TestConfigLogValueReportsBothSecretsByPresenceOnly
+// pins the hygiene half. LogValue exists so a call site can hand a whole
+// Config to slog, and those six attrs are then the entire rendering of a
+// configuration that is env-only, with no reload and no readback endpoint.
+// Every value below differs from any plausible default and from every sibling
+// field, so an attr rewired to a literal or to the wrong field fails here
+// instead of publishing a line that contradicts the configuration running.
+func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		WebhookURL: "https://discord.example/hook",
+		Node:       "observer-borgcube",
+		ListenAddr: "127.0.0.1:19190",
+		BeatToken:  "unit-test-beat-token",
+		Beats: []Beat{
+			{ID: "watchdog-mimir", Deadline: 20 * time.Minute},
+			{ID: "watchdog-loki", Deadline: 26 * time.Hour},
+		},
+		LogLevel: slog.LevelDebug,
+	}
+
+	got := map[string]string{}
+	for _, attr := range cfg.LogValue().Group() {
+		got[attr.Key] = attr.Value.String()
+	}
+
+	want := map[string]string{
+		"beats":       "2",
+		"node":        "observer-borgcube",
+		"listen_addr": "127.0.0.1:19190",
+		"webhook":     "configured",
+		"beat_auth":   "required",
+		"log_level":   "DEBUG",
+	}
+	if len(got) != len(want) {
+		t.Errorf("LogValue() rendered %d attrs %v, want exactly %d: an added attr has to be reviewed for secret content, and a dropped one silently removes a field from the only rendering of an env-only configuration", len(got), got, len(want))
+	}
+	for key, wantValue := range want {
+		if got[key] != wantValue {
+			t.Errorf("LogValue attr %s = %q, want %q", key, got[key], wantValue)
+		}
 	}
 }

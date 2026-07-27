@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +21,11 @@ import (
 	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/slogx/capture"
 )
+
+// stillRunningWarn is the message awaitWatchLoop logs when the watch loop
+// outlives the shutdown grace, spelled out here so a reworded production line
+// fails the tests that assert on it rather than silently matching nothing.
+const stillRunningWarn = "watch loop still running at the end of the shutdown grace"
 
 // waitForMarkerWithin blocks until the health marker reaches the wanted
 // presence, or fails the test. A Stat error other than fs.ErrNotExist is a
@@ -213,19 +220,7 @@ func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	}
 
 	const series = `knell_beat_last_seen_timestamp_seconds{beat="api"}`
-	var baseline float64
-	found := false
-	for line := range strings.SplitSeq(string(body), "\n") {
-		rest, ok := strings.CutPrefix(line, series)
-		if !ok {
-			continue
-		}
-		baseline, err = strconv.ParseFloat(strings.TrimSpace(rest), 64)
-		if err != nil {
-			t.Fatalf("parsing %q: %v", line, err)
-		}
-		found = true
-	}
+	baseline, found := sampleValue(t, string(body), series)
 	if !found {
 		t.Fatalf("%s missing from /metrics; a beat with no published baseline has no quorum signal at all:\n%s", series, body)
 	}
@@ -247,6 +242,25 @@ func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	}
 }
 
+// sampleValue extracts the value of one "name{labels}" sample out of a
+// Prometheus exposition, reporting whether the series was present at all.
+func sampleValue(t *testing.T, exposition, series string) (float64, bool) {
+	t.Helper()
+	value, found := 0.0, false
+	for line := range strings.SplitSeq(exposition, "\n") {
+		rest, ok := strings.CutPrefix(line, series)
+		if !ok {
+			continue
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(rest), 64)
+		if err != nil {
+			t.Fatalf("parsing %q: %v", line, err)
+		}
+		value, found = v, true
+	}
+	return value, found
+}
+
 // scrapeCounter reads one sample out of the process metrics registry by its
 // full "name{labels}" prefix, in process: the registry is a package-level
 // singleton, so it is still readable after run() has returned and the listener
@@ -259,19 +273,11 @@ func scrapeCounter(t *testing.T, series string) float64 {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("in-process /metrics = %d, want 200", rec.Code)
 	}
-	for line := range strings.SplitSeq(rec.Body.String(), "\n") {
-		rest, ok := strings.CutPrefix(line, series)
-		if !ok {
-			continue
-		}
-		v, err := strconv.ParseFloat(strings.TrimSpace(rest), 64)
-		if err != nil {
-			t.Fatalf("parsing %q: %v", line, err)
-		}
-		return v
+	v, ok := sampleValue(t, rec.Body.String(), series)
+	if !ok {
+		t.Fatalf("%s missing from the exposition:\n%s", series, rec.Body.String())
 	}
-	t.Fatalf("%s missing from the exposition:\n%s", series, rec.Body.String())
-	return 0
+	return v
 }
 
 // TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing pins the acceptance
@@ -363,5 +369,180 @@ func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
 	if after := scrapeCounter(t, received); after != before {
 		t.Errorf("%s = %v, want it unchanged at %v: the refused ping must not be counted, or the shutdown tally watch.Run already reported is stale",
 			received, after, before)
+	}
+}
+
+// TestRunGatesTheBeatEndpointWithTheConfiguredToken pins the one half of the
+// beat-token gate main owns: the wiring of cfg.BeatToken into webapi.New. The
+// webapi tests receive the token as an argument, so they cannot catch a
+// composition root that passes "" (or the wrong field): the endpoint would be
+// open to anyone who can reach the port while the operator's BEAT_TOKEN
+// suggests it is gated, and every existing lifecycle test boots WITHOUT a token
+// so an ungated boot looks identical to them.
+func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
+	// process-wide signal, and the shared health-marker path.
+	//
+	// A beat id no other test in this package pings, since the metrics
+	// registry is a package-level singleton shared by the whole test binary.
+	const beat = "token-gate"
+	const token = "unit-test-beat-token"
+	addr := prepareLifecycleRun(t, beat)
+	// After prepareLifecycleRun, which clears BEAT_TOKEN: this is the variable
+	// under test.
+	t.Setenv("BEAT_TOKEN", token)
+
+	done := make(chan error, 1)
+	go func() { done <- run() }()
+	waitForMarkerWithin(t, true, 10*time.Second)
+
+	url := "http://" + addr + "/beat/" + beat
+	unauthorized := postBeat(t, url, "")
+	if unauthorized.status != http.StatusUnauthorized {
+		t.Errorf("unauthenticated ping = %d, want 401: an unwired token leaves the switch keepable by anyone who can reach the port (body %s)",
+			unauthorized.status, unauthorized.body)
+	}
+	if strings.Contains(unauthorized.body, token) {
+		t.Errorf("refusal body = %s, must not echo the configured token", unauthorized.body)
+	}
+
+	if wrong := postBeat(t, url, "Bearer not-the-token"); wrong.status != http.StatusUnauthorized {
+		t.Errorf("ping with a wrong token = %d, want 401 (body %s)", wrong.status, wrong.body)
+	}
+
+	accepted := postBeat(t, url, "Bearer "+token)
+	if accepted.status != http.StatusOK {
+		t.Errorf("ping with the configured token = %d, want 200: the gate must admit the sender the operator configured (body %s)",
+			accepted.status, accepted.body)
+	}
+	if !strings.Contains(accepted.body, `"ok":true`) {
+		t.Errorf("accepted ping body = %s, want the ok acknowledgement", accepted.body)
+	}
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("signalling self: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run() = %v, want nil after a shutdown signal", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run() did not return after a shutdown signal")
+	}
+}
+
+// beatResponse is one /beat answer: the status and the body a failure message
+// should quote.
+type beatResponse struct {
+	body   string
+	status int
+}
+
+// postBeat pings url with the given Authorization header, sending none when
+// auth is empty.
+func postBeat(t *testing.T, url, auth string) beatResponse {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, nil)
+	if err != nil {
+		t.Fatalf("building beat request: %v", err)
+	}
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("ping %s: %v", url, err)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		t.Fatalf("read beat response: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close beat response body: %v", err)
+	}
+	return beatResponse{status: resp.StatusCode, body: string(body)}
+}
+
+// TestAwaitWatchLoopStaysSilentWhenTheLoopStoppedInsideAnExpiredGrace pins the
+// guard the teardown hook exists for. webhttp.Run derives the teardown context
+// from the SAME deadline srv.Shutdown just spent, so a drain that used the whole
+// grace hands the hook an already-expired context: with the loop already stopped
+// AND the context already done, a single select over both would pick
+// pseudo-randomly and log "watch loop still running" on about half of all
+// ordinary shutdowns — a WARN whose whole purpose is to mean the sender's
+// abandoned deliveries went unlogged, so a false one sends the operator hunting
+// for lost notices that were never lost.
+//
+// The repetition is the oracle: collapsing the three selects into one is
+// detected by a single call only half the time, so one call cannot pin the
+// guard at all; 200 calls make the collapse practically certain to show up and
+// still finish in microseconds.
+func TestAwaitWatchLoopStaysSilentWhenTheLoopStoppedInsideAnExpiredGrace(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default.
+	rec := capture.Default(t)
+
+	stopped := make(chan struct{})
+	close(stopped)
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for range 200 {
+		awaitWatchLoop(expired, stopped)
+	}
+
+	if n := rec.CountLevel(slog.LevelWarn, stillRunningWarn); n != 0 {
+		t.Errorf("%d spurious %q warnings over 200 teardowns with the loop already stopped, want 0: a stopped watch loop must never be reported as still running",
+			n, stillRunningWarn)
+	}
+}
+
+// TestAwaitWatchLoopWarnsOnceWhenTheLoopOutlivesTheGrace pins the WARN itself:
+// when the grace is gone and the loop is still running, the abandoned
+// deliveries never got logged, and this line is the operator's only trace that
+// the shutdown tally is incomplete. Dropping it makes that loss silent.
+func TestAwaitWatchLoopWarnsOnceWhenTheLoopOutlivesTheGrace(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default.
+	rec := capture.Default(t)
+
+	running := make(chan struct{}) // never closed: the loop outlives the grace
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	awaitWatchLoop(expired, running)
+
+	if n := rec.CountLevel(slog.LevelWarn, stillRunningWarn); n != 1 {
+		t.Errorf("%q at WARN = %d, want exactly 1; messages = %v", stillRunningWarn, n, rec.Messages())
+	}
+}
+
+// TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace pins that the hook
+// actually WAITS: the single sender needs the window to finish abandoning its
+// in-flight delivery so its log lines land instead of racing process exit. A
+// hook that returned immediately would still pass both cases above, and the
+// loss would only ever show up as missing log lines in production.
+func TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default.
+	rec := capture.Default(t)
+
+	const stopAfter = 50 * time.Millisecond
+	stopping := make(chan struct{})
+	teardownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	time.AfterFunc(stopAfter, func() { close(stopping) })
+
+	start := time.Now()
+	awaitWatchLoop(teardownCtx, stopping)
+	waited := time.Since(start)
+
+	if waited < stopAfter {
+		t.Errorf("awaitWatchLoop returned after %s, want at least %s: it must wait for the watch loop so the sender's abandoned-delivery lines land before exit",
+			waited, stopAfter)
+	}
+	if rec.Contains(stillRunningWarn) {
+		t.Errorf("messages = %v, want no still-running warning for a loop that stopped inside the grace", rec.Messages())
 	}
 }

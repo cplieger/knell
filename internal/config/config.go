@@ -223,12 +223,17 @@ func rejectBlankFileVar(key string) error {
 // plain KEY was also set, so the plain variable was ignored. envx documents
 // this composition as the caller's policy (SecretWithSource reports the
 // source on its error paths too); subject names the credential in the
-// operator's own vocabulary.
+// operator's own vocabulary. Call it only once the secret read SUCCEEDED — on
+// an error path the file supplied nothing, so there is no winner to report and
+// the plain variable was never consulted. The message is static and the
+// variable names ride attributes, so one Loki query covers both credentials
+// and can filter on which variable was ignored.
 func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
 	if src != envx.SourceFile || os.Getenv(key) == "" {
 		return
 	}
-	slog.Warn(key + " and " + key + "_FILE are both set; the file wins and the plain variable is ignored, so unset it to keep " + subject + " out of the process environment")
+	slog.Warn("both the plain variable and its _FILE companion are set; the file wins and the plain variable is ignored, so unset it to keep the credential out of the process environment",
+		"variable", key, "file_variable", key+"_FILE", "credential", subject)
 }
 
 // loadBeatToken reads the optional BEAT_TOKEN bearer gate for
@@ -242,9 +247,9 @@ func loadBeatToken() (string, error) {
 		return "", err
 	}
 	token, tokenSrc, err := envx.SecretWithSource("BEAT_TOKEN")
-	warnPlainVarIgnored("BEAT_TOKEN", "the token", tokenSrc)
 	switch {
 	case err == nil:
+		warnPlainVarIgnored("BEAT_TOKEN", "token", tokenSrc)
 		// Same reason as the webhook: a padded token makes every sender 401
 		// and every beat cross its deadline. A value that is ENTIRELY
 		// whitespace is kept verbatim instead: an empty token is the
@@ -285,7 +290,13 @@ func loadBeatToken() (string, error) {
 		return "", fmt.Errorf("BEAT_TOKEN: %w", err)
 	}
 	if token != "" && len(token) < minTokenLength {
-		slog.Warn("BEAT_TOKEN is shorter than the recommended minimum; a short token is guessable, prefer a long random value", "length", len(token), "minimum", minTokenLength)
+		// The exact length is deliberately NOT logged: it is an attribute of a
+		// live credential, and knell's startup log is shipped to Loki where its
+		// audience is far wider than the age-encrypted file the token itself
+		// lives in. The operator set the token, so the number tells them
+		// nothing they do not know, while it tells a log reader exactly how
+		// large the guess space for an unrate-limited POST /beat/{id} is.
+		slog.Warn("BEAT_TOKEN is shorter than the recommended minimum; a short token is guessable, prefer a long random value", "minimum", minTokenLength)
 	}
 	return token, nil
 }
@@ -299,7 +310,6 @@ func loadWebhook() (string, error) {
 		return "", err
 	}
 	webhook, src, err := envx.SecretWithSource("DISCORD_WEBHOOK_URL")
-	warnPlainVarIgnored("DISCORD_WEBHOOK_URL", "the webhook URL", src)
 	if err != nil {
 		if errors.As(err, new(*envx.MissingError)) {
 			return "", fmt.Errorf("DISCORD_WEBHOOK_URL is required: %w", err)
@@ -309,6 +319,8 @@ func loadWebhook() (string, error) {
 		// operator meant to configure must fail startup, not go unset.
 		return "", fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
 	}
+
+	warnPlainVarIgnored("DISCORD_WEBHOOK_URL", "webhook URL", src)
 
 	// envx trims the _FILE branch only; a plain variable copied from a
 	// deployment file can carry padding. A trailing space survives
