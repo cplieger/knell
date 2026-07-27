@@ -157,9 +157,10 @@ func Load() (Config, error) {
 
 // nodeName resolves the observer name: NODE_NAME when set, else the
 // hostname, else "unknown". A NODE_NAME past maxNodeNameBytes fails startup
-// like any other malformed required value: it would otherwise push every
-// notification past Discord's content limit, so the switch would arm and
-// never ring. The hostname fallback is not length-checked because the kernel
+// like any other malformed required value: the cap (see maxNodeNameBytes for
+// the budget) is what guarantees no name can push a notification past
+// Discord's content limit, where the switch would arm and never ring. The
+// hostname fallback is not length-checked because the kernel
 // already bounds it far below the cap (HOST_NAME_MAX is 64 on Linux, 255 by
 // POSIX), and refusing to start over the machine's own hostname would trade a
 // deliverable notice for no notice at all.
@@ -169,7 +170,7 @@ func nodeName() (string, error) {
 		return hostnameNode(), nil
 	}
 	if len(node) > maxNodeNameBytes {
-		return "", fmt.Errorf("NODE_NAME is %d bytes, maximum is %d: the node name prefixes every Discord notification, and a longer one pushes the message past Discord's 2000-character content limit so no notice can be delivered", len(node), maxNodeNameBytes)
+		return "", fmt.Errorf("NODE_NAME is %d bytes, maximum is %d: the node name prefixes every Discord notification, and the cap keeps every notice far inside Discord's 2000-character content limit (an unbounded name would make Discord reject them all)", len(node), maxNodeNameBytes)
 	}
 	return node, nil
 }

@@ -1743,3 +1743,77 @@ func TestRunServicesRecoveriesAfterABudgetLimitedSweep(t *testing.T) {
 		}
 	})
 }
+
+// anchorNotifier records the live Transition of every missing and recovered
+// notice verbatim. fakeNotifier collapses both to DownFor, which is why a
+// Transition with the right span and the wrong instants passes every other
+// assertion in this package.
+type anchorNotifier struct {
+	missing   []Transition
+	recovered []Transition
+	mu        sync.Mutex
+}
+
+func (n *anchorNotifier) BeatMissing(_ context.Context, _ string, live Transition) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.missing = append(n.missing, live)
+	return nil
+}
+
+func (n *anchorNotifier) BeatRecovered(_ context.Context, _ string, live Transition) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.recovered = append(n.recovered, live)
+	return nil
+}
+
+func (*anchorNotifier) BeatOutageHistory(context.Context, string, []Outage) error { return nil }
+
+// TestLiveNoticesCarryTheInstantsTheyClaim pins the two anchors of the live
+// Transition, not only the span derived from them. The Notifier contract says
+// Started is the beat's last accepted ping and Observed is the instant the
+// notice speaks for -- the sweep that saw the beat silent, or the ping that
+// ended the outage -- and a renderer is entitled to read either one directly.
+// Nothing else in this package does: fakeNotifier records live.DownFor(), so a
+// Transition with both instants shifted by the same amount keeps the whole
+// suite green while every absolute timestamp derived from it is wrong.
+func TestLiveNoticesCarryTheInstantsTheyClaim(t *testing.T) {
+	t.Parallel()
+
+	const id = "live-transition-anchor-probe"
+	clock := newFakeClock()
+	n := &anchorNotifier{}
+	w := New([]Beat{{ID: id, Deadline: 10 * time.Minute}}, n, clock.Now, clock.Now())
+
+	if !w.Beat(id) {
+		t.Fatalf("Beat(%s) = false", id)
+	}
+	lastPing := clock.Now()
+
+	clock.Advance(11 * time.Minute)
+	sweptAt := clock.Now()
+	w.sweep(context.Background())
+
+	clock.Advance(2 * time.Minute)
+	endedAt := clock.Now()
+	if !w.Beat(id) {
+		t.Fatalf("late Beat(%s) = false", id)
+	}
+	drainRecoveries(w)
+
+	if len(n.missing) != 1 {
+		t.Fatalf("missing notices = %d, want 1", len(n.missing))
+	}
+	if got := n.missing[0]; !got.Started.Equal(lastPing) || !got.Observed.Equal(sweptAt) {
+		t.Errorf("missing notice Transition = {Started %s, Observed %s}, want {%s, %s}: Started must be the last accepted ping and Observed the sweep that saw the beat silent",
+			got.Started, got.Observed, lastPing, sweptAt)
+	}
+	if len(n.recovered) != 1 {
+		t.Fatalf("recovered notices = %d, want 1", len(n.recovered))
+	}
+	if got := n.recovered[0]; !got.Started.Equal(lastPing) || !got.Observed.Equal(endedAt) {
+		t.Errorf("recovered notice Transition = {Started %s, Observed %s}, want {%s, %s}: Started must be the last accepted ping before the outage and Observed the ping that ended it",
+			got.Started, got.Observed, lastPing, endedAt)
+	}
+}

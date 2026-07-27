@@ -694,6 +694,43 @@ func TestLoadRejectsANodeNamePastTheLimit(t *testing.T) {
 	}
 }
 
+// TestLoadCountsNodeNameLengthInBytesNotRunes pins the side of the boundary
+// maxNodeNameBytes is measured on. The cap exists so the node name cannot push
+// a notice past Discord's character limit, and counting BYTES is the
+// deliberately conservative direction (UTF-8 bytes are always >= both the
+// character count and the UTF-16 code-unit count). A multi-byte name is the
+// only input that can tell the two counts apart, so without this test a
+// change to utf8.RuneCountInString would silently relax the documented bound.
+func TestLoadCountsNodeNameLengthInBytesNotRunes(t *testing.T) {
+	t.Run("accepts a multi-byte name at exactly the byte limit", func(t *testing.T) {
+		setValidLoadEnv(t)
+		// "é" is 2 UTF-8 bytes, so this is maxNodeNameBytes bytes in half as
+		// many runes: accepted, because the cap is the last accepted value.
+		node := strings.Repeat("é", maxNodeNameBytes/2)
+		t.Setenv("NODE_NAME", node)
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with a %d-byte (%d-rune) NODE_NAME error = %v, want it accepted", len(node), maxNodeNameBytes/2, err)
+		}
+		if cfg.Node != node {
+			t.Errorf("Node = %q, want the configured name verbatim", cfg.Node)
+		}
+	})
+
+	t.Run("rejects a multi-byte name over the byte limit but under it in runes", func(t *testing.T) {
+		setValidLoadEnv(t)
+		// Fewer runes than maxNodeNameBytes, but twice as many bytes: this is
+		// the input a rune-counting implementation would wrongly accept.
+		node := strings.Repeat("é", maxNodeNameBytes-10)
+		t.Setenv("NODE_NAME", node)
+
+		if _, err := Load(); err == nil {
+			t.Fatalf("Load() with a %d-byte (%d-rune) NODE_NAME = nil, want error: the bound is counted in bytes, which is the conservative direction against Discord's character limit", len(node), maxNodeNameBytes-10)
+		}
+	})
+}
+
 func TestLoadRejectsWhitespaceOnlyWebhook(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("DISCORD_WEBHOOK_URL", "   ")

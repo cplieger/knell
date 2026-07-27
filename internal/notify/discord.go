@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"syscall"
 	"time"
 
@@ -287,7 +288,22 @@ func safeTransportError(err error) error {
 	if err == nil {
 		return nil
 	}
+	// Reduce until no *url.Error is left ANYWHERE in the chain, not just at
+	// the top. httpx.LogSafeError searches the chain with errors.As and
+	// RETURNS what it finds, so a url.Error still nested under the cause would
+	// let it unwrap past this wrapper and render that error's cause instead of
+	// the phrase below — in httpx.Do's attempt lines and in post's own
+	// logSafe. The loop terminates: each pass either strips a url.Error or
+	// (for one with a nil Err) substitutes logSafe's fail-closed error, which
+	// is not a url.Error.
 	cause := logSafe(err)
+	for {
+		var nested *url.Error
+		if !errors.As(cause, &nested) {
+			break
+		}
+		cause = logSafe(cause)
+	}
 	return transportError{phrase: transportPhrase(cause), cause: cause}
 }
 
@@ -320,6 +336,8 @@ func transportPhrase(err error) string {
 		return "webhook delivery was canceled"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "a deadline expired" + transportStage(err)
+	case isProxyConnectError(err):
+		return "the egress proxy could not be reached"
 	case errors.As(err, &dnsErr):
 		return "the webhook host could not be resolved"
 	case errors.Is(err, syscall.ECONNREFUSED):
@@ -348,6 +366,23 @@ func transportStage(err error) string {
 		return " during " + opErr.Op
 	}
 	return ""
+}
+
+// isProxyConnectError reports whether the failure happened while reaching the
+// egress proxy rather than the webhook host. knell keeps
+// http.DefaultTransport, which honors HTTPS_PROXY/HTTP_PROXY, and net/http
+// wraps a proxy dial failure as *net.OpError{Op: "proxyconnect"} (a fixed
+// literal of net/http, safe to match). The errno underneath (ECONNREFUSED, a
+// DNS failure) would otherwise satisfy the webhook-host branches in
+// transportPhrase and name the wrong endpoint — a confident wrong diagnosis
+// sends the operator to Discord while their own proxy is what is down. The
+// proxy's HOSTNAME is operator-supplied text and is NOT named, only net's own
+// verb for the stage. errors.As finds the OUTERMOST *net.OpError, which for a
+// proxied attempt is the proxyconnect wrapper, so an unproxied failure (whose
+// first OpError is a "dial"/"read"/"write") is unaffected.
+func isProxyConnectError(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "proxyconnect"
 }
 
 // attemptTimeoutError reports that a single delivery attempt exceeded
@@ -548,16 +583,16 @@ func discordErrorCode(body []byte) (int, bool) {
 // operator can act on; the empty string means knell knows no meaning for the
 // code and reports the bare number. The mapped codes split by what the
 // operator can do about them: 10015 and 50027 mean the webhook this knell
-// posts to no longer accepts it, which only an operator can fix; 50006 means
-// knell built an empty payload, which no configuration change helps; and
-// 50035 is BOTH, so its wording names the configuration to check FIRST and
-// claims a knell bug only if that checks out. Discord answers a payload
-// longer than its 2000-character content limit with 50035, and NODE_NAME
-// (operator-set, length-unbounded) is interpolated into every message, so
-// "this is a knell bug" would be a false verdict that sends the operator away
-// from the one setting that would fix the outage. Values are phrased as that
-// verdict rather than as a translation of Discord's message, which is never
-// read.
+// posts to no longer accepts it, which only an operator can fix; 50006 and
+// 50035 mean Discord refused the payload knell built, which no configuration
+// change helps. 50035 is Discord's answer to a payload past its
+// 2000-character content limit, which is why the wording says so explicitly:
+// NODE_NAME is the only operator-set text in a notice, config caps it at 256
+// bytes on startup (see internal/config maxNodeNameBytes), and the longest
+// notice is ~540 characters at that cap — so an operator reading this code
+// must NOT be sent to re-check a setting startup already validated. Values
+// are phrased as that verdict rather than as a translation of Discord's
+// message, which is never read.
 func discordCodeMeaning(code int) string {
 	switch code {
 	case 10015:
@@ -567,7 +602,7 @@ func discordCodeMeaning(code int) string {
 	case 50006:
 		return "cannot send an empty message: knell built a payload with no content, which is a knell bug, not an operator problem"
 	case 50035:
-		return "invalid request body: Discord rejected knell's payload - check NODE_NAME first, since a long one can push a message past Discord's 2000-character content limit; if the configuration is sound, this is a knell bug"
+		return "invalid request body: Discord rejected knell's payload - no configuration causes this (startup caps NODE_NAME at 256 bytes, which keeps every notice far inside Discord's 2000-character content limit), so this is a knell bug"
 	}
 	return ""
 }

@@ -734,8 +734,24 @@ func TestBeatRefusedWhenCancellationHappensDuringBodyDrain(t *testing.T) {
 		h.ServeHTTP(rec, req)
 	}()
 
-	if _, err := bodyWriter.Write([]byte("ping")); err != nil {
-		t.Fatalf("write request body: %v", err)
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := bodyWriter.Write([]byte("ping"))
+		wrote <- err
+	}()
+	select {
+	case err := <-wrote:
+		if err != nil {
+			t.Fatalf("write request body: %v", err)
+		}
+	case <-done:
+		// The write is a barrier, not a fixture: if the handler ever refuses
+		// BEFORE reading the body, nothing drains the pipe and a synchronous
+		// write here would block until the go-test timeout killed the whole
+		// package. Racing it against handler completion turns that regression
+		// into this named failure. Reading rec.Code is safe: the handler
+		// goroutine has finished.
+		t.Fatalf("handler returned without reading the body (status %d): the barrier write would have deadlocked", rec.Code)
 	}
 	cancel()
 	if err := bodyWriter.Close(); err != nil {

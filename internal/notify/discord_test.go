@@ -3,6 +3,7 @@ package notify
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -834,11 +835,11 @@ func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 	// end. The split the mapped codes must preserve is the one an operator
 	// acts on -- a webhook that no longer accepts this knell (recreate it) vs
 	// a payload Discord refused -- and an unmapped code must report the bare
-	// number rather than invent a meaning. 50035 sits on both sides of that
-	// split (an over-long NODE_NAME produces it, and so does a knell payload
-	// bug), so its wording must name the configuration to check before it
-	// blames knell: a flat "knell bug" verdict would send the operator away
-	// from the only setting that ends the outage.
+	// number rather than invent a meaning. 50035 is Discord's content-length
+	// rejection, and config caps NODE_NAME (the only operator-set text in a
+	// notice) at 256 bytes on startup, so its wording must say that no
+	// configuration causes it rather than sending the operator to re-check a
+	// setting startup already validated.
 	//
 	// All cases use a non-transient status so each runs exactly one attempt.
 	for name, tc := range map[string]struct {
@@ -865,7 +866,7 @@ func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 			want:    []string{"HTTP 400", "Discord error code 50006", "knell bug"},
 			notWant: []string{"Cannot send an empty message", "recreate the webhook"},
 		},
-		"invalid request body names the config to check and then knell": {
+		"invalid request body is a knell bug and says config cannot cause it": {
 			status:  http.StatusBadRequest,
 			body:    `{"message": "Invalid Form Body", "code": 50035, "errors": {"content": {"_errors": [{"code": "BASE_TYPE_MAX_LENGTH", "message": "Must be 2000 or fewer in length."}]}}}`,
 			want:    []string{"Discord error code 50035", "NODE_NAME", "knell bug"},
@@ -976,6 +977,94 @@ func TestReadFailureIsClassifiedStructurally(t *testing.T) {
 			}
 			if strings.Contains(got, leaked) || strings.Contains(got, "MIME") {
 				t.Errorf("readFailure(%v) = %q, want knell's own words, never the error's text", tc.in, got)
+			}
+		})
+	}
+}
+
+// transportPhraseTimeoutError is a net.Error that only times out, for the
+// timeout arm of TestTransportPhraseClassifiesStructurally.
+type transportPhraseTimeoutError struct{ msg string }
+
+func (e transportPhraseTimeoutError) Error() string { return e.msg }
+func (transportPhraseTimeoutError) Timeout() bool   { return true }
+func (transportPhraseTimeoutError) Temporary() bool { return false }
+
+func TestTransportPhraseClassifiesStructurally(t *testing.T) {
+	t.Parallel()
+
+	// transportPhrase is what an operator reads for every failed attempt, and
+	// it must name the cause from its STRUCTURE only: a transport cause can be
+	// written from a response header (see
+	// TestRedirectDerivedTransportErrorsCarryNoRemoteText), so no case may
+	// render cause.Error(). Each case therefore asserts the phrase AND that
+	// the cause's own text did not survive.
+	//
+	// The proxyconnect cases pin the ORDER of the switch, not just its
+	// mapping: net/http wraps a proxy dial failure as
+	// *net.OpError{Op: "proxyconnect"} around the same ECONNREFUSED/DNS
+	// causes the webhook-host branches match, so without that branch first
+	// knell names the wrong endpoint during an egress-proxy outage.
+	const remote = "remotelyauthoredtext"
+	for name, tc := range map[string]struct {
+		cause error
+		want  string
+	}{
+		"canceled": {cause: context.Canceled, want: "webhook delivery was canceled"},
+		"deadline names the stage": {
+			cause: &net.OpError{Op: "dial", Err: fmt.Errorf("%s: %w", remote, context.DeadlineExceeded)},
+			want:  "a deadline expired during dial",
+		},
+		"dns": {
+			cause: &net.DNSError{Err: remote, Name: remote},
+			want:  "the webhook host could not be resolved",
+		},
+		"refused": {
+			cause: &net.OpError{Op: "dial", Err: fmt.Errorf("%s: %w", remote, syscall.ECONNREFUSED)},
+			want:  "the webhook host refused the connection",
+		},
+		"a refused egress proxy is not the webhook host": {
+			cause: &net.OpError{Op: "proxyconnect", Err: &net.OpError{Op: "dial", Err: fmt.Errorf("%s: %w", remote, syscall.ECONNREFUSED)}},
+			want:  "the egress proxy could not be reached",
+		},
+		"an unresolvable egress proxy is not the webhook host": {
+			cause: &net.OpError{Op: "proxyconnect", Err: &net.DNSError{Err: remote, Name: remote}},
+			want:  "the egress proxy could not be reached",
+		},
+		"reset": {
+			cause: &net.OpError{Op: "read", Err: fmt.Errorf("%s: %w", remote, syscall.ECONNRESET)},
+			want:  "the connection to the webhook was reset",
+		},
+		"tls": {
+			cause: &tls.CertificateVerificationError{Err: errors.New(remote)},
+			want:  "the webhook's TLS certificate could not be verified",
+		},
+		"timeout names the stage": {
+			cause: &net.OpError{Op: "read", Err: transportPhraseTimeoutError{msg: remote}},
+			want:  "the webhook did not answer in time during read",
+		},
+		"eof": {
+			cause: io.ErrUnexpectedEOF,
+			want:  "the connection closed before the webhook answered",
+		},
+		"unrecognized reports only the stage": {
+			cause: &net.OpError{Op: "write", Err: errors.New(remote)},
+			want:  "webhook transport failed during write",
+		},
+		"unrecognized without an OpError": {
+			cause: errors.New(remote),
+			want:  "webhook transport failed",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got := transportPhrase(tc.cause)
+			if got != tc.want {
+				t.Errorf("transportPhrase(%v) = %q, want %q", tc.cause, got, tc.want)
+			}
+			if strings.Contains(got, remote) {
+				t.Errorf("transportPhrase(%v) = %q, rendered the cause's own text", tc.cause, got)
 			}
 		})
 	}

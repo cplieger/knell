@@ -163,13 +163,17 @@ var notificationsSent = metricslib.NewLabeledCounter(
 )
 
 // notificationsFailed counts webhook delivery attempts that failed after
-// retries, by kind. That is its only meaning: something was sent and did not
-// get through. A failed missing or history delivery is retried on the next
-// watch tick; a recovered notification is best-effort. One increment per
-// failed MESSAGE, so a failed history message counts once whatever number of
-// ended outages it covered. A notification that was never attempted because
-// its record was discarded by a full queue is NOT counted here (nothing
-// failed and nothing will retry): see notificationsDropped.
+// retries AND still have a record to retry from, by kind. In practice that is
+// missing and history: their records stay queued, so the next sweep re-sends
+// them. It is deliberately NOT every failed attempt — a failed RECOVERED send
+// is counted on notificationsDropped instead, because the event is dequeued
+// before the send and finishRecovery runs unconditionally, so nothing survives
+// to retry (watch.sendRecovered spells this out); failed{kind="recovered"}
+// therefore stays at its pre-minted zero. One increment per failed MESSAGE, so
+// a failed history message counts once whatever number of ended outages it
+// covered. A notification that was never attempted because its record was
+// discarded by a full queue is NOT counted here either: see
+// notificationsDropped.
 var notificationsFailed = metricslib.NewLabeledCounter(
 	"notifications_failed_total",
 	"Webhook delivery attempts that failed after retries, by kind ("+notificationKindsText+"); one per failed message.",
