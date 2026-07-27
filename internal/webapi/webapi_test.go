@@ -370,6 +370,55 @@ func TestBeatTokenGate(t *testing.T) {
 	})
 }
 
+// FuzzBeatTokenAcceptsOnlyTheExactBearerHeader fuzzes the untrusted header the
+// beat gate reads. BEAT_TOKEN is the only thing between the public internet and
+// a sender that can keep the dead-man switch armed with no real heartbeat
+// behind it, and acceptance is documented as exactly "Authorization: Bearer
+// <token>". The invariant is a security equality, not crash-freedom: for ANY
+// header value, the request is authorized iff the value equals the expected
+// string exactly, an unauthorized ping records no beat, and the 401 body never
+// echoes the configured token.
+func FuzzBeatTokenAcceptsOnlyTheExactBearerHeader(f *testing.F) {
+	const token = "s3cret"
+	const expected = "Bearer " + token
+	f.Add(expected)
+	f.Add("")
+	f.Add("bearer s3cret")
+	f.Add("BEARER s3cret")
+	f.Add("Bearer s3cret ")
+	f.Add(" Bearer s3cret")
+	f.Add("Bearer  s3cret")
+	f.Add("Bearer\ts3cret")
+	f.Add("Bearer s3cretx")
+	f.Add("Bearer s3cre")
+	f.Add("Bearer s3cret\x00")
+	f.Add("Basic czNjcmV0OA==")
+	f.Add("Bearer s3cret, Bearer s3cret")
+	f.Add(strings.Repeat("Bearer s3cret", 40))
+	f.Fuzz(func(t *testing.T, auth string) {
+		b := &fakeBeater{known: map[string]bool{"api": true}}
+		h := newTestHandler(b, token)
+		req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
+		req.Header.Set("Authorization", auth)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		wantStatus, wantSeen := http.StatusUnauthorized, 0
+		if auth == expected {
+			wantStatus, wantSeen = http.StatusOK, 1
+		}
+		if rec.Code != wantStatus {
+			t.Fatalf("Authorization %q = %d, want %d (only the exact %q value may pass the gate)", auth, rec.Code, wantStatus, expected)
+		}
+		if len(b.seen) != wantSeen {
+			t.Fatalf("Authorization %q recorded %d beats, want %d (an unauthorized ping must never feed the switch)", auth, len(b.seen), wantSeen)
+		}
+		if wantStatus == http.StatusUnauthorized && strings.Contains(rec.Body.String(), token) {
+			t.Fatalf("401 body %q echoes the configured token", rec.Body.String())
+		}
+	})
+}
+
 func TestTokenGateScopedToBeatEndpoint(t *testing.T) {
 	// /healthz and /metrics must stay reachable without the beat token:
 	// the docker healthcheck and the Prometheus scraper carry no

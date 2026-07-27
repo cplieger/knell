@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -81,19 +80,7 @@ func TestHealthSubcommandReportsTheMarkerVerdictWithoutBooting(t *testing.T) {
 	})
 
 	t.Run("marker present", func(t *testing.T) {
-		// O_EXCL|O_NOFOLLOW, mirroring main_test.go's plant: health.DefaultPath
-		// is a fixed path in a world-writable directory, so a plain
-		// os.WriteFile would follow a pre-planted symlink and truncate its
-		// target as the test user.
-		f, plantErr := os.OpenFile(health.DefaultPath,
-			os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
-		if plantErr != nil {
-			t.Skipf("cannot plant a health marker at %s: %v", health.DefaultPath, plantErr)
-		}
-		if err := f.Close(); err != nil {
-			t.Fatalf("closing planted marker: %v", err)
-		}
-		t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
+		plantHealthMarker(t)
 		code, out := runMain(t, nil, "health")
 		if code != 0 {
 			t.Errorf("knell health with a marker = exit %d, want 0: %s", code, out)

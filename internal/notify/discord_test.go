@@ -338,6 +338,35 @@ func TestLogSafeRedactsCanonicalWebhookURLForms(t *testing.T) {
 	}
 }
 
+func TestLogSafeFailsClosedWhenReductionYieldsNoError(t *testing.T) {
+	t.Parallel()
+
+	// httpx.LogSafeError returns a *url.Error's inner Err verbatim, so a
+	// *url.Error carrying a nil cause reduces to nil. postAttempt's return IS
+	// httpx.Do's success signal, so a nil there would report an UNDELIVERED
+	// notification as delivered: watch would flip the beat to alerted and the
+	// missing notice this app exists to send would never be retried. logSafe
+	// must fail closed instead, and its substitute message must still be
+	// URL-free.
+	const secret = "verysecretclosedtoken"
+	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
+	d := New(rawURL, "node-1")
+	defer d.Close()
+
+	got := d.logSafe(&url.Error{Op: "Post", URL: rawURL})
+	if got == nil {
+		t.Fatal("logSafe(*url.Error with a nil cause) = nil, want an error (a nil reports an undelivered notification as delivered)")
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Errorf("fail-closed error leaks the webhook credential: %v", got)
+	}
+	// The nil-in/nil-out half of the contract: post and postAttempt call
+	// logSafe only on a real failure, so a nil must not become an error.
+	if got := d.logSafe(nil); got != nil {
+		t.Errorf("logSafe(nil) = %v, want nil", got)
+	}
+}
+
 func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 	// Deliberately NOT t.Parallel: slog.Default() is process-global.
 	//
@@ -686,24 +715,52 @@ func TestRequestBuildErrorNeverLeaksWebhookURL(t *testing.T) {
 	}
 }
 
+// roundTripperFunc adapts a function to http.RoundTripper so a test can
+// answer a delivery attempt without a listener, a socket or a dial.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 func TestTransientFailuresExhaustAttempts(t *testing.T) {
 	t.Parallel()
 
 	// Every attempt answers 503 (transient): delivery must stop after
 	// maxAttempts total attempts and surface an error, never retry
 	// unbounded against a hard-down webhook.
-	rec := newWebhookRecorder(http.StatusServiceUnavailable)
-	srv := httptest.NewServer(rec.handler(t))
-	defer srv.Close()
-
-	d := New(srv.URL, "node-1")
-	defer d.Close()
+	//
+	// The 503 comes from a stub transport rather than a listener because the
+	// assertion is an exact attempt COUNT, and over a real socket that count
+	// is not a property of this package: an attempt that fails BEFORE the
+	// handler runs leaves it short while post still returns an error, so the
+	// test reads as a retry-budget regression when nothing regressed. Two
+	// such failures are reachable on a loaded machine -- a dial error under
+	// fd/port pressure (EADDRNOTAVAIL is not in httpx's transient set, so
+	// httpx.Do returns after that attempt) and the 10s per-attempt deadline
+	// (retried, but the server never saw the request). The stub removes the
+	// network and the clock from the oracle; the real-socket retry paths stay
+	// covered by TestTransientFailureRetries and the redirect tests.
+	var attempts atomic.Int64
+	d := New("https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
+	t.Cleanup(d.Close)
+	d.client.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		attempts.Add(1)
+		if _, copyErr := io.Copy(io.Discard, r.Body); copyErr != nil {
+			t.Errorf("reading request body: %v", copyErr)
+		}
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Status:     "503 Service Unavailable",
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+			Request:    r,
+		}, nil
+	})
 
 	err := d.BeatMissing(context.Background(), "api", time.Hour)
 	if err == nil {
 		t.Fatal("BeatMissing with persistent 503 = nil, want error")
 	}
-	if got := rec.hits.Load(); got != maxAttempts {
+	if got := attempts.Load(); got != int64(maxAttempts) {
 		t.Errorf("attempts = %d, want %d (maxAttempts is total, including the first)", got, maxAttempts)
 	}
 }

@@ -103,8 +103,8 @@ type Beat struct {
 // is retried every tick, so a queue this deep only forms during a sustained
 // webhook outage. It is deliberately small: the oldest notices are the
 // actionable ones, and the bound keeps a stuck webhook from growing state
-// without limit. Overflow drops the NEWEST record; queueDetectedOutage owns
-// what a full queue MEANS for a closed vs an ongoing outage.
+// without limit. Overflow drops the NEWEST record; recordEndedOutage and
+// recordOngoingOutage own what a full queue MEANS for their case.
 const missingQueueSize = 8
 
 // overdueBeat is one detected missing transition: a beat past its deadline,
@@ -240,27 +240,6 @@ func (st *beatState) closedRun() []Outage {
 // outage was detected and counted by an earlier call", which covers both a
 // re-detection while the queue stays full and the later call that finally
 // queues that outage.
-//
-// A queue-full event means one of two very different things, which is why the
-// callers below are two functions and not one with a flag:
-//
-//   - recordEndedOutage has a CLOSED record (a ping already ended the outage):
-//     the record was the outage's only remaining trace, so dropping it means no
-//     notice for it will ever arrive. That is a permanent loss, so it moves
-//     metrics.RecordNotificationDropped and logs a WARNING, exactly like a dropped
-//     recovery notice. The warning is not gated on overflowAccounted: it is
-//     reachable at most once per outage (only a ping brings a closed record,
-//     and the same ping re-arms the beat), and suppressing it would hide the
-//     loss precisely in the sequence where it happens — sweeps reporting
-//     back-pressure for an ongoing outage, then the closing ping finding no
-//     slot for its record.
-//   - recordOngoingOutage has an OPEN record (the outage is still in
-//     progress): nothing is lost. The beat stays overdue, openMissing stays
-//     nil, and the next sweep with a free slot records the outage and delivers
-//     it. Nothing failed and nothing was dropped, so no notification counter
-//     moves; it is logged at DEBUG as the ordinary back-pressure it is, gated
-//     on overflowAccounted so one affected outage reports once rather than
-//     once per 15s tick.
 func queueDetectedOutage(st *beatState, rec overdueBeat) bool {
 	if !st.overflowAccounted {
 		metrics.RecordOutage(rec.id)
@@ -274,8 +253,11 @@ func queueDetectedOutage(st *beatState, rec overdueBeat) bool {
 
 // recordEndedOutage queues the missing transition of an outage a ping has
 // already ended, the record that is now that outage's only trace: a full queue
-// loses it for good. See queueDetectedOutage for the contrast with the ongoing
-// case. Callers hold w.mu.
+// loses it for good, so it counts a dropped notification and warns. The warning
+// is ungated: it is reachable at most once per outage (only a ping brings a
+// closed record, and the same ping re-arms the beat), so gating it would hide
+// the loss in exactly the sequence that produces it. Contrast
+// recordOngoingOutage. Callers hold w.mu.
 func recordEndedOutage(st *beatState, rec overdueBeat) {
 	if queueDetectedOutage(st, rec) {
 		return
@@ -288,8 +270,11 @@ func recordEndedOutage(st *beatState, rec overdueBeat) {
 
 // recordOngoingOutage queues the missing transition of an outage that is still
 // in progress: a full queue costs nothing but a deferral, since the outage
-// stays detected and the next sweep with a free slot records it. See
-// queueDetectedOutage for the contrast with the ended case. Callers hold w.mu.
+// stays detected (openMissing stays nil) and the next sweep with a free slot
+// records and delivers it. Nothing was dropped, so no notification counter
+// moves, and the back-pressure is logged at DEBUG once per affected outage via
+// overflowAccounted rather than once per tick. Contrast recordEndedOutage.
+// Callers hold w.mu.
 func recordOngoingOutage(st *beatState, rec overdueBeat) {
 	if queueDetectedOutage(st, rec) {
 		return
@@ -477,22 +462,13 @@ func (w *Watcher) logUndelivered() {
 	total, lostTotal := 0, 0
 	w.mu.Lock()
 	for id, st := range w.beats {
-		// Only a CLOSED record is a permanent loss. The one record that can
-		// still be open (openMissing: always the tail) is an outage that is
-		// STILL ongoing: the boot-armed clock re-detects it after the restart
-		// only if it outlives one full post-restart deadline, so its notice is
-		// delayed rather than lost in that case and silently never sent if the
-		// beat returns inside that window. The per-beat Info line below names
-		// the beat so the operator can tell the two apart.
-		//
-		// The queue is not the whole set of detected work: an ongoing outage
-		// the sweep could not queue lives in overflowAccounted alone (the
-		// deliberate open-overflow path), and a drain can leave the slice
-		// empty while that outage is still in progress. Count it as one more
-		// ongoing record so shutdown never reports an abandoned detected
-		// outage as nothing at all.
-		queued := len(st.pendingMissing)
-		lost, ongoing := queued, 0
+		// Only a CLOSED record is a permanent loss; the open tail (openMissing)
+		// is an outage still in progress, which the godoc above explains.
+		// overflowAccounted counts as one more ongoing record: a detected outage
+		// the sweep could not queue lives in that flag alone, and a drain can
+		// empty the slice while that outage is still in progress, so shutdown
+		// must not report it as nothing at all.
+		lost, ongoing := len(st.pendingMissing), 0
 		if st.openMissing() != nil {
 			lost--
 			ongoing++
@@ -508,18 +484,30 @@ func (w *Watcher) logUndelivered() {
 		lostTotal += lost
 	}
 	w.mu.Unlock()
-	queuedRecoveries := len(w.recoveries)
+	// Drain the queue so the warning can NAME the beats whose recovered
+	// notice dies with the process: nothing consumes the channel after Run
+	// returns, and a bare count leaves the operator unable to tell which
+	// beat is still showing as down in Discord.
+	var lostRecoveries []string
+drain:
+	for {
+		select {
+		case ev := <-w.recoveries:
+			lostRecoveries = append(lostRecoveries, ev.id)
+		default:
+			break drain
+		}
+	}
+	queuedRecoveries := len(lostRecoveries)
 	slog.Info("watch loop stopped",
 		"undelivered_records", total, "permanent_loss", lostTotal,
 		"ongoing_records", total-lostTotal,
 		"queued_recoveries", queuedRecoveries)
 	for _, p := range beats {
 		if p.lost == 0 {
-			// Only a still-open record. The boot-armed clock re-detects the
-			// outage after the restart ONLY if it outlives the beat's full
-			// deadline again; a beat that returns inside that grace window
-			// ends the outage with no notice ever sent (README "Alerting",
-			// KnellRestartChurn). Name the beat instead of staying silent.
+			// Named rather than silent: a beat that returns inside the
+			// post-restart grace window ends the outage with no notice ever
+			// sent (README "Alerting", KnellRestartChurn).
 			slog.Info("shutting down with an ongoing outage, its notice arrives only if the outage outlives the post-restart deadline",
 				"beat", p.id, "still_ongoing", p.ongoing)
 			continue
@@ -529,7 +517,7 @@ func (w *Watcher) logUndelivered() {
 	}
 	if queuedRecoveries > 0 {
 		slog.Warn("shutting down with queued recovered notifications, they will never be delivered",
-			"queued", queuedRecoveries)
+			"queued", queuedRecoveries, "beats", lostRecoveries)
 	}
 }
 

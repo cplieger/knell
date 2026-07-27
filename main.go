@@ -119,7 +119,14 @@ func run() error {
 	// and never reads the response from pinning the goroutine in Write.
 	srv := webhttp.NewServer(handler,
 		webhttp.WithReadTimeout(30*time.Second),
-		webhttp.WithWriteTimeout(30*time.Second))
+		webhttp.WithWriteTimeout(30*time.Second),
+		// Connection-level errors net/http reports itself -- above all
+		// "http: Accept error: ...; retrying", the trace of an exhausted fd
+		// budget that stops every beat from being received -- default to the
+		// standard logger, i.e. an unstructured, level-less line in an
+		// otherwise structured stderr stream. Level-based Loki rules cannot
+		// match it.
+		webhttp.WithErrorLog(slog.NewLogLogger(slog.Default().Handler(), slog.LevelError)))
 
 	// Bind up front so a port-in-use error surfaces synchronously.
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ListenAddr)
@@ -147,15 +154,38 @@ func run() error {
 	// slog.Info, and webhttp cannot enforce the shutdown budget on an inline
 	// callback. Flipping before logging makes the probe fail closed even if
 	// either shutdown log then blocks.
+	// shutdownHooksRan separates "Run never reached the shutdown sequence"
+	// (a fatal serve error) from "the sequence ran and Shutdown reported an
+	// error" (a drain that outlived the grace). webhttp calls preDrain
+	// inline on Run's own goroutine, and only after ctx is cancelled, so
+	// this is a plain same-goroutine write.
+	shutdownHooksRan := false
 	preDrain := webhttp.WithPreDrain(func(context.Context) {
+		shutdownHooksRan = true
 		marker.Set(false)
-		slog.Info("shutting down", "cause", context.Cause(ctx))
+		// No cause attribute: signal.NotifyContext cancels through a plain
+		// context.WithCancel and nothing here uses context.WithCancelCause, so
+		// context.Cause(ctx) can only ever render "context canceled". webhttp
+		// invokes this hook only after ctx is cancelled, and on that path the
+		// cancellation is always the signal, so the message carries the whole
+		// trigger on its own.
+		slog.Info("shutting down")
 	})
 	// Wait for the single sender to finish abandoning its in-flight
 	// delivery, so its "abandoned, shutting down" log lines actually land
 	// instead of racing process exit. Bounded by the shutdown grace: the
 	// teardown context webhttp.Run passes shares that deadline.
 	onShutdown := func(teardownCtx context.Context) {
+		// Check the loop first, on its own: webhttp.Run derives teardownCtx from
+		// the SAME deadline srv.Shutdown just spent, so a drain that used the
+		// whole grace hands this hook an already-expired context. With both
+		// cases ready a single select picks pseudo-randomly, so a watch loop
+		// that DID stop would warn that it is still running half the time.
+		select {
+		case <-watcherDone:
+			return
+		default:
+		}
 		select {
 		case <-watcherDone:
 		case <-teardownCtx.Done():
@@ -163,13 +193,15 @@ func run() error {
 		}
 	}
 	err = webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(shutdownGrace), preDrain)
-	if err != nil {
+	if err != nil && !shutdownHooksRan {
 		// A fatal serve error returns from Run without invoking either hook, so
 		// the marker still reads healthy and the watch loop has not logged the
 		// notices this process will never deliver -- the operator's only trace of
 		// them. Flip the marker, cancel the loop and wait for it, bounded by the
-		// same grace. On the graceful path both already happened, so the marker
-		// flip is a no-op edge and watcherDone is already closed.
+		// same grace. The graceful path is excluded by shutdownHooksRan: there
+		// Run already spent the single budget on pre-drain -> Shutdown ->
+		// onShutdown, and a second full grace here would push the process past
+		// Docker's SIGKILL - the exact failure the 8s budget exists to avoid.
 		marker.Set(false)
 		stop()
 		teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), shutdownGrace)

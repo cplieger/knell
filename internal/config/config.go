@@ -35,6 +35,10 @@ const minDeadline = 30 * time.Second
 // still arms).
 const minTokenLength = 16
 
+// defaultListenAddr is the listener address used when LISTEN_ADDR is unset or
+// blank.
+const defaultListenAddr = ":9190"
+
 // beatIDPattern is the accepted beat-id grammar: URL-path and metric-label
 // safe, human-readable, bounded.
 var beatIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
@@ -54,6 +58,33 @@ type Config struct {
 	BeatToken  string
 	Beats      []Beat
 	LogLevel   slog.Level
+}
+
+// LogValue implements slog.LogValuer so a *Config can never publish its own
+// secrets. DISCORD_WEBHOOK_URL's path IS the Discord credential and BeatToken
+// is the /beat/{id} gate, so both are reported by PRESENCE only: logging a
+// *Config stays leak-free even from a call site that logs the whole struct
+// instead of the hand-picked fields main.go's logConfig chooses today. The
+// receiver is a pointer because Config is too large to copy per log call
+// (gocritic hugeParam); Config is passed as *Config everywhere in this repo,
+// so log a pointer, never a bare Config value.
+func (c *Config) LogValue() slog.Value {
+	webhook := "unset"
+	if c.WebhookURL != "" {
+		webhook = "configured"
+	}
+	beatAuth := "open"
+	if c.BeatToken != "" {
+		beatAuth = "required"
+	}
+	return slog.GroupValue(
+		slog.Int("beats", len(c.Beats)),
+		slog.String("node", c.Node),
+		slog.String("listen_addr", c.ListenAddr),
+		slog.String("webhook", webhook),
+		slog.String("beat_auth", beatAuth),
+		slog.String("log_level", c.LogLevel.String()),
+	)
 }
 
 // Load reads the environment and returns the validated configuration.
@@ -79,16 +110,7 @@ func Load() (Config, error) {
 
 	cfg.Node = nodeName()
 
-	// A padded LISTEN_ADDR copied from a deployment file is not a usable
-	// address (net.Listen resolves " :9190" as a hostname lookup and fails), and
-	// the padding is invisible in the resulting crash-loop log line. Trim it for
-	// the same reason the plain webhook and token values are trimmed; a value
-	// that is entirely whitespace falls back to the default rather than to "",
-	// which would bind an ephemeral port and hide the listener from scrapes.
-	cfg.ListenAddr = ":9190"
-	if addr := strings.TrimSpace(envx.String("LISTEN_ADDR", "")); addr != "" {
-		cfg.ListenAddr = addr
-	}
+	cfg.ListenAddr = listenAddr()
 
 	beatToken, err := loadBeatToken()
 	if err != nil {
@@ -124,6 +146,20 @@ func nodeName() string {
 	return host
 }
 
+// listenAddr resolves the listener address: LISTEN_ADDR when set, else
+// defaultListenAddr. A padded LISTEN_ADDR copied from a deployment file is not
+// a usable address (net.Listen resolves " :9190" as a hostname lookup and
+// fails), and the padding is invisible in the resulting crash-loop log line.
+// Trimmed for the same reason the plain webhook and token values are trimmed; a
+// value that is entirely whitespace falls back to the default rather than to
+// "", which would bind an ephemeral port and hide the listener from scrapes.
+func listenAddr() string {
+	if addr := strings.TrimSpace(envx.String("LISTEN_ADDR", "")); addr != "" {
+		return addr
+	}
+	return defaultListenAddr
+}
+
 // rejectBlankFileVar fails startup when a `_FILE` variable is PRESENT but
 // empty. envx gates its file channel on a non-empty value, so an empty
 // `_FILE` is indistinguishable from unset and silently falls back to the
@@ -155,8 +191,8 @@ func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
 // DISCORD_WEBHOOK_URL uses), keeping the credential out of `docker inspect`
 // output.
 func loadBeatToken() (string, error) {
-	if blankErr := rejectBlankFileVar("BEAT_TOKEN"); blankErr != nil {
-		return "", blankErr
+	if err := rejectBlankFileVar("BEAT_TOKEN"); err != nil {
+		return "", err
 	}
 	token, tokenSrc, err := envx.SecretWithSource("BEAT_TOKEN")
 	warnPlainVarIgnored("BEAT_TOKEN", "the token", tokenSrc)
@@ -168,8 +204,15 @@ func loadBeatToken() (string, error) {
 		// documented open-endpoint sentinel (webapi builds no verifier for
 		// it), so trimming would silently disarm the gate the operator did
 		// set — while the same value via BEAT_TOKEN_FILE fails startup.
-		if trimmed := strings.TrimSpace(token); trimmed != "" {
+		trimmed := strings.TrimSpace(token)
+		if trimmed != "" {
 			token = trimmed
+		} else {
+			// Kept verbatim above so the gate stays armed. Say so: the only
+			// other signal is the length hint below, which reads as "your
+			// token is short" while every sender 401s against a value the
+			// operator cannot see in `docker inspect` output.
+			slog.Warn("BEAT_TOKEN is whitespace only; the /beat/{id} gate is armed with a whitespace token every sender must send verbatim, so set a long random token, or unset the variable to serve the endpoint open")
 		}
 	case errors.As(err, new(*envx.MissingError)):
 		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE is set: the documented

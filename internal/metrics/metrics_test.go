@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestMintNotificationKindsPremintsEveryCounterAndKind pins the whole
@@ -31,11 +32,16 @@ func TestMintNotificationKindsPremintsEveryCounterAndKind(t *testing.T) {
 	// while the explicit re-mint below would still pass.
 	assertNotificationSeries(t, want, "at cold start")
 
-	kinds := []string{KindMissing, KindRecovered, KindHistory}
-	for _, kind := range kinds {
-		notificationsSent.Delete(kind)
-		notificationsFailed.Delete(kind)
-		notificationsDropped.Delete(kind)
+	// Three counters x every legal kind: keyed off notificationKinds so a new
+	// kind fails the guard below until its want lines are added, rather than
+	// silently dropping out of this test.
+	if len(want) != 3*len(notificationKinds) {
+		t.Fatalf("want has %d lines for %d kinds x 3 counters: add the new kind's cold-start lines", len(want), len(notificationKinds))
+	}
+	for _, kind := range notificationKinds {
+		notificationsSent.Delete(string(kind))
+		notificationsFailed.Delete(string(kind))
+		notificationsDropped.Delete(string(kind))
 	}
 
 	mintNotificationKinds()
@@ -55,4 +61,64 @@ func assertNotificationSeries(t *testing.T, want []string, when string) {
 			t.Errorf("/metrics %s is missing the cold-start series %q", when, line)
 		}
 	}
+}
+
+// TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat pins the per-beat
+// half of the cold-start guarantee: InitBeat must publish all four per-beat
+// series, with the two counters born at zero and the last-seen gauge carrying
+// the boot baseline. A counter whose first exposed sample is already nonzero
+// has no earlier sample for increase() to diff against, so a series dropped
+// from InitBeat is an alert that stays silent through the first event of the
+// beat's life; a missing last-seen baseline leaves the operator no window to
+// reconstruct after a dropped notice.
+func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
+	// The registry is a package-level singleton shared by every test in this
+	// binary, so the probe id must be unique to this test for the values below
+	// to be the cold-start ones.
+	const id = "init-beat-cold-start-probe"
+	series := []string{
+		"knell_beat_fresh",
+		"knell_beat_last_seen_timestamp_seconds",
+		"knell_beats_received_total",
+		"knell_beat_outages_total",
+	}
+	for _, name := range series {
+		if got, ok := beatSeriesValue(t, name, id); ok {
+			t.Fatalf("%s{beat=%q} = %s before InitBeat: the probe id is not unique to this test, so it cannot pin cold-start values", name, id, got)
+		}
+	}
+
+	InitBeat(id, time.Unix(1700000000, 0))
+
+	want := map[string]string{
+		"knell_beat_fresh":                       "1",
+		"knell_beat_last_seen_timestamp_seconds": "1700000000",
+		"knell_beats_received_total":             "0",
+		"knell_beat_outages_total":               "0",
+	}
+	for _, name := range series {
+		got, ok := beatSeriesValue(t, name, id)
+		if !ok {
+			t.Errorf("%s{beat=%q} is absent after InitBeat: an increase() alert on it has no cold-start sample and misses the first event of the beat's life", name, id)
+			continue
+		}
+		if got != want[name] {
+			t.Errorf("%s{beat=%q} = %s, want %s", name, id, got, want[name])
+		}
+	}
+}
+
+// beatSeriesValue scrapes the exposition and returns the value token of
+// name{beat="<id>"}, reporting whether the series is present at all.
+func beatSeriesValue(t *testing.T, name, id string) (string, bool) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	prefix := name + `{beat="` + id + `"} `
+	for line := range strings.Lines(rec.Body.String()) {
+		if v, ok := strings.CutPrefix(line, prefix); ok {
+			return strings.TrimSpace(v), true
+		}
+	}
+	return "", false
 }

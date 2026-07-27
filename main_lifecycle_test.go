@@ -6,7 +6,10 @@ import (
 	"io"
 	"io/fs"
 	"net"
+	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -135,5 +138,93 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 	if _, err := os.Stat(health.DefaultPath); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("marker %s after shutdown: stat = %v, want it gone; a stopped switch must not report healthy",
 			health.DefaultPath, err)
+	}
+}
+
+// TestRunPublishesTheBootArmedBaselineFromProcessStart pins the one half of
+// knell's boot-armed clock that main owns: the processStart baseline run()
+// captures before config parsing and hands to watch.New, which publishes it
+// as every beat's initial last-seen sample. If that argument degrades -
+// dropped, zeroed, or replaced by a far-past value - every configured beat
+// boots already overdue and the first sweep fires a false missing notice on
+// every container restart, which is the exact failure the boot-armed clock
+// exists to prevent. The watch package's own tests supply their own start
+// value, so nothing outside main can catch it.
+func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
+	// process-wide signal, and the shared health-marker path.
+	free, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot reserve a port: %v", err)
+	}
+	addr := free.Addr().String()
+	if err := free.Close(); err != nil {
+		t.Fatalf("releasing the reserved port: %v", err)
+	}
+
+	t.Setenv("BEATS", "api:1m")
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/api/webhooks/1234567890/verysecrettoken")
+	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
+	unsetEnv(t, "BEAT_TOKEN")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
+	t.Setenv("LISTEN_ADDR", addr)
+	capture.Default(t)
+	if err := os.Remove(health.DefaultPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Skipf("cannot clear health marker at %s: %v", health.DefaultPath, err)
+	}
+	t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
+
+	// Captured before the boot: the published baseline must sit between this
+	// floor and the scrape. 2s of slack absorbs a slow bind on a loaded host
+	// without admitting a zeroed or epoch baseline.
+	bootFloor := time.Now().Add(-2 * time.Second).Unix()
+	done := make(chan error, 1)
+	go func() { done <- run() }()
+	waitForMarkerWithin(t, true, 10*time.Second)
+
+	resp, err := http.Get("http://" + addr + "/metrics")
+	if err != nil {
+		t.Fatalf("scrape /metrics: %v", err)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		t.Fatalf("read /metrics: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close /metrics body: %v", err)
+	}
+
+	const series = `knell_beat_last_seen_timestamp_seconds{beat="api"}`
+	var baseline float64
+	found := false
+	for line := range strings.SplitSeq(string(body), "\n") {
+		rest, ok := strings.CutPrefix(line, series)
+		if !ok {
+			continue
+		}
+		baseline, err = strconv.ParseFloat(strings.TrimSpace(rest), 64)
+		if err != nil {
+			t.Fatalf("parsing %q: %v", line, err)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("%s missing from /metrics; a beat with no published baseline has no quorum signal at all:\n%s", series, body)
+	}
+	if ceiling := time.Now().Unix(); int64(baseline) < bootFloor || int64(baseline) > ceiling {
+		t.Errorf("boot-armed baseline = %v, want it inside [%d, %d]; a baseline outside the boot window makes every beat overdue at startup and fires a false missing notice on every restart",
+			baseline, bootFloor, ceiling)
+	}
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("signalling self: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run() = %v, want nil after a shutdown signal", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run() did not return after a shutdown signal")
 	}
 }

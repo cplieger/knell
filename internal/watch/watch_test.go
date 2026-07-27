@@ -212,6 +212,35 @@ func TestMissingFiresOncePerOutage(t *testing.T) {
 	}
 }
 
+func TestFirstDeadlineCountsFromProcessStartNotConstruction(t *testing.T) {
+	t.Parallel()
+
+	// main captures the process-start instant at entry and hands it to New as
+	// start, so a beat that never pings alerts one deadline after PROCESS START,
+	// not one deadline after the watcher was wired. Startup work (config parse,
+	// secret file reads, listener bind) sits between the two, and every other
+	// test in this package constructs with start == now, so a regression that
+	// baselined off now() instead of start would extend the very first deadline
+	// by the startup duration -- silently delaying the boot-armed alert that is
+	// knell's whole reason for existing -- without failing anything.
+	const id = "process-start-baseline-probe"
+	clock := newFakeClock()
+	n := &fakeNotifier{}
+	start := clock.Now().Add(-9 * time.Minute)
+	w := New([]Beat{{ID: id, Deadline: 10 * time.Minute}}, n, clock.Now, start)
+
+	clock.Advance(2 * time.Minute)
+	w.sweep(context.Background())
+
+	got := n.snapshot()
+	if len(got) != 1 || got[0].kind != "missing" || got[0].id != id {
+		t.Fatalf("calls = %v, want one missing notice: 11m of process life passed with no ping", got)
+	}
+	if got[0].elapsed != 11*time.Minute {
+		t.Errorf("silence = %s, want 11m measured from the process-start baseline (construction time would report 2m)", got[0].elapsed)
+	}
+}
+
 func TestBootGraceFiresWithoutAnyBeat(t *testing.T) {
 	t.Parallel()
 

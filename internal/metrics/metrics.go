@@ -30,24 +30,39 @@ const (
 	kindLabel = "kind"
 )
 
-// Notification kinds are the legal values of kindLabel on the sent, failed
-// and dropped notification counters; dashboards and the KnellNotifyFailing
-// alert key on them. They count MESSAGES, so KindHistory moves by one for a
-// notice covering any number of ended outages; beatOutages counts outages.
+// Kind is the closed set of legal kindLabel values; typing it keeps a caller
+// from minting a series outside the set the HELP text and the
+// KnellNotifyFailing selector advertise.
+type Kind string
+
+// The notification kinds are the legal values of kindLabel on the sent,
+// failed and dropped notification counters; dashboards and the
+// KnellNotifyFailing alert key on them. They count MESSAGES, so KindHistory
+// moves by one for a notice covering any number of ended outages;
+// beatOutages counts outages.
 const (
-	KindMissing   = "missing"
-	KindRecovered = "recovered"
-	KindHistory   = "history"
+	KindMissing   Kind = "missing"
+	KindRecovered Kind = "recovered"
+	KindHistory   Kind = "history"
 )
 
 // notificationKinds is the single enumeration of the legal kindLabel values:
 // it drives both the zero-minting below and the rendered kind list in the
 // three counters' HELP text, so a new kind cannot be minted while the
 // exposition metadata still advertises the old set.
-var notificationKinds = []string{KindMissing, KindRecovered, KindHistory}
+var notificationKinds = []Kind{KindMissing, KindRecovered, KindHistory}
 
 // notificationKindsText renders notificationKinds for HELP strings.
-var notificationKindsText = strings.Join(notificationKinds, ", ")
+var notificationKindsText = joinKinds(notificationKinds)
+
+// joinKinds renders the kind enumeration for the HELP strings.
+func joinKinds(kinds []Kind) string {
+	parts := make([]string, len(kinds))
+	for i, k := range kinds {
+		parts[i] = string(k)
+	}
+	return strings.Join(parts, ", ")
+}
 
 // mintNotificationKinds pre-mints every notification counter series at zero
 // for every kind, so an increase() alert sees the very first failure or drop:
@@ -60,9 +75,9 @@ var notificationKindsText = strings.Join(notificationKinds, ", ")
 // /metrics without building a Watcher.
 func mintNotificationKinds() {
 	for _, kind := range notificationKinds {
-		notificationsSent.Add(0, kind)
-		notificationsFailed.Add(0, kind)
-		notificationsDropped.Add(0, kind)
+		notificationsSent.Add(0, string(kind))
+		notificationsFailed.Add(0, string(kind))
+		notificationsDropped.Add(0, string(kind))
 	}
 }
 
@@ -211,21 +226,21 @@ func RecordOutage(id string) {
 }
 
 // RecordNotificationSent counts one delivered notification message of kind.
-func RecordNotificationSent(kind string) {
-	notificationsSent.Inc(kind)
+func RecordNotificationSent(kind Kind) {
+	notificationsSent.Inc(string(kind))
 }
 
 // RecordNotificationFailed counts one notification message of kind whose
 // delivery was attempted and failed after retries. Its record survives, so
 // the send retries: this is never the counter for something that was dropped
 // unsent.
-func RecordNotificationFailed(kind string) {
-	notificationsFailed.Inc(kind)
+func RecordNotificationFailed(kind Kind) {
+	notificationsFailed.Inc(string(kind))
 }
 
 // RecordNotificationDropped counts one notification message of kind that will
 // never be delivered because the record it would have been built from was
 // discarded by a full queue. Nothing retries it.
-func RecordNotificationDropped(kind string) {
-	notificationsDropped.Inc(kind)
+func RecordNotificationDropped(kind Kind) {
+	notificationsDropped.Inc(string(kind))
 }

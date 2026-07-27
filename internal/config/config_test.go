@@ -675,3 +675,44 @@ func TestLoadWarnsWhenBeatTokenIsPresentButEmpty(t *testing.T) {
 		t.Errorf("log output %v missing the warning that /beat/{id} is served ungated, the only signal that separates the compose-interpolation accident from a deliberately open endpoint", rec.Messages())
 	}
 }
+
+// TestLoadDoesNotWarnWhenOnlyTheSecretFilesAreSet pins the negative half of
+// the both-channels-set warning: with only BEAT_TOKEN_FILE and
+// DISCORD_WEBHOOK_URL_FILE set, no plain variable is being shadowed, so there
+// is nothing to report. The positive half is pinned by
+// TestLoadBeatTokenFileWinsOverPlainVar and
+// TestLoadWebhookFileWinsOverPlainVar; without this half, dropping
+// warnPlainVarIgnored's plain-variable guard tells every _FILE-only operator
+// to unset a variable they never set, on the one startup line that is
+// supposed to mean a rotated secret is being ignored.
+func TestLoadDoesNotWarnWhenOnlyTheSecretFilesAreSet(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "beat-token")
+	if err := os.WriteFile(tokenFile, []byte("file-borne-beat-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hookFile := filepath.Join(dir, "webhook-url")
+	if err := os.WriteFile(hookFile, []byte("https://discord.example/file-borne-hook\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setValidLoadEnv(t)
+	unsetEnv(t, "BEAT_TOKEN")
+	unsetEnv(t, "DISCORD_WEBHOOK_URL")
+	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+	t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
+
+	rec := capture.Default(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.BeatToken != "file-borne-beat-token" || cfg.WebhookURL != "https://discord.example/file-borne-hook" {
+		t.Fatalf("BeatToken = %q, WebhookURL = %q, want both from their _FILE channels", cfg.BeatToken, cfg.WebhookURL)
+	}
+	if rec.Contains("both set") {
+		t.Errorf("_FILE-only configuration warned that the plain variable is ignored: %v", rec.Messages())
+	}
+}

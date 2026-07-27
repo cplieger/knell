@@ -198,25 +198,29 @@ func TestUnknownBeatMintsNoMetricSeries(t *testing.T) {
 	}
 }
 
+// labeledCounterValue parses the exposition value of name{label="<value>"} as
+// a float. It is the single parse-and-diagnose path behind the two
+// label-specific helpers below.
+func labeledCounterValue(t *testing.T, name, label, value string) float64 {
+	t.Helper()
+	v, err := strconv.ParseFloat(labeledValue(t, name, label, value), 64)
+	if err != nil {
+		t.Fatalf("parsing %s{%s=%q} value: %v", name, label, value, err)
+	}
+	return v
+}
+
 // counterValue parses the exposition value of name{kind="<kind>"} as a float.
 func counterValue(t *testing.T, name, kind string) float64 {
 	t.Helper()
-	v, err := strconv.ParseFloat(labeledValue(t, name, "kind", kind), 64)
-	if err != nil {
-		t.Fatalf("parsing %s{kind=%q} value: %v", name, kind, err)
-	}
-	return v
+	return labeledCounterValue(t, name, "kind", kind)
 }
 
 // beatCounterValue parses the exposition value of name{beat="<beat>"} as a
 // float, for the per-beat counters (outages, received pings).
 func beatCounterValue(t *testing.T, name, beat string) float64 {
 	t.Helper()
-	v, err := strconv.ParseFloat(labeledValue(t, name, "beat", beat), 64)
-	if err != nil {
-		t.Fatalf("parsing %s{beat=%q} value: %v", name, beat, err)
-	}
-	return v
+	return labeledCounterValue(t, name, "beat", beat)
 }
 
 func TestDeliveredNotificationsIncrementSentCounters(t *testing.T) {
