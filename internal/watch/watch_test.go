@@ -54,7 +54,7 @@ type fakeNotifier struct {
 	onMissing func()
 }
 
-func (n *fakeNotifier) BeatMissing(_ context.Context, id string, silence time.Duration) error {
+func (n *fakeNotifier) BeatMissing(_ context.Context, id string, live Transition) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.fail != nil {
@@ -63,17 +63,17 @@ func (n *fakeNotifier) BeatMissing(_ context.Context, id string, silence time.Du
 	if n.onMissing != nil {
 		n.onMissing()
 	}
-	n.calls = append(n.calls, call{kind: "missing", id: id, elapsed: silence})
+	n.calls = append(n.calls, call{kind: "missing", id: id, elapsed: live.DownFor()})
 	return nil
 }
 
-func (n *fakeNotifier) BeatRecovered(_ context.Context, id string, downFor time.Duration) error {
+func (n *fakeNotifier) BeatRecovered(_ context.Context, id string, live Transition) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.fail != nil {
 		return n.fail
 	}
-	n.calls = append(n.calls, call{kind: "recovered", id: id, elapsed: downFor})
+	n.calls = append(n.calls, call{kind: "recovered", id: id, elapsed: live.DownFor()})
 	return nil
 }
 
@@ -637,7 +637,7 @@ type failFirstNotifier struct {
 	attempts int
 }
 
-func (n *failFirstNotifier) BeatMissing(context.Context, string, time.Duration) error {
+func (n *failFirstNotifier) BeatMissing(context.Context, string, Transition) error {
 	n.attempts++
 	if n.attempts == 1 {
 		return errors.New("discord down")
@@ -645,7 +645,7 @@ func (n *failFirstNotifier) BeatMissing(context.Context, string, time.Duration) 
 	return nil
 }
 
-func (*failFirstNotifier) BeatRecovered(context.Context, string, time.Duration) error {
+func (*failFirstNotifier) BeatRecovered(context.Context, string, Transition) error {
 	return nil
 }
 
@@ -684,7 +684,7 @@ type blockingNotifier struct {
 	release chan struct{}
 }
 
-func (n *blockingNotifier) BeatMissing(ctx context.Context, _ string, _ time.Duration) error {
+func (n *blockingNotifier) BeatMissing(ctx context.Context, _ string, _ Transition) error {
 	n.entered <- struct{}{}
 	select {
 	case <-n.release:
@@ -693,7 +693,7 @@ func (n *blockingNotifier) BeatMissing(ctx context.Context, _ string, _ time.Dur
 	return ctx.Err()
 }
 
-func (n *blockingNotifier) BeatRecovered(context.Context, string, time.Duration) error {
+func (n *blockingNotifier) BeatRecovered(context.Context, string, Transition) error {
 	return nil
 }
 

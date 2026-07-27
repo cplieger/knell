@@ -37,13 +37,22 @@ import (
 // else distinguishes the two: a live outage never reaches
 // BeatOutageHistory, and a history notice is never followed by
 // BeatRecovered calls for the outages it covers.
+//
+// Every method carries one of this package's own value types — a Transition
+// for the two live notices, Outage records for history — and each of those
+// derives its own span through DownFor. So the tense lives in the method NAME
+// while "how long was the beat down" has a single home, and an implementation
+// cannot measure the live case one way and the history case another.
 type Notifier interface {
-	// BeatMissing reports that id has been silent for silence (its deadline
-	// has passed) and the outage is still open.
-	BeatMissing(ctx context.Context, id string, silence time.Duration) error
-	// BeatRecovered reports that id pinged again after having been declared
-	// missing, downFor after its last accepted ping.
-	BeatRecovered(ctx context.Context, id string, downFor time.Duration) error
+	// BeatMissing reports that id has been silent since live.Started and was
+	// still silent when the sweep observed it at live.Observed (its deadline
+	// has passed), so the outage is still open. live.DownFor() is the silence
+	// to report.
+	BeatMissing(ctx context.Context, id string, live Transition) error
+	// BeatRecovered reports that id pinged again at live.Observed after having
+	// been declared missing, ending the silence that began at live.Started
+	// (its last accepted ping). live.DownFor() is how long it was down.
+	BeatRecovered(ctx context.Context, id string, live Transition) error
 	// BeatOutageHistory reports outages of id that were already over by the
 	// time anything about them could be sent, collapsed into a single
 	// past-tense notice. outages is chronological and never empty, and every
@@ -52,6 +61,39 @@ type Notifier interface {
 	// which the implementation must report rather than assume: one batch can
 	// hold both.
 	BeatOutageHistory(ctx context.Context, id string, outages []Outage) error
+}
+
+// Transition is the live incident a missing or a recovered notice reports:
+// the beat's silence as the two instants the state machine measured it
+// between, rather than a duration the call site computed. The notifier
+// therefore derives the figure it renders exactly the way it derives an ended
+// outage's (Outage.DownFor), and a new rendering fact about a live notice is
+// a field here instead of a new interface parameter.
+//
+// Both instants are always set: a Transition never carries an empty field, and
+// WHICH observation Observed is comes from the method carrying it, never from a
+// zero value. Nothing here says whether the outage is over — BeatMissing and
+// BeatRecovered do, by being different methods.
+type Transition struct {
+	// Started is the last accepted ping before the outage: the instant the
+	// beat's silence began, or the process-start baseline for a beat that has
+	// never pinged. Outage.Started is the same instant, for an outage that has
+	// already ended.
+	Started time.Time
+	// Observed is the instant this notice speaks for: for a missing notice the
+	// sweep that observed the beat still silent, for a recovered notice the
+	// ping that ended the outage. At or after Started.
+	Observed time.Time
+}
+
+// DownFor is how long the beat had been unseen at Observed, the figure a live
+// notice reports ("silent for ...", "after ... of silence"). It is the same
+// measurement Outage.DownFor makes for an outage that has ended — last
+// accepted ping to the instant being reported — and Outage.DownFor derives it
+// through this method, so the live and history notices cannot report the same
+// span two different ways.
+func (t Transition) DownFor() time.Duration {
+	return t.Observed.Sub(t.Started)
 }
 
 // LateReason names WHY an outage was already over by the time anything about
@@ -94,17 +136,21 @@ const (
 // Outage is one already-ended outage as the state machine observed it, the
 // unit BeatOutageHistory reports. It is the watch package's own output type,
 // so the notifier renders the outage from the state machine's shape without
-// the state machine depending on how (or where) it is rendered.
+// the state machine depending on how (or where) it is rendered. Transition is
+// its live counterpart: same Started anchor, same DownFor measurement, plus
+// the two facts only an ended outage has (its recovery point and LateReason).
 type Outage struct {
 	// Started is the last accepted ping before the outage: the instant the
-	// beat's silence began.
+	// beat's silence began (Transition.Started is the same instant).
 	Started time.Time
 	// Recovered is the first accepted ping after the outage: the instant it
 	// ended. Always after Started.
 	Recovered time.Time
 	// Silence is how long the beat had been quiet when the deadline crossing
-	// was detected. It is a reading taken during the outage, so it is at or
-	// below the outage's full span; DownFor is the span itself.
+	// was detected: the live Transition's own DownFor, frozen at the last
+	// observation before a ping sealed the record. It is a reading taken
+	// during the outage, so it is at or below the outage's full span; DownFor
+	// is the span itself.
 	Silence time.Duration
 	// LateReason says why this outage is reported after the fact instead of
 	// as a live incident. The renderer must not guess it: the two reasons
@@ -114,9 +160,10 @@ type Outage struct {
 
 // DownFor is the outage's full span: from the last ping before it to the
 // first ping after it. It is the figure a past-tense notice reports ("was
-// missing for ..."), derived here so every renderer measures it the same way.
+// missing for ..."), derived through Transition.DownFor — the one home of the
+// measurement — so every renderer, live or history, measures it the same way.
 func (o Outage) DownFor() time.Duration {
-	return o.Recovered.Sub(o.Started)
+	return Transition{Started: o.Started, Observed: o.Recovered}.DownFor()
 }
 
 // LongestOutage returns the longest span among outages, or zero for an empty
@@ -180,18 +227,21 @@ type Beat struct {
 const missingQueueSize = 8
 
 // overdueBeat is one detected missing transition: a beat past its deadline,
-// captured with the lastSeen observed when the crossing was detected. It
-// stays queued on the beat until its notification is delivered.
+// captured as the silence interval observed when the crossing was detected
+// (silence.Started is the lastSeen it was measured from, silence.Observed the
+// sweep that saw it). It stays queued on the beat until its notification is
+// delivered, and sendMissing hands it to BeatMissing unchanged, so the live
+// notice reports the interval the state machine recorded instead of a span
+// re-derived at the send.
 // recoveredAt is set once a ping ends the outage (zero while it is still
 // ongoing), so the ended outage's span survives the wait and its notice can
 // report it in the past tense instead of as a live failure. late says WHY
 // that past-tense notice is late, which only the code that records the
 // crossing knows (see LateReason).
 type overdueBeat struct {
-	seen        time.Time
+	silence     Transition
 	recoveredAt time.Time
 	id          string
-	silence     time.Duration
 	late        LateReason
 }
 
@@ -316,9 +366,9 @@ func (st *beatState) closedRun() []Outage {
 			break
 		}
 		run = append(run, Outage{
-			Started:    rec.seen,
+			Started:    rec.silence.Started,
 			Recovered:  rec.recoveredAt,
-			Silence:    rec.silence,
+			Silence:    rec.silence.DownFor(),
 			LateReason: rec.late,
 		})
 	}
@@ -363,8 +413,8 @@ func recordEndedOutage(st *beatState, rec *overdueBeat) {
 	}
 	metrics.RecordNotificationDropped(metrics.KindMissing)
 	slog.Warn("pending missing queue full, ended outage dropped, its notification will never be delivered",
-		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.String(),
-		"since", rec.seen, "recovered", rec.recoveredAt)
+		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.DownFor().String(),
+		"since", rec.silence.Started, "recovered", rec.recoveredAt)
 }
 
 // recordOngoingOutage queues the missing transition of an outage that is still
@@ -385,8 +435,8 @@ func recordOngoingOutage(st *beatState, rec *overdueBeat) {
 	}
 	st.overflowAccounted = true
 	slog.Debug("pending missing queue full, ongoing outage stays detected and is queued once a slot frees",
-		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.String(),
-		"since", rec.seen)
+		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.DownFor().String(),
+		"since", rec.silence.Started)
 }
 
 // lateReasonForUnqueuedOutage names why the notice for an outage that has NO
@@ -409,10 +459,11 @@ func lateReasonForUnqueuedOutage(st *beatState) LateReason {
 	return LateEndedBeforeDetection
 }
 
-// recoveryEvent is a queued recovered transition, measured at ping arrival.
+// recoveryEvent is a queued recovered transition: the silence the arriving
+// ping ended, measured at ping arrival and handed to BeatRecovered unchanged.
 type recoveryEvent struct {
+	silence Transition
 	id      string
-	downFor time.Duration
 }
 
 // Watcher tracks beat freshness and drives transition notifications. Beat is
@@ -463,7 +514,11 @@ func (w *Watcher) Beat(id string) bool {
 	}
 	now := w.now()
 	previousSeen := st.lastSeen
-	downFor := now.Sub(previousSeen)
+	// The silence this ping ends, as the two instants that bound it: the beat's
+	// last accepted ping and this one. Every figure below reads its span from
+	// here (Transition.DownFor), so the deadline check, the queued record and
+	// the recovered notice cannot measure the same silence differently.
+	silence := Transition{Started: previousSeen, Observed: now}
 	wasAlerted := st.alerted
 	// A late ping ends an outage. When the sweep already recorded that
 	// outage, seal the record it has not delivered yet; when the crossing
@@ -480,11 +535,10 @@ func (w *Watcher) Beat(id string) bool {
 	// overflowAccounted before the reset below clears it.
 	if open := st.openMissing(); open != nil {
 		open.recoveredAt = now
-	} else if !wasAlerted && overdue(downFor, st.deadline) {
+	} else if !wasAlerted && overdue(silence.DownFor(), st.deadline) {
 		recordEndedOutage(st, &overdueBeat{
 			id:          id,
-			silence:     downFor,
-			seen:        previousSeen,
+			silence:     silence,
 			recoveredAt: now,
 			late:        lateReasonForUnqueuedOutage(st),
 		})
@@ -504,7 +558,7 @@ func (w *Watcher) Beat(id string) bool {
 
 	if wasAlerted {
 		select {
-		case w.recoveries <- recoveryEvent{id: id, downFor: downFor}:
+		case w.recoveries <- recoveryEvent{id: id, silence: silence}:
 		default:
 			// Cannot happen while the queue bound matches the beat count
 			// (one pending recovery per beat), but never block a ping.
@@ -517,7 +571,7 @@ func (w *Watcher) Beat(id string) bool {
 			w.mu.Unlock()
 			metrics.RecordNotificationDropped(metrics.KindRecovered)
 			slog.Warn("recovery queue full, dropping recovered notification",
-				"beat", id, "down_for", downFor.String())
+				"beat", id, "down_for", silence.DownFor().String())
 		}
 	}
 	return true
@@ -772,8 +826,11 @@ func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
 	defer w.mu.Unlock()
 	now := w.now()
 	for id, st := range w.beats {
-		silence := now.Sub(st.lastSeen)
-		fresh := publishFreshness(id, silence, st.deadline)
+		// This sweep's reading of the beat's silence, as the two instants that
+		// bound it: the last accepted ping and this sweep. The freshness gauge,
+		// a queued record and the live notice all read their span from it.
+		silence := Transition{Started: st.lastSeen, Observed: now}
+		fresh := publishFreshness(id, silence.DownFor(), st.deadline)
 		// An overdue beat whose current outage is not on the queue yet is
 		// a fresh crossing to record. Recording it here rather than
 		// skipping the beat is what keeps a second outage alive while an
@@ -788,7 +845,7 @@ func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
 		// stated here rather than left to the zero value.
 		if !fresh && !st.alerted && st.openMissing() == nil {
 			recordOngoingOutage(st, &overdueBeat{
-				id: id, silence: silence, seen: st.lastSeen, late: LateUndelivered,
+				id: id, silence: silence, late: LateUndelivered,
 			})
 		}
 		head := st.headMissing()
@@ -796,19 +853,20 @@ func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
 			continue
 		}
 		// Only the still-open current outage refreshes its silence, so a
-		// retry reports how long the beat has been quiet. Once a ping seals
-		// the record, its silence freezes at the reading taken when the
-		// outage was detected — a history notice reports the outage's full
-		// span (Outage.DownFor) instead, so the frozen reading is only
-		// supplementary detail.
+		// retry reports how long the beat has been quiet: its observation
+		// instant moves forward while its start — the record's own anchor —
+		// never does. Once a ping seals the record, that reading freezes at
+		// the observation taken when the outage was detected; a history notice
+		// reports the outage's full span (Outage.DownFor) instead, so the
+		// frozen reading is only supplementary detail.
 		// The lastSeen match is a defensive second guard, the twin of
 		// markDelivered's: an open head is always the tail (openMissing), and
 		// a ping seals the open tail in the same critical section that moves
 		// lastSeen, so today it cannot disagree with recoveredAt. Keep it, so
 		// a record whose start no longer matches lastSeen can never have a
-		// later beat's silence written over its own reading.
-		if head.recoveredAt.IsZero() && head.seen.Equal(st.lastSeen) {
-			head.silence = silence
+		// later beat's observation written over its own reading.
+		if head.recoveredAt.IsZero() && head.silence.Started.Equal(st.lastSeen) {
+			head.silence.Observed = now
 		}
 		// Held while an earlier recovery is queued or in flight, so
 		// transitions reach Discord in chronological order.
@@ -839,12 +897,12 @@ func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 		}
 		metrics.RecordNotificationFailed(metrics.KindMissing)
 		slog.Error("missing notification failed, will retry next sweep",
-			"beat", beat.id, "silence", beat.silence.String(), "error", err)
+			"beat", beat.id, "silence", beat.silence.DownFor().String(), "error", err)
 		return false
 	}
 	metrics.RecordNotificationSent(metrics.KindMissing)
-	slog.Info("beat missing, notified", "beat", beat.id, "silence", beat.silence.String())
-	if event, raced := w.markDelivered(beat.id, beat.seen); raced {
+	slog.Info("beat missing, notified", "beat", beat.id, "silence", beat.silence.DownFor().String())
+	if event, raced := w.markDelivered(beat.id, beat.silence.Started); raced {
 		w.sendRecovered(ctx, event)
 	}
 	return false
@@ -909,21 +967,22 @@ func (w *Watcher) markHistoryUndelivered(id string, n int) {
 	w.beats[id].blameDelivery(n)
 }
 
-// markDelivered records the outcome of a delivered missing send for id,
-// given the lastSeen observed when the sweep decided to notify. It pops the
-// delivered transition, promoting any later queued outage to the head for
-// the next sweep. Normally it marks the beat alerted. When the outage is
+// markDelivered records the outcome of a delivered missing send for id, given
+// the start of the silence that notice reported (the lastSeen the sweep
+// measured it from). It pops the delivered transition, promoting any later
+// queued outage to the head for the next sweep. Normally it marks the beat
+// alerted. When the outage is
 // already over — the popped record carries the recovery point a ping sealed
 // into it, including a ping that raced this very send — marking alerted
 // would swallow the NEXT outage's missing notice, so the beat stays
 // re-armed and the pending recovered transition is returned for immediate
 // delivery.
-func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool) {
+func (w *Watcher) markDelivered(id string, started time.Time) (recoveryEvent, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	st := w.beats[id]
 	delivered := st.popMissing()
-	if delivered.recoveredAt.IsZero() && st.lastSeen.Equal(seen) {
+	if delivered.recoveredAt.IsZero() && st.lastSeen.Equal(started) {
 		st.alerted = true
 		return recoveryEvent{}, false
 	}
@@ -936,7 +995,9 @@ func (w *Watcher) markDelivered(id string, seen time.Time) (recoveryEvent, bool)
 	if !delivered.recoveredAt.IsZero() {
 		recoveredAt = delivered.recoveredAt
 	}
-	return recoveryEvent{id: id, downFor: recoveredAt.Sub(seen)}, true
+	// The recovered notice reports the same silence the missing notice just
+	// reported, ending at the recovery point instead of at the sweep.
+	return recoveryEvent{id: id, silence: Transition{Started: started, Observed: recoveredAt}}, true
 }
 
 // finishRecovery clears the pending-recovery mark for id, re-enabling sweep
@@ -968,16 +1029,16 @@ func (w *Watcher) finishRecovery(id string) {
 // use, because unlike them something WAS attempted and the webhook is broken.
 func (w *Watcher) sendRecovered(ctx context.Context, ev recoveryEvent) {
 	defer w.finishRecovery(ev.id)
-	if err := w.notifier.BeatRecovered(ctx, ev.id, ev.downFor); err != nil {
+	if err := w.notifier.BeatRecovered(ctx, ev.id, ev.silence); err != nil {
 		if errors.Is(err, context.Canceled) {
 			slog.Info("recovered notification abandoned, shutting down", "beat", ev.id)
 			return
 		}
 		metrics.RecordNotificationDropped(metrics.KindRecovered)
 		slog.Error("recovered notification failed, nothing retries it and no notice for this recovery will ever arrive",
-			"beat", ev.id, "down_for", ev.downFor.String(), "error", err)
+			"beat", ev.id, "down_for", ev.silence.DownFor().String(), "error", err)
 		return
 	}
 	metrics.RecordNotificationSent(metrics.KindRecovered)
-	slog.Info("beat recovered, notified", "beat", ev.id, "down_for", ev.downFor.String())
+	slog.Info("beat recovered, notified", "beat", ev.id, "down_for", ev.silence.DownFor().String())
 }

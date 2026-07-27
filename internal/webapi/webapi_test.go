@@ -523,14 +523,14 @@ type recordingNotifier struct {
 	mu        sync.Mutex
 }
 
-func (n *recordingNotifier) BeatMissing(context.Context, string, time.Duration) error {
+func (n *recordingNotifier) BeatMissing(context.Context, string, watch.Transition) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.missing++
 	return nil
 }
 
-func (n *recordingNotifier) BeatRecovered(context.Context, string, time.Duration) error {
+func (n *recordingNotifier) BeatRecovered(context.Context, string, watch.Transition) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.recovered++

@@ -27,25 +27,25 @@ func checkMissingQueueInvariants(t *testing.T, w *Watcher, id string, deadline t
 		if rec.id != id {
 			t.Fatalf("ops %q: record %d has id %q, want %q", ops, i, rec.id, id)
 		}
-		if rec.silence <= deadline {
-			t.Fatalf("ops %q: record %d queued a silence of %s, at or below the %s deadline", ops, i, rec.silence, deadline)
+		if rec.silence.DownFor() <= deadline {
+			t.Fatalf("ops %q: record %d queued a silence of %s, at or below the %s deadline", ops, i, rec.silence.DownFor(), deadline)
 		}
 		if rec.recoveredAt.IsZero() && i != len(q)-1 {
 			t.Fatalf("ops %q: record %d of %d is still open but is not the tail, so a ping would seal the wrong outage", ops, i, len(q))
 		}
-		if !rec.recoveredAt.IsZero() && !rec.recoveredAt.After(rec.seen) {
-			t.Fatalf("ops %q: record %d recovered at %s, not after its last-seen %s", ops, i, rec.recoveredAt, rec.seen)
+		if !rec.recoveredAt.IsZero() && !rec.recoveredAt.After(rec.silence.Started) {
+			t.Fatalf("ops %q: record %d recovered at %s, not after its last-seen %s", ops, i, rec.recoveredAt, rec.silence.Started)
 		}
-		if i > 0 && q[i-1].seen.After(rec.seen) {
+		if i > 0 && q[i-1].silence.Started.After(rec.silence.Started) {
 			t.Fatalf("ops %q: record %d was last seen before record %d, so the queue is out of chronological order", ops, i, i-1)
 		}
 		// Chronological order alone still allows two queued records to cover
 		// overlapping intervals, which a collapsed history notice would report
 		// as an outage that started before the previous one ended. A record's
 		// outage must begin at or after the previous record's recovery point.
-		if i > 0 && !q[i-1].recoveredAt.IsZero() && q[i-1].recoveredAt.After(rec.seen) {
+		if i > 0 && !q[i-1].recoveredAt.IsZero() && q[i-1].recoveredAt.After(rec.silence.Started) {
 			t.Fatalf("ops %q: record %d starts at %s, inside record %d which recovered at %s: a history notice would report overlapping outages",
-				ops, i, rec.seen, i-1, q[i-1].recoveredAt)
+				ops, i, rec.silence.Started, i-1, q[i-1].recoveredAt)
 		}
 	}
 }

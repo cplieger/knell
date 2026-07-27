@@ -3,8 +3,11 @@
 // transient delivery failures via httpx.
 //
 // Wording lives here, not in the state machine: internal/watch decides WHICH
-// transition happened and hands over its own types (watch.Outage), and this
-// package decides how an operator reads it.
+// transition happened and hands over its own types (watch.Transition for a
+// live incident, watch.Outage for one that is already over), and this package
+// decides how an operator reads it. Every duration a notice reports comes from
+// those types' DownFor, so the live and past-tense notices cannot measure the
+// same span differently.
 package notify
 
 import (
@@ -100,19 +103,19 @@ func (d *Discord) Close() {
 }
 
 // BeatMissing announces that a beat's deadline of silence has passed.
-func (d *Discord) BeatMissing(ctx context.Context, id string, silence time.Duration) error {
+func (d *Discord) BeatMissing(ctx context.Context, id string, live watch.Transition) error {
 	msg := fmt.Sprintf(
 		"🚨 [knell %s] beat **%s** MISSING: silent for %s. The sender is down, or nothing on its path can reach this observer.",
-		d.node, id, silence.Truncate(time.Second),
+		d.node, id, live.DownFor().Truncate(time.Second),
 	)
 	return d.post(ctx, "missing "+id, msg)
 }
 
 // BeatRecovered announces the first ping after a missing alert.
-func (d *Discord) BeatRecovered(ctx context.Context, id string, downFor time.Duration) error {
+func (d *Discord) BeatRecovered(ctx context.Context, id string, live watch.Transition) error {
 	msg := fmt.Sprintf(
 		"✅ [knell %s] beat **%s** recovered: pings arriving again after %s of silence.",
-		d.node, id, downFor.Truncate(time.Second),
+		d.node, id, live.DownFor().Truncate(time.Second),
 	)
 	return d.post(ctx, "recovered "+id, msg)
 }
@@ -130,11 +133,12 @@ func (d *Discord) BeatRecovered(ctx context.Context, id string, downFor time.Dur
 // same format: two shapes of the same notice would only invite reading the
 // difference as meaning something.
 //
-// The live notices have no absolute timestamp to widen, deliberately:
-// BeatMissing and BeatRecovered arrive as the transition happens, so their
-// durations are already anchored to the message itself and a bare time of day
-// would be unambiguous there anyway. Keeping the common message short is
-// worth more than a date nobody has to reason about.
+// The live notices render no absolute timestamp to widen, deliberately: their
+// watch.Transition carries the instants, but BeatMissing and BeatRecovered
+// arrive as the transition happens, so their durations are already anchored to
+// the message itself and a bare time of day would be unambiguous there anyway.
+// Keeping the common message short is worth more than a date nobody has to
+// reason about.
 //
 // The zone stays in both halves of the format: the operator reading the
 // notice is not necessarily in the observer's timezone, and the notice is the

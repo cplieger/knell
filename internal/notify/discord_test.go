@@ -59,6 +59,16 @@ func (rec *webhookRecorder) handler(t *testing.T) http.HandlerFunc {
 	}
 }
 
+// liveSilence builds the value a live notice carries for a beat that has been
+// unseen for d: the two instants watch measures the silence between. It exists
+// so these tests construct the new watch.Transition parameter; the figure the
+// notice renders is still exactly d (Transition.DownFor), so every expected
+// string below is unchanged.
+func liveSilence(d time.Duration) watch.Transition {
+	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	return watch.Transition{Started: started, Observed: started.Add(d)}
+}
+
 func TestBeatMissingDelivers(t *testing.T) {
 	t.Parallel()
 
@@ -69,7 +79,7 @@ func TestBeatMissingDelivers(t *testing.T) {
 	d := New(srv.URL, "node-1")
 	defer d.Close()
 
-	if err := d.BeatMissing(context.Background(), "api", 21*time.Minute+30*time.Second); err != nil {
+	if err := d.BeatMissing(context.Background(), "api", liveSilence(21*time.Minute+30*time.Second)); err != nil {
 		t.Fatalf("BeatMissing: %v", err)
 	}
 	content := <-rec.contents
@@ -90,7 +100,7 @@ func TestBeatRecoveredDelivers(t *testing.T) {
 	d := New(srv.URL, "node-1")
 	defer d.Close()
 
-	if err := d.BeatRecovered(context.Background(), "api", 45*time.Minute); err != nil {
+	if err := d.BeatRecovered(context.Background(), "api", liveSilence(45*time.Minute)); err != nil {
 		t.Fatalf("BeatRecovered: %v", err)
 	}
 	content := <-rec.contents
@@ -333,7 +343,7 @@ func TestTransientFailureRetries(t *testing.T) {
 	d := New(srv.URL, "node-1")
 	defer d.Close()
 
-	if err := d.BeatMissing(context.Background(), "api", time.Hour); err != nil {
+	if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err != nil {
 		t.Fatalf("BeatMissing after retry: %v", err)
 	}
 	if got := rec.hits.Load(); got != 2 {
@@ -351,7 +361,7 @@ func TestPermanentFailureDoesNotRetry(t *testing.T) {
 	d := New(srv.URL, "node-1")
 	defer d.Close()
 
-	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
 	if err == nil {
 		t.Fatal("BeatMissing on 404 = nil, want error")
 	}
@@ -374,7 +384,7 @@ func TestUnfollowedRedirectIsNotDelivery(t *testing.T) {
 	d := New(srv.URL, "node-1")
 	defer d.Close()
 
-	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
 	if err == nil {
 		t.Fatal("BeatMissing on 300 = nil, want error (unfollowed 3xx is not delivery)")
 	}
@@ -405,7 +415,7 @@ func TestErrorsNeverLeakWebhookURL(t *testing.T) {
 	d := New("http://127.0.0.1:9"+secretPath, "node-1")
 	defer d.Close()
 
-	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
 	if err == nil {
 		t.Fatal("expected transport error")
 	}
@@ -419,7 +429,7 @@ func TestErrorsNeverLeakWebhookURL(t *testing.T) {
 	defer srv.Close()
 	d2 := New(srv.URL+secretPath, "node-1")
 	defer d2.Close()
-	err = d2.BeatMissing(context.Background(), "api", time.Hour)
+	err = d2.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
 	if err == nil {
 		t.Fatal("expected status error")
 	}
@@ -522,7 +532,7 @@ func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 	d := New("http://127.0.0.1:9/api/webhooks/1234567890/"+secret, "node-1")
 	t.Cleanup(d.Close)
 
-	if err := d.BeatMissing(context.Background(), "api", time.Hour); err == nil {
+	if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err == nil {
 		t.Fatal("BeatMissing against a refused connection = nil, want error")
 	}
 	if buf.Len() == 0 {
@@ -568,7 +578,7 @@ func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
 	d := New(srv.URL+secretPath, "node-1")
 	t.Cleanup(d.Close)
 
-	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
 	if err == nil {
 		t.Fatal("BeatMissing against a persistent 503 = nil, want error")
 	}
@@ -626,7 +636,7 @@ func TestOversizedStatusBodyDropsTheDetail(t *testing.T) {
 	d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
 	t.Cleanup(d.Close)
 
-	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
 	if err == nil {
 		t.Fatal("BeatMissing against a persistent 503 = nil, want error")
 	}
@@ -684,7 +694,7 @@ func TestPartiallyReadStatusBodyReportsOnlyTheReadFailure(t *testing.T) {
 	d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
 	t.Cleanup(d.Close)
 
-	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
 	if err == nil {
 		t.Fatal("BeatMissing against a truncated 503 response = nil, want error")
 	}
@@ -804,7 +814,7 @@ func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 			d := New(srv.URL+"/api/webhooks/1234567890/plainsegment", "node-1")
 			defer d.Close()
 
-			err := d.BeatMissing(context.Background(), "api", time.Hour)
+			err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
 			if err == nil {
 				t.Fatalf("BeatMissing against a %d = nil, want error", tc.status)
 			}
@@ -957,7 +967,7 @@ func TestRateLimitRetriesAfterRetryAfter(t *testing.T) {
 	defer d.Close()
 
 	start := time.Now()
-	if err := d.BeatMissing(context.Background(), "api", time.Hour); err != nil {
+	if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err != nil {
 		t.Fatalf("BeatMissing after rate-limit retry: %v", err)
 	}
 	if got := hits.Load(); got != 2 {
@@ -977,7 +987,7 @@ func TestRequestBuildErrorNeverLeaksWebhookURL(t *testing.T) {
 	d := New("http://127.0.0.1:9/api/webhooks/1234567890/verysecrettoken\x00", "node-1")
 	defer d.Close()
 
-	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
 	if err == nil {
 		t.Fatal("expected request-build error")
 	}
@@ -1027,7 +1037,7 @@ func TestTransientFailuresExhaustAttempts(t *testing.T) {
 		}, nil
 	})
 
-	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
 	if err == nil {
 		t.Fatal("BeatMissing with persistent 503 = nil, want error")
 	}
@@ -1065,7 +1075,7 @@ func TestCanceledDeliveryErrorIsCanceled(t *testing.T) {
 		cancel()
 	}()
 
-	err := d.BeatMissing(ctx, "api", time.Hour)
+	err := d.BeatMissing(ctx, "api", liveSilence(time.Hour))
 	if err == nil {
 		t.Fatal("BeatMissing with canceled context = nil, want error")
 	}
@@ -1088,7 +1098,7 @@ func TestPlainServerErrorIsTerminalPerAttempt(t *testing.T) {
 	d := New(srv.URL, "node-1")
 	defer d.Close()
 
-	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
 	if err == nil {
 		t.Fatal("BeatMissing on 500 = nil, want error (sweep-level retry owns this failure)")
 	}
@@ -1124,7 +1134,7 @@ func TestMethodChangingRedirectIsNotDelivery(t *testing.T) {
 	d := New(srv.URL+"/start", "node-1")
 	defer d.Close()
 
-	if err := d.BeatMissing(context.Background(), "api", time.Hour); err == nil {
+	if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err == nil {
 		t.Fatal("BeatMissing through a POST-to-GET redirect = nil, want delivery error")
 	}
 	if got := postHits.Load(); got != 1 {
@@ -1167,7 +1177,7 @@ func TestCrossHostRedirectIsNotDelivery(t *testing.T) {
 	d := New(origin.URL+secretPath, "node-1")
 	defer d.Close()
 
-	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
 	if err == nil {
 		t.Fatal("BeatMissing through a cross-host 307 = nil, want a delivery error")
 	}
@@ -1211,7 +1221,7 @@ func TestSameHostRedirectIsFollowedAndDelivers(t *testing.T) {
 	d := New(srv.URL+"/start", "node-1")
 	defer d.Close()
 
-	if err := d.BeatMissing(context.Background(), "api", time.Hour); err != nil {
+	if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err != nil {
 		t.Fatalf("BeatMissing through a same-host 307 = %v, want delivery", err)
 	}
 	if got := finishHits.Load(); got != 1 {
