@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -300,49 +301,43 @@ func TestErrorsNeverLeakWebhookURL(t *testing.T) {
 	}
 }
 
-func TestLogSafeRedactsCanonicalWebhookURLForms(t *testing.T) {
+func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 	t.Parallel()
 
-	// A webhook path carrying non-ASCII bytes is accepted by net/url, but
-	// url.Parse CANONICALIZES it: req.URL.String() renders the credential
-	// percent-escaped, so the canonical rendering does not contain the raw
-	// configured string. httpx.LogSafeError's reduction is type-based and
-	// passes an unrecognized error type through unchanged, so an error that
-	// formats req.URL.String() (or just its path) would leak the credential
-	// if logSafe scrubbed only the configured string. post's error and the
-	// httpx retry log both carry exactly logSafe's output, so asserting on
-	// it covers both surfaces.
-	const secret = "vérysecrettoken"
+	// logSafe's whole remaining job, and the one that matters: the *url.Error
+	// net/http builds around a transport failure is the only error shape that
+	// embeds the full request URL, and for a webhook that URL's path IS the
+	// credential. Reducing it to its cause is what keeps the URL out of post's
+	// returned error and out of httpx.Do's retry lines, and the reduction must
+	// not cost the errors.Is chain watch keys shutdown handling on
+	// (context.Canceled) and httpx.Do keys transient classification on.
+	//
+	// There is deliberately no text-matching backstop for an error that
+	// FORMATS a URL rendering into its own message: nothing in this package
+	// publishes remote text or interpolates d.url, so no such error exists to
+	// defend against, and pretending otherwise is what the two earlier leaks
+	// in this file's history were made of.
+	const secret = "verysecretchaintoken"
 	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
-	d := New(rawURL, "node-1")
-	defer d.Close()
 
-	u, parseErr := url.Parse(rawURL)
-	if parseErr != nil {
-		t.Fatalf("url.Parse(%q) = %v", rawURL, parseErr)
-	}
-	escapedSecret := url.PathEscape(secret)
-	if escapedSecret == secret || !strings.Contains(u.String(), escapedSecret) {
-		t.Fatalf("setup: canonical URL %q does not percent-escape the credential, nothing to catch", u.String())
-	}
-
-	for name, msg := range map[string]string{
-		"raw url":        fmt.Sprintf("some future transport error for %s: giving up", rawURL),
-		"canonical url":  fmt.Sprintf("some future transport error for %s: giving up", u.String()),
-		"canonical path": fmt.Sprintf("some future transport error for POST %s: giving up", u.EscapedPath()),
+	// Both shapes occur: postAttempt hands back client.Do's bare *url.Error,
+	// and post applies logSafe again to what httpx.Do returns, where the same
+	// error arrives wrapped in the retry plumbing's own text.
+	for name, in := range map[string]error{
+		"bare url error":    &url.Error{Op: "Post", URL: rawURL, Err: context.Canceled},
+		"wrapped url error": fmt.Errorf("attempt 3 failed: %w", &url.Error{Op: "Post", URL: rawURL, Err: context.Canceled}),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			got := d.logSafe(fmt.Errorf("%s: %w", msg, context.Canceled))
-			if strings.Contains(got.Error(), secret) {
-				t.Errorf("logSafe leaks the raw webhook credential: %v", got)
+			got := logSafe(in)
+			if !strings.Contains(in.Error(), secret) {
+				t.Fatalf("setup: input %q does not carry the credential, the assertion would be vacuous", in)
 			}
-			if strings.Contains(got.Error(), escapedSecret) {
-				t.Errorf("logSafe leaks the percent-encoded webhook credential: %v", got)
-			}
-			if !strings.Contains(got.Error(), "REDACTED") {
-				t.Errorf("logSafe = %q, want the credential replaced by REDACTED", got)
+			for _, leak := range []string{secret, "/api/webhooks/", "discord.example"} {
+				if strings.Contains(got.Error(), leak) {
+					t.Errorf("logSafe kept %q from the request URL: %v", leak, got)
+				}
 			}
 			if !errors.Is(got, context.Canceled) {
 				t.Errorf("logSafe broke the errors.Is chain: %v", got)
@@ -363,10 +358,8 @@ func TestLogSafeFailsClosedWhenReductionYieldsNoError(t *testing.T) {
 	// URL-free.
 	const secret = "verysecretclosedtoken"
 	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
-	d := New(rawURL, "node-1")
-	defer d.Close()
 
-	got := d.logSafe(&url.Error{Op: "Post", URL: rawURL})
+	got := logSafe(&url.Error{Op: "Post", URL: rawURL})
 	if got == nil {
 		t.Fatal("logSafe(*url.Error with a nil cause) = nil, want an error (a nil reports an undelivered notification as delivered)")
 	}
@@ -375,7 +368,7 @@ func TestLogSafeFailsClosedWhenReductionYieldsNoError(t *testing.T) {
 	}
 	// The nil-in/nil-out half of the contract: post and postAttempt call
 	// logSafe only on a real failure, so a nil must not become an error.
-	if got := d.logSafe(nil); got != nil {
+	if got := logSafe(nil); got != nil {
 		t.Errorf("logSafe(nil) = %v, want nil", got)
 	}
 }
@@ -385,7 +378,7 @@ func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 	//
 	// The returned-error assertions cannot cover the LOG surface. post
 	// applies logSafe a SECOND time to whatever httpx.Do returns, so an
-	// attempt-level error that embeds the URL is scrubbed in the error every
+	// attempt-level error that embeds the URL is reduced in the error every
 	// other test reads, while httpx.Do's per-attempt retry and exhausted
 	// lines (both Debug here, via WithExhaustedLevel) log the RAW attempt
 	// error through the type-based LogSafeError only. This pins that surface
@@ -413,22 +406,28 @@ func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 	}
 }
 
-func TestStatusBodyDetailNeverLeaksWebhookURL(t *testing.T) {
+func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
 	// Deliberately NOT t.Parallel: slog.Default() is process-global.
 	//
-	// The other half of the log-surface contract. The refused-connection case
-	// above covers only a transport error, which httpx.LogSafeError reduces by
-	// TYPE. A transient STATUS carries a bounded prefix of the remote body
-	// into the attempt error, and httpx.Do logs that error verbatim through
-	// the type-based reduction alone -- post's logSafe runs too late to scrub
-	// it. So a webhook fronted by a proxy whose 503 page echoes the request
-	// URI would put the credential (which IS the URL path) in the retry and
-	// exhausted lines. postAttempt scrubs at source; this pins it.
+	// The exact shape both real leaks in this file's history came from: an edge
+	// in front of the webhook answers with an error page that echoes the
+	// request URI, and for a Discord webhook that path IS the credential. The
+	// body is no longer published in ANY form — not quoted, not filtered, not
+	// partially — so the whole class is closed by construction instead of by
+	// matching strings inside remote text.
+	//
+	// Both surfaces are asserted because they fail independently: post's
+	// returned error, and httpx.Do's retry/exhausted lines, which log the
+	// ATTEMPT error through the type-based LogSafeError alone (post's logSafe
+	// runs too late for them). What survives is knell's own account of the
+	// body: the status, the byte count, and that the detail was dropped —
+	// enough to tell "the webhook answered and rejected us" from "nothing
+	// answered", which is what keeps the failure diagnosable.
 	const secret = "verysecretbodytoken"
+	const secretPath = "/api/webhooks/1234567890/" + secret
+	wantBody := "502 Bad Gateway: upstream failed for " + secretPath
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The error-page shape that causes the leak: the body echoes the
-		// request path, which for a Discord webhook is the credential.
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte("502 Bad Gateway: upstream failed for " + r.URL.Path))
 	}))
@@ -439,7 +438,7 @@ func TestStatusBodyDetailNeverLeaksWebhookURL(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
+	d := New(srv.URL+secretPath, "node-1")
 	t.Cleanup(d.Close)
 
 	err := d.BeatMissing(context.Background(), "api", time.Hour)
@@ -449,32 +448,46 @@ func TestStatusBodyDetailNeverLeaksWebhookURL(t *testing.T) {
 	if buf.Len() == 0 {
 		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
 	}
-	if got := buf.String(); strings.Contains(got, secret) {
-		t.Errorf("retry/exhausted logs leak the webhook credential: %s", got)
+	// The body is not Discord's error object, so the status branch reports it
+	// as a measurement. Pinning that keeps the absence assertions below
+	// meaningful: a run that failed before the body was read would satisfy
+	// them without the branch under test ever running.
+	if !strings.Contains(err.Error(), "HTTP 503") {
+		t.Fatalf("err = %v, want the HTTP 503 status error (the body branch must have run)", err)
 	}
-	if strings.Contains(err.Error(), secret) {
-		t.Errorf("delivery error leaks the webhook credential: %v", err)
+	for _, want := range []string{
+		"carried no Discord error code",
+		fmt.Sprintf("%d bytes", len(wantBody)),
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to report %q (a bare status reads as \"the webhook explained nothing\")", err, want)
+		}
 	}
-	// The detail must survive the scrub so delivery failures remain
-	// diagnosable; only the credential is removed.
-	if !strings.Contains(err.Error(), "Bad Gateway") {
-		t.Errorf("delivery error dropped the body detail entirely: %v", err)
+	// Not one byte of the body, and nothing derived from the request path.
+	for _, leak := range []string{secret, "/api/webhook", "1234567890", "Bad Gateway", "upstream failed"} {
+		if got := buf.String(); strings.Contains(got, leak) {
+			t.Errorf("retry/exhausted logs carry %q from the response body: %s", leak, got)
+		}
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("delivery error carries %q from the response body: %v", leak, err)
+		}
 	}
 }
 
-func TestOversizedStatusBodyIsDroppedRatherThanTruncated(t *testing.T) {
+func TestOversizedStatusBodyDropsTheDetail(t *testing.T) {
 	// Deliberately NOT t.Parallel: slog.Default() is process-global.
 	//
-	// Redaction is exact-value replacement, so the size cap must never cut a
-	// webhook URL the body echoed: a truncated path matches no candidate and
-	// survives the scrub as a credential prefix. Enough filler ahead of the
-	// echoed request URI puts the cut exactly there, so an oversized body is
-	// dropped whole rather than truncated.
+	// A body past the cap is not Discord's error object at all (that object is
+	// a few hundred bytes), so there is no code to read and nothing to report
+	// but the size. maxErrorBodyBytes+1 is read so the over-cap case is
+	// DETECTABLE rather than silently truncated, and the size is reported as
+	// the fact it is.
 	const secret = "verysecretbodytoken"
+	filler := strings.Repeat("x", maxErrorBodyBytes-12)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(strings.Repeat("x", maxErrorBodyBytes-12) + r.URL.Path))
+		_, _ = w.Write([]byte(filler + r.URL.Path))
 	}))
 	defer srv.Close()
 
@@ -493,25 +506,32 @@ func TestOversizedStatusBodyIsDroppedRatherThanTruncated(t *testing.T) {
 	if buf.Len() == 0 {
 		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
 	}
-	// "/api/webhook" is the truncation's residue: the cut lands inside the
-	// credential-bearing path, so no part of it may reach an error or a log.
-	for _, leak := range []string{secret, "/api/webhook"} {
+	if want := fmt.Sprintf("response body over %d bytes, detail dropped", maxErrorBodyBytes); !strings.Contains(err.Error(), want) {
+		t.Errorf("err = %v, want it to report %q", err, want)
+	}
+	// "/api/webhook" is where the cut would land: no part of the body, cut or
+	// whole, may reach an error or a log line.
+	for _, leak := range []string{secret, "/api/webhook", filler[:32]} {
 		if got := buf.String(); strings.Contains(got, leak) {
-			t.Errorf("retry/exhausted logs leak %q from a truncated body: %s", leak, got)
+			t.Errorf("retry/exhausted logs carry %q from an oversized body: %s", leak, got)
 		}
 		if strings.Contains(err.Error(), leak) {
-			t.Errorf("delivery error leaks %q from a truncated body: %v", leak, err)
+			t.Errorf("delivery error carries %q from an oversized body: %v", leak, err)
 		}
 	}
 }
 
-func TestPartiallyReadStatusBodyIsDropped(t *testing.T) {
+func TestPartiallyReadStatusBodyReportsOnlyTheReadFailure(t *testing.T) {
 	// Deliberately NOT t.Parallel: slog.Default() is process-global.
 	//
-	// io.ReadAll returns the bytes it got ALONGSIDE a read error, and those
-	// bytes can be a prefix of an echoed webhook URL that no exact-value
-	// redaction can remove. A body that did not arrive whole is therefore not
-	// usable diagnostic text.
+	// io.ReadAll returns the bytes it got ALONGSIDE the read error, and BOTH
+	// halves are remote-authored: the partial bytes can be a prefix of an
+	// echoed request URI, and the error's own text can embed remote bytes
+	// (net/textproto renders a malformed trailer as "malformed MIME header
+	// line: <bytes>"). So neither is printed. What is reported is knell's own
+	// account: the byte count, and the failure classified structurally — a
+	// response that broke mid-body points at the path between here and
+	// Discord, not at Discord's verdict, and the status cannot tell them apart.
 	const secret = "verysecretbodytoken"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -547,10 +567,16 @@ func TestPartiallyReadStatusBodyIsDropped(t *testing.T) {
 	// The absence assertions below only mean something if the STATUS branch
 	// ran and dropped its detail. A setup that failed earlier (a transport
 	// error before the headers are read) would satisfy them with no body text
-	// in play at all, so pin the error to the status failure (which carries
-	// the detail-dropped marker, never the partial bytes).
-	if !strings.Contains(err.Error(), "HTTP 503") {
-		t.Fatalf("err = %v, want the HTTP 503 status error with its detail dropped (the partially read body must be dropped, not the request failed)", err)
+	// in play at all, so pin the error to the status failure and to the
+	// structural classification of the read failure.
+	for _, want := range []string{
+		"HTTP 503",
+		"response body unreadable after",
+		"the connection closed before the body was complete",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %v, want it to report %q (a partially read body must be reported structurally, not printed)", err, want)
+		}
 	}
 	for _, leak := range []string{secret, "/api/webhook", "upstream failed"} {
 		if got := buf.String(); strings.Contains(got, leak) {
@@ -562,98 +588,156 @@ func TestPartiallyReadStatusBodyIsDropped(t *testing.T) {
 	}
 }
 
-func TestStatusBodyCarryingOnlyTheCredentialSuffixIsRedacted(t *testing.T) {
-	// Deliberately NOT t.Parallel: slog.Default() is process-global.
+func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
+	t.Parallel()
+
+	// Discord names WHY it rejected a webhook POST as a numeric code in its
+	// JSON error body, and that number is the only part of the body knell
+	// publishes: a number cannot carry a credential, while the object's
+	// "message" string and nested "errors" object are authored by the other
+	// end. The split the mapped codes must preserve is the one an operator
+	// acts on -- a webhook that no longer accepts this knell (recreate it) vs
+	// a payload Discord refused (a knell bug no config change fixes) -- and an
+	// unmapped code must report the bare number rather than invent a meaning.
 	//
-	// The leak class the complete-rendering candidates miss: a proxy or webhook
-	// edge that reports only the credential-bearing TAIL of the request path,
-	// with no scheme, host or leading slash around it. Such a body is short
-	// enough to arrive whole under the size cap, so neither drop guard applies
-	// and only the fragment candidates (credentialForms) can remove it. Before
-	// they existed the suffix passed the scrub untouched, into httpx.Do's retry
-	// and exhaustion lines and into the returned delivery error.
-	const secret = "verysecretbodytoken"
+	// All cases use a non-transient status so each runs exactly one attempt.
+	for name, tc := range map[string]struct {
+		status  int
+		body    string
+		want    []string
+		notWant []string
+	}{
+		"unknown webhook": {
+			status:  http.StatusNotFound,
+			body:    `{"message": "Unknown Webhook", "code": 10015}`,
+			want:    []string{"HTTP 404", "Discord error code 10015", "recreate the webhook"},
+			notWant: []string{"Unknown Webhook"},
+		},
+		"invalid token": {
+			status:  http.StatusUnauthorized,
+			body:    `{"message": "Invalid Webhook Token", "code": 50027}`,
+			want:    []string{"Discord error code 50027", "recreate the webhook"},
+			notWant: []string{"Invalid Webhook Token"},
+		},
+		"empty message is a knell bug": {
+			status:  http.StatusBadRequest,
+			body:    `{"message": "Cannot send an empty message", "code": 50006}`,
+			want:    []string{"HTTP 400", "Discord error code 50006", "knell bug"},
+			notWant: []string{"Cannot send an empty message", "recreate the webhook"},
+		},
+		"invalid request body is a knell bug": {
+			status:  http.StatusBadRequest,
+			body:    `{"message": "Invalid Form Body", "code": 50035, "errors": {"content": {"_errors": [{"code": "BASE_TYPE_MAX_LENGTH", "message": "Must be 2000 or fewer in length."}]}}}`,
+			want:    []string{"Discord error code 50035", "knell bug"},
+			notWant: []string{"Invalid Form Body", "BASE_TYPE_MAX_LENGTH", "2000 or fewer"},
+		},
+		"unmapped code is reported bare": {
+			status: http.StatusBadRequest,
+			body:   `{"message": "Some Future Rejection", "code": 40333}`,
+			want:   []string{"Discord error code 40333"},
+			// No invented meaning, and none of Discord's own words: a
+			// parenthesis after the number would be knell claiming to know
+			// what 40333 means.
+			notWant: []string{"Some Future Rejection", "40333 ("},
+		},
+		"non-JSON body reports only its size": {
+			status:  http.StatusBadRequest,
+			body:    "Bad Request",
+			want:    []string{"HTTP 400", "carried no Discord error code", "11 bytes"},
+			notWant: []string{"Bad Request"},
+		},
+		"JSON without a code reports only its size": {
+			status:  http.StatusBadRequest,
+			body:    `{"message": "You are being rate limited.", "retry_after": 0.5}`,
+			want:    []string{"carried no Discord error code", "62 bytes"},
+			notWant: []string{"rate limited", "retry_after"},
+		},
+		"non-numeric code is no code": {
+			status:  http.StatusBadRequest,
+			body:    `{"code": "10015"}`,
+			want:    []string{"carried no Discord error code"},
+			notWant: []string{"Discord error code 10015"},
+		},
+		"empty body leaves the status alone": {
+			status:  http.StatusBadRequest,
+			body:    "",
+			want:    []string{"HTTP 400"},
+			notWant: []string{"detail dropped", "Discord error code"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("upstream failed for " + strings.TrimPrefix(r.URL.Path, "/api/webhooks/")))
-	}))
-	defer srv.Close()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+			d := New(srv.URL+"/api/webhooks/1234567890/plainsegment", "node-1")
+			defer d.Close()
 
-	d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
-	t.Cleanup(d.Close)
-
-	err := d.BeatMissing(context.Background(), "api", time.Hour)
-	if err == nil {
-		t.Fatal("BeatMissing against a persistent 503 = nil, want error")
-	}
-	if buf.Len() == 0 {
-		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
-	}
-	// The body arrived whole and under the cap, so the detail IS attached;
-	// asserting that pins the branch under test (a dropped body would satisfy
-	// the absence assertions below without exercising the scrub at all).
-	if !strings.Contains(err.Error(), "upstream failed for") {
-		t.Fatalf("err = %v, want the attached body detail (the suffix scrub is what must remove the credential, not a drop)", err)
-	}
-	for _, leak := range []string{secret, "1234567890/" + secret} {
-		if got := buf.String(); strings.Contains(got, leak) {
-			t.Errorf("retry/exhausted logs leak %q from a suffix-only body: %s", leak, got)
-		}
-		if strings.Contains(err.Error(), leak) {
-			t.Errorf("delivery error leaks %q from a suffix-only body: %v", leak, err)
-		}
+			err := d.BeatMissing(context.Background(), "api", time.Hour)
+			if err == nil {
+				t.Fatalf("BeatMissing against a %d = nil, want error", tc.status)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err = %v, want it to report %q", err, want)
+				}
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(err.Error(), notWant) {
+					t.Errorf("err = %v, must not report %q", err, notWant)
+				}
+			}
+		})
 	}
 }
 
-func TestStatusBodyCarryingOnlyAShortCompletePathIsRedacted(t *testing.T) {
-	// Deliberately NOT t.Parallel: slog.Default() is process-global.
-	//
-	// A relay-style webhook may have a SHORT complete path ("/hook"), and the
-	// path IS the credential. A body echoing only that path is under the
-	// minCredentialCandidate floor, so the floor must not apply to a complete
-	// path rendering: with the floor applied to it, "/hook" was dropped as a
-	// candidate and the echoed path passed the scrub untouched, into httpx.Do's
-	// retry/exhaustion lines and into the returned delivery error.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("upstream rejected " + r.URL.Path))
-	}))
-	defer srv.Close()
+func TestReadFailureIsClassifiedStructurally(t *testing.T) {
+	t.Parallel()
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	// The read error's TEXT is remote-authored input: net/textproto renders a
+	// malformed chunked trailer as "malformed MIME header line: <remote
+	// bytes>", so a webhook edge could put the echoed request URI (the
+	// credential) in it. readFailure therefore classifies with errors.Is
+	// against a fixed set and speaks knell's own words; the deadline and
+	// connection-reset shapes are here because neither is reachable from a
+	// httptest server without making the test a timing experiment.
+	const leaked = "/api/webhooks/1234567890/verysecrettrailertoken"
+	for name, tc := range map[string]struct {
+		in   error
+		want string
+	}{
+		"unexpected EOF": {
+			in:   fmt.Errorf("reading body: %w", io.ErrUnexpectedEOF),
+			want: "the connection closed before the body was complete",
+		},
+		"attempt deadline": {
+			in:   fmt.Errorf("reading body: %w", context.DeadlineExceeded),
+			want: "the attempt deadline expired mid-body",
+		},
+		"connection reset": {
+			in:   fmt.Errorf("reading body: %w", &net.OpError{Op: "read", Err: syscall.ECONNRESET}),
+			want: "the connection was reset",
+		},
+		"unrecognized failure carrying remote bytes": {
+			in:   errors.New("malformed MIME header line: " + leaked),
+			want: "the read failed",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	d := New(srv.URL+"/hook", "node-1")
-	t.Cleanup(d.Close)
-
-	err := d.BeatMissing(context.Background(), "api", time.Hour)
-	if err == nil {
-		t.Fatal("BeatMissing against a persistent 503 = nil, want error")
-	}
-	if buf.Len() == 0 {
-		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
-	}
-	// The body arrived whole and under the cap, so the detail IS attached:
-	// the scrub, not a drop, is what has to remove the path.
-	if !strings.Contains(err.Error(), "upstream rejected") {
-		t.Fatalf("err = %v, want the attached body detail (the path scrub is what must remove the credential, not a drop)", err)
-	}
-	if !strings.Contains(err.Error(), "REDACTED") {
-		t.Errorf("err = %v, want the echoed webhook path replaced by REDACTED", err)
-	}
-	if strings.Contains(err.Error(), "/hook") {
-		t.Errorf("delivery error leaks the complete webhook path: %v", err)
-	}
-	if got := buf.String(); strings.Contains(got, "/hook") {
-		t.Errorf("retry/exhausted logs leak the complete webhook path: %s", got)
+			got := readFailure(tc.in)
+			if got != tc.want {
+				t.Errorf("readFailure(%v) = %q, want %q", tc.in, got, tc.want)
+			}
+			if strings.Contains(got, leaked) || strings.Contains(got, "MIME") {
+				t.Errorf("readFailure(%v) = %q, want knell's own words, never the error's text", tc.in, got)
+			}
+		})
 	}
 }
 

@@ -1,160 +1,194 @@
 package notify
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"testing"
+
+	"github.com/cplieger/httpx/v4"
 )
 
-// FuzzLogSafeNeverLeaksWebhookRendering asserts the crown-jewel invariant of
-// this package over an unbounded URL space: neither a complete rendering of the
-// configured webhook URL nor any credential-bearing fragment of its path
-// survives logSafe, and logSafe never breaks the errors.Is chain the sweep and
-// httpx.Do classify through. Each fuzz tail is checked against two webhook
-// path SHAPES, because the shape decides which candidate is the only
-// protection: with Discord's fixed /api/webhooks/ prefix the suffix after it
-// covers the body, while a Discord-compatible edge on its own path (knell
-// accepts any https URL) is covered only by the path minus its leading slash.
-func FuzzLogSafeNeverLeaksWebhookRendering(f *testing.F) {
-	// Seed tails stand in for the credential segment of a webhook URL. They
-	// deliberately avoid secret-shaped keywords ("token", "secret", …): a
-	// literal that looks like a real credential trips the repo's secret scan
-	// even though it is only fuzz seed data.
-	for _, tail := range []string{
-		"1234567890/plainsegment",
-		"1234567890/v\u00e9rylongsegment",
-		"1234567890/tok en",
-		"1234567890/tok#frag",
-		"1234567890/tok?q=1",
-		// A credential carried in the QUERY instead of the path: knell
-		// accepts any https URL, so a relay-style webhook authenticated by
-		// ?key=… is a deployable shape, and the query candidates are its
-		// only protection.
-		"1234567890/plainsegment?key=queryborneexample",
-		"1234567890/%2Ftok",
-		"1234567890/",
-		"",
-		"/",
-		"..",
-		// A fragment-only tail: the path carries no credential at all, so
-		// nothing here is a needle. Found by a fuzz run against an earlier
-		// oracle that derived the credential by trimming a RENDERING and so
-		// demanded redaction of fragment text the request never sends.
-		"#0000000",
+// FuzzDeliveryErrorNeverCarriesWebhookURL asserts the crown-jewel invariant of
+// this package over an unbounded space of REMOTE input: for an arbitrary
+// response status and body, the error the delivery path returns carries no
+// rendering of the configured webhook URL and no fragment of its
+// credential-bearing path.
+//
+// The invariant used to be defended by scrubbing candidate renderings out of
+// the published body text, and this target used to fuzz that candidate
+// machinery. It is now structural — the body's own text is never published at
+// all, only Discord's numeric error code and knell's own wording — so the
+// property holds by construction and this target should pass trivially. That
+// is exactly what makes it worth keeping: it fails the moment a future change
+// puts remote-authored text back into a delivery error.
+//
+// postAttempt is the subject rather than post, for two reasons: it is the
+// function that turns a response into an error, and its return value is
+// verbatim what httpx.Do logs on each attempt (through the type-based
+// LogSafeError, which can only shrink it), so the log surface is covered by
+// the same assertion. Calling it directly also keeps one fuzz iteration to one
+// attempt, with no retry backoff and no 429 Retry-After wait.
+func FuzzDeliveryErrorNeverCarriesWebhookURL(f *testing.F) {
+	// Seed bodies stand in for what the other end can answer with; seed tails
+	// for the credential segment of a webhook URL. They deliberately avoid
+	// secret-shaped keywords ("token", "secret", …): a literal that looks like
+	// a real credential trips the repo's secret scan even as fuzz seed data.
+	for _, seed := range []struct {
+		tail   string
+		status uint16
+		body   string
+	}{
+		{"1234567890/plainsegment", 404, `{"message": "Unknown Webhook", "code": 10015}`},
+		{"1234567890/plainsegment", 400, `{"message": "Invalid Form Body", "code": 50035, "errors": {"content": {}}}`},
+		// The leak shape behind both real leaks: the body echoes the request
+		// URI, which for a webhook IS the credential.
+		{"1234567890/plainsegment", 503, "502 Bad Gateway: upstream failed for /api/webhooks/1234567890/plainsegment"},
+		// The same echo, JSON-escaped ("\/"), a form no byte-for-byte
+		// filtering of the body ever matched.
+		{"1234567890/plainsegment", 500, `{"message": "failed for \/api\/webhooks\/1234567890\/plainsegment"}`},
+		// The credential-bearing tail alone, with no surrounding URL.
+		{"1234567890/plainsegment", 502, "upstream rejected 1234567890/plainsegment"},
+		{"1234567890/plainsegment", 400, strings.Repeat("x", maxErrorBodyBytes+64)},
+		{"1234567890/plainsegment", 204, ""},
+		{"1234567890/plainsegment", 302, ""},
+		{"1234567890/v\u00e9rylongsegment", 400, "for /api/webhooks/1234567890/v\u00e9rylongsegment"},
+		// A relay-style webhook whose whole path is the credential, and one
+		// carrying it in the query: knell accepts any https URL.
+		{"1234567890/plainsegment?key=queryborneexample", 401, `{"code": 50027, "q": "key=queryborneexample"}`},
+		{"", 400, "/api/webhooks/"},
+		{"/", 429, `{"message": "You are being rate limited.", "retry_after": 0.5}`},
+		{"..", 400, `{"code": null}`},
+		{"1234567890/tok en", 400, `{"code": "10015"}`},
+		{"1234567890/%2Ftok", 400, `{"code": 40333}`},
 	} {
-		f.Add(tail)
+		f.Add(seed.tail, seed.status, seed.body)
 	}
 
-	f.Fuzz(func(t *testing.T, tail string) {
+	f.Fuzz(func(t *testing.T, tail string, statusSeed uint16, body string) {
+		// The whole HTTP status space including the informational and
+		// redirect bands, so the 3xx branch and CheckHTTPStatus's 1xx
+		// rejection are fuzzed alongside the body branches.
+		status := 100 + int(statusSeed%600)
 		for _, base := range []string{
 			"https://discord.example/api/webhooks/",
 			"https://relay.example/hooks/",
 		} {
-			assertLogSafeHidesEveryCredentialForm(t, base+tail)
+			assertDeliveryErrorHidesWebhookURL(t, base+tail, status, body)
 		}
 	})
 }
 
-// assertLogSafeHidesEveryCredentialForm checks the leak-and-chain invariant for
-// one configured webhook URL. The four complete renderings (raw, url.String,
-// Path, EscapedPath) and the three credential fragments are derived here
-// independently rather than read from redactionCandidates, so a candidate list
-// that stops covering one of them fails instead of silently narrowing the
-// property with it. Every needle is also fed as an error text in its OWN right,
-// because a remote body that echoes only one fragment is the shape a
-// longer-form-only candidate list passes through untouched: scrubbing a
-// complete rendering out of such a body removes nothing.
-func assertLogSafeHidesEveryCredentialForm(t *testing.T, rawURL string) {
+// assertDeliveryErrorHidesWebhookURL runs one delivery attempt against a stub
+// transport that answers with the given status and body, and checks that the
+// resulting error carries nothing derived from the configured webhook URL.
+//
+// A needle that also appears in the error built for a DIFFERENT (control)
+// webhook URL is skipped: that text came from knell's own message template, so
+// a fuzz tail that happens to contain a phrase like "detail dropped" cannot
+// masquerade as a leak. Everything else is a leak by definition — nothing in
+// the delivery path is supposed to depend on the URL at all.
+func assertDeliveryErrorHidesWebhookURL(t *testing.T, rawURL string, status int, body string) {
+	t.Helper()
+
+	const controlURL = "https://control.example/hooks/controlsegment"
+	gotErr, requested := attemptAgainstStub(t, rawURL, status, body)
+	controlErr, _ := attemptAgainstStub(t, controlURL, status, body)
+	if gotErr == nil {
+		return
+	}
+	for _, needle := range webhookNeedles(rawURL) {
+		// A handful of bytes can occur in the surrounding message text, where
+		// its presence proves nothing.
+		if len(needle) < 8 {
+			continue
+		}
+		if controlErr != nil && strings.Contains(controlErr.Error(), needle) {
+			continue
+		}
+		if strings.Contains(gotErr.Error(), needle) {
+			t.Errorf("delivery error for %q (status %d) kept %q: %v", rawURL, status, needle, gotErr)
+		}
+	}
+	// The other half of the contract the status branch must keep: every
+	// non-2xx stays %w-wrapped around CheckHTTPStatus's typed error, which is
+	// what lets httpx.Do classify 502/503/504 as transient and find the 429's
+	// *RateLimitError. A run where the request was never made (an unusable
+	// fuzzed URL) reaches no status at all.
+	if !requested || (status >= 200 && status < 300) {
+		return
+	}
+	var (
+		statusErr *httpx.HTTPStatusError
+		authErr   *httpx.AuthError
+		rateErr   *httpx.RateLimitError
+	)
+	if !errors.As(gotErr, &statusErr) && !errors.As(gotErr, &authErr) && !errors.As(gotErr, &rateErr) {
+		t.Errorf("delivery error for status %d = %v, want CheckHTTPStatus's typed error still in the chain", status, gotErr)
+	}
+}
+
+// attemptAgainstStub performs one postAttempt against a stub transport that
+// answers with status and body, reporting the resulting error and whether the
+// transport was reached at all (a fuzzed URL that no request can be built from
+// fails earlier, and then no status branch ran).
+func attemptAgainstStub(t *testing.T, rawURL string, status int, body string) (err error, requested bool) {
 	t.Helper()
 
 	d := New(rawURL, "node-1")
 	defer d.Close()
-
-	renderings := []string{rawURL}
-	// The credential needles, derived from the PARSED PATH rather than by
-	// trimming a rendering: a query or fragment in the fuzz tail is not part
-	// of the path (net/http never sends a fragment, and the delivery path
-	// cannot leak what it never carries). All three fragment shapes an error
-	// can carry without the surrounding URL are needles, because each is the
-	// only protection for a different remote-body shape: the path minus its
-	// leading slash, the suffix after Discord's fixed prefix when the URL has
-	// one, and the final segment on its own (a proxy reporting "upstream
-	// failed for <token>"). The query forms below and the JSON slash-escaped
-	// rendering of every form are covered for the same reason: each is the
-	// only protection for one remote-body shape.
-	var credentials []string
-	if u, parseErr := url.Parse(rawURL); parseErr == nil {
-		renderings = append(renderings, u.String(), u.Path, u.EscapedPath())
-		for _, p := range []string{u.Path, u.EscapedPath()} {
-			credentials = append(credentials, strings.TrimPrefix(p, "/"))
-			if suffix, ok := strings.CutPrefix(p, "/api/webhooks/"); ok {
-				credentials = append(credentials, suffix)
-			}
-			if i := strings.LastIndex(p, "/"); i >= 0 {
-				credentials = append(credentials, p[i+1:])
-			}
+	d.client.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		requested = true
+		if _, copyErr := io.Copy(io.Discard, r.Body); copyErr != nil {
+			t.Errorf("reading request body: %v", copyErr)
 		}
-		// The query forms too: a relay-style webhook can carry its
-		// credential as ?key=…, and then the raw query and the decoded
-		// values are the only candidates covering a body that echoes the
-		// request-URI or the query alone.
-		credentials = append(credentials, u.RawQuery)
-		for _, values := range u.Query() {
-			credentials = append(credentials, values...)
+		return &http.Response{
+			StatusCode: status,
+			Status:     fmt.Sprintf("%d Fuzzed", status),
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    r,
+		}, nil
+	})
+	_, err = d.postAttempt(context.Background(), []byte(`{"content":"fuzz"}`))
+	return err, requested
+}
+
+// webhookNeedles lists every text whose presence in a delivery error would be
+// a credential leak: the complete renderings of the configured URL, the
+// credential-bearing fragments of its path (the path itself, the suffix after
+// Discord's fixed prefix, the final segment — each is the only evidence of a
+// leak for a different remote-body shape), its query forms, and the
+// slash-escaped rendering of each, since a JSON error body commonly escapes
+// "/" as "\/".
+func webhookNeedles(rawURL string) []string {
+	needles := []string{rawURL}
+	u, parseErr := url.Parse(rawURL)
+	if parseErr != nil {
+		return needles
+	}
+	needles = append(needles, u.String(), u.Path, u.EscapedPath())
+	for _, p := range []string{u.Path, u.EscapedPath()} {
+		needles = append(needles, strings.TrimPrefix(p, "/"))
+		if suffix, ok := strings.CutPrefix(p, "/api/webhooks/"); ok {
+			needles = append(needles, suffix)
+		}
+		if i := strings.LastIndex(p, "/"); i >= 0 {
+			needles = append(needles, p[i+1:])
 		}
 	}
-	// Carriers are the texts an error can be built from; needles are the
-	// texts that must never survive one. Both are length-guarded: a handful
-	// of bytes can occur in the surrounding error text, where its presence
-	// proves nothing.
-	needles := append(slices.Clone(renderings), credentials...)
-	// A JSON error body commonly escapes "/" as "\/" (PHP json_encode does so
-	// by default), which carries the very same credential in a form no
-	// plain-byte candidate matches. Each escaped rendering is therefore both a
-	// carrier (the remote body shape) and a needle (what must not survive it).
-	for _, form := range slices.Clone(needles) {
+	needles = append(needles, u.RawQuery)
+	for _, values := range u.Query() {
+		needles = append(needles, values...)
+	}
+	for _, form := range needles[:len(needles):len(needles)] {
 		if escaped := strings.ReplaceAll(form, "/", `\/`); escaped != form {
 			needles = append(needles, escaped)
 		}
 	}
-	for _, carrier := range needles {
-		if len(carrier) < 8 {
-			continue
-		}
-		// An empty-message sentinel keeps arbitrary fuzz input out of the
-		// wrapped cause while still giving errors.Is a stable identity:
-		// with a fixed-text cause, a fuzz tail equal to that text would
-		// make a needle match the scaffolding instead of a leak. So any
-		// match below can only be the secret itself.
-		sentinel := errors.New("")
-		// Two error SHAPES, because logSafe has two halves and production
-		// takes the second one. A plain wrapError exercises the
-		// value-based backstop (scrub the candidates out of the text); a
-		// *url.Error exercises the type-based reduction
-		// httpx.LogSafeError performs, which is what postAttempt's
-		// transport path actually returns.
-		shapes := map[string]error{
-			"wrapped text": fmt.Errorf("%s: %w", carrier, sentinel),
-			"url error":    &url.Error{Op: "Post", URL: carrier, Err: sentinel},
-		}
-		for shape, in := range shapes {
-			got := d.logSafe(in)
-			for _, needle := range needles {
-				// Only a needle the input actually rendered can prove a
-				// leak; absence of one that was never there is vacuous.
-				if len(needle) < 8 || !strings.Contains(in.Error(), needle) {
-					continue
-				}
-				if strings.Contains(got.Error(), needle) {
-					t.Errorf("logSafe(%s of %q) kept %q in %q", shape, carrier, needle, got)
-				}
-			}
-			if !errors.Is(got, sentinel) {
-				t.Errorf("logSafe(%s, %q) broke the errors.Is chain: %v", shape, carrier, got)
-			}
-		}
-	}
+	return needles
 }

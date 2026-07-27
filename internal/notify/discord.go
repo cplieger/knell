@@ -16,10 +16,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
-	"slices"
-	"strconv"
-	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cplieger/httpx/v4"
@@ -34,13 +31,14 @@ const attemptTimeout = 10 * time.Second
 // semantics: total, including the first).
 const maxAttempts = 3
 
-// maxErrorBodyBytes caps how much of a rejected response's body is carried
-// into the delivery error. Discord names the cause there (a deleted webhook
-// vs a rejected payload); a few hundred bytes is the whole explanation and
-// keeps a hostile or chatty body out of the log. A body that exceeds the cap
-// is dropped whole rather than truncated: truncation can cut a webhook URL
-// the body echoed, and a partial URL is a credential fragment no exact-value
-// redaction can remove (see postAttempt).
+// maxErrorBodyBytes caps how much of a rejected response's body is READ, and
+// nothing about it is ever printed. Discord names the cause in that body as a
+// numeric code (a deleted webhook vs a rejected payload), and knell reports
+// the code plus its own wording for it — never the body's own text, which is
+// authored by the other end and can echo the webhook URL that IS the
+// credential. The cap bounds the JSON parse; a body past it is not Discord's
+// error object at all (that object is a few hundred bytes), so the size is
+// reported as the fact it is and the detail is dropped.
 const maxErrorBodyBytes = 512
 
 // userAgent identifies this client to Discord's edge. Go sends
@@ -58,10 +56,6 @@ type Discord struct {
 	client *http.Client
 	url    string
 	node   string
-	// redact holds every rendering of the webhook URL that an error
-	// message can carry (see redactionCandidates); logSafe scrubs all of
-	// them, not only the raw configured string.
-	redact []string
 	// attemptTimeout bounds one delivery attempt. It is a field rather than
 	// a direct use of the constant only so a test can shorten it on its own
 	// notifier; New always sets it to attemptTimeout.
@@ -96,164 +90,8 @@ func New(webhookURL, node string) *Discord {
 		client:         client,
 		url:            webhookURL,
 		node:           node,
-		redact:         redactionCandidates(webhookURL),
 		attemptTimeout: attemptTimeout,
 	}
-}
-
-// redactionCandidates lists every rendering of the webhook URL whose presence
-// in an error message would leak the credential (a Discord webhook carries it
-// in the URL path). The raw configured string is only one of them: HTTP code
-// renders req.URL.String(), which net/url canonicalizes — non-ASCII path bytes
-// come back percent-escaped — so the canonical form can carry the credential
-// without containing the configured string. The bare path forms cover an error
-// that quotes only the path; credentialForms' fragments cover a remote body
-// that echoes only the credential-bearing tail. The request-URI form
-// (path?query), the raw query and each decoded query value cover a
-// relay-style webhook whose credential rides in the query string (config
-// accepts any https URL, so that shape is deployable): scrubbing only the
-// path forms out of an echoed request-URI would leave its query behind.
-// Redaction is plain replacement, so order matters: each form group runs
-// longest-first. The two path encodings interleave rather than sorting into one
-// descending list, so a fragment CAN fire inside text that also carried a
-// longer rendering — safe only because every fragment is anchored at the END of
-// the path, which makes even an out-of-order match remove the token instead of
-// leaving it behind.
-// Keep that anchoring when adding a candidate. Duplicates, the empty path, the
-// bare "/" and any DERIVED form shorter than minCredentialCandidate are
-// dropped: such a fragment appears in unrelated messages and redacting it would
-// mangle them without hiding a secret. The complete path renderings are exempt
-// from that floor — the path IS the credential, so a short configured path must
-// still be scrubbed when a body echoes only it. An unparseable URL yields the
-// raw value and its escaped rendering alone, which is all the text such an
-// error embeds.
-func redactionCandidates(webhookURL string) []string {
-	candidates := []string{webhookURL}
-	u, parseErr := url.Parse(webhookURL)
-	if parseErr != nil {
-		// The raw value is the only rendering such an error can embed — plus
-		// its JSON slash-escaped form, for the same reason the escaped loop
-		// below exists: a body that escapes "/" carries the credential in a
-		// form the plain value does not match.
-		if escaped := strings.ReplaceAll(webhookURL, "/", `\/`); escaped != webhookURL {
-			candidates = append(candidates, escaped)
-		}
-		return candidates
-	}
-	// The configured string leads the list so the escaped loop below covers it
-	// as well (the dedup loop then drops the plain form as already present).
-	// u.RequestURI() is what a proxy error page echoes (path?query); it is
-	// listed before the bare path forms so an echoed request-URI is removed
-	// whole instead of leaving its query behind. RawQuery and the decoded
-	// query values cover a body that echoes only the query; the length floor
-	// below keeps a short non-secret value (?wait=true) from mangling log
-	// text.
-	forms := []string{webhookURL, u.String(), u.RequestURI(), u.Path, u.EscapedPath(), u.RawQuery}
-	forms = append(forms, queryValueForms(u)...)
-	for _, p := range []string{u.Path, u.EscapedPath()} {
-		forms = append(forms, credentialForms(p)...)
-	}
-	completePaths := completePathForms(u)
-	// A JSON error body commonly escapes "/" as "\/" (PHP json_encode does so
-	// by default), which no plain-byte candidate matches. Register the escaped
-	// rendering of every slash-bearing form; the loop runs over a snapshot so
-	// the escaped forms are not re-escaped.
-	for _, form := range slices.Clone(forms) {
-		if escaped := strings.ReplaceAll(form, "/", `\/`); escaped != form {
-			forms = append(forms, escaped)
-		}
-	}
-	for _, c := range forms {
-		// The length floor applies to every DERIVED form — the sub-path
-		// fragments credentialForms builds and the query forms: a fragment too
-		// short to be a usable credential is also too short to replace without
-		// mangling unrelated text (the reason a bare "/" was rejected,
-		// generalized). It cannot weaken the guarantee for a COMPLETE
-		// rendering: the configured string is kept unconditionally above,
-		// u.String() is never shorter than "https://h/", and the complete path
-		// renderings (u.Path, u.EscapedPath() and their slash-escaped forms)
-		// are exempt via completePaths, so a webhook whose whole path is a
-		// handful of bytes is still scrubbed when a body echoes only that path.
-		if c == "" || c == "/" || slices.Contains(candidates, c) {
-			continue
-		}
-		if len(c) < minCredentialCandidate && !slices.Contains(completePaths, c) {
-			continue
-		}
-		candidates = append(candidates, c)
-	}
-	return candidates
-}
-
-// webhookPathPrefix is the fixed part of a Discord webhook path; everything
-// after it is the credential.
-const webhookPathPrefix = "/api/webhooks/"
-
-// queryValueForms lists the renderings of the query VALUES a body can echo
-// without the surrounding query string: each decoded value, and each value's
-// WIRE (percent-encoded) rendering. Both encodings are registered for the same
-// reason the path has u.Path and u.EscapedPath(): a body echoing a value with
-// escapable bytes carries it in a shape the other form does not match. A
-// relay-style webhook can hold its credential in the query (config accepts any
-// https URL), and the length floor in redactionCandidates drops the short
-// non-secret values (?wait=true) these loops also collect.
-func queryValueForms(u *url.URL) []string {
-	var forms []string
-	for _, values := range u.Query() {
-		forms = append(forms, values...)
-	}
-	for pair := range strings.SplitSeq(u.RawQuery, "&") {
-		if _, encValue, ok := strings.Cut(pair, "="); ok {
-			forms = append(forms, encValue)
-		}
-	}
-	return forms
-}
-
-// completePathForms lists the COMPLETE renderings of the path component —
-// u.Path, u.EscapedPath() and their JSON slash-escaped forms. The path IS the
-// credential, so these are exempt from redactionCandidates' length floor
-// however short the configured path is (a body echoing only "/hook" echoes the
-// whole secret). The empty path and the bare "/" are excluded: neither is a
-// credential, and redacting "/" would mangle every path in a log line.
-func completePathForms(u *url.URL) []string {
-	var forms []string
-	for _, p := range []string{u.Path, u.EscapedPath()} {
-		if p == "" || p == "/" {
-			continue
-		}
-		forms = append(forms, p)
-		if escaped := strings.ReplaceAll(p, "/", `\/`); escaped != p {
-			forms = append(forms, escaped)
-		}
-	}
-	return forms
-}
-
-// minCredentialCandidate is the shortest fragment worth redacting. A handful
-// of bytes cannot be a usable webhook credential (a real path carries a long
-// channel id and token), while replacing such a fragment would mangle every
-// unrelated log line containing it — the same reason a bare "/" is rejected.
-const minCredentialCandidate = 8
-
-// credentialForms lists the credential-bearing fragments of a webhook path
-// that an error can carry WITHOUT the surrounding URL or the leading slash, in
-// descending length: the path minus its leading slash, the suffix after the
-// fixed /api/webhooks/ prefix (when present), and the final token segment. A
-// proxy or webhook edge commonly reports only one of these (a body reading
-// "upstream failed for <id>/<token>" is the whole credential), and an exact
-// value-based redaction that knows only the complete renderings passes such
-// text through untouched — into httpx.Do's per-attempt and exhaustion log
-// lines and into the returned delivery error.
-func credentialForms(p string) []string {
-	forms := []string{strings.TrimPrefix(p, "/")}
-	if suffix, ok := strings.CutPrefix(p, webhookPathPrefix); ok {
-		forms = append(forms, suffix)
-	}
-	if i := strings.LastIndex(p, "/"); i >= 0 {
-		forms = append(forms, p[i+1:])
-	}
-	return forms
 }
 
 // Close releases idle connections. Call once on shutdown.
@@ -317,11 +155,13 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 }
 
 // post delivers one message, retrying transient failures. The webhook URL
-// never appears in returned errors or logs: transport errors are reduced by
-// logSafe, and a status failure is httpx.CheckHTTPStatus's error (the status
-// code only) plus the remote body when it arrived whole and fits the size
-// cap, which postAttempt scrubs against the same candidates before wrapping
-// it (an oversized or partially read body is dropped, never truncated).
+// cannot appear in returned errors or logs, because no text the OTHER end
+// authored is ever printed: every message this package publishes is written
+// here (none of them interpolates d.url), and the two places remote text
+// could enter are reduced structurally instead of filtered — a transport
+// error through logSafe (httpx.LogSafeError unwraps the *url.Error that
+// embeds the URL) and a rejected response through statusDetail (Discord's
+// numeric error code and knell's own wording for it, never the body's text).
 func (d *Discord) post(ctx context.Context, label, content string) error {
 	body, err := json.Marshal(map[string]string{"content": content})
 	if err != nil {
@@ -338,69 +178,39 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 		// without the alarm, which is what WithExhaustedLevel is for.
 		httpx.WithExhaustedLevel(slog.LevelDebug))
 	if err != nil {
-		return fmt.Errorf("delivering %s notification: %w", label, d.logSafe(err))
+		return fmt.Errorf("delivering %s notification: %w", label, logSafe(err))
 	}
 	return nil
 }
 
-// logSafe reduces err to a form that cannot carry the webhook URL.
-// httpx.LogSafeError strips the *url.Error wrapper that embeds it; the
-// value-based redaction below is the backstop for any error type whose text
-// carries the URL without being a *url.Error (LogSafeError passes those
-// through unchanged, so the type-based reduction alone is only as complete as
-// httpx's error taxonomy). Every candidate rendering is scrubbed, not just the
-// raw configured string, because an unrecognized error commonly formats
-// req.URL.String() — net/url's canonical form, which may percent-escape the
-// credential-bearing path. Wrapping preserves errors.Is/As, which the sweep
-// relies on for context.Canceled and httpx.Do for transient classification —
-// httpx.RedactSecret cannot be used here because it returns a bare
-// errors.New and would break both.
-func (d *Discord) logSafe(err error) error {
-	safe := httpx.LogSafeError(err)
-	if safe == nil {
-		if err == nil {
-			return nil
-		}
-		// LogSafeError returns urlErr.Err verbatim, so a *url.Error whose
-		// own Err is nil would reduce a real failure to nil. postAttempt's
-		// return IS httpx.Do's success signal, so a nil there would report
-		// an undelivered notification as delivered and suppress the alert;
-		// fail closed instead.
-		return errors.New("webhook delivery failed")
+// logSafe reduces err to a form that cannot carry the webhook URL. The
+// reduction is purely STRUCTURAL: httpx.LogSafeError unwraps the *url.Error
+// net/http builds around a transport failure, which is the one error shape
+// that embeds the full request URL, and returns everything else untouched.
+// There is deliberately no string search-and-replace backstop: text-matching
+// redaction can only defend text knell chose to publish, and this package
+// publishes none — every message is authored here (never interpolating d.url)
+// and a rejected response contributes a number, not its own words (see
+// statusDetail). postAttempt applies this before returning, because httpx.Do
+// logs each attempt's error itself and reduces it by type only.
+//
+// The reduced error is returned as-is rather than re-wrapped, which keeps
+// errors.Is/As intact: the sweep relies on it for context.Canceled and
+// httpx.Do for transient classification. httpx.RedactSecret cannot be used
+// here — it returns a bare errors.New and would break both.
+func logSafe(err error) error {
+	if err == nil {
+		return nil
 	}
-	// Candidates are never empty (config rejects an empty/non-https webhook
-	// URL before New is called), and RedactSecretString is a no-op on an
-	// empty secret, so this cannot mask an error into an empty message.
-	msg := safe.Error()
-	scrubbed := d.scrubText(msg)
-	if scrubbed != msg {
-		return &redactedError{msg: scrubbed, err: safe}
+	if safe := httpx.LogSafeError(err); safe != nil {
+		return safe
 	}
-	return safe
+	// LogSafeError returns urlErr.Err verbatim, so a *url.Error whose own Err
+	// is nil would reduce a real failure to nil. postAttempt's return IS
+	// httpx.Do's success signal, so a nil there would report an undelivered
+	// notification as delivered and suppress the alert; fail closed instead.
+	return errors.New("webhook delivery failed")
 }
-
-// scrubText removes every candidate rendering of the webhook URL from text.
-// It is the value-based half of logSafe, split out because postAttempt must
-// scrub a response body at source (before httpx.Do logs the attempt error)
-// rather than through logSafe, which only sees httpx.Do's return.
-// RedactSecretString is a plain replacement, so this is a no-op on text that
-// does not carry the credential.
-func (d *Discord) scrubText(text string) string {
-	for _, candidate := range d.redact {
-		text = httpx.RedactSecretString(text, candidate)
-	}
-	return text
-}
-
-// redactedError carries a scrubbed message while keeping the original error in
-// the chain for errors.Is/As.
-type redactedError struct {
-	err error
-	msg string
-}
-
-func (e *redactedError) Error() string { return e.msg }
-func (e *redactedError) Unwrap() error { return e.err }
 
 // attemptTimeoutError reports that a single delivery attempt exceeded
 // postAttempt's private per-attempt deadline while the caller's context was
@@ -409,13 +219,14 @@ func (e *redactedError) Unwrap() error { return e.err }
 // terminal caller-cancellation decision before consulting IsTransient. Its
 // message carries no URL.
 type attemptTimeoutError struct {
-	// cause is the SCRUBBED text of the transport error the expired deadline
-	// produced, and after is the bound that expired. A string, not an error:
-	// the type must still not unwrap to context.DeadlineExceeded (httpx
-	// classifies that terminal before consulting IsTransient), and the text is
-	// exactly what the non-timeout transport path already returns through
-	// logSafe, so it carries no rendering of the webhook URL. The zero value
-	// stays valid and renders the bare message.
+	// cause is the text of the STRUCTURALLY REDUCED transport error the
+	// expired deadline produced, and after is the bound that expired. A
+	// string, not an error: the type must still not unwrap to
+	// context.DeadlineExceeded (httpx classifies that terminal before
+	// consulting IsTransient), and the text is exactly what the non-timeout
+	// transport path already returns through logSafe — a transport error with
+	// its URL-bearing *url.Error wrapper removed, never remote body bytes.
+	// The zero value stays valid and renders the bare message.
 	cause string
 	after time.Duration
 }
@@ -436,17 +247,18 @@ func (attemptTimeoutError) IsTransient() bool { return true }
 // per-attempt deadline, request construction, transport call, response
 // cleanup, and strict delivery validation. It is the retry callback post
 // hands to httpx.Do, which owns the retry policy and terminal wrapping.
-// Every error it returns is URL-free — including the remote body detail on a
-// status failure, which is scrubbed here rather than by post's logSafe,
-// because httpx.Do logs the attempt error before post sees it. That detail
-// is only ever a COMPLETE body under the cap; a truncated one is dropped.
+// Every error it returns is URL-free by CONSTRUCTION rather than by
+// filtering: a transport error is reduced to its cause by logSafe, and a
+// rejected response contributes only statusDetail's numbers and knell's own
+// wording for them. The reduction happens here rather than in post's logSafe
+// because httpx.Do logs each attempt's error before post ever sees it.
 func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error) {
 	attemptCtx, cancel := httpx.ContextWithDefaultTimeout(ctx, d.attemptTimeout)
 	defer cancel()
 	req, reqErr := http.NewRequestWithContext(attemptCtx, http.MethodPost, d.url, bytes.NewReader(body))
 	if reqErr != nil {
 		// The raw error would embed the URL; report the cause only.
-		return struct{}{}, fmt.Errorf("building webhook request: %w", d.logSafe(reqErr))
+		return struct{}{}, fmt.Errorf("building webhook request: %w", logSafe(reqErr))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", userAgent)
@@ -457,19 +269,19 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 		// terminal, so translate only this per-attempt timeout into its
 		// Transient contract; caller cancellation/deadlines stay terminal.
 		if errors.Is(doErr, context.DeadlineExceeded) && ctx.Err() == nil {
-			// Carry the scrubbed cause and the bound that fired: a
-			// "dial tcp <host>:443: ..." stall and a bare "context deadline
-			// exceeded" after the connection was established are different
-			// incidents (egress/DNS blocked vs Discord answering slowly), and
-			// this error is the whole incident record — httpx.Do returns it
-			// verbatim on exhaustion and watch logs that at Error. logSafe
-			// applies the same reduction the non-timeout path below returns,
-			// so no rendering of the webhook URL survives.
-			return struct{}{}, attemptTimeoutError{cause: d.logSafe(doErr).Error(), after: d.attemptTimeout}
+			// Carry the structurally reduced cause and the bound that fired:
+			// a "dial tcp <host>:443: ..." stall and a bare "context
+			// deadline exceeded" after the connection was established are
+			// different incidents (egress/DNS blocked vs Discord answering
+			// slowly), and this error is the whole incident record — httpx.Do
+			// returns it verbatim on exhaustion and watch logs that at Error.
+			// logSafe applies the same reduction the non-timeout path below
+			// returns, so no rendering of the webhook URL survives.
+			return struct{}{}, attemptTimeoutError{cause: logSafe(doErr).Error(), after: d.attemptTimeout}
 		}
 		// *url.Error embeds the full webhook URL; reduce it to its cause
 		// (transient classification survives the reduction).
-		return struct{}{}, d.logSafe(doErr)
+		return struct{}{}, logSafe(doErr)
 	}
 	defer httpx.DrainClose(resp.Body)
 	// Success is exactly 2xx here: CheckHTTPStatus rejects every other
@@ -496,48 +308,131 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 				statusErr)
 		}
 		// The code alone cannot tell a deleted webhook from a rejected
-		// payload; Discord names the cause in the body. Wrapping keeps the
-		// typed error in the chain, so httpx.Do still classifies 502/503/504
-		// as transient and still finds *RateLimitError for the 429 wait.
-		// The excerpt is scrubbed HERE, not by post's logSafe: httpx.Do logs
-		// a transient attempt's error through the type-based LogSafeError
-		// only, which passes this wrapped error through unchanged, so a body
-		// echoing the request path would otherwise carry the credential into
-		// the retry and exhausted log lines. Scrub precedes Quote because
-		// Quote escapes any byte that is not printable UTF-8, which would put
-		// such a byte out of reach of an exact match.
+		// payload; Discord names that difference in the body as a numeric
+		// code, and statusDetail reports the code plus knell's own wording
+		// for it. Wrapping keeps the typed error in the chain, so httpx.Do
+		// still classifies 502/503/504 as transient and still finds
+		// *RateLimitError for the 429 wait.
 		//
-		// Redaction removes only text matching a candidate exactly — a
-		// complete rendering or one of credentialForms' path fragments — so a
-		// credential cut MID-VALUE matches nothing and must never be
-		// published. Both ways to hold one drop the detail instead of
-		// publishing it: a body past the cap (read cap+1 to detect it, since
-		// a body echoing the request path across the cutoff leaves a
-		// truncated path behind), and a read that failed midway (io.ReadAll
-		// returns the partial bytes with the error).
-		detail, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes+1))
-		switch {
-		case readErr == nil && len(detail) > 0 && len(detail) <= maxErrorBodyBytes:
-			return struct{}{}, fmt.Errorf("%w: %s", statusErr, strconv.Quote(d.scrubText(string(detail))))
-		case readErr != nil:
-			// The body did not arrive whole, so its bytes are unusable; say
-			// so, or a bare status reads as "the webhook explained nothing".
-			// Never the partial bytes themselves (a cut path is an
-			// unscrubbable credential prefix), but the byte count and the
-			// scrubbed read failure: a response that broke mid-body points at
-			// the path between here and the webhook, not at the webhook's
-			// verdict, and the status code alone cannot tell them apart.
-			// Quote for the same reason the whole-body case does: the read
-			// error can carry remote bytes verbatim (net/textproto reports a
-			// malformed chunked trailer as "malformed MIME header line:
-			// <remote bytes>"), and Quote neutralizes control characters
-			// before the text reaches a log line.
-			return struct{}{}, fmt.Errorf("%w (response body unreadable after %d bytes, detail dropped: %s)",
-				statusErr, len(detail), strconv.Quote(d.scrubText(readErr.Error())))
-		case len(detail) > maxErrorBodyBytes:
-			return struct{}{}, fmt.Errorf("%w (response body over %d bytes, detail dropped)", statusErr, maxErrorBodyBytes)
+		// The detail is built HERE, not by post's logSafe: httpx.Do logs a
+		// transient attempt's error through the type-based LogSafeError only,
+		// which passes this wrapped error through unchanged, so anything the
+		// body's own text contributed would reach the retry and exhausted log
+		// lines — and for a webhook whose edge echoes the request URI, that
+		// text IS the credential. statusDetail therefore publishes numbers
+		// and knell's words only. An empty body has nothing to add, and the
+		// typed status error is returned unwrapped.
+		if detail := statusDetail(resp.Body); detail != "" {
+			return struct{}{}, fmt.Errorf("%w%s", statusErr, detail)
 		}
 		return struct{}{}, statusErr
 	}
 	return struct{}{}, nil
+}
+
+// statusDetail renders what a rejected response adds to its status code,
+// using only numbers this package measured and words this package wrote.
+//
+// Discord answers a rejected webhook POST with a JSON error object whose
+// numeric "code" field names the cause, and that number is the body's whole
+// diagnostic value: a number cannot carry a credential. The object's own
+// "message" string and nested "errors" object are authored by the other end
+// and are never published, in any form — a webhook edge that echoes the
+// request URI would otherwise put the credential (for a webhook the URL path
+// IS the credential) into this error and into httpx.Do's log lines.
+//
+// Everything else about the body is reported as a fact ABOUT the body and
+// never as its content: a body that is not Discord's error object, one past
+// maxErrorBodyBytes, and one that did not arrive whole all report the byte
+// count and that the detail was dropped. The empty string means the status is
+// the whole verdict (an empty body), which the caller reports as the bare
+// typed error.
+func statusDetail(body io.Reader) string {
+	// One byte past the cap, so an over-cap body is DETECTABLE instead of
+	// silently truncated into a partial (and then unattributable) fragment.
+	detail, readErr := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes+1))
+	switch {
+	case readErr != nil:
+		// A body that did not arrive whole is worth saying out loud: a bare
+		// status reads as "the webhook explained nothing", while a response
+		// that broke mid-body points at the path between here and Discord
+		// rather than at Discord's verdict, and the status cannot tell them
+		// apart. The partial bytes are dropped, and so is the read error's
+		// own text — net/textproto renders a malformed trailer as "malformed
+		// MIME header line: <remote bytes>", which is remote-authored like
+		// any body. readFailure classifies it structurally instead.
+		return fmt.Sprintf(" (response body unreadable after %d bytes, detail dropped: %s)",
+			len(detail), readFailure(readErr))
+	case len(detail) > maxErrorBodyBytes:
+		return fmt.Sprintf(" (response body over %d bytes, detail dropped)", maxErrorBodyBytes)
+	case len(detail) == 0:
+		return ""
+	}
+	code, ok := discordErrorCode(detail)
+	if !ok {
+		return fmt.Sprintf(" (response body of %d bytes carried no Discord error code, detail dropped)", len(detail))
+	}
+	if meaning := discordCodeMeaning(code); meaning != "" {
+		return fmt.Sprintf(": Discord error code %d (%s)", code, meaning)
+	}
+	// An unmapped code is still the one fact worth having — the operator can
+	// look it up in Discord's error reference — and knell claims no meaning
+	// it does not know.
+	return fmt.Sprintf(": Discord error code %d", code)
+}
+
+// discordErrorCode reports the numeric error code of a rejected response
+// body. Exactly one field is decoded: the surrounding object's text fields
+// are remote-authored, so they are never bound to a variable this package
+// formats. A body that is not a JSON object, or whose "code" is missing or
+// not a number, reports no code, and the decode error is discarded rather
+// than reported — encoding/json's message describes the input.
+func discordErrorCode(body []byte) (int, bool) {
+	var parsed struct {
+		Code *int `json:"code"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || parsed.Code == nil {
+		return 0, false
+	}
+	return *parsed.Code, true
+}
+
+// discordCodeMeaning is knell's own wording for the Discord error codes an
+// operator can act on; the empty string means knell knows no meaning for the
+// code and reports the bare number. The mapped codes split exactly the way
+// the response to them splits: 10015 and 50027 mean the webhook this knell
+// posts to no longer accepts it, which only an operator can fix, while 50006
+// and 50035 mean Discord rejected the payload knell built, which no
+// configuration change helps. Values are phrased as that verdict rather than
+// as a translation of Discord's message, which is never read.
+func discordCodeMeaning(code int) string {
+	switch code {
+	case 10015:
+		return "unknown webhook: it was deleted, or DISCORD_WEBHOOK_URL points at one that never existed - recreate the webhook and update the config"
+	case 50027:
+		return "invalid webhook token: DISCORD_WEBHOOK_URL's token does not match the webhook - recreate the webhook and update the config"
+	case 50006:
+		return "cannot send an empty message: knell built a payload with no content, which is a knell bug, not an operator problem"
+	case 50035:
+		return "invalid request body: Discord rejected the shape of knell's payload, which is a knell bug, not an operator problem"
+	}
+	return ""
+}
+
+// readFailure names why reading a rejected response's body failed, in knell's
+// own words. The read error is classified structurally (errors.Is against a
+// fixed set) and never rendered: io.ReadAll surfaces net/textproto's
+// "malformed MIME header line: <remote bytes>" verbatim, so its text is
+// remote-authored input, not a diagnosis. An unrecognized failure reports
+// only that the read failed; the caller's byte count carries the rest.
+func readFailure(err error) string {
+	switch {
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "the connection closed before the body was complete"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "the attempt deadline expired mid-body"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "the connection was reset"
+	}
+	return "the read failed"
 }
