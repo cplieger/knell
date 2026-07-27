@@ -91,11 +91,11 @@ A live incident and one that is already over are reported differently: nothing a
 - **Recovered**: sent on the first accepted ping after a missing notice, best-effort. Delivery uses bounded retries with jittered backoff and honors `Retry-After` on rate limits. It is fire-once: the queued transition is consumed before the send, so a delivery that still fails has nothing left to retry from and that recovery notice will never arrive. It therefore counts as `knell_notifications_dropped_total{kind="recovered"}`, not as a failure you can wait out.
 - **Ended outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of being collapsed into that earlier one and lost. Records whose outage has already ended by the time they can be delivered are reported once in the past tense. One ended outage reads as a single sentence:
 
-  > 🕓 [knell server-1] beat **cron-backup** was missing for 12m0s, recovered at 14:07 UTC. This notice is late: notifications were failing while the outage happened.
+  > 🕓 [knell server-1] beat **cron-backup** was missing for 12m0s, recovered at 2026-07-23 14:07 UTC. This notice is late: notifications were failing while the outage happened.
 
   Several become one summary:
 
-  > 🕓 [knell server-1] beat **cron-backup** had 3 outages while notifications were failing: longest 47m0s, last recovered at 14:07 UTC.
+  > 🕓 [knell server-1] beat **cron-backup** had 3 outages while notifications were failing: longest 47m0s, last recovered at 2026-07-23 14:07 UTC.
 
   The whole run of ended outages goes out in a single sweep, so a genuinely live outage queued behind it waits one sweep rather than one sweep per stale record. Because the notice states the outages are over, no recovered notice follows for them.
 - **Queued outages**: each beat queues up to 8 records and reports them oldest first. When a beat's queue is full, the newest record is not queued, and the two cases that can arise differ in consequence:

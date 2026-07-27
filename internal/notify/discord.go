@@ -117,10 +117,26 @@ func (d *Discord) BeatRecovered(ctx context.Context, id string, downFor time.Dur
 	return d.post(ctx, "recovered "+id, msg)
 }
 
-// historyTimeFormat renders a recovery point for an operator reading the
-// notice minutes after the fact: wall-clock time plus zone, so it lines up
-// with a dashboard without guessing which observer's timezone it came from.
-const historyTimeFormat = "15:04 MST"
+// historyTimeFormat renders the recovery point in the HISTORY notice, and it
+// carries the DATE because that notice exists precisely because it could not
+// be delivered when the outage ended: the record waited in watch's per-beat
+// queue for a webhook that was unreachable, and beat deadlines are measured in
+// hours, so the recovery point being reported is commonly a different day than
+// the message an operator is reading. Discord's own message timestamp only
+// bounds it from above, which leaves a bare "14:07" ambiguous between today,
+// yesterday and Monday — and reconstructing the missed window is the whole
+// point of a late notice.
+//
+// The live notices have no absolute timestamp to widen, deliberately:
+// BeatMissing and BeatRecovered arrive as the transition happens, so their
+// durations are already anchored to the message itself and a bare time of day
+// would be unambiguous there anyway. Keeping the common message short is
+// worth more than a date nobody has to reason about.
+//
+// The zone stays in both halves of the format: the operator reading the
+// notice is not necessarily in the observer's timezone, and the notice is the
+// whole record.
+const historyTimeFormat = "2006-01-02 15:04 MST"
 
 // BeatOutageHistory announces outages that had already ended before this
 // observer could deliver their notices, in one past-tense message so a

@@ -121,7 +121,11 @@ func TestBeatOutageHistoryReportsOneEndedOutageInThePastTense(t *testing.T) {
 		t.Fatalf("BeatOutageHistory: %v", err)
 	}
 	content := <-rec.contents
-	for _, want := range []string{"node-1", "api", "was missing for 12m0s", "recovered at 14:07 UTC"} {
+	// The timestamp is asserted WHOLE, date included: a time-only format
+	// cannot satisfy this string, so dropping the date fails here rather
+	// than shipping a recovery point that could be any day (the notice is
+	// late by construction — see historyTimeFormat).
+	for _, want := range []string{"node-1", "api", "was missing for 12m0s", "recovered at 2026-07-23 14:07 UTC"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("content %q missing %q", content, want)
 		}
@@ -162,7 +166,8 @@ func TestBeatOutageHistorySummarizesSeveralEndedOutages(t *testing.T) {
 		"node-1", "api",
 		"had 3 outages while notifications were failing",
 		"longest 47m0s",
-		"last recovered at 14:07 UTC",
+		// Whole timestamp, date included: see the singular test.
+		"last recovered at 2026-07-23 14:07 UTC",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("content %q missing %q", content, want)
