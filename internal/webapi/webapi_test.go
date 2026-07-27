@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/slogx/capture"
@@ -41,7 +42,7 @@ func newTestHandlerHealthz(b *fakeBeater, token string, healthzStatus int) http.
 	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(healthzStatus)
 	})
-	return New(b, token, Routes{Healthz: healthz, Metrics: metrics.Registry.Handler()})
+	return New(b, token, Routes{Healthz: healthz, Metrics: metrics.Handler()})
 }
 
 func TestBeatEndpoint(t *testing.T) {
@@ -97,12 +98,11 @@ func TestBeatEndpoint(t *testing.T) {
 }
 
 func TestMetricsExposition(t *testing.T) {
-	// Touch the asserted metrics so their series exist even when this
-	// package's tests run in isolation (labeled metrics emit no output
-	// until a first series is recorded).
-	metrics.BeatsReceived.Add(0, "webapi-test")
-	metrics.BeatFresh.Set(1, "webapi-test")
-	metrics.NotificationsSent.Add(0, "missing")
+	// Declare a beat so the per-beat series exist even when this package's
+	// tests run in isolation (labeled metrics emit no output until a first
+	// series is recorded). The notification counters need no touch: the
+	// metrics package pre-mints every kind at init.
+	metrics.InitBeat("webapi-test", time.Unix(0, 0))
 
 	h := newTestHandler(&fakeBeater{}, "")
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
@@ -263,7 +263,7 @@ func TestPanicUnderBeatHandlerAnswers500AndIsLogged(t *testing.T) {
 		Healthz: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		}),
-		Metrics: metrics.Registry.Handler(),
+		Metrics: metrics.Handler(),
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))

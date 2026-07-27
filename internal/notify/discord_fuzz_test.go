@@ -1,7 +1,6 @@
 package notify
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/url"
@@ -10,12 +9,16 @@ import (
 )
 
 // FuzzLogSafeNeverLeaksWebhookRendering asserts the crown-jewel invariant of
-// this package over an unbounded URL space: no rendering of the configured
-// webhook URL survives logSafe, and logSafe never breaks the errors.Is chain
-// the sweep and httpx.Do classify through. The four renderings are derived
-// here independently (raw, url.String, Path, EscapedPath) rather than read from
-// redactionCandidates, so a candidate list that stops covering one of them
-// fails instead of silently narrowing the property with it.
+// this package over an unbounded URL space: neither a complete rendering of the
+// configured webhook URL nor its credential-bearing suffix survives logSafe,
+// and logSafe never breaks the errors.Is chain the sweep and httpx.Do classify
+// through. The four renderings are derived here independently (raw, url.String,
+// Path, EscapedPath) rather than read from redactionCandidates, so a candidate
+// list that stops covering one of them fails instead of silently narrowing the
+// property with it. The credential needle is derived independently of the
+// full-rendering needle for the same reason: a redaction that removes only the
+// harmless scheme+host prefix makes the complete rendering disappear while the
+// /api/webhooks/<credential> segment still reaches the log.
 func FuzzLogSafeNeverLeaksWebhookRendering(f *testing.F) {
 	// Seed tails stand in for the credential segment of a webhook URL. They
 	// deliberately avoid secret-shaped keywords ("token", "secret", …): a
@@ -51,24 +54,39 @@ func FuzzLogSafeNeverLeaksWebhookRendering(f *testing.F) {
 			if len(rendering) < 8 {
 				continue
 			}
+			// The credential-bearing suffix, derived independently of the
+			// full-rendering needle above. Prefix-only redaction (drop the
+			// scheme+host, keep /api/webhooks/<credential>) satisfies the
+			// full-rendering assertion while still leaking the secret, so
+			// the suffix is asserted on its own. Guarded by the same
+			// minimum length: a few bytes prove nothing.
+			credential := strings.TrimPrefix(rendering, "https://discord.example")
+			credential = strings.TrimPrefix(credential, "/api/webhooks/")
 			// Two error SHAPES, because logSafe has two halves and production
 			// takes the second one. A plain wrapError exercises the
 			// value-based backstop (scrub the candidates out of the text); a
 			// *url.Error exercises the type-based reduction
 			// httpx.LogSafeError performs, which is what postAttempt's
 			// transport path actually returns.
-			// Minimal scaffolding on purpose: the only other text is the
-			// wrapped error, so a match can only be the credential itself.
+			// An empty-message sentinel keeps arbitrary fuzz input out of the
+			// wrapped cause while still giving errors.Is a stable identity:
+			// with a fixed-text cause, a fuzz tail equal to that text would
+			// make the credential needle match the scaffolding instead of a
+			// leak. So any match below can only be the credential itself.
+			sentinel := errors.New("")
 			shapes := map[string]error{
-				"wrapped text": fmt.Errorf("%s: %w", rendering, context.Canceled),
-				"url error":    &url.Error{Op: "Post", URL: rendering, Err: context.Canceled},
+				"wrapped text": fmt.Errorf("%s: %w", rendering, sentinel),
+				"url error":    &url.Error{Op: "Post", URL: rendering, Err: sentinel},
 			}
 			for shape, in := range shapes {
 				got := d.logSafe(in)
 				if strings.Contains(got.Error(), rendering) {
 					t.Errorf("logSafe(%s) kept webhook rendering %q in %q", shape, rendering, got)
 				}
-				if !errors.Is(got, context.Canceled) {
+				if len(credential) >= 8 && strings.Contains(got.Error(), credential) {
+					t.Errorf("logSafe(%s) kept webhook credential %q in %q", shape, credential, got)
+				}
+				if !errors.Is(got, sentinel) {
 					t.Errorf("logSafe(%s, %q) broke the errors.Is chain: %v", shape, rendering, got)
 				}
 			}

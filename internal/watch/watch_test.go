@@ -140,7 +140,7 @@ func checkSpans(t *testing.T, outages []Outage, want ...time.Duration) {
 func newTestWatcher(beats ...Beat) (*Watcher, *fakeClock, *fakeNotifier) {
 	clock := newFakeClock()
 	notifier := &fakeNotifier{}
-	return New(beats, notifier, clock.Now), clock, notifier
+	return New(beats, notifier, clock.Now, clock.Now()), clock, notifier
 }
 
 // drainRecoveries synchronously delivers queued recovered transitions, in
@@ -592,7 +592,7 @@ func TestOneBeatsFailedSendDoesNotStarveTheOthers(t *testing.T) {
 		{ID: "starve-probe-a", Deadline: 10 * time.Minute},
 		{ID: "starve-probe-b", Deadline: 10 * time.Minute},
 		{ID: "starve-probe-c", Deadline: 10 * time.Minute},
-	}, n, clock.Now)
+	}, n, clock.Now, clock.Now())
 
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
@@ -636,7 +636,7 @@ func TestFreshnessGaugeUpdatesWhileSenderBlocked(t *testing.T) {
 		w := New([]Beat{
 			{ID: "blocked-sender-a", Deadline: 10 * time.Minute},
 			{ID: "blocked-sender-b", Deadline: 30 * time.Minute},
-		}, n, clock.Now)
+		}, n, clock.Now, clock.Now())
 
 		// Beat a goes overdue before the loop starts; its missing send
 		// will block the sender loop indefinitely.

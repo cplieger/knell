@@ -207,26 +207,27 @@ func loadWebhook() (string, error) {
 	}
 	webhook, src, err := envx.SecretWithSource("DISCORD_WEBHOOK_URL")
 	warnPlainVarIgnored("DISCORD_WEBHOOK_URL", "the webhook URL", src)
-	if err == nil {
-		// envx trims the _FILE branch only; a plain variable copied from a
-		// deployment file can carry padding. A trailing space survives
-		// url.Parse and is escaped as %20 on every POST, so Discord answers
-		// 404 forever and the switch can never ring.
-		webhook = strings.TrimSpace(webhook)
-		if webhook == "" {
-			// Whitespace-only: the variable WAS provided, so this is a broken
-			// secret pipeline, not a missing setting. Reported as such instead
-			// of falling through to the shape check, which would answer
-			// "scheme must be https" for a value that carries no scheme.
-			return "", errors.New("DISCORD_WEBHOOK_URL is set but empty (whitespace only): point it at the https webhook URL, or use DISCORD_WEBHOOK_URL_FILE")
-		}
-	}
 	if err != nil {
 		if errors.As(err, new(*envx.MissingError)) {
 			return "", fmt.Errorf("DISCORD_WEBHOOK_URL is required: %w", err)
 		}
-		// Provided via _FILE but unreadable/empty: not a missing-variable case.
+		// Provided via _FILE but unreadable/empty: not a missing-variable
+		// case, and never a fallback to the plain variable — a webhook the
+		// operator meant to configure must fail startup, not go unset.
 		return "", fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
+	}
+
+	// envx trims the _FILE branch only; a plain variable copied from a
+	// deployment file can carry padding. A trailing space survives
+	// url.Parse and is escaped as %20 on every POST, so Discord answers
+	// 404 forever and the switch can never ring.
+	webhook = strings.TrimSpace(webhook)
+	if webhook == "" {
+		// Whitespace-only: the variable WAS provided, so this is a broken
+		// secret pipeline, not a missing setting. Reported as such instead
+		// of falling through to the shape check, which would answer
+		// "scheme must be https" for a value that carries no scheme.
+		return "", errors.New("DISCORD_WEBHOOK_URL is set but empty (whitespace only): point it at the https webhook URL, or use DISCORD_WEBHOOK_URL_FILE")
 	}
 	if _, err := parseWebhookURL(webhook); err != nil {
 		return "", fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)

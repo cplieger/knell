@@ -33,9 +33,9 @@ func TestMintNotificationKindsPremintsEveryCounterAndKind(t *testing.T) {
 
 	kinds := []string{KindMissing, KindRecovered, KindHistory}
 	for _, kind := range kinds {
-		NotificationsSent.Delete(kind)
-		NotificationsFailed.Delete(kind)
-		NotificationsDropped.Delete(kind)
+		notificationsSent.Delete(kind)
+		notificationsFailed.Delete(kind)
+		notificationsDropped.Delete(kind)
 	}
 
 	mintNotificationKinds()
@@ -48,7 +48,7 @@ func TestMintNotificationKindsPremintsEveryCounterAndKind(t *testing.T) {
 func assertNotificationSeries(t *testing.T, want []string, when string) {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	Registry.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	exposition := rec.Body.String()
 	for _, line := range want {
 		if !strings.Contains(exposition, line+"\n") {

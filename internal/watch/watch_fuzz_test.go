@@ -153,7 +153,7 @@ func FuzzMissingQueue(f *testing.F) {
 // every observer scraping it, so the count must not move for an unknown id.
 func beatFreshSeriesCount() int {
 	rec := httptest.NewRecorder()
-	metrics.Registry.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	n := 0
 	for line := range strings.Lines(rec.Body.String()) {
 		if strings.HasPrefix(line, "knell_beat_fresh{") {

@@ -36,7 +36,10 @@ const maxAttempts = 3
 // maxErrorBodyBytes caps how much of a rejected response's body is carried
 // into the delivery error. Discord names the cause there (a deleted webhook
 // vs a rejected payload); a few hundred bytes is the whole explanation and
-// keeps a hostile or chatty body out of the log.
+// keeps a hostile or chatty body out of the log. A body that exceeds the cap
+// is dropped whole rather than truncated: truncation can cut a webhook URL
+// the body echoed, and a partial URL is a credential fragment no exact-value
+// redaction can remove (see postAttempt).
 const maxErrorBodyBytes = 512
 
 // userAgent identifies this client to Discord's edge. Discord's HTTP API
@@ -324,8 +327,17 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 		// precedes Quote because Quote escapes a non-ASCII candidate byte out
 		// of reach of the match; Quote then neutralizes control characters
 		// before the text reaches a log line.
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-		if len(detail) > 0 {
+		//
+		// Redaction is exact-value replacement, so it can only remove a
+		// COMPLETE candidate: any text that does not hold the whole webhook
+		// URL is unscrubbable, and a partial one is still a credential
+		// prefix. Two ways to end up holding one, both of which drop the
+		// body detail rather than publish a fragment: a body longer than the
+		// cap (read cap+1 to detect it, since a body echoing the request path
+		// across the cutoff leaves a truncated path behind), and a read that
+		// fails midway (io.ReadAll returns the partial bytes with the error).
+		detail, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes+1))
+		if readErr == nil && len(detail) > 0 && len(detail) <= maxErrorBodyBytes {
 			return struct{}{}, fmt.Errorf("%w: %s", statusErr, strconv.Quote(d.scrubText(string(detail))))
 		}
 		return struct{}{}, statusErr

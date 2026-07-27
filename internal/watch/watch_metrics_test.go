@@ -20,7 +20,7 @@ import (
 // of name{label="<value>"}, reporting whether the series is present at all.
 func findLabeledValue(name, label, value string) (string, bool) {
 	rec := httptest.NewRecorder()
-	metrics.Registry.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	prefix := name + `{` + label + `="` + value + `"} `
 	for line := range strings.Lines(rec.Body.String()) {
 		if v, ok := strings.CutPrefix(line, prefix); ok {
@@ -476,7 +476,7 @@ func TestRecoveryQueueDropIsCountedAsDroppedNotFailed(t *testing.T) {
 	}
 	clock := newFakeClock()
 	n := &fakeNotifier{}
-	w := New(beats, n, clock.Now)
+	w := New(beats, n, clock.Now, clock.Now())
 	// New sizes the queue from the beat count, so shrink it by one slot to
 	// reach the drop path at all (defensive-only in production).
 	w.recoveries = make(chan recoveryEvent, len(beats)-1)
@@ -515,22 +515,15 @@ func TestHistoryNoticeCountsOncePerMessageWhileOutagesCountEach(t *testing.T) {
 	// notification counters, which the parallel tests also move.
 	const id = "history-counter-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
-
-	// Both history kinds are pre-minted at boot, alongside missing and
-	// recovered: without an earlier zero sample, an increase() alert would
-	// miss the very first history failure. labeledValue fails when a series
-	// is absent, so these lookups ARE the pre-minting assertion (the values
-	// themselves belong to other tests, which share the registry).
-	labeledValue(t, "knell_notifications_sent_total", "kind", "history")
-	labeledValue(t, "knell_notifications_failed_total", "kind", "history")
-	// The per-beat outage counter is pre-minted per configured beat, and
-	// this beat id is unique to this test, so its boot value is exactly 0.
-	if got := labeledValue(t, "knell_beat_outages_total", "beat", id); got != "0" {
-		t.Errorf("beat_outages_total at boot = %s, want 0 (pre-minted so increase() has a baseline)", got)
-	}
+	w.Beat(id)
+	// Baseline, not zero: the registry is package-global and survives every
+	// test in this binary, so `go test -count=N` re-enters this test with the
+	// previous invocation's total. The cold-start zero matrix is pinned once
+	// in internal/metrics (TestMintNotificationKindsPremintsEveryCounterAndKind);
+	// what is unique here is the +3 delta.
+	outagesBefore := beatCounterValue(t, "knell_beat_outages_total", id)
 
 	// Three outages that all end before any of them can be reported.
-	w.Beat(id)
 	n.setFail(errors.New("discord down"))
 	const outages = 3
 	for range outages {
@@ -539,7 +532,7 @@ func TestHistoryNoticeCountsOncePerMessageWhileOutagesCountEach(t *testing.T) {
 			t.Fatalf("Beat(%s) = false", id)
 		}
 	}
-	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), float64(outages); got != want {
+	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), outagesBefore+outages; got != want {
 		t.Errorf("beat_outages_total = %v after %d detected outages, want %v (counted at detection, no delivery involved)", got, outages, want)
 	}
 
@@ -563,7 +556,7 @@ func TestHistoryNoticeCountsOncePerMessageWhileOutagesCountEach(t *testing.T) {
 	if got := counterValue(t, "knell_notifications_sent_total", "recovered"); got != recoveredBefore {
 		t.Errorf("sent{recovered} = %v after a history notice, want unchanged %v (the notice states the outages are over)", got, recoveredBefore)
 	}
-	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), float64(outages); got != want {
+	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), outagesBefore+outages; got != want {
 		t.Errorf("beat_outages_total = %v after delivery, want %v (delivery must not move an outage counter)", got, want)
 	}
 }
@@ -722,5 +715,79 @@ func TestShutdownWarnsAboutQueuedRecoveredNotifications(t *testing.T) {
 	}
 	if !rec.HasAttr("shutting down with queued recovered notifications", "queued", "1") {
 		t.Errorf("queued-recovery warning does not report how many notices are lost: %v", rec.Records())
+	}
+}
+
+func TestLogUndeliveredCountsAnUnqueuedOngoingOutage(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default. The open-overflow path deliberately keeps an ongoing outage
+	// OUTSIDE pendingMissing (overflowAccounted alone), so a shutdown
+	// snapshot derived only from the slice reports ongoing_records=0 for a
+	// detected outage this process is abandoning -- and reports nothing at
+	// all once a history drain has emptied the slice.
+	const id = "shutdown-overflow-ongoing-probe"
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+
+	// Fill the queue with missingQueueSize already-ended records: each late
+	// ping closes an outage and queues its record, none are delivered.
+	n.setFail(context.Canceled)
+	for range missingQueueSize {
+		clock.Advance(11 * time.Minute)
+		if !w.Beat(id) {
+			t.Fatalf("Beat(%s) = false", id)
+		}
+	}
+	if got := len(w.beats[id].pendingMissing); got != missingQueueSize {
+		t.Fatalf("queued records = %d, want %d (the test's own precondition)", got, missingQueueSize)
+	}
+
+	// A further silence is detected by the sweep with no slot free: the
+	// outage lives in overflowAccounted only.
+	clock.Advance(11 * time.Minute)
+	w.collectDue()
+	if !w.beats[id].overflowAccounted {
+		t.Fatalf("overflowAccounted = false, want true (the test's own precondition)")
+	}
+
+	rec := capture.Default(t)
+	w.logUndelivered()
+	if !rec.HasAttr("watch loop stopped", "undelivered_records", "9") {
+		t.Errorf("shutdown summary omits the unqueued ongoing outage: %v", rec.Records())
+	}
+	if !rec.HasAttr("watch loop stopped", "ongoing_records", "1") {
+		t.Errorf("shutdown summary does not count the unqueued ongoing outage: %v", rec.Records())
+	}
+	if !rec.HasAttr("watch loop stopped", "permanent_loss", "8") {
+		t.Errorf("shutdown summary miscounts the permanently lost ended records: %v", rec.Records())
+	}
+	if !rec.HasAttr("shutting down with undelivered ended-outage records", "still_ongoing", "1") {
+		t.Errorf("per-beat loss warning omits the unqueued ongoing outage: %v", rec.Records())
+	}
+
+	// Same state after a successful history drain empties the slice: the
+	// abandoned outage is then the ONLY undelivered work, and a
+	// slice-derived snapshot would skip the beat entirely.
+	n.setFail(nil)
+	w.sweep(context.Background())
+	if got := len(w.beats[id].pendingMissing); got != 0 {
+		t.Fatalf("queued records after the history drain = %d, want 0", got)
+	}
+	if !w.beats[id].overflowAccounted {
+		t.Fatalf("overflowAccounted = false after the drain, want the abandoned outage still tracked")
+	}
+
+	drained := capture.Default(t)
+	w.logUndelivered()
+	if !drained.HasAttr("watch loop stopped", "undelivered_records", "1") {
+		t.Errorf("drained shutdown summary omits the unqueued ongoing outage: %v", drained.Records())
+	}
+	if !drained.HasAttr("watch loop stopped", "ongoing_records", "1") {
+		t.Errorf("drained shutdown summary does not count the unqueued ongoing outage: %v", drained.Records())
+	}
+	if !drained.HasAttr("watch loop stopped", "permanent_loss", "0") {
+		t.Errorf("an ongoing outage must not be reported as permanently lost: %v", drained.Records())
+	}
+	if got := drained.CountLevel(slog.LevelInfo, "shutting down with an ongoing outage"); got != 1 {
+		t.Errorf("ongoing-outage notices = %d, want exactly 1: %v", got, drained.Messages())
 	}
 }

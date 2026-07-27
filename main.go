@@ -64,6 +64,12 @@ func main() {
 // run wires the app and blocks until a shutdown signal or a serve error.
 // It returns nil on a clean signal-driven shutdown.
 func run() error {
+	// The boot-armed clock's baseline is process start, not the instant
+	// wiring reaches watch.New: marker probing and mounted-secret reads can
+	// delay that point, and every beat's first deadline must still count
+	// from here (README "boot-armed clock").
+	processStart := time.Now()
+
 	// Install the handler before config parsing so config warnings render
 	// through the configured handler; apply the parsed level after.
 	levelVar := slogx.Setup(slogx.Options{})
@@ -100,11 +106,11 @@ func run() error {
 	for i, b := range cfg.Beats {
 		beats[i] = watch.Beat{ID: b.ID, Deadline: b.Deadline}
 	}
-	watcher := watch.New(beats, notifier, time.Now)
+	watcher := watch.New(beats, notifier, time.Now, processStart)
 
 	handler := webapi.New(watcher, cfg.BeatToken, webapi.Routes{
 		Healthz: health.Handler(marker),
-		Metrics: metrics.Registry.Handler(),
+		Metrics: metrics.Handler(),
 	})
 	// No route streams, so whole-request read and write bounds are safe
 	// here: the read bound stops a slow-trickled body from holding a
@@ -136,9 +142,14 @@ func run() error {
 	// closure does not cover — would call a draining container healthy for the
 	// whole window. A serve error returns from Run without invoking either
 	// hook; the deferred marker.Cleanup covers that path.
+	// The flip goes FIRST inside the hook: slogx installs a synchronous
+	// stderr handler, so a blocked container log driver can stall inside
+	// slog.Info, and webhttp cannot enforce the shutdown budget on an inline
+	// callback. Flipping before logging makes the probe fail closed even if
+	// either shutdown log then blocks.
 	preDrain := webhttp.WithPreDrain(func(context.Context) {
-		slog.Info("shutting down", "cause", context.Cause(ctx))
 		marker.Set(false)
+		slog.Info("shutting down", "cause", context.Cause(ctx))
 	})
 	// Wait for the single sender to finish abandoning its in-flight
 	// delivery, so its "abandoned, shutting down" log lines actually land

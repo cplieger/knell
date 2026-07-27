@@ -303,7 +303,7 @@ func TestLoadBeatToken(t *testing.T) {
 
 func TestLoadBeatTokenDefaultsEmpty(t *testing.T) {
 	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "")
+	unsetEnv(t, "BEAT_TOKEN")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 
 	cfg, err := Load()

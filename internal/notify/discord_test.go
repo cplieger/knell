@@ -413,10 +413,99 @@ func TestStatusBodyDetailNeverLeaksWebhookURL(t *testing.T) {
 	if strings.Contains(err.Error(), secret) {
 		t.Errorf("delivery error leaks the webhook credential: %v", err)
 	}
-	// The detail must still SURVIVE the scrub, or the diagnostic value l-f33
-	// added is gone: only the credential is removed.
+	// The detail must survive the scrub so delivery failures remain
+	// diagnosable; only the credential is removed.
 	if !strings.Contains(err.Error(), "Bad Gateway") {
 		t.Errorf("delivery error dropped the body detail entirely: %v", err)
+	}
+}
+
+func TestOversizedStatusBodyIsDroppedRatherThanTruncated(t *testing.T) {
+	// Deliberately NOT t.Parallel: slog.Default() is process-global.
+	//
+	// Redaction is exact-value replacement, so the size cap must never cut a
+	// webhook URL the body echoed: a truncated path matches no candidate and
+	// survives the scrub as a credential prefix. Enough filler ahead of the
+	// echoed request URI puts the cut exactly there, so an oversized body is
+	// dropped whole rather than truncated.
+	const secret = "verysecretbodytoken"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(strings.Repeat("x", maxErrorBodyBytes-12) + r.URL.Path))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
+	t.Cleanup(d.Close)
+
+	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	if err == nil {
+		t.Fatal("BeatMissing against a persistent 503 = nil, want error")
+	}
+	if buf.Len() == 0 {
+		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
+	}
+	// "/api/webhook" is the truncation's residue: the cut lands inside the
+	// credential-bearing path, so no part of it may reach an error or a log.
+	for _, leak := range []string{secret, "/api/webhook"} {
+		if got := buf.String(); strings.Contains(got, leak) {
+			t.Errorf("retry/exhausted logs leak %q from a truncated body: %s", leak, got)
+		}
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("delivery error leaks %q from a truncated body: %v", leak, err)
+		}
+	}
+}
+
+func TestPartiallyReadStatusBodyIsDropped(t *testing.T) {
+	// Deliberately NOT t.Parallel: slog.Default() is process-global.
+	//
+	// io.ReadAll returns the bytes it got ALONGSIDE a read error, and those
+	// bytes can be a prefix of an echoed webhook URL that no exact-value
+	// redaction can remove. A body that did not arrive whole is therefore not
+	// usable diagnostic text.
+	const secret = "verysecretbodytoken"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, connBuf, hijackErr := w.(http.Hijacker).Hijack()
+		if hijackErr != nil {
+			t.Errorf("hijack: %v", hijackErr)
+			return
+		}
+		defer conn.Close()
+		// Announce more body than is written, then drop the connection: the
+		// client's read ends with partial bytes plus an unexpected-EOF error.
+		detail := "503 upstream failed for " + r.URL.Path
+		_, _ = fmt.Fprintf(connBuf, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: %d\r\n\r\n%s", len(detail)+64, detail)
+		_ = connBuf.Flush()
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
+	t.Cleanup(d.Close)
+
+	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	if err == nil {
+		t.Fatal("BeatMissing against a truncated 503 response = nil, want error")
+	}
+	for _, leak := range []string{secret, "/api/webhook", "upstream failed"} {
+		if got := buf.String(); strings.Contains(got, leak) {
+			t.Errorf("logs carry %q from a partially read body: %s", leak, got)
+		}
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("delivery error carries %q from a partially read body: %v", leak, err)
+		}
 	}
 }
 
