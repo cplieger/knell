@@ -1096,10 +1096,9 @@ func TestCanceledHistorySendKeepsTheLateReasonItWasRecordedWith(t *testing.T) {
 
 	// The twin of the test above, and the reason the upgrade sits behind the
 	// context.Canceled arm rather than in front of it: a shutdown abandons the
-	// send, it does not fail it. Nothing was refused, so the record handed to
-	// the next process run must still report the truth it was recorded with,
-	// or every restart with queued history rewrites its own history into a
-	// webhook incident that never happened.
+	// send, it does not fail it. Nothing was refused, so the queued record must
+	// keep the reason it was recorded with; rewriting it would turn a shutdown
+	// into a webhook incident that never happened.
 	const id = "history-cancel-reason-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)

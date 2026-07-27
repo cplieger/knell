@@ -43,18 +43,19 @@ func waitForMarkerWithin(t *testing.T, present bool, timeout time.Duration) {
 	t.Fatalf("marker %s presence never became %v within %s", health.DefaultPath, present, timeout)
 }
 
-// TestRunTracksHealthMarkerAcrossServeAndDrain pins the full lifecycle of the
-// marker — the only thing the baked `knell health` probe looks at — including
-// the ordering the deferred marker.Cleanup hides: the marker becomes present
-// once the listener is serving (a dropped marker.Set(true) would leave the
-// container unhealthy forever while serving correctly), it becomes ABSENT
-// while run() is still draining a real in-flight /beat request (a deleted or
-// post-Shutdown marker.Set(false) would call a draining container healthy for
-// the whole stop window), and a SIGTERM returns run() with a nil error so the
-// container exits 0 instead of looking like a crash.
-func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
-	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
-	// process-wide signal, and the shared health-marker path.
+// prepareLifecycleRun installs the one process-global contract every full
+// run() test shares and returns the address run() will bind. It reserves and
+// releases an ephemeral port (so the test knows the address before run()
+// chooses it), installs a complete beat/webhook environment with the _FILE and
+// token variables explicitly cleared (a leaked one from another test changes
+// what run() reads), swaps in a fresh slog default that is restored at test
+// end, and establishes marker ABSENCE before the boot: a marker left by a
+// previous failed run or another knell process would satisfy a presence wait
+// immediately and let a caller signal itself before run() installed its signal
+// context. Callers keep their own done channel/start/wait sequence, so a test
+// can still observe state (e.g. a boot floor) between this setup and run().
+func prepareLifecycleRun(t *testing.T, beat string) string {
+	t.Helper()
 	free, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Skipf("cannot reserve a port: %v", err)
@@ -64,37 +65,39 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 		t.Fatalf("releasing the reserved port: %v", err)
 	}
 
-	t.Setenv("BEATS", "api:1m")
+	t.Setenv("BEATS", beat+":1m")
 	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/api/webhooks/1234567890/verysecrettoken")
 	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
 	unsetEnv(t, "BEAT_TOKEN")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 	t.Setenv("LISTEN_ADDR", addr)
-	// Installs a fresh recorder and restores the previous default at test
-	// end; run() replaces the default with its own handler.
 	capture.Default(t)
-	// Establish absence first: a marker left by a previous failed run or
-	// another knell process would satisfy the presence wait immediately and
-	// let the test signal itself before run() installed its signal context.
 	if err := os.Remove(health.DefaultPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		t.Skipf("cannot clear health marker at %s: %v", health.DefaultPath, err)
 	}
 	t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
+	return addr
+}
 
-	done := make(chan error, 1)
-	go func() { done <- run() }()
-	waitForMarkerWithin(t, true, 10*time.Second)
-
-	// Hold one real request open across the shutdown so the interval between
-	// pre-drain and the deferred cleanup becomes observable. Expect:
-	// 100-continue proves the server accepted the request and is inside the
-	// handler before the signal, without sending the body.
+// startHeldBeatRequest opens a beat request against a serving knell and stops
+// with the handler already inside the body read, leaving the request in flight
+// for the caller to complete or abandon. The Expect: 100-continue exchange is
+// the oracle: net/http emits the interim response on the first Read of the
+// body, so receiving it proves the request was accepted AND the handler
+// entered, without sending any body bytes. The returned reader holds whatever
+// the connection has buffered past the interim response, so a caller reading
+// the final response must read through it rather than the raw conn. The read
+// deadline set here covers only the handshake; callers clear or replace it.
+func startHeldBeatRequest(t *testing.T, addr, beat string, contentLength int) (net.Conn, *bufio.Reader) {
+	t.Helper()
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("dial serving knell: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if _, err := io.WriteString(conn, "POST /beat/api HTTP/1.1\r\nHost: "+addr+"\r\nContent-Length: 1048576\r\nExpect: 100-continue\r\n\r\n"); err != nil {
+	headers := "POST /beat/" + beat + " HTTP/1.1\r\nHost: " + addr +
+		"\r\nContent-Length: " + strconv.Itoa(contentLength) + "\r\nExpect: 100-continue\r\n\r\n"
+	if _, err := io.WriteString(conn, headers); err != nil {
 		t.Fatalf("start slow beat request: %v", err)
 	}
 	reader := bufio.NewReader(conn)
@@ -111,6 +114,32 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 	if line, err = reader.ReadString('\n'); err != nil || line != "\r\n" {
 		t.Fatalf("continue terminator = %q, %v, want blank line", line, err)
 	}
+	return conn, reader
+}
+
+// TestRunTracksHealthMarkerAcrossServeAndDrain pins the full lifecycle of the
+// marker — the only thing the baked `knell health` probe looks at — including
+// the ordering the deferred marker.Cleanup hides: the marker becomes present
+// once the listener is serving (a dropped marker.Set(true) would leave the
+// container unhealthy forever while serving correctly), it becomes ABSENT
+// while run() is still draining a real in-flight /beat request (a deleted or
+// post-Shutdown marker.Set(false) would call a draining container healthy for
+// the whole stop window), and a SIGTERM returns run() with a nil error so the
+// container exits 0 instead of looking like a crash.
+func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
+	// process-wide signal, and the shared health-marker path.
+	addr := prepareLifecycleRun(t, "api")
+
+	done := make(chan error, 1)
+	go func() { done <- run() }()
+	waitForMarkerWithin(t, true, 10*time.Second)
+
+	// Hold one real request open across the shutdown so the interval between
+	// pre-drain and the deferred cleanup becomes observable. Expect:
+	// 100-continue proves the server accepted the request and is inside the
+	// handler before the signal, without sending the body.
+	conn, _ := startHeldBeatRequest(t, addr, "api", 1<<20)
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		t.Fatalf("clear continue deadline: %v", err)
 	}
@@ -161,26 +190,7 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal, and the shared health-marker path.
-	free, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Skipf("cannot reserve a port: %v", err)
-	}
-	addr := free.Addr().String()
-	if err := free.Close(); err != nil {
-		t.Fatalf("releasing the reserved port: %v", err)
-	}
-
-	t.Setenv("BEATS", "api:1m")
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/api/webhooks/1234567890/verysecrettoken")
-	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
-	unsetEnv(t, "BEAT_TOKEN")
-	unsetEnv(t, "BEAT_TOKEN_FILE")
-	t.Setenv("LISTEN_ADDR", addr)
-	capture.Default(t)
-	if err := os.Remove(health.DefaultPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		t.Skipf("cannot clear health marker at %s: %v", health.DefaultPath, err)
-	}
-	t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
+	addr := prepareLifecycleRun(t, "api")
 
 	// Captured before the boot: the published baseline must sit between this
 	// floor and the scrape. 2s of slack absorbs a slow bind on a loaded host
@@ -283,29 +293,11 @@ func scrapeCounter(t *testing.T, series string) float64 {
 func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal, and the shared health-marker path.
-	free, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Skipf("cannot reserve a port: %v", err)
-	}
-	addr := free.Addr().String()
-	if err := free.Close(); err != nil {
-		t.Fatalf("releasing the reserved port: %v", err)
-	}
-
+	//
 	// A beat id no other test in this package pings, since the metrics
 	// registry is a package-level singleton shared by the whole test binary.
 	const beat = "drain-guard"
-	t.Setenv("BEATS", beat+":1m")
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/api/webhooks/1234567890/verysecrettoken")
-	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
-	unsetEnv(t, "BEAT_TOKEN")
-	unsetEnv(t, "BEAT_TOKEN_FILE")
-	t.Setenv("LISTEN_ADDR", addr)
-	capture.Default(t)
-	if err := os.Remove(health.DefaultPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		t.Skipf("cannot clear health marker at %s: %v", health.DefaultPath, err)
-	}
-	t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
+	addr := prepareLifecycleRun(t, beat)
 
 	received := `knell_beats_received_total{beat="` + beat + `"}`
 	done := make(chan error, 1)
@@ -316,28 +308,7 @@ func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
 	// Admit the ping while the app is live, then hold it inside the handler's
 	// body read. Expect: 100-continue is the proof the handler was entered and
 	// is reading: net/http emits it on the first Read of the body.
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial serving knell: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
-	if _, err := io.WriteString(conn, "POST /beat/"+beat+" HTTP/1.1\r\nHost: "+addr+"\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\n"); err != nil {
-		t.Fatalf("start slow beat request: %v", err)
-	}
-	reader := bufio.NewReader(conn)
-	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatalf("set continue deadline: %v", err)
-	}
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		t.Fatalf("read 100-continue response: %v", err)
-	}
-	if line != "HTTP/1.1 100 Continue\r\n" {
-		t.Fatalf("continue status line = %q, want HTTP/1.1 100 Continue", line)
-	}
-	if line, err = reader.ReadString('\n'); err != nil || line != "\r\n" {
-		t.Fatalf("continue terminator = %q, %v, want blank line", line, err)
-	}
+	conn, reader := startHeldBeatRequest(t, addr, beat, 1)
 
 	// Cancel the shared context. The marker flip happens in the pre-drain hook,
 	// which webhttp invokes only after cancellation, so waiting for the marker

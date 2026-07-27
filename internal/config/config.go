@@ -35,6 +35,23 @@ const minDeadline = 30 * time.Second
 // still arms).
 const minTokenLength = 16
 
+// maxNodeNameBytes caps NODE_NAME so every notification stays inside
+// Discord's 2000-character `content` limit. The node name is interpolated
+// into EVERY notice (missing, recovered, history), so an unbounded value
+// makes Discord reject all of them: knell would start, accept beats and
+// detect outages while no notice is ever delivered — a dead-man switch that
+// delivers nothing.
+//
+// The budget, worst case over notify's templates: the longest fixed text is
+// the single-outage history notice (54 chars) plus its longest late clause
+// (111) = 165, plus a beat id (<= 64 by beatIDPattern), a truncated duration
+// (<= 32) and a "2006-01-02 15:04 MST" recovery timestamp (20) = 281
+// characters. That leaves ~1719 for the node name, so 256 keeps a wide
+// margin while admitting every DNS-legal hostname (253 max). Counting BYTES
+// is conservative against Discord's character limit: UTF-8 bytes are always
+// >= the character count and >= the UTF-16 code-unit count.
+const maxNodeNameBytes = 256
+
 // defaultListenAddr is the listener address used when LISTEN_ADDR is unset or
 // blank.
 const defaultListenAddr = ":9190"
@@ -114,7 +131,11 @@ func Load() (Config, error) {
 	}
 	cfg.WebhookURL = webhook
 
-	cfg.Node = nodeName()
+	node, err := nodeName()
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Node = node
 
 	cfg.ListenAddr = listenAddr()
 
@@ -135,11 +156,29 @@ func Load() (Config, error) {
 }
 
 // nodeName resolves the observer name: NODE_NAME when set, else the
-// hostname, else "unknown".
-func nodeName() string {
-	if node := strings.TrimSpace(envx.String("NODE_NAME", "")); node != "" {
-		return node
+// hostname, else "unknown". A NODE_NAME past maxNodeNameBytes fails startup
+// like any other malformed required value: it would otherwise push every
+// notification past Discord's content limit, so the switch would arm and
+// never ring. The hostname fallback is not length-checked because the kernel
+// already bounds it far below the cap (HOST_NAME_MAX is 64 on Linux, 255 by
+// POSIX), and refusing to start over the machine's own hostname would trade a
+// deliverable notice for no notice at all.
+func nodeName() (string, error) {
+	node := strings.TrimSpace(envx.String("NODE_NAME", ""))
+	if node == "" {
+		return hostnameNode(), nil
 	}
+	if len(node) > maxNodeNameBytes {
+		return "", fmt.Errorf("NODE_NAME is %d bytes, maximum is %d: the node name prefixes every Discord notification, and a longer one pushes the message past Discord's 2000-character content limit so no notice can be delivered", len(node), maxNodeNameBytes)
+	}
+	return node, nil
+}
+
+// hostnameNode is the NODE_NAME fallback: the hostname, else "unknown". A
+// missing or blank hostname is a warning rather than a startup failure — the
+// notices stay deliverable and attributable to something, which beats not
+// arming the switch at all.
+func hostnameNode() string {
 	host, err := os.Hostname()
 	if err != nil {
 		slog.Warn("failed to determine hostname, using fallback node name", "node", "unknown", "error", err)

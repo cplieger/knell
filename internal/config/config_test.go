@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -45,8 +46,10 @@ func setValidLoadEnv(t *testing.T) {
 // unsetEnv removes key for the duration of the test. t.Setenv registers the
 // restore of the original value, so the following os.Unsetenv leaves the
 // variable absent inside the test and restored afterwards. A plain
-// t.Setenv(key, "") would leave a PRESENT-but-empty variable, which Load
-// rejects for `_FILE` keys (an empty _FILE is a broken mount, not a fallback).
+// t.Setenv(key, "") would leave it present-but-empty, which is not equivalent
+// for the keys this helper serves: `_FILE` keys reject a broken mount, and
+// BEAT_TOKEN rejects an accidental empty gate while absence deliberately serves
+// /beat/{id} open.
 func unsetEnv(t *testing.T, key string) {
 	t.Helper()
 	t.Setenv(key, "")
@@ -658,6 +661,36 @@ func TestLoadTrimsPaddedNodeName(t *testing.T) {
 	}
 	if cfg.Node != "node-1" {
 		t.Errorf("Node = %q, want \"node-1\": the node name prefixes every Discord notice, so padding misattributes which observer reported the outage", cfg.Node)
+	}
+}
+
+func TestLoadAcceptsANodeNameAtTheLimit(t *testing.T) {
+	setValidLoadEnv(t)
+	node := strings.Repeat("n", maxNodeNameBytes)
+	t.Setenv("NODE_NAME", node)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with a %d-byte NODE_NAME error = %v, want it accepted: the cap is the last accepted value, and it still leaves every notice far inside Discord's 2000-character limit", maxNodeNameBytes, err)
+	}
+	if cfg.Node != node {
+		t.Errorf("Node = %q, want the configured %d-byte name verbatim", cfg.Node, maxNodeNameBytes)
+	}
+}
+
+func TestLoadRejectsANodeNamePastTheLimit(t *testing.T) {
+	setValidLoadEnv(t)
+	t.Setenv("NODE_NAME", strings.Repeat("n", maxNodeNameBytes+1))
+
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("Load() with a %d-byte NODE_NAME = nil, want error: the name prefixes every notice, so an oversized one makes Discord reject missing, recovered and history alike - the switch arms and never rings", maxNodeNameBytes+1)
+	}
+	if !strings.Contains(err.Error(), "NODE_NAME") {
+		t.Errorf("Load() error = %q, want it to name NODE_NAME so the operator knows which variable to shorten", err)
+	}
+	if !strings.Contains(err.Error(), strconv.Itoa(maxNodeNameBytes)) {
+		t.Errorf("Load() error = %q, want it to state the %d-byte limit", err, maxNodeNameBytes)
 	}
 }
 

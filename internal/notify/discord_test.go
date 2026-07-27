@@ -479,6 +479,24 @@ func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 			if !errors.Is(got, context.Canceled) {
 				t.Errorf("logSafe broke the errors.Is chain: %v", got)
 			}
+			// safeTransportError is what postAttempt actually returns, and it
+			// replaces the message entirely -- so the chain it exposes through
+			// Unwrap is the ONLY thing left for watch's shutdown exemption
+			// (errors.Is(err, context.Canceled), which decides whether a
+			// failed send is logged as an error or as a cancelled sweep) and
+			// for httpx's transient classification to read.
+			safe := safeTransportError(in)
+			if !errors.Is(safe, context.Canceled) {
+				t.Errorf("safeTransportError broke the errors.Is chain: %v", safe)
+			}
+			for _, leak := range []string{secret, "/api/webhooks/", "discord.example"} {
+				if strings.Contains(safe.Error(), leak) {
+					t.Errorf("safeTransportError kept %q from the request URL: %v", leak, safe)
+				}
+			}
+			if safeTransportError(nil) != nil {
+				t.Error("safeTransportError(nil) != nil, want nil (a nil must not become a delivery failure)")
+			}
 		})
 	}
 }
@@ -507,6 +525,87 @@ func TestLogSafeFailsClosedWhenReductionYieldsNoError(t *testing.T) {
 	// logSafe only on a real failure, so a nil must not become an error.
 	if got := logSafe(nil); got != nil {
 		t.Errorf("logSafe(nil) = %v, want nil", got)
+	}
+}
+
+func TestRedirectDerivedTransportErrorsCarryNoRemoteText(t *testing.T) {
+	t.Parallel()
+
+	// The third channel remote text can enter by, and the one no body-side
+	// defense covers: a REDIRECT. net/http writes two of its transport causes
+	// from the response's Location header -- a malformed one as `failed to
+	// parse Location header "<the header>"`, and httpx's policy refusal as
+	// `refusing redirect to <the header's host>` -- and stripping the
+	// *url.Error wrapper leaves exactly that text. An endpoint that answers a
+	// webhook POST with a redirect echoing the request URI would therefore put
+	// the credential (for a webhook the URL path IS the credential) into the
+	// returned error and into httpx.Do's attempt lines, without ever sending a
+	// response body. safeTransportError closes it by classifying the cause
+	// instead of rendering it.
+	//
+	// Both error surfaces are asserted: post's returned error, and postAttempt's
+	// return, which is verbatim what httpx.Do logs for each attempt (through
+	// the type-based LogSafeError, which can only shrink it) -- so the log
+	// surface is covered by asserting on the attempt error and on that
+	// reduction of it.
+	const secret = "verysecretlocationtoken"
+	for name, tc := range map[string]struct {
+		location string
+		leaks    []string
+		status   int
+	}{
+		// Location parsing fails before any policy runs, so this shape needs
+		// only a redirect net/http would follow.
+		"malformed location echoing the request path": {
+			status:   http.StatusFound,
+			location: "/api/webhooks/1234567890/" + secret + "%zz",
+			leaks:    []string{secret, "/api/webhooks/", "%zz"},
+		},
+		// A method-PRESERVING cross-host hop is the one the policy refuses
+		// with an error (a method-changing one surfaces its 3xx instead, which
+		// TestMethodChangingRedirectIsNotDelivery covers).
+		"cross-host location whose hostname carries the credential": {
+			status:   http.StatusTemporaryRedirect,
+			location: "https://" + secret + ".redirect.example/hooks/1",
+			leaks:    []string{secret, "redirect.example"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Location", tc.location)
+				w.WriteHeader(tc.status)
+			}))
+			t.Cleanup(srv.Close)
+
+			d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
+			t.Cleanup(d.Close)
+
+			_, attemptErr := d.postAttempt(context.Background(), []byte(`{"content":"probe"}`))
+			postErr := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
+			if attemptErr == nil || postErr == nil {
+				t.Fatalf("postAttempt = %v, BeatMissing = %v against a hostile redirect, want errors on both (nothing was delivered)", attemptErr, postErr)
+			}
+			// The attempt failed on the transport path, so knell's own phrase
+			// for it is what the operator reads. Pinning it keeps the absence
+			// assertions below meaningful: a run that failed for some other
+			// reason would satisfy them without the branch under test running.
+			if !strings.Contains(attemptErr.Error(), "webhook transport failed") {
+				t.Errorf("attempt error = %v, want knell's own transport phrase", attemptErr)
+			}
+			for _, leak := range tc.leaks {
+				for surface, got := range map[string]error{
+					"attempt error":                  attemptErr,
+					"attempt error as httpx logs it": httpx.LogSafeError(attemptErr),
+					"returned error":                 postErr,
+				} {
+					if strings.Contains(got.Error(), leak) {
+						t.Errorf("%s kept %q from the Location header: %v", surface, leak, got)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -734,8 +833,12 @@ func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 	// "message" string and nested "errors" object are authored by the other
 	// end. The split the mapped codes must preserve is the one an operator
 	// acts on -- a webhook that no longer accepts this knell (recreate it) vs
-	// a payload Discord refused (a knell bug no config change fixes) -- and an
-	// unmapped code must report the bare number rather than invent a meaning.
+	// a payload Discord refused -- and an unmapped code must report the bare
+	// number rather than invent a meaning. 50035 sits on both sides of that
+	// split (an over-long NODE_NAME produces it, and so does a knell payload
+	// bug), so its wording must name the configuration to check before it
+	// blames knell: a flat "knell bug" verdict would send the operator away
+	// from the only setting that ends the outage.
 	//
 	// All cases use a non-transient status so each runs exactly one attempt.
 	for name, tc := range map[string]struct {
@@ -762,10 +865,10 @@ func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 			want:    []string{"HTTP 400", "Discord error code 50006", "knell bug"},
 			notWant: []string{"Cannot send an empty message", "recreate the webhook"},
 		},
-		"invalid request body is a knell bug": {
+		"invalid request body names the config to check and then knell": {
 			status:  http.StatusBadRequest,
 			body:    `{"message": "Invalid Form Body", "code": 50035, "errors": {"content": {"_errors": [{"code": "BASE_TYPE_MAX_LENGTH", "message": "Must be 2000 or fewer in length."}]}}}`,
-			want:    []string{"Discord error code 50035", "knell bug"},
+			want:    []string{"Discord error code 50035", "NODE_NAME", "knell bug"},
 			notWant: []string{"Invalid Form Body", "BASE_TYPE_MAX_LENGTH", "2000 or fewer"},
 		},
 		"unmapped code is reported bare": {
@@ -930,20 +1033,49 @@ func TestAttemptTimeoutIsRetried(t *testing.T) {
 	}
 }
 
-func TestAttemptTimeoutErrorIsRetryableAndOpaque(t *testing.T) {
+func TestAttemptTimeoutReportsSafeDiagnostic(t *testing.T) {
 	t.Parallel()
 
 	// postAttempt translates a fired per-attempt deadline into
-	// attemptTimeoutError so httpx.Do retries it. Two properties keep that
-	// working: httpx must classify it transient, and it must NOT unwrap to
+	// attemptTimeoutError so httpx.Do retries it, and that error is the whole
+	// incident record an operator reads (httpx.Do returns it verbatim on
+	// exhaustion, watch logs it at Error). Four properties keep it useful and
+	// safe, and only driving the real request path exercises them: the bound
+	// that fired is named, the classified cause is carried, httpx must
+	// classify it transient, and it must NOT unwrap to
 	// context.DeadlineExceeded -- httpx rejects context errors as terminal
 	// BEFORE consulting IsTransient, so adding an Unwrap would silently
 	// restore the single-attempt loss this type exists to fix.
-	if errors.Is(attemptTimeoutError{}, context.DeadlineExceeded) {
-		t.Error("attemptTimeoutError unwraps to context.DeadlineExceeded: httpx.Do would treat it as terminal before consulting IsTransient")
+	const secret = "verysecrettimeouttoken"
+	d := New("https://discord.example/api/webhooks/1234567890/"+secret, "node-1")
+	t.Cleanup(d.Close)
+	d.attemptTimeout = time.Millisecond
+	d.client.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})
+
+	_, err := d.postAttempt(context.Background(), []byte(`{"content":"probe"}`))
+	if err == nil {
+		t.Fatal("postAttempt after its private deadline = nil, want error")
 	}
-	if !httpx.IsTransient(attemptTimeoutError{}) {
-		t.Error("httpx.IsTransient(attemptTimeoutError{}) = false: a timed-out attempt would not be retried")
+	// "a deadline expired" is safeTransportError's classified phrase for the
+	// cause; the cause's own text is never rendered, because a transport cause
+	// can be written from a response header (see
+	// TestRedirectDerivedTransportErrorsCarryNoRemoteText).
+	for _, want := range []string{"webhook attempt timed out after 1ms", "a deadline expired"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("timeout error = %q, want it to contain %q", err, want)
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("timeout error = %v, want an opaque retryable error rather than caller cancellation", err)
+	}
+	if !httpx.IsTransient(err) {
+		t.Errorf("httpx.IsTransient(%v) = false, want a retryable attempt timeout", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("timeout error leaks the webhook credential: %v", err)
 	}
 }
 

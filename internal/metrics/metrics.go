@@ -60,13 +60,10 @@ const (
 	kindLabel = "kind"
 )
 
-// Kind names the legal kindLabel values. The named type keeps a plain string
-// VARIABLE out of the three recording functions, so a kind can only come from
-// the constants below or an explicit, visible conversion - it is not a closed
-// set the compiler can enforce (an untyped literal like "mising" still
-// converts implicitly), so a new kind must still be added to
-// notificationKinds, which drives both the zero-minting and the rendered HELP
-// list the KnellNotifyFailing selector is written against.
+// Kind distinguishes notification label values from runtime strings. String
+// variables require an explicit conversion before reaching the recording
+// functions. It is not a closed set: untyped literals remain assignable, so
+// callers must use the constants below and keep notificationKinds in sync.
 type Kind string
 
 // The notification kinds are the legal values of kindLabel on the sent,
@@ -80,16 +77,12 @@ const (
 	KindHistory   Kind = "history"
 )
 
-// notificationKinds is the single enumeration of the legal kindLabel values:
-// it drives both the zero-minting below and the rendered kind list in the
-// three counters' HELP text, so a new kind cannot be minted while the
-// exposition metadata still advertises the old set.
+// notificationKinds drives cold-start pre-minting and the HELP kind list. Add
+// every new Kind constant here so those two exposition views stay aligned.
 var notificationKinds = []Kind{KindMissing, KindRecovered, KindHistory}
 
-// notificationKindsText renders notificationKinds for HELP strings.
 var notificationKindsText = joinKinds(notificationKinds)
 
-// joinKinds renders the kind enumeration for the HELP strings.
 func joinKinds(kinds []Kind) string {
 	parts := make([]string, len(kinds))
 	for i, k := range kinds {

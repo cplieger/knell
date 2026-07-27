@@ -49,8 +49,6 @@ func TestMintNotificationKindsPremintsEveryCounterAndKind(t *testing.T) {
 	assertNotificationSeries(t, want, "after an explicit re-mint")
 }
 
-// assertNotificationSeries scrapes the registry and requires every wanted
-// exposition line to be present.
 func assertNotificationSeries(t *testing.T, want []string, when string) {
 	t.Helper()
 	rec := httptest.NewRecorder()
@@ -108,8 +106,6 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 	}
 }
 
-// beatSeriesValue scrapes the exposition and returns the value token of
-// name{beat="<id>"}, reporting whether the series is present at all.
 func beatSeriesValue(t *testing.T, name, id string) (string, bool) {
 	t.Helper()
 	rec := httptest.NewRecorder()

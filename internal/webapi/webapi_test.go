@@ -512,56 +512,22 @@ func (c *fakeClock) advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
-// recordingNotifier is a watch.Notifier that delivers everything successfully
-// and counts what it was asked to deliver. A delivered send is what flips a
-// beat to alerted, which is the state a ping turns into a recovered
-// notification.
-type recordingNotifier struct {
-	missing   int
-	recovered int
-	history   int
-	mu        sync.Mutex
-}
+// deliveringNotifier is a watch.Notifier that delivers everything successfully.
+// A delivered send is what flips a beat to alerted, so a watcher wired to it
+// reaches the states a live deployment reaches. It counts nothing: the tests
+// below assert on the exposition, which is the operator-visible ground truth.
+type deliveringNotifier struct{}
 
-func (n *recordingNotifier) BeatMissing(context.Context, string, watch.Transition) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.missing++
+func (n *deliveringNotifier) BeatMissing(context.Context, string, watch.Transition) error {
 	return nil
 }
 
-func (n *recordingNotifier) BeatRecovered(context.Context, string, watch.Transition) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.recovered++
+func (n *deliveringNotifier) BeatRecovered(context.Context, string, watch.Transition) error {
 	return nil
 }
 
-func (n *recordingNotifier) BeatOutageHistory(context.Context, string, []watch.Outage) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.history++
+func (n *deliveringNotifier) BeatOutageHistory(context.Context, string, []watch.Outage) error {
 	return nil
-}
-
-// counts returns the delivered message counts, per kind.
-func (n *recordingNotifier) counts() (missing, recovered, history int) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.missing, n.recovered, n.history
-}
-
-// waitUntil polls cond until it holds, failing the test on timeout.
-func waitUntil(t *testing.T, timeout time.Duration, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	t.Fatalf("timed out after %s waiting for %s", timeout, what)
 }
 
 // scrapeExposition returns the /metrics body served through the routed handler,
@@ -637,7 +603,7 @@ func TestBeatRefusedOnceTheApplicationContextIsCancelled(t *testing.T) {
 	const ghost = "webapi-shutdown-guard-ghost"
 	start := time.Unix(1_700_000_000, 0).UTC()
 	clock := &fakeClock{now: start}
-	watcher := watch.New([]watch.Beat{{ID: id, Deadline: time.Minute}}, &recordingNotifier{}, clock.Now, start)
+	watcher := watch.New([]watch.Beat{{ID: id, Deadline: time.Minute}}, &deliveringNotifier{}, clock.Now, start)
 
 	appCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -749,89 +715,41 @@ func TestBeatRefusedOnceTheApplicationContextIsCancelled(t *testing.T) {
 	})
 }
 
-// TestPingRefusedDuringShutdownQueuesNoRecovery pins the half of the loss that
-// no counter and no log line can show: the recovered notification. A ping on an
-// ALERTED beat queues a recoveryEvent on watch's bounded channel, whose only
-// reader is watch.Run — which returned the moment the shared context was
-// cancelled. Pre-fix the ping was accepted there and the notice died in the
-// channel silently; the beat was even re-armed, so nothing ever reported the
-// outage as over. The queue is unreadable from outside the watch package, so
-// the oracle here is a fresh reader: give the channel a Run again and prove
-// nothing comes out of it.
-func TestPingRefusedDuringShutdownQueuesNoRecovery(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and it must be installed before New.
-	capture.Default(t)
-	const id = "webapi-recovery-guard"
-	start := time.Unix(1_700_100_000, 0).UTC()
-	clock := &fakeClock{now: start}
-	notifier := &recordingNotifier{}
-	watcher := watch.New([]watch.Beat{{ID: id, Deadline: time.Minute}}, notifier, clock.Now, start)
-
+// TestBeatRefusedWhenCancellationHappensDuringBodyDrain pins the lifecycle
+// check after the ignored request body is drained. The pipe write proves the
+// handler passed the first context check and entered the body read before
+// cancellation, so a 503 can only come from the post-drain check.
+func TestBeatRefusedWhenCancellationHappensDuringBodyDrain(t *testing.T) {
 	appCtx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	h := New(appCtx, watcher, "", Routes{Healthz: staticHealthz(http.StatusOK), Metrics: metrics.Handler()})
+	defer cancel()
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	h := newTestHandlerCtx(appCtx, b, "")
 
-	// Drive the beat into the alerted state: silence past its deadline, then one
-	// sweep DELIVERS the missing notice (alerted flips only on a delivered
-	// send). Only an alerted beat turns its next ping into a recovery.
-	clock.advance(2 * time.Minute)
-	runDone := make(chan struct{})
+	bodyReader, bodyWriter := io.Pipe()
+	req := httptest.NewRequest(http.MethodPost, "/beat/api", bodyReader)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
 	go func() {
-		defer close(runDone)
-		watcher.Run(appCtx, time.Millisecond)
+		defer close(done)
+		h.ServeHTTP(rec, req)
 	}()
-	waitUntil(t, 10*time.Second, "the missing notice to be delivered", func() bool {
-		missing, _, _ := notifier.counts()
-		return missing == 1
-	})
 
-	// SIGTERM's effect: Run returns after taking its undelivered-work snapshot,
-	// while the HTTP surface is still live for the rest of the drain.
+	if _, err := bodyWriter.Write([]byte("ping")); err != nil {
+		t.Fatalf("write request body: %v", err)
+	}
 	cancel()
-	select {
-	case <-runDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("watch.Run did not return after the application context was cancelled")
+	if err := bodyWriter.Close(); err != nil {
+		t.Fatalf("close request body: %v", err)
 	}
+	<-done
 
-	if rec := beatRequest(t, h, http.MethodPost, "/beat/"+id); rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("POST /beat/%s after the watch loop stopped = %d, want 503 (body %s)", id, rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST canceled during body drain = %d, want 503 (body %s)", rec.Code, rec.Body.String())
 	}
-
-	// Give the recovery channel a reader again. Anything the ping queued would
-	// be delivered on this loop's very next select; a long tick keeps its sweep
-	// out of the way so a delivered recovery can only have come from the queue.
-	// The wait for ABSENCE is bounded rather than deterministic: a ready channel
-	// is consumed on the loop's first select, so with the guard reverted this
-	// breaks out in microseconds (verified by reverting it).
-	drainCtx, stopDrain := context.WithCancel(context.Background())
-	drainDone := make(chan struct{})
-	go func() {
-		defer close(drainDone)
-		watcher.Run(drainCtx, time.Hour)
-	}()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if _, recovered, _ := notifier.counts(); recovered > 0 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	if len(b.seen) != 0 {
+		t.Fatalf("beats recorded after cancellation during body drain = %v, want none", b.seen)
 	}
-	stopDrain()
-	select {
-	case <-drainDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the second watch.Run did not return after cancellation")
-	}
-
-	missing, recovered, history := notifier.counts()
-	if recovered != 0 {
-		t.Errorf("recovered notifications delivered = %d, want 0: a ping refused during shutdown must queue no recovery, or the notice dies in a channel with no reader and nothing counts it",
-			recovered)
-	}
-	if missing != 1 || history != 0 {
-		t.Errorf("delivered messages = missing %d, history %d, want missing 1, history 0: the refused ping must not have changed the outage's delivery state either",
-			missing, history)
+	if !strings.Contains(rec.Body.String(), "shutting_down") {
+		t.Errorf("503 body = %s, want the shutting_down code", rec.Body.String())
 	}
 }

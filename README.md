@@ -60,14 +60,14 @@ Silence past the deadline rings the bell:
 | --- | --- | --- | --- |
 | `BEATS` | comma-separated `id:deadline` list, e.g. `api:20m,backup:26h`. Ids match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; deadlines are Go durations, minimum `30s`, maximum 64 beats | _none_ | Yes |
 | `DISCORD_WEBHOOK_URL` | the webhook notifications post to, `https` only: the URL's own path carries the credential, so a plain-http webhook would put it on the wire in cleartext. `DISCORD_WEBHOOK_URL_FILE` points at a mounted secret file instead | _none_ | Yes |
-| `NODE_NAME` | names this observer instance in every notification | container hostname | No |
+| `NODE_NAME` | names this observer instance in every notification; maximum 256 bytes, since the name prefixes every notice and a longer one would push the message past Discord's 2000-character limit | container hostname | No |
 | `BEAT_TOKEN` | when set, `/beat/{id}` requires `Authorization: Bearer <token>` from senders. Empty leaves the endpoint open. `BEAT_TOKEN_FILE` points at a mounted secret file instead | _(unset)_ | No |
 | `LISTEN_ADDR` | TCP listen address (`host:port`) | `:9190` | No |
 | `LOG_LEVEL` | `debug`/`info`/`warn`/`error`; unknown falls back to `info` | `info` | No |
 
 knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext. Put a TLS reverse proxy in front, or keep pings on a trusted network.
 
-A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling back, and so does a webhook URL on any scheme other than `https`. When a `_FILE` variable is set but its file cannot be read, because it is missing, unreadable, or empty, startup fails instead of falling back to the plain variable; only an unset `_FILE` variable falls back. A dead-man switch running with the wrong config is worse than one that refuses to start.
+A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling back, and so does a webhook URL on any scheme other than `https` or a `NODE_NAME` over 256 bytes. When a `_FILE` variable is set but its file cannot be read, because it is missing, unreadable, or empty, startup fails instead of falling back to the plain variable; only an unset `_FILE` variable falls back. A dead-man switch running with the wrong config is worse than one that refuses to start.
 
 ## Endpoints
 

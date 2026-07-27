@@ -921,9 +921,9 @@ func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 // A real failure also rewrites the late reason of the records it left queued
 // (markHistoryUndelivered): they are now late because this notice's own
 // delivery failed, so the retry must not still claim nothing was wrong with
-// delivery. Cancellation is exempt from that as well as from the counter — a
-// shutdown is not a delivery failure, and the records are handed to the next
-// process run unchanged.
+// delivery. Cancellation is exempt from that as well as from the counter: a
+// shutdown is not a delivery failure, so the queued records keep their
+// original reason until logUndelivered reports their loss.
 func (w *Watcher) sendHistory(ctx context.Context, past beatOutages) bool {
 	if err := w.notifier.BeatOutageHistory(ctx, past.id, past.outages); err != nil {
 		if errors.Is(err, context.Canceled) {

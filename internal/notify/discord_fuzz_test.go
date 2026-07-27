@@ -13,26 +13,12 @@ import (
 	"github.com/cplieger/httpx/v4"
 )
 
-// FuzzDeliveryErrorNeverCarriesWebhookURL asserts the crown-jewel invariant of
-// this package over an unbounded space of REMOTE input: for an arbitrary
-// response status and body, the error the delivery path returns carries no
-// rendering of the configured webhook URL and no fragment of its
-// credential-bearing path.
-//
-// The invariant used to be defended by scrubbing candidate renderings out of
-// the published body text, and this target used to fuzz that candidate
-// machinery. It is now structural — the body's own text is never published at
-// all, only Discord's numeric error code and knell's own wording — so the
-// property holds by construction and this target should pass trivially. That
-// is exactly what makes it worth keeping: it fails the moment a future change
-// puts remote-authored text back into a delivery error.
-//
-// postAttempt is the subject rather than post, for two reasons: it is the
-// function that turns a response into an error, and its return value is
-// verbatim what httpx.Do logs on each attempt (through the type-based
-// LogSafeError, which can only shrink it), so the log surface is covered by
-// the same assertion. Calling it directly also keeps one fuzz iteration to one
-// attempt, with no retry backoff and no 429 Retry-After wait.
+// FuzzDeliveryErrorNeverCarriesWebhookURL checks that arbitrary response
+// statuses and bodies cannot place the configured webhook URL or a
+// credential-bearing path fragment in a delivery error. It invokes
+// postAttempt directly because that is the exact error httpx.Do logs, while
+// avoiding retry backoff and rate-limit waits. It also checks that non-2xx
+// responses retain the typed errors used for retry classification.
 func FuzzDeliveryErrorNeverCarriesWebhookURL(f *testing.F) {
 	// Seed bodies stand in for what the other end can answer with; seed tails
 	// for the credential segment of a webhook URL. They deliberately avoid
@@ -99,6 +85,14 @@ func assertDeliveryErrorHidesWebhookURL(t *testing.T, rawURL string, status int,
 	gotErr, requested := attemptAgainstStub(t, rawURL, status, body)
 	controlErr, _ := attemptAgainstStub(t, controlURL, status, body)
 	if gotErr == nil {
+		// A nil error is only correct when nothing was delivered-checked (an
+		// unusable fuzzed URL never reached the transport) or the status was
+		// a 2xx. Returning unconditionally here would let the more serious
+		// regression — a non-2xx reported as a successful delivery, which
+		// silently disarms the switch — pass this target.
+		if requested && (status < 200 || status >= 300) {
+			t.Errorf("postAttempt status %d returned nil, want a typed status error", status)
+		}
 		return
 	}
 	for _, needle := range webhookNeedles(rawURL) {
@@ -114,11 +108,20 @@ func assertDeliveryErrorHidesWebhookURL(t *testing.T, rawURL string, status int,
 			t.Errorf("delivery error for %q (status %d) kept %q: %v", rawURL, status, needle, gotErr)
 		}
 	}
-	// The other half of the contract the status branch must keep: every
-	// non-2xx stays %w-wrapped around CheckHTTPStatus's typed error, which is
-	// what lets httpx.Do classify 502/503/504 as transient and find the 429's
-	// *RateLimitError. A run where the request was never made (an unusable
-	// fuzzed URL) reaches no status at all.
+	assertTypedStatusError(t, gotErr, requested, status)
+}
+
+// assertTypedStatusError checks the other half of the contract the status
+// branch must keep: every non-2xx stays %w-wrapped around CheckHTTPStatus's
+// typed error, which is what lets httpx.Do classify 502/503/504 as transient
+// and find the 429's *RateLimitError. A run where the request was never made
+// (an unusable fuzzed URL) reaches no status at all, and a 2xx is a delivery.
+//
+// Split out of assertDeliveryErrorHidesWebhookURL so the leak oracle and the
+// typed-chain oracle are one assertion each.
+func assertTypedStatusError(t *testing.T, gotErr error, requested bool, status int) {
+	t.Helper()
+
 	if !requested || (status >= 200 && status < 300) {
 		return
 	}
