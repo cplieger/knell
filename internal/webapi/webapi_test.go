@@ -1,16 +1,19 @@
 package webapi
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/cplieger/knell/internal/metrics"
+	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -29,20 +32,31 @@ func (f *fakeBeater) Beat(id string) bool {
 }
 
 // newTestHandler assembles the routed handler around b with a healthy
-// liveness endpoint; token gates the beat endpoint exactly as in production
-// ("" = open).
+// liveness endpoint and a LIVE application context (nothing shutting down);
+// token gates the beat endpoint exactly as in production ("" = open).
 func newTestHandler(b *fakeBeater, token string) http.Handler {
-	return newTestHandlerHealthz(b, token, http.StatusOK)
+	return newTestHandlerCtx(context.Background(), b, token)
 }
 
-// newTestHandlerHealthz is newTestHandler with the liveness status under test
-// control, so a test can drive a FAILING probe: health.Handler answers 503
+// newTestHandlerCtx is newTestHandler with the shared application context
+// under test control, so a test can close beat acceptance the way SIGTERM
+// does: cancel it, and every later ping must be refused.
+func newTestHandlerCtx(appCtx context.Context, b *fakeBeater, token string) http.Handler {
+	return newTestHandlerHealthz(appCtx, b, token, http.StatusOK)
+}
+
+// newTestHandlerHealthz is newTestHandlerCtx with the liveness status under
+// test control, so a test can drive a FAILING probe: health.Handler answers 503
 // whenever the liveness marker is absent (boot, or after the pre-drain flip).
-func newTestHandlerHealthz(b *fakeBeater, token string, healthzStatus int) http.Handler {
-	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(healthzStatus)
+func newTestHandlerHealthz(appCtx context.Context, b *fakeBeater, token string, healthzStatus int) http.Handler {
+	return New(appCtx, b, token, Routes{Healthz: staticHealthz(healthzStatus), Metrics: metrics.Handler()})
+}
+
+// staticHealthz stands in for health.Handler with a fixed verdict.
+func staticHealthz(status int) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
 	})
-	return New(b, token, Routes{Healthz: healthz, Metrics: metrics.Handler()})
 }
 
 func TestBeatEndpoint(t *testing.T) {
@@ -181,7 +195,7 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 			// slog default. It must be installed BEFORE New, because
 			// webhttp.Logging resolves slog.Default() when the chain is built.
 			rec := capture.Default(t)
-			h := newTestHandlerHealthz(&fakeBeater{known: map[string]bool{"api": true}}, "", tt.healthzStatus)
+			h := newTestHandlerHealthz(context.Background(), &fakeBeater{known: map[string]bool{"api": true}}, "", tt.healthzStatus)
 
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			w := httptest.NewRecorder()
@@ -259,7 +273,7 @@ func TestPanicUnderBeatHandlerAnswers500AndIsLogged(t *testing.T) {
 	// net/http: the sender sees a reset connection rather than a 500, and the
 	// access log never reports a status for the endpoint that feeds the switch.
 	rec := capture.Default(t)
-	h := New(panicBeater{}, "", Routes{
+	h := New(context.Background(), panicBeater{}, "", Routes{
 		Healthz: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		}),
@@ -475,5 +489,349 @@ func TestHeadRejectionSetsAllowHeader(t *testing.T) {
 	}
 	if got := rec.Header().Get("Allow"); got != "GET, POST" {
 		t.Errorf("Allow = %q, want \"GET, POST\" (a 405 must name the permitted methods so a HEAD-only prober learns how pings are recorded)", got)
+	}
+}
+
+// fakeClock is a manual clock for the shutdown tests. watch.Run reads it from
+// its sweep and gauge goroutines while the test advances it, so the mutex is
+// what keeps these tests race-clean.
+type fakeClock struct {
+	now time.Time
+	mu  sync.Mutex
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// recordingNotifier is a watch.Notifier that delivers everything successfully
+// and counts what it was asked to deliver. A delivered send is what flips a
+// beat to alerted, which is the state a ping turns into a recovered
+// notification.
+type recordingNotifier struct {
+	missing   int
+	recovered int
+	history   int
+	mu        sync.Mutex
+}
+
+func (n *recordingNotifier) BeatMissing(context.Context, string, time.Duration) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.missing++
+	return nil
+}
+
+func (n *recordingNotifier) BeatRecovered(context.Context, string, time.Duration) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.recovered++
+	return nil
+}
+
+func (n *recordingNotifier) BeatOutageHistory(context.Context, string, []watch.Outage) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.history++
+	return nil
+}
+
+// counts returns the delivered message counts, per kind.
+func (n *recordingNotifier) counts() (missing, recovered, history int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.missing, n.recovered, n.history
+}
+
+// waitUntil polls cond until it holds, failing the test on timeout.
+func waitUntil(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for %s", timeout, what)
+}
+
+// scrapeExposition returns the /metrics body served through the routed handler,
+// asserting the scrape itself succeeded. Called with a cancelled application
+// context it doubles as the check that the exposition keeps serving through the
+// drain: only the beat endpoint refuses.
+func scrapeExposition(t *testing.T, h http.Handler) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /metrics = %d, want 200: the exposition is the quorum ground truth and must keep serving", rec.Code)
+	}
+	return rec.Body.String()
+}
+
+// seriesValue reads one exposition sample by its full "name{labels}" prefix.
+func seriesValue(t *testing.T, exposition, series string) (float64, bool) {
+	t.Helper()
+	for line := range strings.SplitSeq(exposition, "\n") {
+		rest, ok := strings.CutPrefix(line, series)
+		if !ok {
+			continue
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(rest), 64)
+		if err != nil {
+			t.Fatalf("parsing %q: %v", line, err)
+		}
+		return v, true
+	}
+	return 0, false
+}
+
+// mustSeriesValue is seriesValue for a sample that has to exist.
+func mustSeriesValue(t *testing.T, exposition, series string) float64 {
+	t.Helper()
+	v, ok := seriesValue(t, exposition, series)
+	if !ok {
+		t.Fatalf("%s missing from the exposition:\n%s", series, exposition)
+	}
+	return v
+}
+
+// beatRequest sends one ping through the routed handler.
+func beatRequest(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(""))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestBeatRefusedOnceTheApplicationContextIsCancelled pins the acceptance
+// window against the real state machine and the real exposition. On SIGTERM the
+// shared context is cancelled, which returns watch.Run (after it snapshots its
+// undelivered work) while webhttp keeps the HTTP surface live for up to the
+// shutdown grace. A ping accepted in that window is recorded behind a sender
+// that no longer exists: lastSeen moves, knell_beats_received_total moves,
+// knell_beat_fresh is republished as 1 — a false "all good" sample for the
+// quorum rules — and for an alerted beat a recovered notification is queued on
+// a channel nobody reads again. So from the instant the context is cancelled
+// the endpoint must record NOTHING and say so honestly, while /healthz and
+// /metrics keep serving through the drain.
+func TestBeatRefusedOnceTheApplicationContextIsCancelled(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and it must be installed before New (webhttp.Logging resolves
+	// slog.Default() when the chain is built).
+	capture.Default(t)
+	// Ids unique to this test: the metrics registry is a package-level
+	// singleton shared by the whole test binary.
+	const id = "webapi-shutdown-guard"
+	const ghost = "webapi-shutdown-guard-ghost"
+	start := time.Unix(1_700_000_000, 0).UTC()
+	clock := &fakeClock{now: start}
+	watcher := watch.New([]watch.Beat{{ID: id, Deadline: time.Minute}}, &recordingNotifier{}, clock.Now, start)
+
+	appCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	h := New(appCtx, watcher, "", Routes{Healthz: staticHealthz(http.StatusOK), Metrics: metrics.Handler()})
+
+	receivedSeries := `knell_beats_received_total{beat="` + id + `"}`
+	lastSeenSeries := `knell_beat_last_seen_timestamp_seconds{beat="` + id + `"}`
+	freshSeries := `knell_beat_fresh{beat="` + id + `"}`
+
+	// The normal path first, so the refusal below is not a handler that was
+	// broken for every ping: while the app is live a ping is recorded. The
+	// counter is read as a DELTA — the registry is a package-level singleton, so
+	// a repeated run (go test -count=2) carries the previous run's total.
+	receivedBefore, _ := seriesValue(t, scrapeExposition(t, h), receivedSeries)
+	if rec := beatRequest(t, h, http.MethodPost, "/beat/"+id); rec.Code != http.StatusOK {
+		t.Fatalf("POST /beat/%s before cancellation = %d, want 200 (body %s)", id, rec.Code, rec.Body.String())
+	}
+	exposition := scrapeExposition(t, h)
+	if got := mustSeriesValue(t, exposition, receivedSeries); got != receivedBefore+1 {
+		t.Fatalf("%s after one live ping = %v, want %v", receivedSeries, got, receivedBefore+1)
+	}
+	if got := mustSeriesValue(t, exposition, lastSeenSeries); got != float64(start.Unix()) {
+		t.Fatalf("%s after one live ping = %v, want %d", lastSeenSeries, got, start.Unix())
+	}
+
+	// Publish the beat overdue, the state a sweep leaves behind for a silent
+	// beat: it is the sample the quorum rules alert on, and the one an accepted
+	// ping would flip back to 1.
+	metrics.SetBeatFresh(id, false)
+	// Advance the clock so a recorded ping would be VISIBLE in lastSeen rather
+	// than landing on the same second as the live one.
+	clock.advance(time.Hour)
+
+	// SIGTERM's effect on the app, and the only trigger the guard may key on.
+	cancel()
+
+	for _, method := range []string{http.MethodPost, http.MethodGet} {
+		t.Run("refused "+method, func(t *testing.T) {
+			rec := beatRequest(t, h, method, "/beat/"+id)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("%s /beat/%s after cancellation = %d, want 503 (body %s)",
+					method, id, rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, "shutting_down") {
+				t.Errorf("503 body = %s, want the shutting_down code so a sender can tell a refusal from a 404", body)
+			}
+			if strings.Contains(body, id) {
+				t.Errorf("503 body = %s, must not echo the beat id", body)
+			}
+		})
+	}
+
+	// Nothing may have moved: this is the tally watch.Run already reported.
+	exposition = scrapeExposition(t, h)
+	if got := mustSeriesValue(t, exposition, receivedSeries); got != receivedBefore+1 {
+		t.Errorf("%s after a refused ping = %v, want it still %v: a refused ping must not be counted",
+			receivedSeries, got, receivedBefore+1)
+	}
+	if got := mustSeriesValue(t, exposition, lastSeenSeries); got != float64(start.Unix()) {
+		t.Errorf("%s after a refused ping = %v, want it still %d: a refused ping must not move lastSeen",
+			lastSeenSeries, got, start.Unix())
+	}
+	if got := mustSeriesValue(t, exposition, freshSeries); got != 0 {
+		t.Errorf("%s after a refused ping = %v, want it still 0: a refused ping must not republish a silent beat as fresh, which is exactly the sample the quorum rules read",
+			freshSeries, got)
+	}
+
+	t.Run("unknown id refused without minting a series", func(t *testing.T) {
+		rec := beatRequest(t, h, http.MethodPost, "/beat/"+ghost)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("POST /beat/%s after cancellation = %d, want 503 (body %s)", ghost, rec.Code, rec.Body.String())
+		}
+		if body := rec.Body.String(); strings.Contains(body, ghost) {
+			t.Errorf("503 body = %s, must not echo the unknown beat id", body)
+		}
+		if exposition := scrapeExposition(t, h); strings.Contains(exposition, ghost) {
+			t.Errorf("exposition mentions %s: a refused ping must mint no series, like the 404 path", ghost)
+		}
+	})
+
+	t.Run("refused without reading the body", func(t *testing.T) {
+		// The refusal lands before the body drain, like the 401 one: a ping
+		// arriving during the drain must not be able to hold a handler
+		// goroutine — and with it srv.Shutdown — open by trickling a payload.
+		body := &countingReader{}
+		req := httptest.NewRequest(http.MethodPost, "/beat/"+id, body)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", rec.Code)
+		}
+		if body.reads != 0 {
+			t.Errorf("body reads = %d, want 0 (a refused ping must not be drained)", body.reads)
+		}
+	})
+
+	t.Run("healthz and metrics keep serving", func(t *testing.T) {
+		// The orchestrator has to observe the health flip, and a last scrape
+		// during the drain is useful. Only the beat endpoint refuses.
+		for _, path := range []string{"/healthz", "/metrics"} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Errorf("GET %s with the app context cancelled = %d, want 200", path, rec.Code)
+			}
+		}
+	})
+}
+
+// TestPingRefusedDuringShutdownQueuesNoRecovery pins the half of the loss that
+// no counter and no log line can show: the recovered notification. A ping on an
+// ALERTED beat queues a recoveryEvent on watch's bounded channel, whose only
+// reader is watch.Run — which returned the moment the shared context was
+// cancelled. Pre-fix the ping was accepted there and the notice died in the
+// channel silently; the beat was even re-armed, so nothing ever reported the
+// outage as over. The queue is unreadable from outside the watch package, so
+// the oracle here is a fresh reader: give the channel a Run again and prove
+// nothing comes out of it.
+func TestPingRefusedDuringShutdownQueuesNoRecovery(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and it must be installed before New.
+	capture.Default(t)
+	const id = "webapi-recovery-guard"
+	start := time.Unix(1_700_100_000, 0).UTC()
+	clock := &fakeClock{now: start}
+	notifier := &recordingNotifier{}
+	watcher := watch.New([]watch.Beat{{ID: id, Deadline: time.Minute}}, notifier, clock.Now, start)
+
+	appCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	h := New(appCtx, watcher, "", Routes{Healthz: staticHealthz(http.StatusOK), Metrics: metrics.Handler()})
+
+	// Drive the beat into the alerted state: silence past its deadline, then one
+	// sweep DELIVERS the missing notice (alerted flips only on a delivered
+	// send). Only an alerted beat turns its next ping into a recovery.
+	clock.advance(2 * time.Minute)
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		watcher.Run(appCtx, time.Millisecond)
+	}()
+	waitUntil(t, 10*time.Second, "the missing notice to be delivered", func() bool {
+		missing, _, _ := notifier.counts()
+		return missing == 1
+	})
+
+	// SIGTERM's effect: Run returns after taking its undelivered-work snapshot,
+	// while the HTTP surface is still live for the rest of the drain.
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("watch.Run did not return after the application context was cancelled")
+	}
+
+	if rec := beatRequest(t, h, http.MethodPost, "/beat/"+id); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST /beat/%s after the watch loop stopped = %d, want 503 (body %s)", id, rec.Code, rec.Body.String())
+	}
+
+	// Give the recovery channel a reader again. Anything the ping queued would
+	// be delivered on this loop's very next select; a long tick keeps its sweep
+	// out of the way so a delivered recovery can only have come from the queue.
+	// The wait for ABSENCE is bounded rather than deterministic: a ready channel
+	// is consumed on the loop's first select, so with the guard reverted this
+	// breaks out in microseconds (verified by reverting it).
+	drainCtx, stopDrain := context.WithCancel(context.Background())
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		watcher.Run(drainCtx, time.Hour)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, recovered, _ := notifier.counts(); recovered > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stopDrain()
+	select {
+	case <-drainDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the second watch.Run did not return after cancellation")
+	}
+
+	missing, recovered, history := notifier.counts()
+	if recovered != 0 {
+		t.Errorf("recovered notifications delivered = %d, want 0: a ping refused during shutdown must queue no recovery, or the notice dies in a channel with no reader and nothing counts it",
+			recovered)
+	}
+	if missing != 1 || history != 0 {
+		t.Errorf("delivered messages = missing %d, history %d, want missing 1, history 0: the refused ping must not have changed the outage's delivery state either",
+			missing, history)
 	}
 }

@@ -108,7 +108,16 @@ func run() error {
 	}
 	watcher := watch.New(beats, notifier, time.Now, processStart)
 
-	handler := webapi.New(watcher, cfg.BeatToken, webapi.Routes{
+	// The app context goes into webapi so beat ACCEPTANCE closes at the same
+	// instant the watch loop stops: watcher.Run returns on ctx.Done() after
+	// snapshotting its undelivered work, while the HTTP surface stays live for
+	// up to the shutdown grace below. A ping accepted in that window would be
+	// recorded behind a sender that no longer exists — the recovered notice it
+	// queues has no reader left — and would make the snapshot stale after the
+	// fact. Gating on the shared ctx rather than on the pre-drain hook keeps
+	// that deterministic: pre-drain and Run's exit race each other, ctx
+	// cancellation is one instant both see.
+	handler := webapi.New(ctx, watcher, cfg.BeatToken, webapi.Routes{
 		Healthz: health.Handler(marker),
 		Metrics: metrics.Handler(),
 	})

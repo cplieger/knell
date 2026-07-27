@@ -452,6 +452,14 @@ func (w *Watcher) refreshFreshness() {
 // permanent-loss path no delivery counter can show — notifications_dropped_total
 // means "discarded by a full queue" (metrics.go, README) — so the log line is
 // the operator's only trace of it.
+//
+// The tally below is complete by construction: acceptance closes at the same
+// cancellation that brings Run here. webapi.New gates /beat/{id} on the shared
+// application context, so a ping arriving from that instant on is refused with
+// 503 and records nothing (see webapi.New), whichever order the HTTP drain and
+// this loop's exit happen to run in. Only a ping already past that gate when
+// cancellation fired can still record — a window of a few instructions, where
+// it used to be the whole shutdown grace of fully live serving.
 func (w *Watcher) logUndelivered() {
 	type pending struct {
 		id      string

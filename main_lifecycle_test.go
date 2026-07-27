@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cplieger/health"
+	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -232,5 +234,163 @@ func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("run() did not return after a shutdown signal")
+	}
+}
+
+// scrapeCounter reads one sample out of the process metrics registry by its
+// full "name{labels}" prefix, in process: the registry is a package-level
+// singleton, so it is still readable after run() has returned and the listener
+// is gone.
+func scrapeCounter(t *testing.T, series string) float64 {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("in-process /metrics = %d, want 200", rec.Code)
+	}
+	for line := range strings.SplitSeq(rec.Body.String(), "\n") {
+		rest, ok := strings.CutPrefix(line, series)
+		if !ok {
+			continue
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(rest), 64)
+		if err != nil {
+			t.Fatalf("parsing %q: %v", line, err)
+		}
+		return v
+	}
+	t.Fatalf("%s missing from the exposition:\n%s", series, rec.Body.String())
+	return 0
+}
+
+// TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing pins the acceptance
+// window end to end, through a real listener, a real SIGTERM and the real
+// drain. It is the window srv.Shutdown keeps open BY DESIGN: an in-flight
+// request is waited for, so a ping admitted while the app was still live can
+// reach the state machine well after the shared context was cancelled — which
+// is after watch.Run already returned, took its undelivered-work snapshot, and
+// stopped reading the recovery channel. A ping recorded there is a signal
+// accepted with no sender behind it: it moves lastSeen and
+// knell_beats_received_total, republishes the beat as fresh, and can queue a
+// recovered notice nobody will ever deliver, all of it invisible to the
+// shutdown log that just reported zero undelivered work.
+//
+// The request here is admitted BEFORE the signal (the 100-continue proves the
+// handler is already inside the body read) and completes AFTER it, so this can
+// only pass if acceptance is closed on the far side of the body read too, not
+// merely at handler entry.
+func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
+	// process-wide signal, and the shared health-marker path.
+	free, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot reserve a port: %v", err)
+	}
+	addr := free.Addr().String()
+	if err := free.Close(); err != nil {
+		t.Fatalf("releasing the reserved port: %v", err)
+	}
+
+	// A beat id no other test in this package pings, since the metrics
+	// registry is a package-level singleton shared by the whole test binary.
+	const beat = "drain-guard"
+	t.Setenv("BEATS", beat+":1m")
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/api/webhooks/1234567890/verysecrettoken")
+	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
+	unsetEnv(t, "BEAT_TOKEN")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
+	t.Setenv("LISTEN_ADDR", addr)
+	capture.Default(t)
+	if err := os.Remove(health.DefaultPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Skipf("cannot clear health marker at %s: %v", health.DefaultPath, err)
+	}
+	t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
+
+	received := `knell_beats_received_total{beat="` + beat + `"}`
+	done := make(chan error, 1)
+	go func() { done <- run() }()
+	waitForMarkerWithin(t, true, 10*time.Second)
+	before := scrapeCounter(t, received)
+
+	// Admit the ping while the app is live, then hold it inside the handler's
+	// body read. Expect: 100-continue is the proof the handler was entered and
+	// is reading: net/http emits it on the first Read of the body.
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial serving knell: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if _, err := io.WriteString(conn, "POST /beat/"+beat+" HTTP/1.1\r\nHost: "+addr+"\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\n"); err != nil {
+		t.Fatalf("start slow beat request: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set continue deadline: %v", err)
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read 100-continue response: %v", err)
+	}
+	if line != "HTTP/1.1 100 Continue\r\n" {
+		t.Fatalf("continue status line = %q, want HTTP/1.1 100 Continue", line)
+	}
+	if line, err = reader.ReadString('\n'); err != nil || line != "\r\n" {
+		t.Fatalf("continue terminator = %q, %v, want blank line", line, err)
+	}
+
+	// Cancel the shared context. The marker flip happens in the pre-drain hook,
+	// which webhttp invokes only after cancellation, so waiting for the marker
+	// to go makes the rest of this test deterministically post-cancellation.
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("signalling self: %v", err)
+	}
+	waitForMarkerWithin(t, false, 5*time.Second)
+
+	// Complete the body: the handler leaves its read and decides, now, whether
+	// to record a ping the watch loop can no longer account for.
+	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set body write deadline: %v", err)
+	}
+	if _, err := io.WriteString(conn, "x"); err != nil {
+		t.Fatalf("finish slow beat body: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set response deadline: %v", err)
+	}
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("read beat response: %v", err)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		t.Fatalf("read beat response body: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close beat response body: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("in-flight ping completing during the drain = %d, want 503: a beat accepted after the watch loop stopped is a signal recorded with no sender behind it (body %s)",
+			resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "shutting_down") {
+		t.Errorf("refusal body = %s, want the shutting_down code", body)
+	}
+	if strings.Contains(string(body), beat) {
+		t.Errorf("refusal body = %s, must not echo the beat id", body)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run() = %v, want nil after the shutdown signal", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("run() did not return after the drain")
+	}
+
+	if after := scrapeCounter(t, received); after != before {
+		t.Errorf("%s = %v, want it unchanged at %v: the refused ping must not be counted, or the shutdown tally watch.Run already reported is stale",
+			received, after, before)
 	}
 }
