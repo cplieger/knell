@@ -189,7 +189,14 @@ func run() error {
 		select {
 		case <-watcherDone:
 		case <-teardownCtx.Done():
-			slog.Warn("watch loop still running at the end of the shutdown grace")
+			// The watcher may have closed after the preliminary check while
+			// this already-expired context was competing in the select, so
+			// re-check before declaring the loop still running.
+			select {
+			case <-watcherDone:
+			default:
+				slog.Warn("watch loop still running at the end of the shutdown grace")
+			}
 		}
 	}
 	err = webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(shutdownGrace), preDrain)

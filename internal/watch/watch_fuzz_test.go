@@ -77,7 +77,10 @@ func checkSwitchStaysArmed(t *testing.T, w *Watcher, id string, now time.Time, o
 // across notices. The last clause is the one the queue's structural
 // invariants cannot express: an outage reported in two different notices
 // (a delivered run that was not consumed) shows up as a notice whose first
-// outage starts before the previously reported one recovered.
+// outage starts before the previously reported one recovered. That clause
+// assumes a SINGLE beat: fakeNotifier.histories is not keyed by beat and two
+// beats' outages may legitimately overlap, so only call this on a one-beat
+// watcher.
 func checkHistoryPayloads(t *testing.T, n *fakeNotifier, ops string) {
 	t.Helper()
 	n.mu.Lock()

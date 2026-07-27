@@ -720,6 +720,9 @@ func TestShutdownWarnsAboutQueuedRecoveredNotifications(t *testing.T) {
 	if !rec.HasAttr("shutting down with queued recovered notifications", "queued", "1") {
 		t.Errorf("queued-recovery warning does not report how many notices are lost: %v", rec.Records())
 	}
+	if !rec.AttrContains("shutting down with queued recovered notifications", "beats", id) {
+		t.Errorf("queued-recovery warning does not name the beat whose recovered notice is lost: %v", rec.Records())
+	}
 }
 
 func TestLogUndeliveredCountsAnUnqueuedOngoingOutage(t *testing.T) {

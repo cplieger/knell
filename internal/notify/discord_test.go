@@ -253,6 +253,19 @@ func TestUnfollowedRedirectIsNotDelivery(t *testing.T) {
 	if got := rec.hits.Load(); got != 1 {
 		t.Errorf("attempts = %d, want 1 (non-transient status, no per-attempt retry)", got)
 	}
+	// The diagnosis must stay factual for THIS case: a bare 300 with no
+	// Location involves no hop and no policy refusal, so the message may not
+	// blame a cross-origin or method-changing redirect (that shape never
+	// reaches this branch — CheckRedirect's error surfaces on the transport
+	// path). TestMethodChangingRedirectIsNotDelivery pins the policy itself.
+	if !strings.Contains(err.Error(), "nothing was delivered") {
+		t.Errorf("err = %v, want it to say nothing was delivered (a bare \"HTTP 300\" reads like a webhook-side rejection)", err)
+	}
+	for _, wrong := range []string{"cross-origin", "method-changing"} {
+		if strings.Contains(err.Error(), wrong) {
+			t.Errorf("err = %v, names %q as the cause, but a bare 300 with no Location was refused by no policy", err, wrong)
+		}
+	}
 }
 
 func TestErrorsNeverLeakWebhookURL(t *testing.T) {
@@ -534,9 +547,10 @@ func TestPartiallyReadStatusBodyIsDropped(t *testing.T) {
 	// The absence assertions below only mean something if the STATUS branch
 	// ran and dropped its detail. A setup that failed earlier (a transport
 	// error before the headers are read) would satisfy them with no body text
-	// in play at all, so pin the error to the bare status failure.
+	// in play at all, so pin the error to the status failure (which carries
+	// the detail-dropped marker, never the partial bytes).
 	if !strings.Contains(err.Error(), "HTTP 503") {
-		t.Fatalf("err = %v, want the bare HTTP 503 status error (the partially read body must be dropped, not the request failed)", err)
+		t.Fatalf("err = %v, want the HTTP 503 status error with its detail dropped (the partially read body must be dropped, not the request failed)", err)
 	}
 	for _, leak := range []string{secret, "/api/webhook", "upstream failed"} {
 		if got := buf.String(); strings.Contains(got, leak) {
@@ -594,6 +608,52 @@ func TestStatusBodyCarryingOnlyTheCredentialSuffixIsRedacted(t *testing.T) {
 		if strings.Contains(err.Error(), leak) {
 			t.Errorf("delivery error leaks %q from a suffix-only body: %v", leak, err)
 		}
+	}
+}
+
+func TestStatusBodyCarryingOnlyAShortCompletePathIsRedacted(t *testing.T) {
+	// Deliberately NOT t.Parallel: slog.Default() is process-global.
+	//
+	// A relay-style webhook may have a SHORT complete path ("/hook"), and the
+	// path IS the credential. A body echoing only that path is under the
+	// minCredentialCandidate floor, so the floor must not apply to a complete
+	// path rendering: with the floor applied to it, "/hook" was dropped as a
+	// candidate and the echoed path passed the scrub untouched, into httpx.Do's
+	// retry/exhaustion lines and into the returned delivery error.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("upstream rejected " + r.URL.Path))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	d := New(srv.URL+"/hook", "node-1")
+	t.Cleanup(d.Close)
+
+	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	if err == nil {
+		t.Fatal("BeatMissing against a persistent 503 = nil, want error")
+	}
+	if buf.Len() == 0 {
+		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
+	}
+	// The body arrived whole and under the cap, so the detail IS attached:
+	// the scrub, not a drop, is what has to remove the path.
+	if !strings.Contains(err.Error(), "upstream rejected") {
+		t.Fatalf("err = %v, want the attached body detail (the path scrub is what must remove the credential, not a drop)", err)
+	}
+	if !strings.Contains(err.Error(), "REDACTED") {
+		t.Errorf("err = %v, want the echoed webhook path replaced by REDACTED", err)
+	}
+	if strings.Contains(err.Error(), "/hook") {
+		t.Errorf("delivery error leaks the complete webhook path: %v", err)
+	}
+	if got := buf.String(); strings.Contains(got, "/hook") {
+		t.Errorf("retry/exhausted logs leak the complete webhook path: %s", got)
 	}
 }
 

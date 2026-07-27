@@ -30,9 +30,13 @@ const (
 	kindLabel = "kind"
 )
 
-// Kind is the closed set of legal kindLabel values; typing it keeps a caller
-// from minting a series outside the set the HELP text and the
-// KnellNotifyFailing selector advertise.
+// Kind names the legal kindLabel values. The named type keeps a plain string
+// VARIABLE out of the three recording functions, so a kind can only come from
+// the constants below or an explicit, visible conversion - it is not a closed
+// set the compiler can enforce (an untyped literal like "mising" still
+// converts implicitly), so a new kind must still be added to
+// notificationKinds, which drives both the zero-minting and the rendered HELP
+// list the KnellNotifyFailing selector is written against.
 type Kind string
 
 // The notification kinds are the legal values of kindLabel on the sent,

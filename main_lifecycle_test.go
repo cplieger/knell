@@ -150,6 +150,12 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 // every container restart, which is the exact failure the boot-armed clock
 // exists to prevent. The watch package's own tests supply their own start
 // value, so nothing outside main can catch it.
+//
+// The oracle is a range, so it pins that the published baseline is a real
+// boot-window instant, not the exact instruction that captured it: moving the
+// capture from run()'s entry to the watch.New call site shifts it by under a
+// second and this test still passes. The degradation class it does catch is
+// the one that breaks the switch - a dropped, zeroed, or far-past baseline.
 func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal, and the shared health-marker path.

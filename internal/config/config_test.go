@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,15 @@ import (
 	"time"
 
 	"github.com/cplieger/slogx/capture"
+)
+
+// Both forms must satisfy slog.LogValuer: the redaction seam only covers a
+// call site that logs the whole struct if the VALUE implements it too (Load
+// returns Config by value, and a pointer-receiver method set would leave that
+// value reflection-rendered, secrets included).
+var (
+	_ slog.LogValuer = Config{}
+	_ slog.LogValuer = (*Config)(nil)
 )
 
 func TestMain(m *testing.M) {
@@ -553,6 +563,8 @@ func TestLoadKeepsAWhitespaceOnlyBeatTokenArmed(t *testing.T) {
 	t.Setenv("BEAT_TOKEN", "   ")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 
+	rec := capture.Default(t)
+
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
@@ -562,6 +574,13 @@ func TestLoadKeepsAWhitespaceOnlyBeatTokenArmed(t *testing.T) {
 	}
 	if cfg.BeatToken != "   " {
 		t.Errorf("BeatToken = %q, want the value preserved verbatim", cfg.BeatToken)
+	}
+	// The shape, not just the length: the generic short-token warning fires
+	// for "   " too (length=3), so without this assertion the one warning
+	// that names the actual misconfiguration can be dropped and the log
+	// still looks populated.
+	if !rec.Contains("whitespace only") {
+		t.Errorf("log output %v never says the token is whitespace only; the only other signal is the length hint, which reads as \"your token is short\" while every sender 401s", rec.Messages())
 	}
 }
 
@@ -714,5 +733,50 @@ func TestLoadDoesNotWarnWhenOnlyTheSecretFilesAreSet(t *testing.T) {
 	}
 	if rec.Contains("both set") {
 		t.Errorf("_FILE-only configuration warned that the plain variable is ignored: %v", rec.Messages())
+	}
+}
+
+// TestConfigLogValueReportsBothSecretsByPresenceOnly pins the redaction seam:
+// LogValue is the reason a call site can log a whole Config without leaking,
+// so it must report DISCORD_WEBHOOK_URL and BEAT_TOKEN by presence and never
+// by value. The receiver under test is a VALUE, not a pointer: Load returns
+// Config by value and that is the form a future slog call would hand a
+// logger, so a seam that only covers *Config would not cover the leak.
+func TestConfigLogValueReportsBothSecretsByPresenceOnly(t *testing.T) {
+	t.Parallel()
+
+	const (
+		secretHook  = "https://discord.example/api/webhooks/1/leak-me-if-you-can"
+		secretToken = "leak-me-if-you-can-token"
+	)
+	cfg := Config{
+		WebhookURL: secretHook,
+		Node:       "node-a",
+		ListenAddr: ":9190",
+		BeatToken:  secretToken,
+		Beats:      []Beat{{ID: "api", Deadline: time.Hour}},
+		LogLevel:   slog.LevelInfo,
+	}
+
+	got := map[string]string{}
+	for _, attr := range cfg.LogValue().Group() {
+		got[attr.Key] = attr.Value.String()
+	}
+	for key, value := range got {
+		if strings.Contains(value, secretHook) || strings.Contains(value, secretToken) {
+			t.Errorf("LogValue attr %s = %q carries a secret verbatim: logging a Config would publish the Discord credential and the /beat/{id} gate into the log store", key, value)
+		}
+	}
+	if got["webhook"] != "configured" || got["beat_auth"] != "required" {
+		t.Errorf("webhook = %q, beat_auth = %q, want \"configured\" and \"required\": presence is the only thing these two attrs may report", got["webhook"], got["beat_auth"])
+	}
+
+	empty := Config{LogLevel: slog.LevelInfo}
+	got = map[string]string{}
+	for _, attr := range empty.LogValue().Group() {
+		got[attr.Key] = attr.Value.String()
+	}
+	if got["webhook"] != "unset" || got["beat_auth"] != "open" {
+		t.Errorf("unconfigured: webhook = %q, beat_auth = %q, want \"unset\" and \"open\"; beat_auth must not read \"required\" for an ungated endpoint", got["webhook"], got["beat_auth"])
 	}
 }

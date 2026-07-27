@@ -60,15 +60,21 @@ type Config struct {
 	LogLevel   slog.Level
 }
 
-// LogValue implements slog.LogValuer so a *Config can never publish its own
+// LogValue implements slog.LogValuer so a Config can never publish its own
 // secrets. DISCORD_WEBHOOK_URL's path IS the Discord credential and BeatToken
 // is the /beat/{id} gate, so both are reported by PRESENCE only: logging a
-// *Config stays leak-free even from a call site that logs the whole struct
-// instead of the hand-picked fields main.go's logConfig chooses today. The
-// receiver is a pointer because Config is too large to copy per log call
-// (gocritic hugeParam); Config is passed as *Config everywhere in this repo,
-// so log a pointer, never a bare Config value.
-func (c *Config) LogValue() slog.Value {
+// Config (or a *Config, whose method set includes this value receiver) stays
+// leak-free even from a call site that logs the whole struct instead of the
+// hand-picked fields main.go's logConfig chooses today.
+//
+// The receiver is deliberately a VALUE, not a pointer: a method set on *Config
+// leaves a bare Config value (what Load returns, and what run() holds) outside
+// slog.LogValuer, so the one call site the redaction exists to survive - a
+// future slog call that logs the whole struct by value - would reflection-render
+// both secrets. The copy is a startup-frequency 96 bytes.
+//
+//nolint:gocritic // hugeParam: slog.LogValuer must sit on the value receiver so a bare Config redacts too; the copy happens at most once per config log line.
+func (c Config) LogValue() slog.Value {
 	webhook := "unset"
 	if c.WebhookURL != "" {
 		webhook = "configured"

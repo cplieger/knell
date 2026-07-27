@@ -122,3 +122,40 @@ func beatSeriesValue(t *testing.T, name, id string) (string, bool) {
 	}
 	return "", false
 }
+
+// TestNotificationCountersAdvertiseTheKindListInTheirHelpText pins the third
+// leg of the exposition contract: the kind vocabulary is published as
+// exposition METADATA, and an operator writing a KnellNotifyFailing selector
+// reads the HELP text to learn which kind values exist. Rendered literally
+// rather than via joinKinds, so a changed separator or a dropped kind fails
+// here instead of silently reshaping the advertised set.
+func TestNotificationCountersAdvertiseTheKindListInTheirHelpText(t *testing.T) {
+	const kindList = "(missing, recovered, history)"
+	want := []string{
+		"knell_notifications_sent_total",
+		"knell_notifications_failed_total",
+		"knell_notifications_dropped_total",
+	}
+
+	rec := httptest.NewRecorder()
+	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	for _, name := range want {
+		prefix := "# HELP " + name + " "
+		var help string
+		for line := range strings.Lines(body) {
+			if v, ok := strings.CutPrefix(line, prefix); ok {
+				help = v
+				break
+			}
+		}
+		if help == "" {
+			t.Errorf("%s has no HELP line: the exposition lost the metadata an operator reads to learn the metric's meaning", name)
+			continue
+		}
+		if !strings.Contains(help, kindList) {
+			t.Errorf("%s HELP = %q, want it to advertise %s: the rendered kind list is what tells an operator which kind label values a selector may match", name, strings.TrimSpace(help), kindList)
+		}
+	}
+}

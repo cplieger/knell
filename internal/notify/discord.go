@@ -119,11 +119,14 @@ func New(webhookURL, node string) *Discord {
 // longer rendering — safe only because every fragment is anchored at the END of
 // the path, which makes even an out-of-order match remove the token instead of
 // leaving it behind.
-// Keep that anchoring when adding a candidate. Duplicates, the empty path and
-// any form shorter than minCredentialCandidate are dropped: such a fragment
-// appears in unrelated messages and redacting it would mangle them without
-// hiding a secret. An unparseable URL yields the raw value and its escaped
-// rendering alone, which is all the text such an error embeds.
+// Keep that anchoring when adding a candidate. Duplicates, the empty path, the
+// bare "/" and any DERIVED form shorter than minCredentialCandidate are
+// dropped: such a fragment appears in unrelated messages and redacting it would
+// mangle them without hiding a secret. The complete path renderings are exempt
+// from that floor — the path IS the credential, so a short configured path must
+// still be scrubbed when a body echoes only it. An unparseable URL yields the
+// raw value and its escaped rendering alone, which is all the text such an
+// error embeds.
 func redactionCandidates(webhookURL string) []string {
 	candidates := []string{webhookURL}
 	u, parseErr := url.Parse(webhookURL)
@@ -146,12 +149,11 @@ func redactionCandidates(webhookURL string) []string {
 	// below keeps a short non-secret value (?wait=true) from mangling log
 	// text.
 	forms := []string{webhookURL, u.String(), u.RequestURI(), u.Path, u.EscapedPath(), u.RawQuery}
-	for _, values := range u.Query() {
-		forms = append(forms, values...)
-	}
+	forms = append(forms, queryValueForms(u)...)
 	for _, p := range []string{u.Path, u.EscapedPath()} {
 		forms = append(forms, credentialForms(p)...)
 	}
+	completePaths := completePathForms(u)
 	// A JSON error body commonly escapes "/" as "\/" (PHP json_encode does so
 	// by default), which no plain-byte candidate matches. Register the escaped
 	// rendering of every slash-bearing form; the loop runs over a snapshot so
@@ -162,14 +164,20 @@ func redactionCandidates(webhookURL string) []string {
 		}
 	}
 	for _, c := range forms {
-		// The length floor applies to every DERIVED form, the bare path and
-		// the query forms included: a form too short to be a usable
-		// credential is also too short to replace without mangling unrelated
-		// text (the reason a bare "/" was rejected, generalized). It cannot
-		// weaken the guarantee: the configured string is kept unconditionally
-		// above and u.String() is never shorter than "https://h/", so every
-		// COMPLETE rendering is still scrubbed.
-		if c == "" || len(c) < minCredentialCandidate || slices.Contains(candidates, c) {
+		// The length floor applies to every DERIVED form — the sub-path
+		// fragments credentialForms builds and the query forms: a fragment too
+		// short to be a usable credential is also too short to replace without
+		// mangling unrelated text (the reason a bare "/" was rejected,
+		// generalized). It cannot weaken the guarantee for a COMPLETE
+		// rendering: the configured string is kept unconditionally above,
+		// u.String() is never shorter than "https://h/", and the complete path
+		// renderings (u.Path, u.EscapedPath() and their slash-escaped forms)
+		// are exempt via completePaths, so a webhook whose whole path is a
+		// handful of bytes is still scrubbed when a body echoes only that path.
+		if c == "" || c == "/" || slices.Contains(candidates, c) {
+			continue
+		}
+		if len(c) < minCredentialCandidate && !slices.Contains(completePaths, c) {
 			continue
 		}
 		candidates = append(candidates, c)
@@ -180,6 +188,47 @@ func redactionCandidates(webhookURL string) []string {
 // webhookPathPrefix is the fixed part of a Discord webhook path; everything
 // after it is the credential.
 const webhookPathPrefix = "/api/webhooks/"
+
+// queryValueForms lists the renderings of the query VALUES a body can echo
+// without the surrounding query string: each decoded value, and each value's
+// WIRE (percent-encoded) rendering. Both encodings are registered for the same
+// reason the path has u.Path and u.EscapedPath(): a body echoing a value with
+// escapable bytes carries it in a shape the other form does not match. A
+// relay-style webhook can hold its credential in the query (config accepts any
+// https URL), and the length floor in redactionCandidates drops the short
+// non-secret values (?wait=true) these loops also collect.
+func queryValueForms(u *url.URL) []string {
+	var forms []string
+	for _, values := range u.Query() {
+		forms = append(forms, values...)
+	}
+	for pair := range strings.SplitSeq(u.RawQuery, "&") {
+		if _, encValue, ok := strings.Cut(pair, "="); ok {
+			forms = append(forms, encValue)
+		}
+	}
+	return forms
+}
+
+// completePathForms lists the COMPLETE renderings of the path component —
+// u.Path, u.EscapedPath() and their JSON slash-escaped forms. The path IS the
+// credential, so these are exempt from redactionCandidates' length floor
+// however short the configured path is (a body echoing only "/hook" echoes the
+// whole secret). The empty path and the bare "/" are excluded: neither is a
+// credential, and redacting "/" would mangle every path in a log line.
+func completePathForms(u *url.URL) []string {
+	var forms []string
+	for _, p := range []string{u.Path, u.EscapedPath()} {
+		if p == "" || p == "/" {
+			continue
+		}
+		forms = append(forms, p)
+		if escaped := strings.ReplaceAll(p, "/", `\/`); escaped != p {
+			forms = append(forms, escaped)
+		}
+	}
+	return forms
+}
 
 // minCredentialCandidate is the shortest fragment worth redacting. A handful
 // of bytes cannot be a usable webhook credential (a real path carries a long
@@ -433,15 +482,17 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 			// A 3xx reaches a caller only because the hop was NOT followed:
 			// New's policy hands back the 3xx for a method-changing hop
 			// (http.ErrUseLastResponse), and net/http does not follow a 3xx
-			// with no usable Location. "HTTP 302" alone reads like a
-			// webhook-side rejection, so name the cause instead — a
-			// misconfigured (redirecting) webhook URL never delivers and no
-			// other signal explains why. The response body of an unfollowed
-			// redirect is not diagnostic, and neither the Location nor the
-			// request URL is included: for a webhook the path IS the
+			// with no usable Location (a cross-host refusal never reaches
+			// here — CheckRedirect's error surfaces on the doErr path above).
+			// "HTTP 302" alone reads like a webhook-side rejection, so say
+			// that nothing was delivered and what to point the URL at; the
+			// specific reason the hop was not followed is not knowable here,
+			// so the text does not claim one. The response body of an
+			// unfollowed redirect is not diagnostic, and neither the Location
+			// nor the request URL is included: for a webhook the path IS the
 			// credential.
 			return struct{}{}, fmt.Errorf(
-				"%w: redirect not followed, nothing was delivered (this client refuses a cross-origin or method-changing hop; point DISCORD_WEBHOOK_URL at the final URL)",
+				"%w: redirect or other 3xx response was not followed, nothing was delivered (point DISCORD_WEBHOOK_URL at an endpoint that accepts the POST with a 2xx response)",
 				statusErr)
 		}
 		// The code alone cannot tell a deleted webhook from a rejected
@@ -476,8 +527,13 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 			// scrubbed read failure: a response that broke mid-body points at
 			// the path between here and the webhook, not at the webhook's
 			// verdict, and the status code alone cannot tell them apart.
+			// Quote for the same reason the whole-body case does: the read
+			// error can carry remote bytes verbatim (net/textproto reports a
+			// malformed chunked trailer as "malformed MIME header line:
+			// <remote bytes>"), and Quote neutralizes control characters
+			// before the text reaches a log line.
 			return struct{}{}, fmt.Errorf("%w (response body unreadable after %d bytes, detail dropped: %s)",
-				statusErr, len(detail), d.scrubText(readErr.Error()))
+				statusErr, len(detail), strconv.Quote(d.scrubText(readErr.Error())))
 		case len(detail) > maxErrorBodyBytes:
 			return struct{}{}, fmt.Errorf("%w (response body over %d bytes, detail dropped)", statusErr, maxErrorBodyBytes)
 		}
