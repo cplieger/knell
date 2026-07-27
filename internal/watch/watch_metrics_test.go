@@ -899,3 +899,58 @@ func TestLogUndeliveredCountsAnUnqueuedOngoingOutage(t *testing.T) {
 		t.Errorf("ongoing-outage notices = %d, want exactly 1: %v", got, drained.Messages())
 	}
 }
+
+func TestBudgetCutIsLoggedOncePerSweepWithTheDeferredCount(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, which every other test writes through.
+	//
+	// Cutting a sweep short is ordinary back-pressure while deliveries are
+	// slow, not a fault, so it is levelled exactly like the other
+	// back-pressure case (recordOngoingOutage's full-queue deferral) rather
+	// than as a warning that would page on a delivery outage knell is already
+	// reporting. One line per affected SWEEP, naming how many beats the next
+	// sweep must pick up: one line per deferred beat would bury real faults
+	// under 60 lines every 15s, and a line with no count leaves the operator
+	// unable to tell a one-beat overrun from a stalled fleet.
+	const (
+		total    = 12
+		perSend  = 2 * time.Second
+		deadline = 10 * time.Minute
+	)
+	beats := budgetProbeBeats("budget-cut-log-probe", total, deadline)
+	clock := newFakeClock()
+	n := &fakeNotifier{}
+	w := New(beats, n, clock.Now, clock.Now())
+
+	clock.Advance(deadline + time.Minute)
+	slowSends(n, clock, perSend)
+
+	rec := capture.Default(t)
+	w.sweep(context.Background())
+
+	const msg = "sweep send budget spent"
+	if got := rec.CountLevel(slog.LevelDebug, msg); got != 1 {
+		t.Fatalf("budget-cut debug lines = %d, want exactly 1 for the sweep (not one per deferred beat): %v", got, rec.Messages())
+	}
+	for _, level := range []slog.Level{slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
+		if got := rec.CountLevel(level, msg); got != 0 {
+			t.Errorf("budget-cut lines at %s = %d, want 0 (back-pressure during a delivery outage is not a fault): %v", level, got, rec.Messages())
+		}
+	}
+	wantDeferred := total - sendsBeforeBudgetCut(perSend)
+	if !rec.HasAttr(msg, "deferred_beats", strconv.Itoa(wantDeferred)) {
+		t.Errorf("budget-cut line does not report the %d beats deferred to the next sweep: %v", wantDeferred, rec.Records())
+	}
+	if !rec.HasAttr(msg, "budget", sweepSendBudget.String()) {
+		t.Errorf("budget-cut line does not name the budget it spent: %v", rec.Records())
+	}
+
+	// The line belongs to the cut, not to sweeping: once sends are quick
+	// enough to finish the remaining beats, the sweep must stay silent.
+	n.onMissing = nil
+	quiet := capture.Default(t)
+	w.sweep(context.Background())
+	if got := quiet.Count(msg); got != 0 {
+		t.Errorf("budget-cut lines in a sweep that delivered everything = %d, want 0: %v", got, quiet.Messages())
+	}
+}

@@ -88,6 +88,32 @@ func LongestOutage(outages []Outage) time.Duration {
 // hours, so a fixed 15s sweep bounds alert latency without configuration.
 const DefaultTick = 15 * time.Second
 
+// sweepSendBudget bounds how long ONE sweep keeps STARTING sends before it
+// gives the Run loop its select back, leaving the beats it did not reach for
+// the next sweep. sweep is the single sender and Run cannot service the
+// recoveries channel while the sweep sits inside a delivery, so without a
+// bound the failure that makes every beat go missing at once — whatever fans
+// the heartbeats out dies, so every configured beat crosses its deadline in
+// the SAME sweep (internal/config caps a fleet at 64) — becomes 64 posts to
+// one webhook in a tight loop, each notification worth up to 3x(10s attempt +
+// 30s rate-limit wait), with every recovery notice stuck behind the storm.
+//
+// 5s is a third of the 15s DefaultTick: it leaves two thirds of every interval
+// for queued recoveries and keeps the next sweep near its schedule, while
+// still being several sends wide so a storm drains over a handful of ticks
+// rather than one beat per tick. It is a floor on responsiveness, not a cap on
+// sweep duration: the budget is checked only BETWEEN beats, so the send in
+// flight when it expires runs to completion and one sweep can overrun it.
+// Interrupting a send is deliberately not attempted — the goal is to stop
+// ADDING work, not to abandon a notice already being delivered.
+//
+// Nothing is lost by cutting a sweep short. alerted flips only on a delivered
+// send, so a beat the sweep never reached keeps its queued record and the next
+// sweep delivers it; the retry that a failed send already relies on carries
+// the deferral too. In the healthy case the budget never bites — 64 quick
+// webhook posts take well under a second — so normal delivery is unchanged.
+const sweepSendBudget = 5 * time.Second
+
 // Beat is one watched beat as the state machine needs it: an id and the
 // silence deadline that declares it missing. It is the watch package's own
 // input type, so the state machine and its tests do not depend on how (or
@@ -564,18 +590,56 @@ func publishFreshness(id string, silence, deadline time.Duration) bool {
 // sweep, which is why a live outage queued behind a backlog waits a single
 // tick rather than one tick per stale record. Run calls sweep on every tick;
 // in-package tests call it directly.
+//
+// Sending is bounded by sweepSendBudget: once it is spent the sweep stops
+// starting sends and returns, so Run can service the recoveries channel
+// instead of waiting out a whole storm of missing notices. The cut lands at
+// the tail of this sweep's ordering — a beat is never skipped to reach a later
+// one — and a beat left unreached is untouched, so the next sweep sends it.
 func (w *Watcher) sweep(ctx context.Context) {
 	live, history := w.collectDue()
-	for _, past := range history {
+	budget := w.now().Add(sweepSendBudget)
+	for i, past := range history {
+		// Every unsent entry is one beat, history and live alike (collectDue
+		// yields at most one notice per beat), so the whole remainder of both
+		// orderings is what a cut here defers.
+		if w.budgetSpent(budget, len(history)-i+len(live)) {
+			return
+		}
 		if w.sendHistory(ctx, past) {
 			return
 		}
 	}
-	for _, beat := range live {
+	for i, beat := range live {
+		if w.budgetSpent(budget, len(live)-i) {
+			return
+		}
 		if w.sendMissing(ctx, beat) {
 			return
 		}
 	}
+}
+
+// budgetSpent reports whether this sweep has spent its send budget and must
+// stop before STARTING the next beat's send, logging the cut once with the
+// number of beats deferred to the next sweep. Callers check it between beats
+// only, so a send already in flight is never interrupted.
+//
+// A deferred beat moves NO counter and keeps alerted where it was: nothing was
+// attempted for it, so it is neither a failed delivery (which would promise a
+// retry that is already the plain behavior here) nor a dropped notice (which
+// would claim it will never arrive). Its state is exactly what it was before
+// the sweep, down to the queued record the next sweep picks up — which is also
+// why a cut can never swallow an outage. DEBUG matches recordOngoingOutage:
+// like a full pending queue during a webhook outage, this is back-pressure
+// that costs a tick, not a fault.
+func (w *Watcher) budgetSpent(budget time.Time, deferred int) bool {
+	if !w.now().After(budget) {
+		return false
+	}
+	slog.Debug("sweep send budget spent, remaining beats deferred to the next sweep",
+		"budget", sweepSendBudget.String(), "deferred_beats", deferred)
+	return true
 }
 
 // beatOutages is one beat's run of already-ended outages, the payload of a

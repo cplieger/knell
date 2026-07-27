@@ -1216,3 +1216,325 @@ func TestQueuedOngoingOutageReportsLiveSilenceWhenPromoted(t *testing.T) {
 	}
 	checkSpans(t, onlyHistory(t, n), 11*time.Minute)
 }
+
+// budgetProbeBeats builds n beats named from prefix for the send-budget
+// tests. Every id must be unique across the package: the metric registry is
+// global, and these tests assert per-beat counter deltas.
+func budgetProbeBeats(prefix string, n int, deadline time.Duration) []Beat {
+	beats := make([]Beat, n)
+	for i := range beats {
+		beats[i] = Beat{ID: fmt.Sprintf("%s-%02d", prefix, i), Deadline: deadline}
+	}
+	return beats
+}
+
+// sendsBeforeBudgetCut is how many sends one sweep starts when every send
+// burns perSend of the budget: the first starts with the budget untouched,
+// and each further one starts while the elapsed time is still within it (the
+// cut happens on the check AFTER the budget is exceeded, never mid-send). It
+// is derived rather than hardcoded so the expectations below follow
+// sweepSendBudget if the constant is ever retuned.
+func sendsBeforeBudgetCut(perSend time.Duration) int {
+	return int(sweepSendBudget/perSend) + 1
+}
+
+// slowSends makes every missing send burn perSend of the sweep's budget, the
+// stand-in for a webhook that answers slowly or rate-limits. Set it before
+// starting any Run loop: the hook is read from the sender goroutine.
+func slowSends(n *fakeNotifier, clock *fakeClock, perSend time.Duration) {
+	n.onMissing = func() { clock.Advance(perSend) }
+}
+
+func TestSweepStopsAtItsSendBudgetAndDefersTheRest(t *testing.T) {
+	// Serial (no t.Parallel): asserts deltas on the package-global
+	// notification counters, which the parallel tests also move.
+	//
+	// The failure this pins: when whatever fans the heartbeats out dies, every
+	// beat crosses its deadline in the SAME sweep, and the single sender used
+	// to push all of them through one rate-limited webhook back to back --
+	// holding Run's select, and every queued recovery, for minutes. The sweep
+	// must stop once its budget is spent instead. The beats it never reached
+	// must then be untouched: not counted as failed (an attempt that will be
+	// retried), not as dropped (a notice that will never arrive), and not
+	// marked alerted, because nothing was attempted for them at all.
+	const (
+		total    = 12
+		perSend  = 2 * time.Second
+		deadline = 10 * time.Minute
+	)
+	beats := budgetProbeBeats("budget-cut-probe", total, deadline)
+	clock := newFakeClock()
+	n := &fakeNotifier{}
+	w := New(beats, n, clock.Now, clock.Now())
+
+	wantSent := sendsBeforeBudgetCut(perSend)
+	if wantSent >= total {
+		t.Fatalf("test precondition: %d sends fit in the %s budget at %s each, want fewer than the %d due beats",
+			wantSent, sweepSendBudget, perSend, total)
+	}
+
+	// One sweep with every beat overdue: the boot-armed clock arms them all
+	// from construction, so a single advance puts the whole fleet past its
+	// deadline at once -- the delivery storm this budget exists for.
+	clock.Advance(deadline + time.Minute)
+	slowSends(n, clock, perSend)
+
+	sentBefore := counterValue(t, "knell_notifications_sent_total", "missing")
+	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
+	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "missing")
+	outagesBefore := make(map[string]float64, len(beats))
+	for _, b := range beats {
+		outagesBefore[b.ID] = beatCounterValue(t, "knell_beat_outages_total", b.ID)
+	}
+
+	w.sweep(context.Background())
+
+	got := n.snapshot()
+	if len(got) != wantSent {
+		t.Fatalf("notices in the budget-limited sweep = %d (%v), want %d: the sweep must stop starting sends once its %s budget is spent",
+			len(got), got, wantSent, sweepSendBudget)
+	}
+	notified := make(map[string]bool, len(got))
+	for i, c := range got {
+		if c.kind != "missing" {
+			t.Errorf("calls[%d] = %+v, want a missing notice", i, c)
+		}
+		notified[c.id] = true
+	}
+	if len(notified) != len(got) {
+		t.Errorf("the sweep sent %d notices across only %d distinct beats: one notice per beat per sweep", len(got), len(notified))
+	}
+
+	// A beat the sweep never reached must be in exactly the state it was in
+	// before the sweep: not alerted, and still holding the open record its
+	// retry comes from. Which beats those are is deliberately not asserted --
+	// Watcher stores beats in a map and promises no iteration order.
+	for _, b := range beats {
+		st := w.beats[b.ID]
+		if notified[b.ID] {
+			if !st.alerted {
+				t.Errorf("beat %s was notified but is not marked alerted, so its outage would be announced twice", b.ID)
+			}
+			continue
+		}
+		if st.alerted {
+			t.Errorf("beat %s was never reached by the sweep but is marked alerted: its outage would never be announced", b.ID)
+		}
+		if st.openMissing() == nil {
+			t.Errorf("beat %s was never reached by the sweep but has no queued open record, so the next sweep has nothing to send", b.ID)
+		}
+	}
+
+	if got, want := counterValue(t, "knell_notifications_sent_total", "missing"), sentBefore+float64(wantSent); got != want {
+		t.Errorf("sent{missing} = %v, want %v (one per delivered notice: only the beats the sweep reached were delivered)", got, want)
+	}
+	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
+		t.Errorf("failed{missing} = %v after a budget-limited sweep, want unchanged %v (a beat the sweep never reached had no delivery attempt to fail)", got, failedBefore)
+	}
+	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
+		t.Errorf("dropped{missing} = %v after a budget-limited sweep, want unchanged %v (a deferred notice arrives on a later sweep, so nothing is lost for good)", got, droppedBefore)
+	}
+	// Detection is delivery-independent and happens in collectDue, before the
+	// first send: every crossing counts as an outage whether or not this sweep
+	// got as far as notifying it.
+	for _, b := range beats {
+		if got, want := beatCounterValue(t, "knell_beat_outages_total", b.ID), outagesBefore[b.ID]+1; got != want {
+			t.Errorf("beat_outages_total{%s} = %v, want %v (a detected outage counts even when its notice is deferred)", b.ID, got, want)
+		}
+	}
+}
+
+func TestBudgetDeferredBeatsAreDeliveredOnALaterSweep(t *testing.T) {
+	// Serial (no t.Parallel): asserts deltas on the package-global
+	// notification counters, which the parallel tests also move.
+	//
+	// The whole premise of cutting a sweep short: the beats it did not reach
+	// are DEFERRED, not lost. Nothing new retries them -- the existing
+	// sweep-level retry does, because alerted flips only on a delivered send --
+	// so if a cut beat could not be picked up later the budget would trade a
+	// stalled sender for a swallowed outage, which is strictly worse.
+	const (
+		total    = 12
+		perSend  = 2 * time.Second
+		deadline = 10 * time.Minute
+	)
+	beats := budgetProbeBeats("budget-defer-probe", total, deadline)
+	clock := newFakeClock()
+	n := &fakeNotifier{}
+	w := New(beats, n, clock.Now, clock.Now())
+
+	clock.Advance(deadline + time.Minute)
+	slowSends(n, clock, perSend)
+
+	sentBefore := counterValue(t, "knell_notifications_sent_total", "missing")
+	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
+	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "missing")
+
+	// Keep sweeping at the same slow send rate: each sweep delivers another
+	// budget's worth and defers the rest, so the storm drains over a handful
+	// of ticks instead of one beat per tick.
+	perBeat := make(map[string]int, total)
+	sweeps := 0
+	for len(perBeat) < total {
+		if sweeps > total {
+			t.Fatalf("still only %d of %d beats delivered after %d sweeps: deferred beats are not being retried", len(perBeat), total, sweeps)
+		}
+		w.sweep(context.Background())
+		sweeps++
+		perBeat = make(map[string]int, total)
+		for _, c := range n.snapshot() {
+			perBeat[c.id]++
+		}
+	}
+	if sweeps < 2 {
+		t.Fatalf("all %d beats were delivered in %d sweep(s): the budget never cut, so this test proves nothing about deferral", total, sweeps)
+	}
+
+	for _, b := range beats {
+		if got := perBeat[b.ID]; got != 1 {
+			t.Errorf("beat %s received %d notices across %d sweeps, want exactly 1 (one message per live outage)", b.ID, got, sweeps)
+		}
+		st := w.beats[b.ID]
+		if !st.alerted {
+			t.Errorf("beat %s is not marked alerted after its deferred notice was delivered", b.ID)
+		}
+		if len(st.pendingMissing) != 0 {
+			t.Errorf("beat %s still holds %d queued record(s) after delivery, want 0", b.ID, len(st.pendingMissing))
+		}
+	}
+
+	if got, want := counterValue(t, "knell_notifications_sent_total", "missing"), sentBefore+float64(total); got != want {
+		t.Errorf("sent{missing} = %v after every deferred beat was delivered, want %v", got, want)
+	}
+	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
+		t.Errorf("failed{missing} = %v across the deferred sweeps, want unchanged %v (a deferral is not a failed delivery)", got, failedBefore)
+	}
+	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
+		t.Errorf("dropped{missing} = %v across the deferred sweeps, want unchanged %v (a deferral is not a permanent loss)", got, droppedBefore)
+	}
+}
+
+func TestFastSendsDeliverEveryDueBeatInOneSweep(t *testing.T) {
+	t.Parallel()
+
+	// The healthy path must be untouched by the budget: a full fleet of quick
+	// webhook posts takes well under a second, so a sweep that finds every
+	// beat due still delivers every one of them in that single sweep. A budget
+	// that bit here would delay real alerts by a tick for no reason.
+	const (
+		total    = 64 // the configured maximum (internal/config maxBeats)
+		perSend  = 10 * time.Millisecond
+		deadline = 10 * time.Minute
+	)
+	if spent := time.Duration(total) * perSend; spent >= sweepSendBudget {
+		t.Fatalf("test precondition: %d sends at %s each spend %s, which is not well under the %s budget", total, perSend, spent, sweepSendBudget)
+	}
+
+	beats := budgetProbeBeats("budget-healthy-probe", total, deadline)
+	clock := newFakeClock()
+	n := &fakeNotifier{}
+	w := New(beats, n, clock.Now, clock.Now())
+
+	clock.Advance(deadline + time.Minute)
+	slowSends(n, clock, perSend)
+	w.sweep(context.Background())
+
+	got := n.snapshot()
+	if len(got) != total {
+		t.Fatalf("notices in one healthy sweep = %d, want all %d due beats (fast sends must never hit the %s budget)", len(got), total, sweepSendBudget)
+	}
+	for _, b := range beats {
+		st := w.beats[b.ID]
+		if !st.alerted {
+			t.Errorf("beat %s was not alerted by the healthy sweep", b.ID)
+		}
+		if len(st.pendingMissing) != 0 {
+			t.Errorf("beat %s still holds %d queued record(s) after a delivered send, want 0", b.ID, len(st.pendingMissing))
+		}
+	}
+}
+
+func TestRunServicesRecoveriesAfterABudgetLimitedSweep(t *testing.T) {
+	t.Parallel()
+
+	// The harm the budget actually fixes: while sweep is inside a delivery,
+	// Run's select cannot touch the recoveries channel at all, so a recovered
+	// notice queued during a delivery storm waits for the WHOLE storm. With
+	// the budget, the sweep hands the select back after a bounded number of
+	// sends and the recovery goes out then -- ahead of the beats this sweep
+	// deferred, not behind all of them.
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			storm       = 12
+			perSend     = 2 * time.Second
+			stormWindow = 10 * time.Minute
+			recoverID   = "budget-recovery-probe"
+			tick        = 5 * time.Millisecond
+		)
+		clock := newFakeClock()
+		n := &fakeNotifier{}
+		beats := append(
+			[]Beat{{ID: recoverID, Deadline: time.Minute}},
+			budgetProbeBeats("budget-recovery-storm", storm, stormWindow)...,
+		)
+		w := New(beats, n, clock.Now, clock.Now())
+
+		// Phase 1, on this goroutine: alert the recovering beat alone, on its
+		// own short deadline. An alerted beat yields no notice, so it takes no
+		// part in the storm sweep below and its recovery is the only thing
+		// competing with it.
+		clock.Advance(2 * time.Minute)
+		w.sweep(t.Context())
+		if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" || got[0].id != recoverID {
+			t.Fatalf("calls = %v, want one missing notice for %s before the storm", got, recoverID)
+		}
+
+		// Phase 2: the whole storm fleet crosses its deadline, and the first
+		// send of the storm sweep is when the recovering beat pings -- so the
+		// recovery is queued while the sender is deep in the storm.
+		clock.Advance(stormWindow)
+		sends := 0
+		n.onMissing = func() {
+			sends++
+			if sends == 1 {
+				w.Beat(recoverID)
+			}
+			clock.Advance(perSend)
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			w.Run(ctx, tick)
+		}()
+
+		time.Sleep(tick)
+		synctest.Wait()
+
+		got := n.snapshot()
+		stormsBefore, found := 0, false
+		for _, c := range got[1:] {
+			if c.kind == "recovered" && c.id == recoverID {
+				found = true
+				break
+			}
+			stormsBefore++
+		}
+		if !found {
+			t.Fatalf("calls = %v, want the queued recovered notice delivered after the budget-limited sweep returned to the select", got)
+		}
+		if want := sendsBeforeBudgetCut(perSend); stormsBefore != want {
+			t.Errorf("storm notices ahead of the recovery = %d, want %d: the recovery must be serviced as soon as the sweep spends its budget, not after all %d storm beats",
+				stormsBefore, want, storm)
+		}
+
+		cancel()
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("Run did not stop on ctx cancel")
+		}
+	})
+}
