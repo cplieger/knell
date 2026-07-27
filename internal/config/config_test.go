@@ -602,3 +602,76 @@ func TestLoadFallsBackToTheHostnameWhenNodeNameIsUnset(t *testing.T) {
 		t.Errorf("Node = %q, want the hostname %q; the node name prefixes every Discord notice, so a fallback that reports a constant makes a three-observer set unattributable", cfg.Node, host)
 	}
 }
+
+func TestLoadTrimsPaddedListenAddr(t *testing.T) {
+	setValidLoadEnv(t)
+	t.Setenv("LISTEN_ADDR", "  0.0.0.0:9999  ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.ListenAddr != "0.0.0.0:9999" {
+		t.Errorf("ListenAddr = %q, want the trimmed address: net.Listen resolves a padded address as a hostname lookup, so the container crash-loops with the padding invisible in the log line", cfg.ListenAddr)
+	}
+}
+
+func TestLoadFallsBackToTheDefaultListenAddrWhenBlank(t *testing.T) {
+	setValidLoadEnv(t)
+	t.Setenv("LISTEN_ADDR", "   ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.ListenAddr != ":9190" {
+		t.Errorf("ListenAddr = %q, want :9190: an empty address makes net.Listen bind an EPHEMERAL port, hiding /metrics from Alloy and /beat/{id} from every sender", cfg.ListenAddr)
+	}
+}
+
+func TestLoadTrimsPaddedNodeName(t *testing.T) {
+	setValidLoadEnv(t)
+	t.Setenv("NODE_NAME", "  node-1  ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Node != "node-1" {
+		t.Errorf("Node = %q, want \"node-1\": the node name prefixes every Discord notice, so padding misattributes which observer reported the outage", cfg.Node)
+	}
+}
+
+func TestLoadRejectsWhitespaceOnlyWebhook(t *testing.T) {
+	setValidLoadEnv(t)
+	t.Setenv("DISCORD_WEBHOOK_URL", "   ")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() with a whitespace-only DISCORD_WEBHOOK_URL = nil, want error: a broken secret pipeline must fail startup rather than arm a switch that can never ring")
+	}
+	if !strings.Contains(err.Error(), "set but empty") {
+		t.Errorf("error = %q, want the set-but-empty diagnosis rather than the misleading https-scheme rejection", err)
+	}
+}
+
+func TestLoadWarnsWhenBeatTokenIsPresentButEmpty(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", "")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
+
+	rec := capture.Default(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.BeatToken != "" {
+		t.Errorf("BeatToken = %q, want empty: envx.Require cannot tell a present-but-empty BEAT_TOKEN from an unset one", cfg.BeatToken)
+	}
+	if !rec.Contains("BEAT_TOKEN is set but empty") {
+		t.Errorf("log output %v missing the warning that /beat/{id} is served ungated, the only signal that separates the compose-interpolation accident from a deliberately open endpoint", rec.Messages())
+	}
+}

@@ -371,6 +371,55 @@ func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 	}
 }
 
+func TestStatusBodyDetailNeverLeaksWebhookURL(t *testing.T) {
+	// Deliberately NOT t.Parallel: slog.Default() is process-global.
+	//
+	// The other half of the log-surface contract. The refused-connection case
+	// above covers only a transport error, which httpx.LogSafeError reduces by
+	// TYPE. A transient STATUS carries a bounded prefix of the remote body
+	// into the attempt error, and httpx.Do logs that error verbatim through
+	// the type-based reduction alone -- post's logSafe runs too late to scrub
+	// it. So a webhook fronted by a proxy whose 503 page echoes the request
+	// URI would put the credential (which IS the URL path) in the retry and
+	// exhausted lines. postAttempt scrubs at source; this pins it.
+	const secret = "verysecretbodytoken"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The error-page shape that causes the leak: the body echoes the
+		// request path, which for a Discord webhook is the credential.
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("502 Bad Gateway: upstream failed for " + r.URL.Path))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
+	t.Cleanup(d.Close)
+
+	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	if err == nil {
+		t.Fatal("BeatMissing against a persistent 503 = nil, want error")
+	}
+	if buf.Len() == 0 {
+		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
+	}
+	if got := buf.String(); strings.Contains(got, secret) {
+		t.Errorf("retry/exhausted logs leak the webhook credential: %s", got)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("delivery error leaks the webhook credential: %v", err)
+	}
+	// The detail must still SURVIVE the scrub, or the diagnostic value l-f33
+	// added is gone: only the credential is removed.
+	if !strings.Contains(err.Error(), "Bad Gateway") {
+		t.Errorf("delivery error dropped the body detail entirely: %v", err)
+	}
+}
+
 func TestAttemptTimeoutIsRetried(t *testing.T) {
 	t.Parallel()
 
@@ -674,9 +723,10 @@ func TestSameHostRedirectIsFollowedAndDelivers(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("followed hop method = %s, want POST (body must survive the hop)", r.Method)
 		}
-		buf := make([]byte, 4096)
-		n, _ := r.Body.Read(buf)
-		finishBody.Store(string(buf[:n]))
+		// io.ReadAll, not a single Read: one Read may return a short prefix of
+		// the replayed body and the payload assertion below would flake.
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+		finishBody.Store(string(body))
 		w.WriteHeader(http.StatusNoContent)
 	})
 	srv := httptest.NewServer(mux)

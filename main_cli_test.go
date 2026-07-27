@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cplieger/health"
 )
@@ -23,12 +27,31 @@ func TestMain(m *testing.M) {
 }
 
 // runMain re-executes this test binary as knell with args and env, returning
-// the child's exit code and its combined output.
+// the child's exit code and its combined output. An env entry "KEY=" removes
+// KEY from the child environment rather than blanking it.
 func runMain(t *testing.T, env []string, args ...string) (int, string) {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], args...)
+	// Bounded: every case asserts the child EXITS (a probe verdict, a usage
+	// error, a rejected boot). If a regression makes it boot instead, the
+	// child would otherwise hold CombinedOutput open until the package-wide
+	// test timeout panics; the kill turns that into this test's failure.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	cmd := exec.CommandContext(ctx, os.Args[0], args...)
 	cmd.Env = append(os.Environ(), "KNELL_TEST_REEXEC_MAIN=1")
-	cmd.Env = append(cmd.Env, env...)
+	// An entry "KEY=" removes KEY from the child environment entirely:
+	// config.Load rejects a PRESENT-but-empty _FILE variable, so blanking one
+	// would fail the boot at the blank-_FILE gate instead of the gate under
+	// test. Any other entry overrides the parent's value.
+	for _, e := range env {
+		if key, val, _ := strings.Cut(e, "="); val == "" {
+			cmd.Env = slices.DeleteFunc(cmd.Env, func(entry string) bool {
+				return strings.HasPrefix(entry, key+"=")
+			})
+			continue
+		}
+		cmd.Env = append(cmd.Env, e)
+	}
 	out, err := cmd.CombinedOutput()
 	var exitErr *exec.ExitError
 	switch {
@@ -58,8 +81,17 @@ func TestHealthSubcommandReportsTheMarkerVerdictWithoutBooting(t *testing.T) {
 	})
 
 	t.Run("marker present", func(t *testing.T) {
-		if err := os.WriteFile(health.DefaultPath, nil, 0o600); err != nil {
-			t.Skipf("cannot plant a health marker at %s: %v", health.DefaultPath, err)
+		// O_EXCL|O_NOFOLLOW, mirroring main_test.go's plant: health.DefaultPath
+		// is a fixed path in a world-writable directory, so a plain
+		// os.WriteFile would follow a pre-planted symlink and truncate its
+		// target as the test user.
+		f, plantErr := os.OpenFile(health.DefaultPath,
+			os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+		if plantErr != nil {
+			t.Skipf("cannot plant a health marker at %s: %v", health.DefaultPath, plantErr)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("closing planted marker: %v", err)
 		}
 		t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
 		code, out := runMain(t, nil, "health")
@@ -102,6 +134,9 @@ func TestRejectedConfigExitsOneWithoutLeakingTheWebhook(t *testing.T) {
 	}
 	if !strings.Contains(out, "knell exited with error") {
 		t.Errorf("output = %q, want the boot failure reported", out)
+	}
+	if !strings.Contains(out, "scheme must be https") {
+		t.Errorf("output = %q, want the https-only webhook gate to be the rejection", out)
 	}
 	if strings.Contains(out, "verysecrettoken") {
 		t.Errorf("the boot-failure output leaks the webhook URL: %s", out)

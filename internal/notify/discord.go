@@ -181,8 +181,9 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 
 // post delivers one message, retrying transient failures. The webhook URL
 // never appears in returned errors or logs: transport errors are reduced by
-// logSafe, and a status failure is httpx.CheckHTTPStatus's error, which
-// carries the status code only (no URL to strip).
+// logSafe, and a status failure is httpx.CheckHTTPStatus's error (the status
+// code only) plus a bounded prefix of the remote body, which postAttempt
+// scrubs against the same candidates before wrapping it.
 func (d *Discord) post(ctx context.Context, label, content string) error {
 	body, err := json.Marshal(map[string]string{"content": content})
 	if err != nil {
@@ -233,14 +234,24 @@ func (d *Discord) logSafe(err error) error {
 	// URL before New is called), and RedactSecretString is a no-op on an
 	// empty secret, so this cannot mask an error into an empty message.
 	msg := safe.Error()
-	scrubbed := msg
-	for _, candidate := range d.redact {
-		scrubbed = httpx.RedactSecretString(scrubbed, candidate)
-	}
+	scrubbed := d.scrubText(msg)
 	if scrubbed != msg {
 		return &redactedError{msg: scrubbed, err: safe}
 	}
 	return safe
+}
+
+// scrubText removes every candidate rendering of the webhook URL from text.
+// It is the value-based half of logSafe, split out because postAttempt must
+// scrub a response body at source (before httpx.Do logs the attempt error)
+// rather than through logSafe, which only sees httpx.Do's return.
+// RedactSecretString is a plain replacement, so this is a no-op on text that
+// does not carry the credential.
+func (d *Discord) scrubText(text string) string {
+	for _, candidate := range d.redact {
+		text = httpx.RedactSecretString(text, candidate)
+	}
+	return text
 }
 
 // redactedError carries a scrubbed message while keeping the original error in
@@ -268,8 +279,9 @@ func (attemptTimeoutError) IsTransient() bool { return true }
 // per-attempt deadline, request construction, transport call, response
 // cleanup, and strict delivery validation. It is the retry callback post
 // hands to httpx.Do, which owns the retry policy and terminal wrapping.
-// Every error it returns is URL-free, so the webhook secret cannot reach a
-// log or a returned error.
+// Every error it returns is URL-free — including the remote body prefix on a
+// status failure, which is scrubbed here rather than by post's logSafe,
+// because httpx.Do logs the attempt error before post sees it.
 func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error) {
 	attemptCtx, cancel := httpx.ContextWithDefaultTimeout(ctx, d.attemptTimeout)
 	defer cancel()
@@ -303,12 +315,18 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 		// The code alone cannot tell a deleted webhook from a rejected
 		// payload; Discord names the cause in the body. Wrapping keeps the
 		// typed error in the chain (httpx.Do still classifies 502/503/504 as
-		// transient and still finds *RateLimitError for the 429 wait), post's
-		// logSafe scrubs the URL candidates from this text too, and Quote
-		// neutralizes control characters before it reaches a log line.
+		// transient and still finds *RateLimitError for the 429 wait). The
+		// excerpt is scrubbed HERE, not by post's logSafe: httpx.Do logs a
+		// transient attempt's error through the type-based LogSafeError only,
+		// which passes this wrapped error through unchanged, so a body that
+		// echoes the request path (a common proxy error page) would otherwise
+		// carry the credential into the retry and exhausted log lines. Scrub
+		// precedes Quote because Quote escapes a non-ASCII candidate byte out
+		// of reach of the match; Quote then neutralizes control characters
+		// before the text reaches a log line.
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		if len(detail) > 0 {
-			return struct{}{}, fmt.Errorf("%w: %s", statusErr, strconv.Quote(string(detail)))
+			return struct{}{}, fmt.Errorf("%w: %s", statusErr, strconv.Quote(d.scrubText(string(detail))))
 		}
 		return struct{}{}, statusErr
 	}

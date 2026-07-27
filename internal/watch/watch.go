@@ -466,8 +466,8 @@ func (w *Watcher) refreshFreshness() {
 // way out. Both queues die with the process: a pendingMissing record whose
 // outage already ended is that outage's only trace (the boot-armed clock
 // re-detects an ONGOING outage after the restart only if it outlasts one full
-// post-restart deadline, and never a closed one), and
-// a queued recovered transition is gone with the channel. This is the one
+// post-restart deadline, and never a closed one), and a queued recovered
+// transition is gone with the channel. This is the one
 // permanent-loss path no delivery counter can show — notifications_dropped_total
 // means "discarded by a full queue" (metrics.go, README) — so the log line is
 // the operator's only trace of it.
@@ -487,8 +487,11 @@ func (w *Watcher) logUndelivered() {
 		}
 		// Only a CLOSED record is a permanent loss. The one record that can
 		// still be open (openMissing: always the tail) is an outage that is
-		// STILL ongoing, and the boot-armed clock re-detects it after the
-		// restart, so its notice is delayed rather than lost.
+		// STILL ongoing: the boot-armed clock re-detects it after the restart
+		// only if it outlives one full post-restart deadline, so its notice is
+		// delayed rather than lost in that case and silently never sent if the
+		// beat returns inside that window. The per-beat Info line below names
+		// the beat so the operator can tell the two apart.
 		lost := n
 		if st.openMissing() != nil {
 			lost--

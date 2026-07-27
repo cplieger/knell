@@ -641,15 +641,16 @@ func TestLogUndeliveredClassifiesOnlyEndedRecordsAsPermanentLoss(t *testing.T) {
 	}
 }
 
-func TestLogUndeliveredStaysQuietForAnOngoingOutageOnly(t *testing.T) {
+func TestLogUndeliveredReportsAnOngoingOutageWithoutTheLossWarning(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default. The mixed-queue test cannot see this branch -- its beat has an
 	// ended record, so the WARN fires for it either way. Only a queue holding
-	// nothing but the open tail proves logUndelivered stays quiet about an
-	// outage the boot-armed clock re-detects after the restart; without this
-	// assertion, dropping the `p.lost == 0` guard pages the operator that
-	// "no notice will ever arrive" for an outage that will in fact be
-	// re-detected -- the exact false alarm the classification exists to avoid.
+	// nothing but the open tail pins both halves of the classification:
+	// dropping the `p.lost == 0` guard pages the operator that "no notice will
+	// ever arrive" for an outage that will in fact be re-detected (the false
+	// alarm the split exists to avoid), while dropping the Info line hides the
+	// beat whose notice arrives only if the outage outlives the post-restart
+	// deadline -- the one shutdown loss that is conditional rather than certain.
 	const id = "shutdown-ongoing-only-probe"
 	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 
@@ -669,6 +670,15 @@ func TestLogUndeliveredStaysQuietForAnOngoingOutageOnly(t *testing.T) {
 	}
 	if got := rec.CountLevel(slog.LevelWarn, "shutting down with undelivered ended-outage records"); got != 0 {
 		t.Errorf("ended-outage loss warnings = %d, want 0 for an ongoing outage: %v", got, rec.Messages())
+	}
+	if !rec.HasAttr("watch loop stopped", "ongoing_records", "1") {
+		t.Errorf("shutdown summary does not separate the ongoing record from the permanent losses: %v", rec.Records())
+	}
+	if got := rec.CountLevel(slog.LevelInfo, "shutting down with an ongoing outage"); got != 1 {
+		t.Errorf("ongoing-outage notices = %d, want exactly 1 (its notice is conditional, not silent): %v", got, rec.Messages())
+	}
+	if !rec.HasAttr("shutting down with an ongoing outage", "beat", id) {
+		t.Errorf("ongoing-outage notice does not name the beat: %v", rec.Records())
 	}
 }
 

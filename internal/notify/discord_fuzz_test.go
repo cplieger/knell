@@ -12,8 +12,8 @@ import (
 // FuzzLogSafeNeverLeaksWebhookRendering asserts the crown-jewel invariant of
 // this package over an unbounded URL space: no rendering of the configured
 // webhook URL survives logSafe, and logSafe never breaks the errors.Is chain
-// the sweep and httpx.Do classify through. The three renderings are derived
-// here independently (raw, url.String, EscapedPath) rather than read from
+// the sweep and httpx.Do classify through. The four renderings are derived
+// here independently (raw, url.String, Path, EscapedPath) rather than read from
 // redactionCandidates, so a candidate list that stops covering one of them
 // fails instead of silently narrowing the property with it.
 func FuzzLogSafeNeverLeaksWebhookRendering(f *testing.F) {
@@ -43,7 +43,7 @@ func FuzzLogSafeNeverLeaksWebhookRendering(f *testing.F) {
 
 		renderings := []string{rawURL}
 		if u, parseErr := url.Parse(rawURL); parseErr == nil {
-			renderings = append(renderings, u.String(), u.EscapedPath())
+			renderings = append(renderings, u.String(), u.Path, u.EscapedPath())
 		}
 		for _, rendering := range renderings {
 			// Skip a degenerate rendering: a handful of bytes can occur in
@@ -51,14 +51,26 @@ func FuzzLogSafeNeverLeaksWebhookRendering(f *testing.F) {
 			if len(rendering) < 8 {
 				continue
 			}
+			// Two error SHAPES, because logSafe has two halves and production
+			// takes the second one. A plain wrapError exercises the
+			// value-based backstop (scrub the candidates out of the text); a
+			// *url.Error exercises the type-based reduction
+			// httpx.LogSafeError performs, which is what postAttempt's
+			// transport path actually returns.
 			// Minimal scaffolding on purpose: the only other text is the
 			// wrapped error, so a match can only be the credential itself.
-			got := d.logSafe(fmt.Errorf("%s: %w", rendering, context.Canceled))
-			if strings.Contains(got.Error(), rendering) {
-				t.Errorf("logSafe kept webhook rendering %q in %q", rendering, got)
+			shapes := map[string]error{
+				"wrapped text": fmt.Errorf("%s: %w", rendering, context.Canceled),
+				"url error":    &url.Error{Op: "Post", URL: rendering, Err: context.Canceled},
 			}
-			if !errors.Is(got, context.Canceled) {
-				t.Errorf("logSafe(%q) broke the errors.Is chain: %v", rendering, got)
+			for shape, in := range shapes {
+				got := d.logSafe(in)
+				if strings.Contains(got.Error(), rendering) {
+					t.Errorf("logSafe(%s) kept webhook rendering %q in %q", shape, rendering, got)
+				}
+				if !errors.Is(got, context.Canceled) {
+					t.Errorf("logSafe(%s, %q) broke the errors.Is chain: %v", shape, rendering, got)
+				}
 			}
 		}
 	})

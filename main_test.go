@@ -70,6 +70,19 @@ func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
 			// pre-planted symlink and truncate its target as the test user.
 			f, plantErr := os.OpenFile(health.DefaultPath,
 				os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+			if errors.Is(plantErr, fs.ErrExist) {
+				// A marker left behind by an earlier test (or by a knell
+				// running on this host) must not silently disable this
+				// contract: drop it and retry with the same refusing flags,
+				// so a symlink planted in the window is still refused.
+				if info, lerr := os.Lstat(health.DefaultPath); lerr == nil && info.Mode().IsRegular() {
+					if rerr := os.Remove(health.DefaultPath); rerr != nil {
+						t.Skipf("cannot clear a stale marker at %s: %v", health.DefaultPath, rerr)
+					}
+					f, plantErr = os.OpenFile(health.DefaultPath,
+						os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+				}
+			}
 			if plantErr != nil {
 				t.Skipf("cannot plant a health marker at %s: %v", health.DefaultPath, plantErr)
 			}

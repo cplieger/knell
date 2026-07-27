@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"io/fs"
-	"log/slog"
 	"net"
 	"os"
 	"syscall"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cplieger/health"
+	"github.com/cplieger/slogx/capture"
 )
 
 // waitForMarker blocks until the health marker exists, or fails the test.
@@ -27,13 +27,16 @@ func waitForMarker(t *testing.T, present bool) {
 	t.Fatalf("marker %s presence never became %v", health.DefaultPath, present)
 }
 
-// TestRunArmsTheMarkerOnlyOnceBoundAndReturnsCleanlyOnSignal pins the boot and
+// TestRunArmsTheMarkerWhileServingAndReturnsCleanlyOnSignal pins the boot and
 // shutdown halves of the switch's lifecycle: the marker — the only thing the
-// baked `knell health` probe looks at — is armed after the listener is bound
-// (never before, so a boot that fails to bind is never reported healthy), and
-// a SIGTERM returns run() with a nil error so the container exits 0 instead of
-// looking like a crash.
-func TestRunArmsTheMarkerOnlyOnceBoundAndReturnsCleanlyOnSignal(t *testing.T) {
+// baked `knell health` probe looks at — becomes present once the listener is
+// serving (a dropped marker.Set(true) would leave the container unhealthy
+// forever while serving correctly), a SIGTERM returns run() with a nil error
+// so the container exits 0 instead of looking like a crash, and the marker is
+// gone afterwards. The ORDER of bind and arm is not observable from here: on a
+// failed bind the deferred marker.Cleanup removes the marker either way, so
+// this test cannot distinguish arm-before-bind from arm-after-bind.
+func TestRunArmsTheMarkerWhileServingAndReturnsCleanlyOnSignal(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal, and the shared health-marker path.
 	free, err := net.Listen("tcp", "127.0.0.1:0")
@@ -51,8 +54,9 @@ func TestRunArmsTheMarkerOnlyOnceBoundAndReturnsCleanlyOnSignal(t *testing.T) {
 	unsetEnv(t, "BEAT_TOKEN")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 	t.Setenv("LISTEN_ADDR", addr)
-	original := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(original) })
+	// Installs a fresh recorder and restores the previous default at test
+	// end; run() replaces the default with its own handler.
+	capture.Default(t)
 	t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
 
 	done := make(chan error, 1)
