@@ -1030,6 +1030,97 @@ func TestFailedHistoryDeliveryKeepsRecordsAndRetries(t *testing.T) {
 	}
 }
 
+// queueOutageNoSweepEverSaw drives one full deadline of silence ended by a late
+// ping, the only producer of a LateEndedBeforeDetection record, and asserts the
+// beat is left holding exactly that. It is the precondition of the two tests
+// below: both are about what happens to that reason afterwards, so a change
+// that stopped producing it would otherwise make them pass vacuously.
+func queueOutageNoSweepEverSaw(t *testing.T, w *Watcher, clock *fakeClock, id string) {
+	t.Helper()
+	clock.Advance(11 * time.Minute)
+	if !w.Beat(id) {
+		t.Fatalf("late Beat(%s) = false", id)
+	}
+	queued := w.beats[id].pendingMissing
+	if len(queued) != 1 {
+		t.Fatalf("queued records = %d, want the one closed record the late ping recorded", len(queued))
+	}
+	if got := queued[0].late; got != LateEndedBeforeDetection {
+		t.Fatalf("queued late reason = %s, want %s: nothing here can vouch for delivery any more",
+			reasonName(got), reasonName(LateEndedBeforeDetection))
+	}
+}
+
+func TestFailedHistorySendMakesTheRetriedNoticeBlameDelivery(t *testing.T) {
+	t.Parallel()
+
+	// A record that no sweep ever saw starts out able to say "nothing was
+	// wrong with delivery" (LateEndedBeforeDetection). Then its own history
+	// notice fails to send and stays queued for the next sweep, which makes
+	// that statement false in the opposite direction: the notice an operator
+	// finally reads was refused once by the very webhook it vouches for.
+	// notify renders the reason verbatim
+	// (TestBeatOutageHistoryStatesTheTrueReasonForALateNotice), so the state
+	// machine is the only place that can keep the claim honest.
+	const id = "history-late-reason-probe"
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+	queueOutageNoSweepEverSaw(t, w, clock, id)
+
+	n.setFail(errors.New("discord down"))
+	w.sweep(context.Background())
+	if calls := n.snapshot(); len(calls) != 0 {
+		t.Fatalf("failed history send recorded calls: %v", calls)
+	}
+	if got := len(w.beats[id].pendingMissing); got != 1 {
+		t.Fatalf("queued records = %d after the failed history send, want the record retained for the retry", got)
+	}
+
+	n.setFail(nil)
+	w.sweep(context.Background())
+	got := n.snapshot()
+	if len(got) != 1 || got[0] != (call{kind: "history", id: id, outages: 1}) {
+		t.Fatalf("calls = %v, want the retried history notice covering the one ended outage", got)
+	}
+	outages := onlyHistory(t, n)
+	// The outage itself is unchanged by the retry: only the REASON moves.
+	checkSpans(t, outages, 11*time.Minute)
+	if got := outages[0].LateReason; got != LateUndelivered {
+		t.Errorf(`late reason on the retried notice = %s, want %s: %s renders as "nothing was wrong with delivery", which is false in a notice this webhook already refused once - the operator is told to look nowhere while delivery is what failed`,
+			reasonName(got), reasonName(LateUndelivered), reasonName(got))
+	}
+}
+
+func TestCanceledHistorySendKeepsTheLateReasonItWasRecordedWith(t *testing.T) {
+	t.Parallel()
+
+	// The twin of the test above, and the reason the upgrade sits behind the
+	// context.Canceled arm rather than in front of it: a shutdown abandons the
+	// send, it does not fail it. Nothing was refused, so the record handed to
+	// the next process run must still report the truth it was recorded with,
+	// or every restart with queued history rewrites its own history into a
+	// webhook incident that never happened.
+	const id = "history-cancel-reason-probe"
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+	queueOutageNoSweepEverSaw(t, w, clock, id)
+
+	n.setFail(context.Canceled)
+	w.sweep(context.Background())
+	if calls := n.snapshot(); len(calls) != 0 {
+		t.Fatalf("abandoned history send recorded calls: %v", calls)
+	}
+
+	n.setFail(nil)
+	w.sweep(context.Background())
+	outages := onlyHistory(t, n)
+	checkSpans(t, outages, 11*time.Minute)
+	if got := outages[0].LateReason; got != LateEndedBeforeDetection {
+		t.Errorf("late reason after a shutdown-abandoned send = %s, want %s: a cancelled send is not a delivery failure and must not rewrite what the record says",
+			reasonName(got), reasonName(LateEndedBeforeDetection))
+	}
+}
+
 func TestPendingMissingQueueOverflowIsAccountedNotSilent(t *testing.T) {
 	// Serial (no t.Parallel): it asserts deltas on the package-global
 	// notification counters, which the parallel tests also move.

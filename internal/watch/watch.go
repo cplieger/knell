@@ -62,12 +62,15 @@ type Notifier interface {
 type LateReason uint8
 
 const (
-	// LateUndelivered means a sweep detected the outage while it was still
-	// open, so a live missing notice WAS due for it, and that notice had not
-	// been delivered when the ping ended the outage. Every way that happens is
-	// a delivery that did not complete in time — the send failed, the beat was
-	// held behind an earlier recovery, or sweepSendBudget deferred it to a
-	// later sweep — so the notice points the operator at the webhook.
+	// LateUndelivered means the notice is late because delivery was behind.
+	// Either a sweep detected the outage while it was still open, so a live
+	// missing notice WAS due for it and had not been delivered when the ping
+	// ended the outage (the send failed, the beat was held behind an earlier
+	// recovery, or sweepSendBudget deferred it to a later sweep), or the
+	// past-tense notice reporting it failed to send and is being retried
+	// (sendHistory upgrades the records it left queued). Every one of those is
+	// a delivery that did not complete in time, so the notice points the
+	// operator at the webhook.
 	//
 	// It is the zero value deliberately: a future producer that queues a
 	// record without naming a reason then points at delivery instead of
@@ -79,6 +82,12 @@ const (
 	// (DefaultTick), so no live notice was ever due and delivery was never
 	// involved. Reporting it as a delivery problem would send an operator
 	// hunting through a webhook that was working.
+	//
+	// It is the one reason a record can LOSE: the statement holds only while
+	// nothing about the outage has failed to send, so the first failed history
+	// send upgrades it to LateUndelivered (sendHistory). A reason only ever
+	// moves in that direction — toward blaming delivery — because a notice
+	// that vouches for delivery must be able to defend the claim.
 	LateEndedBeforeDetection
 )
 
@@ -272,6 +281,24 @@ func (st *beatState) popMissing() overdueBeat {
 // exceed the queue length; the clamp keeps a future caller in range.
 func (st *beatState) dropMissing(n int) {
 	st.pendingMissing = st.pendingMissing[min(n, len(st.pendingMissing)):]
+}
+
+// blameDelivery sets the late reason of the first n queued records to
+// LateUndelivered: the run whose own past-tense notice just failed to send and
+// stays queued for the next sweep. Once that has happened the records ARE late
+// because of delivery, whatever held them back before, so the retried notice
+// can say so — a record still claiming LateEndedBeforeDetection would tell the
+// operator "nothing was wrong with delivery" in a message delivery had just
+// refused once.
+//
+// The write only ever goes toward blaming delivery, never back: that is the
+// direction the zero value already points (see LateUndelivered), so the reason
+// can only get safer, and a record whose reason is already LateUndelivered is
+// unchanged. The same clamp as dropMissing keeps a future caller in range.
+func (st *beatState) blameDelivery(n int) {
+	for i := range st.pendingMissing[:min(n, len(st.pendingMissing))] {
+		st.pendingMissing[i].late = LateUndelivered
+	}
 }
 
 // closedRun returns the already-ended outages queued in an unbroken run at
@@ -832,6 +859,13 @@ func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 // outages are over, so no recovered notification follows for them; the
 // counters therefore move once for the message while metrics.RecordOutage
 // already moved once per outage at detection.
+//
+// A real failure also rewrites the late reason of the records it left queued
+// (markHistoryUndelivered): they are now late because this notice's own
+// delivery failed, so the retry must not still claim nothing was wrong with
+// delivery. Cancellation is exempt from that as well as from the counter — a
+// shutdown is not a delivery failure, and the records are handed to the next
+// process run unchanged.
 func (w *Watcher) sendHistory(ctx context.Context, past beatOutages) bool {
 	if err := w.notifier.BeatOutageHistory(ctx, past.id, past.outages); err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -839,6 +873,7 @@ func (w *Watcher) sendHistory(ctx context.Context, past beatOutages) bool {
 			return true
 		}
 		metrics.RecordNotificationFailed(metrics.KindHistory)
+		w.markHistoryUndelivered(past.id, len(past.outages))
 		slog.Error("outage history notification failed, will retry next sweep",
 			"beat", past.id, "outages", len(past.outages), "error", err)
 		return false
@@ -859,6 +894,19 @@ func (w *Watcher) dropDelivered(id string, n int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.beats[id].dropMissing(n)
+}
+
+// markHistoryUndelivered blames delivery for the n head records a FAILED
+// history notice left queued, so the retry reports the true reason it is late
+// (see beatState.blameDelivery). The n records it rewrites are exactly the ones
+// the failed notice covered, by the same reasoning dropDelivered relies on:
+// only the sender pops, and a concurrent ping appends at the tail or seals the
+// open tail, so the head run cannot shift under it. A record queued after the
+// failed send keeps its own reason — this notice never tried to deliver it.
+func (w *Watcher) markHistoryUndelivered(id string, n int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.beats[id].blameDelivery(n)
 }
 
 // markDelivered records the outcome of a delivered missing send for id,

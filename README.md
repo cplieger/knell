@@ -97,6 +97,8 @@ A live incident and one that is already over are reported differently: nothing a
 
   > 🕓 [knell server-1] beat **cron-backup** was missing for 12m0s, recovered at 2026-07-23 14:07 UTC. This notice is late only because the outage ended before a sweep detected it - nothing was wrong with delivery.
 
+  That second wording is only used while nothing about the outage has failed to send. If the past-tense notice itself fails and is retried, the outage is late because of delivery after all, so the notice that eventually arrives carries the webhook wording instead — it never vouches for a webhook that just refused it.
+
   Several become one summary. When the batch mixes the two reasons, it reports both counts rather than blaming one for all of them:
 
   > 🕓 [knell server-1] beat **cron-backup** had 3 outages: longest 47m0s, last recovered at 2026-07-23 14:07 UTC. 2 had an undelivered alert (check the webhook), 1 ended before a sweep detected it.

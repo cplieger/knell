@@ -9,10 +9,40 @@
 // functions). Callers therefore cannot register, rename or delete a series,
 // nor write a raw label position, which is what keeps the metric names, label
 // sets and cold-start zero samples the quorum and delivery alerts read in one
-// place. Label CARDINALITY is not structurally contained: InitBeat mints a
-// per-beat series for whatever id it is handed, so keeping the beat label
-// bounded stays the caller's contract (watch.New passes only configured ids;
-// unknown ids answer 404 in webapi and never reach here).
+// place.
+//
+// # Label-cardinality contract (read this before adding a caller)
+//
+// Label CARDINALITY is not structurally contained, and cannot be: Prometheus
+// creates the labelled child on first use, so InitBeat, RecordBeat,
+// SetBeatFresh and RecordOutage mint a per-beat series for whatever id they
+// are handed and this package has nothing to reject it with. A series, once
+// minted, is permanent for the process lifetime — in knell and in every
+// observer scraping it.
+//
+// Keeping the beat label bounded is therefore the CALLER's contract, enforced
+// by exactly three things upstream of here:
+//
+//   - internal/config validates every id against
+//     [A-Za-z0-9][A-Za-z0-9_-]{0,63} and caps a fleet at 64 beats;
+//   - internal/watch passes only ids from that configured set (New's beat map
+//     is the whole domain of every call it makes);
+//   - internal/webapi answers 404 for an unknown id, so an arbitrary request
+//     path never reaches watch.Beat at all.
+//
+// The only packages that may call the four id-taking functions are
+// internal/watch (production) and internal/webapi's own tests (fixed literal
+// ids). If you are adding a call from anywhere else, you have just inherited
+// that contract: pass only an id internal/config validated and capped, or
+// route through internal/watch, or validate the id yourself before the call.
+// A raw id from a request path, a filename, a log line or a remote payload
+// makes Mimir's label set grow without bound, and the growth is not
+// recoverable by fixing the caller afterwards.
+//
+// Runtime enforcement inside this package is deliberately NOT the answer: it
+// would add state plus an init-order dependency on config to defend against a
+// caller that does not exist. This comment is the guard instead — a reviewer's
+// (or an agent's) tripwire, not the compiler's.
 package metrics
 
 import (
@@ -195,7 +225,8 @@ func Handler() http.Handler {
 // deadline counts from), and its per-beat counters are pre-minted at zero for
 // the same reason mintNotificationKinds pre-mints the notification counters —
 // increase() needs an earlier sample to diff against. Only configured ids
-// reach here, which is what keeps the beat label bounded.
+// reach here, which is what keeps the beat label bounded (see the package
+// doc's label-cardinality contract).
 func InitBeat(id string, start time.Time) {
 	beatFresh.Set(1, id)
 	beatLastSeen.Set(float64(start.Unix()), id)
@@ -206,7 +237,8 @@ func InitBeat(id string, start time.Time) {
 // RecordBeat records an accepted ping for id observed at now: the ping is
 // counted and the beat is published fresh with its new last-seen timestamp.
 // The caller publishes under its own lock so concurrent pings cannot write
-// the gauges out of state order.
+// the gauges out of state order. id is a label: see the package doc's
+// label-cardinality contract.
 func RecordBeat(id string, now time.Time) {
 	beatsReceived.Inc(id)
 	beatFresh.Set(1, id)
@@ -216,7 +248,8 @@ func RecordBeat(id string, now time.Time) {
 // SetBeatFresh publishes the quorum gauge for id: fresh when the last ping is
 // within the beat's deadline, overdue otherwise. The freshness boundary
 // itself belongs to the watch state machine; this is only the exposition of
-// its verdict.
+// its verdict. id is a label: see the package doc's label-cardinality
+// contract.
 func SetBeatFresh(id string, fresh bool) {
 	if fresh {
 		beatFresh.Set(1, id)
@@ -227,7 +260,8 @@ func SetBeatFresh(id string, fresh bool) {
 
 // RecordOutage counts one detected outage for id, at detection time and
 // independent of whether its notice is ever delivered. It is the only
-// counter that counts OUTAGES rather than messages.
+// counter that counts OUTAGES rather than messages. id is a label: see the
+// package doc's label-cardinality contract.
 func RecordOutage(id string) {
 	beatOutages.Inc(id)
 }
