@@ -6,10 +6,13 @@
 // The registry and the collectors are unexported: the package's edge is
 // Handler plus the knell-semantic recording functions below (InitBeat,
 // RecordBeat, SetBeatFresh, RecordOutage and the three RecordNotification*
-// functions). Callers therefore cannot mint or delete series, write a raw
-// label position, or change the exposition contract from outside this file,
-// which is what keeps the metric names, label sets and cold-start zero
-// samples the quorum and delivery alerts read in one place.
+// functions). Callers therefore cannot register, rename or delete a series,
+// nor write a raw label position, which is what keeps the metric names, label
+// sets and cold-start zero samples the quorum and delivery alerts read in one
+// place. Label CARDINALITY is not structurally contained: InitBeat mints a
+// per-beat series for whatever id it is handed, so keeping the beat label
+// bounded stays the caller's contract (watch.New passes only configured ids;
+// unknown ids answer 404 in webapi and never reach here).
 package metrics
 
 import (
@@ -30,7 +33,7 @@ const (
 // Notification kinds are the legal values of kindLabel on the sent, failed
 // and dropped notification counters; dashboards and the KnellNotifyFailing
 // alert key on them. They count MESSAGES, so KindHistory moves by one for a
-// notice covering any number of ended outages; BeatOutages counts outages.
+// notice covering any number of ended outages; beatOutages counts outages.
 const (
 	KindMissing   = "missing"
 	KindRecovered = "recovered"

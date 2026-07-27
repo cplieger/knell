@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cplieger/httpx/v4"
@@ -103,8 +104,13 @@ func New(webhookURL, node string) *Discord {
 // req.URL.String(), which net/url canonicalizes — non-ASCII path bytes come
 // back percent-escaped — so the canonical form can carry the credential
 // without containing the configured string. The bare path forms cover an
-// error that quotes only the path. Duplicates, the empty path and a bare "/"
-// are dropped ("/" appears in nearly every message and redacting it would
+// error that quotes only the path, and the fragment forms below them cover a
+// remote body that echoes only the credential-bearing tail (see
+// credentialForms). Candidates are ordered longest-first, because redaction is
+// plain replacement: a complete rendering is removed before the shorter forms
+// nested inside it are looked for, so a fragment candidate only ever fires on
+// text that carried that fragment alone. Duplicates, the empty path and a bare
+// "/" are dropped ("/" appears in nearly every message and redacting it would
 // mangle unrelated text without hiding a secret). An unparseable URL yields
 // the raw value alone, which is exactly the text such an error embeds.
 func redactionCandidates(webhookURL string) []string {
@@ -113,13 +119,52 @@ func redactionCandidates(webhookURL string) []string {
 	if parseErr != nil {
 		return candidates
 	}
-	for _, c := range []string{u.String(), u.Path, u.EscapedPath()} {
+	forms := []string{u.String(), u.Path, u.EscapedPath()}
+	for _, p := range []string{u.Path, u.EscapedPath()} {
+		for _, fragment := range credentialForms(p) {
+			if len(fragment) < minCredentialCandidate {
+				continue
+			}
+			forms = append(forms, fragment)
+		}
+	}
+	for _, c := range forms {
 		if c == "" || c == "/" || slices.Contains(candidates, c) {
 			continue
 		}
 		candidates = append(candidates, c)
 	}
 	return candidates
+}
+
+// webhookPathPrefix is the fixed part of a Discord webhook path; everything
+// after it is the credential.
+const webhookPathPrefix = "/api/webhooks/"
+
+// minCredentialCandidate is the shortest fragment worth redacting. A handful
+// of bytes cannot be a usable webhook credential (a real path carries a long
+// channel id and token), while replacing such a fragment would mangle every
+// unrelated log line containing it — the same reason a bare "/" is rejected.
+const minCredentialCandidate = 8
+
+// credentialForms lists the credential-bearing fragments of a webhook path
+// that an error can carry WITHOUT the surrounding URL or the leading slash, in
+// descending length: the path minus its leading slash, the suffix after the
+// fixed /api/webhooks/ prefix (when present), and the final token segment. A
+// proxy or webhook edge commonly reports only one of these (a body reading
+// "upstream failed for <id>/<token>" is the whole credential), and an exact
+// value-based redaction that knows only the complete renderings passes such
+// text through untouched — into httpx.Do's per-attempt and exhaustion log
+// lines and into the returned delivery error.
+func credentialForms(p string) []string {
+	forms := []string{strings.TrimPrefix(p, "/")}
+	if suffix, ok := strings.CutPrefix(p, webhookPathPrefix); ok {
+		forms = append(forms, suffix)
+	}
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		forms = append(forms, p[i+1:])
+	}
+	return forms
 }
 
 // Close releases idle connections. Call once on shutdown.
@@ -185,8 +230,9 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 // post delivers one message, retrying transient failures. The webhook URL
 // never appears in returned errors or logs: transport errors are reduced by
 // logSafe, and a status failure is httpx.CheckHTTPStatus's error (the status
-// code only) plus a bounded prefix of the remote body, which postAttempt
-// scrubs against the same candidates before wrapping it.
+// code only) plus the remote body when it arrived whole and fits the size
+// cap, which postAttempt scrubs against the same candidates before wrapping
+// it (an oversized or partially read body is dropped, never truncated).
 func (d *Discord) post(ctx context.Context, label, content string) error {
 	body, err := json.Marshal(map[string]string{"content": content})
 	if err != nil {
@@ -282,9 +328,10 @@ func (attemptTimeoutError) IsTransient() bool { return true }
 // per-attempt deadline, request construction, transport call, response
 // cleanup, and strict delivery validation. It is the retry callback post
 // hands to httpx.Do, which owns the retry policy and terminal wrapping.
-// Every error it returns is URL-free — including the remote body prefix on a
+// Every error it returns is URL-free — including the remote body detail on a
 // status failure, which is scrubbed here rather than by post's logSafe,
-// because httpx.Do logs the attempt error before post sees it.
+// because httpx.Do logs the attempt error before post sees it. That detail
+// is only ever a COMPLETE body under the cap; a truncated one is dropped.
 func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error) {
 	attemptCtx, cancel := httpx.ContextWithDefaultTimeout(ctx, d.attemptTimeout)
 	defer cancel()

@@ -499,12 +499,71 @@ func TestPartiallyReadStatusBodyIsDropped(t *testing.T) {
 	if err == nil {
 		t.Fatal("BeatMissing against a truncated 503 response = nil, want error")
 	}
+	if buf.Len() == 0 {
+		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
+	}
+	// The absence assertions below only mean something if the STATUS branch
+	// ran and dropped its detail. A setup that failed earlier (a transport
+	// error before the headers are read) would satisfy them with no body text
+	// in play at all, so pin the error to the bare status failure.
+	if !strings.Contains(err.Error(), "HTTP 503") {
+		t.Fatalf("err = %v, want the bare HTTP 503 status error (the partially read body must be dropped, not the request failed)", err)
+	}
 	for _, leak := range []string{secret, "/api/webhook", "upstream failed"} {
 		if got := buf.String(); strings.Contains(got, leak) {
 			t.Errorf("logs carry %q from a partially read body: %s", leak, got)
 		}
 		if strings.Contains(err.Error(), leak) {
 			t.Errorf("delivery error carries %q from a partially read body: %v", leak, err)
+		}
+	}
+}
+
+func TestStatusBodyCarryingOnlyTheCredentialSuffixIsRedacted(t *testing.T) {
+	// Deliberately NOT t.Parallel: slog.Default() is process-global.
+	//
+	// The leak class the complete-rendering candidates miss: a proxy or webhook
+	// edge that reports only the credential-bearing TAIL of the request path,
+	// with no scheme, host or leading slash around it. Such a body is short
+	// enough to arrive whole under the size cap, so neither drop guard applies
+	// and only the fragment candidates (credentialForms) can remove it. Before
+	// they existed the suffix passed the scrub untouched, into httpx.Do's retry
+	// and exhaustion lines and into the returned delivery error.
+	const secret = "verysecretbodytoken"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("upstream failed for " + strings.TrimPrefix(r.URL.Path, "/api/webhooks/")))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
+	t.Cleanup(d.Close)
+
+	err := d.BeatMissing(context.Background(), "api", time.Hour)
+	if err == nil {
+		t.Fatal("BeatMissing against a persistent 503 = nil, want error")
+	}
+	if buf.Len() == 0 {
+		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
+	}
+	// The body arrived whole and under the cap, so the detail IS attached;
+	// asserting that pins the branch under test (a dropped body would satisfy
+	// the absence assertions below without exercising the scrub at all).
+	if !strings.Contains(err.Error(), "upstream failed for") {
+		t.Fatalf("err = %v, want the attached body detail (the suffix scrub is what must remove the credential, not a drop)", err)
+	}
+	for _, leak := range []string{secret, "1234567890/" + secret} {
+		if got := buf.String(); strings.Contains(got, leak) {
+			t.Errorf("retry/exhausted logs leak %q from a suffix-only body: %s", leak, got)
+		}
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("delivery error leaks %q from a suffix-only body: %v", leak, err)
 		}
 	}
 }
