@@ -169,7 +169,7 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 
 	t.Setenv("BEATS", "api:20m")
 	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/api/webhooks/1234567890/verysecrettoken")
-	t.Setenv("BEAT_TOKEN", "")
+	unsetEnv(t, "BEAT_TOKEN")
 	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 	t.Setenv("LISTEN_ADDR", occupied.Addr().String())

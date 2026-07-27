@@ -192,10 +192,11 @@ func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
 }
 
 // loadBeatToken reads the optional BEAT_TOKEN bearer gate for
-// POST/GET /beat/{id}; an empty return disables the check. BEAT_TOKEN_FILE
-// points at a mounted secret file instead (the same convention
-// DISCORD_WEBHOOK_URL uses), keeping the credential out of `docker inspect`
-// output.
+// POST/GET /beat/{id}; an empty return disables the check. Optional means
+// ABSENT, not blank: a present-but-empty BEAT_TOKEN fails startup, like an
+// empty BEAT_TOKEN_FILE. BEAT_TOKEN_FILE points at a mounted secret file
+// instead (the same convention DISCORD_WEBHOOK_URL uses), keeping the
+// credential out of `docker inspect` output.
 func loadBeatToken() (string, error) {
 	if err := rejectBlankFileVar("BEAT_TOKEN"); err != nil {
 		return "", err
@@ -225,13 +226,16 @@ func loadBeatToken() (string, error) {
 		// open-endpoint case, so the empty token stands and webapi's gate
 		// never arms. A PRESENT-but-empty BEAT_TOKEN lands here too (envx
 		// Require cannot tell it from unset) and that is exactly the shape
-		// compose interpolation of an unset variable produces — the accident
-		// rejectBlankFileVar already refuses on the _FILE channel. Acceptance
-		// is deliberately unchanged (the endpoint stays open); the WARN is
-		// what separates the accident from a deliberately open endpoint,
-		// which the INFO beat_auth=open line cannot.
+		// compose interpolation of an undefined variable produces — so it is
+		// REFUSED rather than read as consent to an open endpoint, matching
+		// rejectBlankFileVar on the _FILE channel, whose own consequence is
+		// the same unauthenticated /beat/{id}. Only an ABSENT variable means
+		// "serve it open"; an operator who typed the name is asking for the
+		// gate, and a startup failure is the one signal an accident cannot
+		// be mistaken for intent (the INFO beat_auth=open line looks
+		// identical either way).
 		if v, ok := os.LookupEnv("BEAT_TOKEN"); ok && v == "" {
-			slog.Warn("BEAT_TOKEN is set but empty, so /beat/{id} is served ungated; unset the variable if an open endpoint is intended, or set a long random token")
+			return "", errors.New("BEAT_TOKEN is set but empty: unset the variable entirely to serve /beat/{id} open on purpose, or set it to a long random token")
 		}
 		token = ""
 	default:

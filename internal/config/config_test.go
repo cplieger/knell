@@ -674,24 +674,17 @@ func TestLoadRejectsWhitespaceOnlyWebhook(t *testing.T) {
 	}
 }
 
-func TestLoadWarnsWhenBeatTokenIsPresentButEmpty(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
+func TestLoadRejectsAPresentButEmptyBeatToken(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 
-	rec := capture.Default(t)
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() with a present-but-empty BEAT_TOKEN = nil, want error; envx.Require cannot tell it from unset, and it is exactly what compose interpolation of an undefined variable produces, so accepting it would serve /beat/{id} unauthenticated by accident")
 	}
-	if cfg.BeatToken != "" {
-		t.Errorf("BeatToken = %q, want empty: envx.Require cannot tell a present-but-empty BEAT_TOKEN from an unset one", cfg.BeatToken)
-	}
-	if !rec.Contains("BEAT_TOKEN is set but empty") {
-		t.Errorf("log output %v missing the warning that /beat/{id} is served ungated, the only signal that separates the compose-interpolation accident from a deliberately open endpoint", rec.Messages())
+	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
+		t.Errorf("error = %q, want BEAT_TOKEN context: the operator has to know which variable to unset or fill in", err)
 	}
 }
 
