@@ -174,10 +174,10 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 // nobody spends an evening on a webhook that posted this very message on its
 // first try.
 func lateClause(reason watch.LateReason) string {
-	if reason == watch.LateUndelivered {
-		return "This notice is late: its alert was still undelivered when the beat returned - check the webhook."
+	if reason == watch.LateEndedBeforeDetection {
+		return "This notice is late only because the outage ended before a sweep detected it - nothing was wrong with delivery."
 	}
-	return "This notice is late only because the outage ended before a sweep detected it - nothing was wrong with delivery."
+	return "This notice is late: its alert was still undelivered when the beat returned - check the webhook."
 }
 
 // batchLateClause explains why a whole run of ended outages is reported after
@@ -189,20 +189,20 @@ func lateClause(reason watch.LateReason) string {
 // reason enough to look at delivery, while naming the outages that ended before
 // a sweep saw them stops the count from reading as that many webhook failures.
 func batchLateClause(outages []watch.Outage) string {
-	undelivered := 0
+	ended := 0
 	for _, o := range outages {
-		if o.LateReason == watch.LateUndelivered {
-			undelivered++
+		if o.LateReason == watch.LateEndedBeforeDetection {
+			ended++
 		}
 	}
-	switch undelivered {
+	switch ended {
 	case len(outages):
-		return "Their alerts were still undelivered when it returned - check the webhook."
-	case 0:
 		return "Each ended before a sweep detected it - nothing was wrong with delivery."
+	case 0:
+		return "Their alerts were still undelivered when it returned - check the webhook."
 	default:
 		return fmt.Sprintf("%d had an undelivered alert (check the webhook), %d ended before a sweep detected it.",
-			undelivered, len(outages)-undelivered)
+			len(outages)-ended, ended)
 	}
 }
 
@@ -253,14 +253,14 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 // rather than to nil (v4.2.0 fixed that at the source), so a real failure can
 // never be reduced to a success signal here — nil in, nil out, and non-nil in,
 // non-nil out.
+//
 // There is deliberately no string search-and-replace backstop: text-matching
 // redaction can only defend text knell chose to publish, and this package
 // publishes none (see post for that invariant).
 //
-// Stripping the wrapper leaves the CAUSE's text, which for two of net/http's
-// redirect causes is written from a response header, so postAttempt's
-// transport path does not return this error as-is: safeTransportError adds the
-// classification step that keeps remote text out of the message. This function
+// Stripping the wrapper leaves the CAUSE's text, which is why the transport
+// path must NOT return this error as-is; safeTransportError, immediately
+// below, names those causes and adds the classification step. This function
 // is the reduction those callers share.
 //
 // The reduced error is returned as-is rather than re-wrapped, which keeps
@@ -304,8 +304,17 @@ func safeTransportError(err error) error {
 	// logSafe. The loop terminates: each pass either strips a url.Error or
 	// (for one with a nil Err) substitutes httpx's contentless stand-in, which
 	// is not a url.Error.
+	// maxURLErrorDepth bounds the reduction. Real chains are one or two
+	// levels deep (net/http wraps at most a redirect error inside a
+	// transport error), and httpx.LogSafeError reduces strictly, so the
+	// cap is never reached. It is here because the loop's termination
+	// would otherwise rest entirely on the library's behavior: a value
+	// that reduces to itself would spin this bare loop forever inside the
+	// delivery attempt, which no context can interrupt, and knell's only
+	// sender goroutine would stop notifying with /healthz still green.
+	const maxURLErrorDepth = 8
 	cause := logSafe(err)
-	for {
+	for range maxURLErrorDepth {
 		var nested *url.Error
 		if !errors.As(cause, &nested) {
 			break

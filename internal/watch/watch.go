@@ -382,7 +382,7 @@ func (st *beatState) closedRun() []Outage {
 //
 // rec travels by pointer through this trio only to avoid copying the record at
 // every hop (gocritic hugeParam); nothing here retains the pointer.
-func queueDetectedOutage(st *beatState, rec *overdueBeat) bool {
+func (st *beatState) queueDetectedOutage(rec *overdueBeat) bool {
 	if !st.overflowAccounted {
 		metrics.RecordOutage(rec.id)
 	}
@@ -400,8 +400,8 @@ func queueDetectedOutage(st *beatState, rec *overdueBeat) bool {
 // closed record, and the same ping re-arms the beat), so gating it would hide
 // the loss in exactly the sequence that produces it. Contrast
 // recordOngoingOutage. Callers hold w.mu.
-func recordEndedOutage(st *beatState, rec *overdueBeat) {
-	if queueDetectedOutage(st, rec) {
+func (st *beatState) recordEndedOutage(rec *overdueBeat) {
+	if st.queueDetectedOutage(rec) {
 		return
 	}
 	metrics.RecordNotificationDropped(metrics.KindMissing)
@@ -417,8 +417,8 @@ func recordEndedOutage(st *beatState, rec *overdueBeat) {
 // moves, and the back-pressure is logged at DEBUG once per affected outage via
 // overflowAccounted rather than once per tick. Contrast recordEndedOutage.
 // Callers hold w.mu.
-func recordOngoingOutage(st *beatState, rec *overdueBeat) {
-	if queueDetectedOutage(st, rec) {
+func (st *beatState) recordOngoingOutage(rec *overdueBeat) {
+	if st.queueDetectedOutage(rec) {
 		return
 	}
 	if st.overflowAccounted {
@@ -445,7 +445,7 @@ func recordOngoingOutage(st *beatState, rec *overdueBeat) {
 // notice is late because delivery was not keeping up, so it reports
 // LateUndelivered — calling it undetected would vouch for a webhook that is
 // demonstrably behind. Callers hold w.mu.
-func lateReasonForUnqueuedOutage(st *beatState) LateReason {
+func (st *beatState) lateReasonForUnqueuedOutage() LateReason {
 	if st.overflowAccounted {
 		return LateUndelivered
 	}
@@ -516,8 +516,8 @@ func (w *Watcher) Beat(id string) bool {
 	// A late ping ends an outage. When the sweep already recorded that
 	// outage, seal the record it has not delivered yet; when the crossing
 	// is one no sweep has seen at all, record the whole closed outage so
-	// this ping cannot erase it. Recording no longer depends on the queue
-	// being empty, so an outage that both begins AND ends while an earlier
+	// this ping cannot erase it. Recording is independent of the queue's
+	// contents, so an outage that both begins AND ends while an earlier
 	// notice is undelivered still reaches Discord instead of vanishing.
 	//
 	// The two arms are the two reasons a history notice is late, and they are
@@ -529,11 +529,11 @@ func (w *Watcher) Beat(id string) bool {
 	if open := st.openMissing(); open != nil {
 		open.recoveredAt = now
 	} else if !wasAlerted && overdue(silence.DownFor(), st.deadline) {
-		recordEndedOutage(st, &overdueBeat{
+		st.recordEndedOutage(&overdueBeat{
 			id:          id,
 			silence:     silence,
 			recoveredAt: now,
-			late:        lateReasonForUnqueuedOutage(st),
+			late:        st.lateReasonForUnqueuedOutage(),
 		})
 	}
 	// This ping ends the beat's outage, so a later queue-full overflow
@@ -837,7 +837,7 @@ func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
 		// delivered — so the reason is LateUndelivered for every one of them,
 		// stated here rather than left to the zero value.
 		if !fresh && !st.alerted && st.openMissing() == nil {
-			recordOngoingOutage(st, &overdueBeat{
+			st.recordOngoingOutage(&overdueBeat{
 				id: id, silence: silence, late: LateUndelivered,
 			})
 		}

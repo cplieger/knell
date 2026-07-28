@@ -1,8 +1,10 @@
 package metrics
 
 import (
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -51,14 +53,22 @@ func TestMintNotificationKindsPremintsEveryCounterAndKind(t *testing.T) {
 
 func assertNotificationSeries(t *testing.T, want []string, when string) {
 	t.Helper()
-	rec := httptest.NewRecorder()
-	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	exposition := rec.Body.String()
+	body := exposition(t)
 	for _, line := range want {
-		if !strings.Contains(exposition, line+"\n") {
+		if !strings.Contains(body, line+"\n") {
 			t.Errorf("/metrics %s is missing the cold-start series %q", when, line)
 		}
 	}
+}
+
+// exposition scrapes /metrics once and returns the rendered body. Every
+// assertion in this file reads the real handler output rather than a collector,
+// because what the alerts consume is the exposition text.
+func exposition(t *testing.T) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	return rec.Body.String()
 }
 
 // TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat pins the per-beat
@@ -106,17 +116,12 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 	}
 }
 
+// beatSeriesValue returns the rendered value of name{beat=id}. It is
+// rawSeriesValue with the beat-label prefix spelled for it, so the two cannot
+// drift apart on how a series is located in the exposition.
 func beatSeriesValue(t *testing.T, name, id string) (string, bool) {
 	t.Helper()
-	rec := httptest.NewRecorder()
-	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	prefix := name + `{beat="` + id + `"} `
-	for line := range strings.Lines(rec.Body.String()) {
-		if v, ok := strings.CutPrefix(line, prefix); ok {
-			return strings.TrimSpace(v), true
-		}
-	}
-	return "", false
+	return rawSeriesValue(t, name+`{beat="`+id+`"} `)
 }
 
 // TestNotificationCountersAdvertiseTheKindListInTheirHelpText pins the third
@@ -133,9 +138,7 @@ func TestNotificationCountersAdvertiseTheKindListInTheirHelpText(t *testing.T) {
 		"knell_notifications_dropped_total",
 	}
 
-	rec := httptest.NewRecorder()
-	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	body := rec.Body.String()
+	body := exposition(t)
 
 	for _, name := range want {
 		prefix := "# HELP " + name + " "
@@ -189,20 +192,30 @@ func TestRecordHTTPRecordsBothTheCounterAndTheDuration(t *testing.T) {
 		t.Errorf("knell_http_request_duration_seconds_count = %q, was %q: RecordHTTP observed no duration, so the latency view is unwired", countAfter, countBefore)
 	}
 	sumAfter, _ := rawSeriesValue(t, "knell_http_request_duration_seconds_sum")
-	if sumAfter == sumBefore {
-		t.Errorf("knell_http_request_duration_seconds_sum = %q, was %q: the observation carried no elapsed time", sumAfter, sumBefore)
+	// The _sum is a UNIT-BEARING sample, so "it moved" is not the contract: the
+	// series is named _seconds, and a duration observed in any other unit leaves
+	// every latency panel, quantile and slow-request threshold wrong by three
+	// orders of magnitude with nothing failing.
+	before, err := strconv.ParseFloat(sumBefore, 64)
+	if err != nil {
+		t.Fatalf("parsing the pre-call sum %q: %v (the histogram is registered at init, so it must always be published)", sumBefore, err)
+	}
+	after, err := strconv.ParseFloat(sumAfter, 64)
+	if err != nil {
+		t.Fatalf("parsing the post-call sum %q: %v", sumAfter, err)
+	}
+	if delta := after - before; math.Abs(delta-0.25) > 1e-6 {
+		t.Errorf("knell_http_request_duration_seconds_sum moved by %v for a 250ms request, want 0.25: the observation is not in seconds, so every latency query against a series named _seconds is wrong", delta)
 	}
 }
 
 // rawSeriesValue returns the rendered value of the first exposition line
-// starting with prefix, and whether one was present. The beat-labelled sibling
-// beatSeriesValue cannot serve the http series: one is unlabelled and the
-// other is keyed on method/path/status.
+// starting with prefix, and whether one was present. It is the general form:
+// beatSeriesValue is this function with a beat-label prefix, and the unlabelled
+// http series (keyed on method/path/status) can only be reached through here.
 func rawSeriesValue(t *testing.T, prefix string) (string, bool) {
 	t.Helper()
-	rec := httptest.NewRecorder()
-	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	for line := range strings.Lines(rec.Body.String()) {
+	for line := range strings.Lines(exposition(t)) {
 		if v, ok := strings.CutPrefix(line, prefix); ok {
 			return strings.TrimSpace(v), true
 		}

@@ -834,6 +834,50 @@ func TestBeatTokenFitsHeaderMatchesWhatHTTPActuallyCarries(t *testing.T) {
 	}
 }
 
+// TestBeatTokenFitsHeaderAgreesWithTheTransportForEveryByte sweeps the
+// whole byte space through the same oracle
+// TestBeatTokenFitsHeaderMatchesWhatHTTPActuallyCarries applies to eleven
+// hand-picked values. The predicate claims to model exactly what an HTTP field
+// value can carry, and both directions of a divergence are silent: a byte it
+// wrongly ACCEPTS arms a gate no sender can present (every ping 401s and every
+// beat goes falsely missing one deadline later), and a byte it wrongly REJECTS
+// fails startup on a working configuration. Only the interior position is
+// swept, because the predicate's precondition is that edge ASCII whitespace was
+// already trimmed.
+func TestBeatTokenFitsHeaderAgreesWithTheTransportForEveryByte(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Echo", r.Header.Get("Authorization"))
+	}))
+	t.Cleanup(srv.Close)
+
+	for b := range 256 {
+		// INTERIOR placement only: a trailing SP or HTAB is legal in a field
+		// value yet stripped by the wire, and the predicate answers the
+		// byte-legality question for an already-trimmed value (see
+		// asciiWhitespace).
+		token := "alpha" + string([]byte{byte(b)}) + "beta"
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatalf("NewRequestWithContext: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, doErr := srv.Client().Do(req)
+		echoed := ""
+		if doErr == nil {
+			echoed = resp.Header.Get("X-Echo")
+			if err := resp.Body.Close(); err != nil {
+				t.Errorf("closing body: %v", err)
+			}
+		}
+
+		carried := doErr == nil && echoed == "Bearer "+token
+		if got := beatTokenFitsHeader(token); got != carried {
+			t.Errorf("interior byte 0x%02x: beatTokenFitsHeader = %v, but the transport carried it verbatim = %v (err=%v echo=%q); the predicate and the wire must agree or startup either arms an unpresentable token or refuses a working one", b, got, carried, doErr, echoed)
+		}
+	}
+}
+
 func TestLoadBeatTokenAtWarnBoundaryDoesNotWarn(t *testing.T) {
 	// Serial (t.Setenv forbids t.Parallel): swaps the process-global slog
 	// default to assert the absence of the short-token warning.
@@ -1171,5 +1215,79 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		if got[key] != wantValue {
 			t.Errorf("LogValue attr %s = %q, want %q", key, got[key], wantValue)
 		}
+	}
+}
+
+// TestLoadWarnsOnlyWhenLogLevelIsUnparseable pins the ONLY signal that a
+// mistyped LOG_LEVEL was ignored. slogx.ParseLevel returns ok=true for an unset
+// value and ok=false only for a non-empty unparseable one, so this WARN is what
+// separates "the operator asked for debug and got debug" from "the operator
+// typo'd and is silently running at info" — a distinction that matters exactly
+// when someone is turning up logging to diagnose a live outage.
+// TestLoadInvalidLogLevelFallsBackToInfo pins the resulting level but captures
+// no log, so inverting or dropping the !ok guard keeps every existing test
+// green while every default deployment either loses the warning or gains a
+// spurious one on a perfectly valid level.
+func TestLoadWarnsOnlyWhenLogLevelIsUnparseable(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	tests := map[string]struct {
+		raw      string
+		want     string
+		wantWarn bool
+	}{
+		"unparseable value warns":   {raw: "chatty", want: "INFO", wantWarn: true},
+		"unset does not warn":       {raw: "", want: "INFO", wantWarn: false},
+		"valid value does not warn": {raw: "debug", want: "DEBUG", wantWarn: false},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			t.Setenv("LOG_LEVEL", tt.raw)
+
+			rec := capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if cfg.LogLevel.String() != tt.want {
+				t.Errorf("LogLevel = %v, want %v", cfg.LogLevel, tt.want)
+			}
+			if got := rec.Contains("invalid LOG_LEVEL"); got != tt.wantWarn {
+				t.Errorf("LOG_LEVEL=%q: warned = %v, want %v; the warning is the only signal that a typo was ignored, and a warning on a valid level trains the operator to ignore it: %v", tt.raw, got, tt.wantWarn, rec.Messages())
+			}
+		})
+	}
+}
+
+// TestLoadRejectsAFileBorneBeatTokenHTTPCannotCarry pins that the
+// control-byte refusal covers the _FILE channel too, the same way
+// TestLoadRejectsPlainHTTPWebhookFromFile pins the https gate for the webhook's
+// file channel. envx trims only the file's edges, so a two-line secret file (a
+// stray second line, a copy-pasted pair of lines) hands loadBeatToken a token
+// with an INTERIOR newline that no trim can rescue and no sender can present.
+// TestLoadRejectsABeatTokenHTTPCannotCarry covers the plain variable only, so
+// scoping the check to the plain channel — the shape the cycle-8 normalization
+// work moved code toward — leaves the mounted-secret path arming a gate that
+// 401s every ping while every existing test stays green.
+func TestLoadRejectsAFileBorneBeatTokenHTTPCannotCarry(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "beat-token")
+	if err := os.WriteFile(tokenFile, []byte("alpha\nbeta\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setValidLoadEnv(t)
+	unsetEnv(t, "BEAT_TOKEN")
+	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() with a two-line BEAT_TOKEN_FILE = nil, want error: the interior newline is illegal in a header value, so the gate would be armed with a token no sender can present and every configured beat goes falsely missing one deadline later")
+	}
+	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
+		t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which secret to fix", err)
+	}
+	if strings.Contains(err.Error(), "alpha") || strings.Contains(err.Error(), "beta") {
+		t.Errorf("error = %q embeds the token value; the startup error is shipped to Loki, so it must describe the shape and never echo the credential", err)
 	}
 }

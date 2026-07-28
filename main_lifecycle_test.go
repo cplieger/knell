@@ -61,8 +61,8 @@ func waitForMarkerWithin(t *testing.T, present bool, timeout time.Duration) {
 // end, and establishes marker ABSENCE before the boot: a marker left by a
 // previous failed run or another knell process would satisfy a presence wait
 // immediately and let a caller signal itself before run() installed its signal
-// context. Callers keep their own done channel/start/wait sequence, so a test
-// can still observe state (e.g. a boot floor) between this setup and run().
+// context. It is deliberately separate from startLifecycleRun, so a test can
+// still observe state (e.g. a boot floor) between this setup and the boot.
 func prepareLifecycleRun(t *testing.T, beat string) string {
 	t.Helper()
 	free, err := net.Listen("tcp", "127.0.0.1:0")
@@ -86,6 +86,72 @@ func prepareLifecycleRun(t *testing.T, beat string) string {
 	}
 	t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
 	return addr
+}
+
+// lifecycleRun is one background run() under test: the channel its return
+// value lands on, plus whether the test already collected it.
+type lifecycleRun struct {
+	done    chan error
+	stopped bool
+}
+
+// startLifecycleRun boots run() in the background and registers the guard
+// every full-lifecycle test needs: a t.Fatalf between the boot and the test's
+// own SIGTERM leaves run() serving, and a surviving run reacts to the NEXT
+// test's self-signal by flipping the SHARED health marker under it — so one
+// real failure makes a later test's marker oracle attributable to the wrong
+// process. Both registrations receive a process-wide SIGTERM, so a surviving
+// run steals nothing; the damage is the interference.
+func startLifecycleRun(t *testing.T) *lifecycleRun {
+	t.Helper()
+	r := &lifecycleRun{done: make(chan error, 1)}
+	go func() { r.done <- run() }()
+	t.Cleanup(func() {
+		if r.stopped {
+			return
+		}
+		// Arm our own SIGTERM guard BEFORE checking whether run has stopped:
+		// run() can have returned (its deferred stop() already unregistering
+		// its NotifyContext) without the wrapper goroutine having reached
+		// `r.done <- run()` yet. In that window the nonblocking receive below
+		// sees nothing, and a SIGTERM with no handler registered takes the
+		// process's default termination path — killing the test binary mid-run
+		// instead of stopping run(), with no failure report.
+		signalGuard := make(chan os.Signal, 1)
+		signal.Notify(signalGuard, syscall.SIGTERM)
+		defer signal.Stop(signalGuard)
+
+		select {
+		case <-r.done:
+			return
+		default:
+		}
+		if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+			t.Errorf("cleanup signal: %v", err)
+			return
+		}
+		select {
+		case <-r.done:
+		case <-time.After(10 * time.Second):
+			t.Error("run() did not stop during cleanup")
+		}
+	})
+	return r
+}
+
+// waitForReturn waits for run() to return within timeout. after names the
+// event the return is expected after, so a stalled path names itself.
+func (r *lifecycleRun) waitForReturn(t *testing.T, timeout time.Duration, after string) {
+	t.Helper()
+	select {
+	case err := <-r.done:
+		r.stopped = true
+		if err != nil {
+			t.Fatalf("run() = %v, want nil %s", err, after)
+		}
+	case <-time.After(timeout):
+		t.Fatalf("run() did not return %s", after)
+	}
 }
 
 // startHeldBeatRequest opens a beat request against a serving knell and stops
@@ -140,8 +206,7 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 	// process-wide signal, and the shared health-marker path.
 	addr := prepareLifecycleRun(t, "api")
 
-	done := make(chan error, 1)
-	go func() { done <- run() }()
+	r := startLifecycleRun(t)
 	waitForMarkerWithin(t, true, 10*time.Second)
 
 	// Hold one real request open across the shutdown so the interval between
@@ -158,7 +223,8 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 	}
 	waitForMarkerWithin(t, false, time.Second)
 	select {
-	case err := <-done:
+	case err := <-r.done:
+		r.stopped = true
 		t.Fatalf("run() returned before its active request drained: %v", err)
 	default:
 	}
@@ -166,14 +232,7 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 	if err := conn.Close(); err != nil {
 		t.Fatalf("release slow beat request: %v", err)
 	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("run() = %v, want nil after the active request drained", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("run() did not return after the active request drained")
-	}
+	r.waitForReturn(t, 10*time.Second, "after the active request drained")
 
 	if _, err := os.Stat(health.DefaultPath); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("marker %s after shutdown: stat = %v, want it gone; a stopped switch must not report healthy",
@@ -205,8 +264,7 @@ func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	// floor and the scrape. 2s of slack absorbs a slow bind on a loaded host
 	// without admitting a zeroed or epoch baseline.
 	bootFloor := time.Now().Add(-2 * time.Second).Unix()
-	done := make(chan error, 1)
-	go func() { done <- run() }()
+	r := startLifecycleRun(t)
 	waitForMarkerWithin(t, true, 10*time.Second)
 
 	resp, err := http.Get("http://" + addr + "/metrics")
@@ -234,14 +292,7 @@ func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatalf("signalling self: %v", err)
 	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("run() = %v, want nil after a shutdown signal", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("run() did not return after a shutdown signal")
-	}
+	r.waitForReturn(t, 10*time.Second, "after a shutdown signal")
 }
 
 // sampleValue extracts the value of one "name{labels}" sample out of a
@@ -308,8 +359,7 @@ func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
 	addr := prepareLifecycleRun(t, beat)
 
 	received := `knell_beats_received_total{beat="` + beat + `"}`
-	done := make(chan error, 1)
-	go func() { done <- run() }()
+	r := startLifecycleRun(t)
 	waitForMarkerWithin(t, true, 10*time.Second)
 	before := scrapeCounter(t, received)
 
@@ -359,14 +409,7 @@ func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
 		t.Errorf("refusal body = %s, must not echo the beat id", body)
 	}
 
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("run() = %v, want nil after the shutdown signal", err)
-		}
-	case <-time.After(15 * time.Second):
-		t.Fatal("run() did not return after the drain")
-	}
+	r.waitForReturn(t, 15*time.Second, "after the drain")
 
 	if after := scrapeCounter(t, received); after != before {
 		t.Errorf("%s = %v, want it unchanged at %v: the refused ping must not be counted, or the shutdown tally watch.Run already reported is stale",
@@ -394,45 +437,7 @@ func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 	// under test.
 	t.Setenv("BEAT_TOKEN", token)
 
-	done := make(chan error, 1)
-	go func() { done <- run() }()
-	// Stop run() even when a t.Fatalf below skips the explicit SIGTERM: a
-	// surviving run goroutine keeps the listener, the signal registration and
-	// the shared marker alive into later tests, and would consume a later
-	// test's process-wide SIGTERM.
-	runStopped := false
-	t.Cleanup(func() {
-		if runStopped {
-			return
-		}
-		// Arm our own SIGTERM guard BEFORE checking whether run has stopped:
-		// run() can have returned (its deferred stop() already unregistering
-		// its NotifyContext) without the wrapper goroutine having reached
-		// `done <- run()` yet. In that window the nonblocking receive below
-		// sees nothing, and a SIGTERM with no handler registered takes the
-		// process's default termination path — killing the test binary mid-run
-		// instead of stopping run(), with no failure report. While run is
-		// alive both registrations receive the signal, so the guard only ever
-		// adds safety.
-		signalGuard := make(chan os.Signal, 1)
-		signal.Notify(signalGuard, syscall.SIGTERM)
-		defer signal.Stop(signalGuard)
-
-		select {
-		case <-done:
-			return
-		default:
-		}
-		if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-			t.Errorf("cleanup signal: %v", err)
-			return
-		}
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			t.Error("run() did not stop during cleanup")
-		}
-	})
+	r := startLifecycleRun(t)
 	waitForMarkerWithin(t, true, 10*time.Second)
 
 	url := "http://" + addr + "/beat/" + beat
@@ -461,15 +466,7 @@ func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatalf("signalling self: %v", err)
 	}
-	select {
-	case err := <-done:
-		runStopped = true
-		if err != nil {
-			t.Fatalf("run() = %v, want nil after a shutdown signal", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("run() did not return after a shutdown signal")
-	}
+	r.waitForReturn(t, 10*time.Second, "after a shutdown signal")
 }
 
 // beatResponse is one /beat answer: the status and the body a failure message
@@ -588,4 +585,76 @@ func TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace(t *testing.T) {
 	if rec.CountLevel(slog.LevelWarn, stillRunningWarn) != 0 {
 		t.Errorf("messages = %v, want no still-running warning for a loop that stopped inside the grace", rec.Messages())
 	}
+}
+
+// TestRunServesTheMarkerVerdictOnHealthz pins the composition root's wiring of
+// health.Handler(marker) into webapi.Routes.Healthz -- the HTTP liveness
+// endpoint the README documents and external monitoring probes. The webapi
+// tests inject staticHealthz, a fixed verdict, so they cannot catch a root that
+// wires the wrong handler here: with metrics.Handler in that slot /healthz
+// answers 200 forever and an unhealthy switch is never reported, and with a nil
+// or absent route it answers 404/503 forever and a live switch is paged as
+// down. Removing the marker mid-run is what makes this a real oracle rather
+// than a 200 check: the endpoint has to FOLLOW the marker, which is what
+// Handler(marker) means.
+func TestRunServesTheMarkerVerdictOnHealthz(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
+	// process-wide signal, and the shared health-marker path.
+	//
+	// A beat id no other test in this package pings, since the metrics
+	// registry is a package-level singleton shared by the whole test binary.
+	addr := prepareLifecycleRun(t, "healthz-probe")
+
+	done := make(chan error, 1)
+	go func() { done <- run() }()
+	waitForMarkerWithin(t, true, 10*time.Second)
+
+	if status, body := getHealthz(t, addr); status != http.StatusOK || !strings.Contains(body, `"status":"OK"`) {
+		t.Errorf("/healthz on a serving switch = %d %s, want 200 with the OK verdict; a root that wires the wrong handler here reports liveness that is not the marker's",
+			status, body)
+	}
+
+	// Drop the marker under the running server: Marker.Healthy stats the file
+	// per call, so a handler actually backed by it must now refuse.
+	if err := os.Remove(health.DefaultPath); err != nil {
+		t.Fatalf("removing the marker under the serving switch: %v", err)
+	}
+	if status, body := getHealthz(t, addr); status != http.StatusServiceUnavailable {
+		t.Errorf("/healthz with the marker gone = %d %s, want 503: an endpoint that keeps answering healthy without the marker cannot report an unhealthy switch at all",
+			status, body)
+	}
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("signalling self: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run() = %v, want nil after a shutdown signal", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run() did not return after a shutdown signal")
+	}
+}
+
+// getHealthz probes the liveness endpoint of a serving knell, returning the
+// status and the body a failure message should quote.
+func getHealthz(t *testing.T, addr string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("building healthz request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("probe /healthz: %v", err)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		t.Fatalf("read /healthz body: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close /healthz body: %v", err)
+	}
+	return resp.StatusCode, string(body)
 }

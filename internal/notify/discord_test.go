@@ -1,7 +1,6 @@
 package notify
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/cplieger/httpx/v4"
 	"github.com/cplieger/knell/internal/watch"
+	"github.com/cplieger/slogx/capture"
 )
 
 // webhookRecorder captures posted payloads and serves scripted status codes.
@@ -60,25 +60,28 @@ func (rec *webhookRecorder) handler(t *testing.T) http.HandlerFunc {
 	}
 }
 
-// captureDeliveryLogs redirects slog.Default() into a buffer at Debug for the
-// duration of the test and restores it afterwards, so a test can assert on
-// httpx.Do's per-attempt and exhausted lines. slog.Default() is process-global,
-// so a caller must NOT use t.Parallel.
-func captureDeliveryLogs(t *testing.T) *bytes.Buffer {
+// captureDeliveryLogs captures slog.Default()'s records for the duration of
+// the test and restores the previous default afterwards, so a test can assert
+// on httpx.Do's per-attempt and exhausted lines. Records are asserted at the
+// record level (message and raw attribute values) rather than through a
+// handler's rendered text, so an assertion does not depend on a rendering step
+// production may not use. slog.Default() is process-global, so a caller must
+// NOT use t.Parallel.
+func captureDeliveryLogs(t *testing.T) *capture.Recorder {
 	t.Helper()
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-	return &buf
+	return capture.Default(t)
 }
 
-// requireLogged fails the test when no delivery log line was captured: every
-// absence assertion against the log surface is vacuous if nothing was logged.
-func requireLogged(t *testing.T, buf *bytes.Buffer) {
+// requireLogged fails the test when httpx.Do's delivery lines are absent: every
+// absence assertion against the log surface is vacuous if the records it scans
+// were never emitted.
+func requireLogged(t *testing.T, rec *capture.Recorder) {
 	t.Helper()
-	if buf.Len() == 0 {
-		t.Fatal("no delivery log lines captured, the leak assertion would be vacuous")
+	// Both of httpx.Do's lines, not just "something logged": the per-attempt
+	// retry line and the exhausted line are the surface these leak assertions
+	// scan, so a run that emitted neither would satisfy them vacuously.
+	if rec.Count("failed, retrying") == 0 || rec.Count("retries exhausted") == 0 {
+		t.Fatalf("delivery logs missing httpx's retry/exhausted lines, the leak assertion would be vacuous; records = %v", rec.Records())
 	}
 }
 
@@ -702,7 +705,7 @@ func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 	// end to end.
 	const secret = "verysecretlogtoken"
 
-	buf := captureDeliveryLogs(t)
+	rec := captureDeliveryLogs(t)
 
 	// Connection refused is transient, so all maxAttempts run and both the
 	// per-attempt and exhausted lines are emitted.
@@ -712,9 +715,9 @@ func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 	if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err == nil {
 		t.Fatal("BeatMissing against a refused connection = nil, want error")
 	}
-	requireLogged(t, buf)
-	if got := buf.String(); strings.Contains(got, secret) {
-		t.Errorf("delivery logs leak the webhook credential: %s", got)
+	requireLogged(t, rec)
+	if rec.Contains(secret) || rec.AttrContains("", "", secret) {
+		t.Errorf("delivery logs leak the webhook credential; records = %v", rec.Records())
 	}
 }
 
@@ -745,7 +748,7 @@ func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	buf := captureDeliveryLogs(t)
+	rec := captureDeliveryLogs(t)
 
 	d := New(srv.URL+secretPath, "node-1")
 	t.Cleanup(d.Close)
@@ -754,7 +757,7 @@ func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
 	if err == nil {
 		t.Fatal("BeatMissing against a persistent 503 = nil, want error")
 	}
-	requireLogged(t, buf)
+	requireLogged(t, rec)
 	// The body is not Discord's error object, so the status branch reports it
 	// as a measurement. Pinning that keeps the absence assertions below
 	// meaningful: a run that failed before the body was read would satisfy
@@ -772,8 +775,8 @@ func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
 	}
 	// Not one byte of the body, and nothing derived from the request path.
 	for _, leak := range []string{secret, "/api/webhook", "1234567890", "Bad Gateway", "upstream failed"} {
-		if got := buf.String(); strings.Contains(got, leak) {
-			t.Errorf("retry/exhausted logs carry %q from the response body: %s", leak, got)
+		if rec.Contains(leak) || rec.AttrContains("", "", leak) {
+			t.Errorf("retry/exhausted logs carry %q from the response body; records = %v", leak, rec.Records())
 		}
 		if strings.Contains(err.Error(), leak) {
 			t.Errorf("delivery error carries %q from the response body: %v", leak, err)
@@ -798,7 +801,7 @@ func TestOversizedStatusBodyDropsTheDetail(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	buf := captureDeliveryLogs(t)
+	rec := captureDeliveryLogs(t)
 
 	d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
 	t.Cleanup(d.Close)
@@ -807,15 +810,15 @@ func TestOversizedStatusBodyDropsTheDetail(t *testing.T) {
 	if err == nil {
 		t.Fatal("BeatMissing against a persistent 503 = nil, want error")
 	}
-	requireLogged(t, buf)
+	requireLogged(t, rec)
 	if want := fmt.Sprintf("response body over %d bytes, detail dropped", maxErrorBodyBytes); !strings.Contains(err.Error(), want) {
 		t.Errorf("err = %v, want it to report %q", err, want)
 	}
 	// "/api/webhook" is where the cut would land: no part of the body, cut or
 	// whole, may reach an error or a log line.
 	for _, leak := range []string{secret, "/api/webhook", filler[:32]} {
-		if got := buf.String(); strings.Contains(got, leak) {
-			t.Errorf("retry/exhausted logs carry %q from an oversized body: %s", leak, got)
+		if rec.Contains(leak) || rec.AttrContains("", "", leak) {
+			t.Errorf("retry/exhausted logs carry %q from an oversized body; records = %v", leak, rec.Records())
 		}
 		if strings.Contains(err.Error(), leak) {
 			t.Errorf("delivery error carries %q from an oversized body: %v", leak, err)
@@ -851,7 +854,7 @@ func TestPartiallyReadStatusBodyReportsOnlyTheReadFailure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	buf := captureDeliveryLogs(t)
+	rec := captureDeliveryLogs(t)
 
 	d := New(srv.URL+"/api/webhooks/1234567890/"+secret, "node-1")
 	t.Cleanup(d.Close)
@@ -860,7 +863,7 @@ func TestPartiallyReadStatusBodyReportsOnlyTheReadFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("BeatMissing against a truncated 503 response = nil, want error")
 	}
-	requireLogged(t, buf)
+	requireLogged(t, rec)
 	// The absence assertions below only mean something if the STATUS branch
 	// ran and dropped its detail. A setup that failed earlier (a transport
 	// error before the headers are read) would satisfy them with no body text
@@ -876,8 +879,8 @@ func TestPartiallyReadStatusBodyReportsOnlyTheReadFailure(t *testing.T) {
 		}
 	}
 	for _, leak := range []string{secret, "/api/webhook", "upstream failed"} {
-		if got := buf.String(); strings.Contains(got, leak) {
-			t.Errorf("logs carry %q from a partially read body: %s", leak, got)
+		if rec.Contains(leak) || rec.AttrContains("", "", leak) {
+			t.Errorf("logs carry %q from a partially read body; records = %v", leak, rec.Records())
 		}
 		if strings.Contains(err.Error(), leak) {
 			t.Errorf("delivery error carries %q from a partially read body: %v", leak, err)
@@ -955,7 +958,7 @@ func TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError(t *testing.T)
 	// that succeeds on the first attempt logs nothing, and this test's
 	// non-vacuity comes from the control read of the malformed trailer
 	// instead.
-	buf := captureDeliveryLogs(t)
+	rec := captureDeliveryLogs(t)
 
 	d := New(srv.URL+secretPath, "node-1")
 	t.Cleanup(d.Close)
@@ -977,16 +980,17 @@ func TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError(t *testing.T)
 	// any regression that renders that error's text again trips on it, whether
 	// or not the remote bytes happen to look like a credential.
 	for _, leak := range []string{secret, "/api/webhook", "MIME", "this-is-not-a-header"} {
-		if got := buf.String(); strings.Contains(got, leak) {
-			t.Errorf("delivery logs carry %q from the body drain's read error: %s", leak, got)
+		if rec.Contains(leak) || rec.AttrContains("", "", leak) {
+			t.Errorf("delivery logs carry %q from the body drain's read error; records = %v", leak, rec.Records())
 		}
 	}
 	// The invariant stated directly rather than by proxy: the drain's error
 	// VALUE reaches no log attribute. Pre-v4.2.1 httpx rendered it as
-	// error="malformed MIME header ..."; nothing else in a first-attempt
-	// delivery logs at all, so any error attribute here is that value.
-	if got := buf.String(); strings.Contains(got, "error=") {
-		t.Errorf("delivery logs carry an error attribute from the body drain: %s", got)
+	// error="malformed MIME header ..."; the assertion is scoped to the drain
+	// record itself, so it states the invariant instead of matching a
+	// handler-specific `error=` rendering that a JSON handler would not emit.
+	if value, found := rec.AttrValue("failed to drain response body", "error"); found {
+		t.Errorf("drain line carries an error attribute from the body read: %q", value)
 	}
 }
 
@@ -1740,5 +1744,149 @@ func TestSameHostRedirectIsFollowedAndDelivers(t *testing.T) {
 	}
 	if body, _ := finishBody.Load().(string); !strings.Contains(body, "MISSING") {
 		t.Errorf("followed hop body = %q, want the notification payload", body)
+	}
+}
+
+func TestDeliveryIdentifiesKnellToTheWebhookEdge(t *testing.T) {
+	t.Parallel()
+
+	// Go sends "Go-http-client/1.1" when User-Agent is unset, which an edge or
+	// WAF in front of a webhook commonly refuses -- and that refusal arrives as
+	// a non-transient 4xx the sweep re-posts forever, so every notice for the
+	// beat is lost while /metrics still reports a healthy observer. Nothing
+	// else in this package pins the header, so dropping the Set (or emptying
+	// the constant, which makes net/http fall back to its own default) is
+	// invisible to the suite.
+	//
+	// A stub transport rather than a listener: the assertion is a request
+	// header, so no socket, no dial and no clock belong in the oracle. The
+	// exact string is deliberately NOT compared against userAgent -- that
+	// assertion passes even when the constant is emptied.
+	var sent http.Header
+	d := New("https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
+	t.Cleanup(d.Close)
+	d.client.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		sent = r.Header.Clone()
+		if _, copyErr := io.Copy(io.Discard, r.Body); copyErr != nil {
+			t.Errorf("reading request body: %v", copyErr)
+		}
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Status:     "204 No Content",
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+			Request:    r,
+		}, nil
+	})
+
+	if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err != nil {
+		t.Fatalf("BeatMissing: %v", err)
+	}
+	ua := sent.Get("User-Agent")
+	if ua == "" || strings.HasPrefix(ua, "Go-http-client/") {
+		t.Errorf("outbound User-Agent = %q, want knell's own agent (an edge in front of the webhook refuses Go's default, and that 4xx is re-posted forever)", ua)
+	}
+	if !strings.Contains(ua, "knell") {
+		t.Errorf("outbound User-Agent = %q, want it to identify knell", ua)
+	}
+}
+
+func TestStatusBodyAtTheReadCapKeepsItsDiscordErrorCode(t *testing.T) {
+	t.Parallel()
+
+	// The cap decides whether an operator gets Discord's numeric code -- the
+	// only fact knell publishes from a rejection -- so both sides of the
+	// boundary are pinned. One byte past the cap is READ (statusDetail's
+	// +1) so an over-cap body is detectable rather than silently truncated
+	// into an unparseable fragment reported as "carried no Discord error
+	// code"; a body of exactly the cap is Discord's object and keeps its code.
+	// Neither an off-by-one in the comparison nor a lost +1 in the LimitReader
+	// changes any other test in this file.
+	//
+	// padTo builds a valid Discord error object of exactly n bytes.
+	padTo := func(n int) string {
+		body := `{"code":10015,"pad":""}`
+		if n < len(body) {
+			t.Fatalf("cannot build a %d-byte error object, the envelope alone is %d", n, len(body))
+		}
+		return `{"code":10015,"pad":"` + strings.Repeat("x", n-len(body)) + `"}`
+	}
+	for name, tc := range map[string]struct {
+		body    string
+		want    []string
+		notWant []string
+	}{
+		"a body of exactly the cap keeps its code": {
+			body:    padTo(maxErrorBodyBytes),
+			want:    []string{"Discord error code 10015", "recreate the webhook"},
+			notWant: []string{"detail dropped"},
+		},
+		"one byte past the cap is reported as over-cap, not as codeless": {
+			body:    padTo(maxErrorBodyBytes + 1),
+			want:    []string{fmt.Sprintf("response body over %d bytes, detail dropped", maxErrorBodyBytes)},
+			notWant: []string{"Discord error code", "carried no Discord error code"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if len(tc.body) > maxErrorBodyBytes+1 || len(tc.body) < maxErrorBodyBytes {
+				t.Fatalf("setup: body is %d bytes, want the cap boundary", len(tc.body))
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			d := New(srv.URL+"/api/webhooks/1234567890/plainsegment", "node-1")
+			defer d.Close()
+
+			err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour))
+			if err == nil {
+				t.Fatal("BeatMissing against a 404 = nil, want error")
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err = %v, want it to report %q", err, want)
+				}
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(err.Error(), notWant) {
+					t.Errorf("err = %v, must not report %q", err, notWant)
+				}
+			}
+		})
+	}
+}
+
+func TestExhaustedDeliveryIsLoggedBelowAlarmLevel(t *testing.T) {
+	// Deliberately NOT t.Parallel: slog.Default() is process-global.
+	//
+	// watch already publishes the terminal verdict for a failed delivery at
+	// Error (with the beat, the silence and the retry plan), so httpx's own
+	// exhaustion line is a second, thinner record of the SAME event.
+	// WithExhaustedLevel demotes it to Debug; dropping the option restores
+	// httpx's default Warn and every failed notification then raises two
+	// alarm-level lines, which is exactly the duplicate an operator reading
+	// the log during a Discord outage has to reconcile.
+	rec := captureDeliveryLogs(t)
+
+	// Connection refused is transient, so all maxAttempts run and the
+	// exhausted line is emitted.
+	d := New("http://127.0.0.1:9/api/webhooks/1234567890/plainsegment", "node-1")
+	t.Cleanup(d.Close)
+
+	if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err == nil {
+		t.Fatal("BeatMissing against a refused connection = nil, want error")
+	}
+	requireLogged(t, rec)
+	// The level asserted as a level, not as TextHandler's `level=WARN`
+	// rendering: CountLevel reads the record's own Level, so the assertion
+	// survives a handler change and cannot be retired by a rendering one.
+	for _, alarm := range []slog.Level{slog.LevelWarn, slog.LevelError} {
+		if n := rec.CountLevel(alarm, ""); n > 0 {
+			t.Errorf("delivery logs contain %d %s records: %v (watch owns the alarm-level verdict for a failed delivery)", n, alarm, rec.Records())
+		}
 	}
 }

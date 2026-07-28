@@ -60,6 +60,13 @@ func main() {
 		slog.Error("knell exited with error", "error", err)
 		os.Exit(1)
 	}
+	// Last line of a clean stop, emitted once run's defers have flushed the
+	// marker, the notifier and the watch-loop teardown. "shutting down" is
+	// logged BEFORE the drain, so without this line a stop that finished under
+	// its own power and one killed at the container stop timeout leave identical
+	// logs, and the exit code lives in Docker's inspect state rather than in the
+	// stream Loki keeps.
+	slog.Info("stopped")
 }
 
 // run wires the app and blocks until a shutdown signal or a serve error.
@@ -204,17 +211,28 @@ func run() error {
 	// wait out the whole grace for a watch loop nobody asked to stop.
 	serveExit := webhttp.WithServeExit(func(exitCtx context.Context) {
 		marker.Set(false)
+		// The graceful path's "shutting down" does not run here (webhttp skips
+		// pre-drain when Serve returns on its own), and the serve error itself is
+		// logged only after this teardown returns. Without this line the watch
+		// loop's abandoned-delivery lines are read before anything says why.
+		slog.Info("serve loop exited, tearing down")
 		stop()
 		onShutdown(exitCtx)
 	})
 	err = webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
+	return classifyServeError(err)
+}
+
+// classifyServeError turns webhttp.Run's outcome into run's own contract.
+//
+// A shutdown sequence that ran and reported its own deadline means in-flight
+// requests outlived the single grace budget. Name that, so the one ERROR line
+// points at the drain and at the constant that bounds it instead of at an
+// anonymous expired context. Only the graceful path can produce this error:
+// the other one returns srv.Serve's own failure, an accept error that carries
+// no deadline. Every other outcome, nil included, passes through untouched.
+func classifyServeError(err error) error {
 	if err != nil && errors.Is(err, context.DeadlineExceeded) {
-		// The shutdown sequence ran and Shutdown reported its own deadline:
-		// in-flight requests outlived the single grace budget. Name that, so
-		// the one ERROR line points at the drain and at the constant that
-		// bounds it instead of at an anonymous expired context. Only the
-		// graceful path can produce this error: the other one returns
-		// srv.Serve's own failure, an accept error that carries no deadline.
 		return fmt.Errorf("the shutdown sequence outlived the %s shutdown grace (in-flight requests still draining, or a stalled pre-drain hook): %w", shutdownGrace, err)
 	}
 	return err

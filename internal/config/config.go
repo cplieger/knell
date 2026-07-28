@@ -99,11 +99,9 @@ type Config struct {
 // leak-free even from a call site that logs the whole struct instead of the
 // hand-picked fields main.go's logConfig chooses today.
 //
-// The receiver is deliberately a VALUE, not a pointer: a method set on *Config
-// leaves a bare Config value (what Load returns, and what run() holds) outside
-// slog.LogValuer, so the one call site the redaction exists to survive - a
-// future slog call that logs the whole struct by value - would reflection-render
-// both secrets. The copy is a startup-frequency 96 bytes.
+// The VALUE receiver is the load-bearing part: a *Config method set would leave
+// the bare Config that Load returns (and run() holds) outside slog.LogValuer, so
+// a slog call that logged the whole struct would reflection-render both secrets.
 //
 //nolint:gocritic // hugeParam: slog.LogValuer must sit on the value receiver so a bare Config redacts too; the copy happens at most once per config log line.
 func (c Config) LogValue() slog.Value {
@@ -170,7 +168,8 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// nodeName resolves the observer name: NODE_NAME when set, else the
+// nodeName resolves the observer name: NODE_NAME when set to a non-blank value
+// (a blank one is warned about and ignored), else the
 // hostname, else "unknown". A NODE_NAME past maxNodeNameBytes fails startup
 // like any other malformed required value: the cap (see maxNodeNameBytes for
 // the budget) is what guarantees no name can push a notification past
@@ -180,8 +179,15 @@ func Load() (Config, error) {
 // POSIX), and refusing to start over the machine's own hostname would trade a
 // deliverable notice for no notice at all.
 func nodeName() (string, error) {
-	node := strings.TrimSpace(envx.String("NODE_NAME", ""))
+	raw, present := os.LookupEnv("NODE_NAME")
+	node := strings.TrimSpace(raw)
 	if node == "" {
+		if present {
+			// Same rule as listenAddr: an unset NODE_NAME is the documented
+			// hostname default, while a blank one is a value the operator set
+			// and this process threw away.
+			slog.Warn("NODE_NAME is set but blank and was ignored; the node name prefixes every Discord notice, so set it to name this observer, or unset the variable to use the hostname")
+		}
 		return hostnameNode(), nil
 	}
 	if len(node) > maxNodeNameBytes {
@@ -207,16 +213,25 @@ func hostnameNode() string {
 	return host
 }
 
-// listenAddr resolves the listener address: LISTEN_ADDR when set, else
-// defaultListenAddr. A padded LISTEN_ADDR copied from a deployment file is not
+// listenAddr resolves the listener address: LISTEN_ADDR when set to a non-blank
+// value (a blank one is warned about and ignored), else defaultListenAddr. A
+// padded LISTEN_ADDR copied from a deployment file is not
 // a usable address (net.Listen resolves " :9190" as a hostname lookup and
 // fails), and the padding is invisible in the resulting crash-loop log line.
 // Trimmed for the same reason the plain webhook and token values are trimmed; a
 // value that is entirely whitespace falls back to the default rather than to
 // "", which would bind an ephemeral port and hide the listener from scrapes.
 func listenAddr() string {
-	if addr := strings.TrimSpace(envx.String("LISTEN_ADDR", "")); addr != "" {
+	// LookupEnv, not envx.String: only the PRESENT-but-blank case is an
+	// accident worth a line (compose interpolation of an undefined variable
+	// produces exactly it), and envx.String collapses that with "unset",
+	// which is the documented default case and must stay silent.
+	raw, present := os.LookupEnv("LISTEN_ADDR")
+	if addr := strings.TrimSpace(raw); addr != "" {
 		return addr
+	}
+	if present {
+		slog.Warn("LISTEN_ADDR is set but blank and was ignored; the listener binds every interface at the default address, so unset the variable to accept that on purpose, or set a host:port to narrow it", "listen_addr", defaultListenAddr)
 	}
 	return defaultListenAddr
 }
@@ -275,6 +290,40 @@ func beatTokenFitsHeader(value string) bool {
 	return true
 }
 
+// normalizeBeatToken turns a configured BEAT_TOKEN into the form that reaches
+// the verifier on the wire, or refuses it.
+//
+// Same reason as the webhook: a padded token makes every sender 401
+// and every beat cross its deadline, so padding is trimmed. Trim
+// FIRST, with the ASCII cutset, and classify what is left: an
+// expected header value that ENDS in a cutset byte can never reach
+// the verifier intact (the wire strips trailing SP/TAB and refuses
+// CR, LF, VT and FF outright — see asciiWhitespace), so the trimmed
+// form is the deliverable shape of this token. Deciding on
+// strings.TrimSpace first instead would keep a value like
+// " \u00a0 " verbatim — its trailing space makes it undeliverable,
+// so every ping 401s against an endpoint that reports itself gated.
+func normalizeBeatToken(token string) (string, error) {
+	token = strings.Trim(token, asciiWhitespace)
+	if token == "" {
+		// Nothing survives the wire: the token cannot be presented at
+		// all, so it fails startup like a present-but-empty BEAT_TOKEN
+		// and a blank BEAT_TOKEN_FILE. Keeping it armed reported a gated
+		// endpoint that rejected every ping.
+		return "", errors.New("BEAT_TOKEN is set but contains only whitespace: HTTP strips the leading and trailing spaces and tabs from a header value and forbids CR, LF and the other control bytes outright, so no sender can present this token and POST /beat/{id} would reject every ping while the endpoint reports itself gated; set it to a long random token, or unset the variable entirely to serve /beat/{id} open on purpose")
+	}
+	if strings.TrimSpace(token) == "" {
+		// All whitespace by Unicode rules, but at least one rune
+		// survives the header (a non-ASCII space): the token IS
+		// presentable, so it is kept verbatim and the gate stays armed.
+		// Say so, because the only other signal is the length hint
+		// below, which reads as "your token is short" for a value the
+		// operator cannot see in `docker inspect` output.
+		slog.Warn("BEAT_TOKEN is whitespace only; the /beat/{id} gate is armed with a whitespace token every sender must send verbatim, so set a long random token, or unset the variable to serve the endpoint open")
+	}
+	return token, nil
+}
+
 // loadBeatToken reads the optional BEAT_TOKEN bearer gate for
 // POST/GET /beat/{id}; an empty return disables the check. Optional means
 // ABSENT, not blank: a present-but-empty BEAT_TOKEN fails startup, and so does
@@ -297,33 +346,11 @@ func loadBeatToken() (string, error) {
 	switch {
 	case err == nil:
 		warnPlainVarIgnored("BEAT_TOKEN", "token", tokenSrc)
-		// Same reason as the webhook: a padded token makes every sender 401
-		// and every beat cross its deadline, so padding is trimmed. Trim
-		// FIRST, with the ASCII cutset, and classify what is left: an
-		// expected header value that ENDS in a cutset byte can never reach
-		// the verifier intact (the wire strips trailing SP/TAB and refuses
-		// CR, LF, VT and FF outright — see asciiWhitespace), so the trimmed
-		// form is the deliverable shape of this token. Deciding on
-		// strings.TrimSpace first instead would keep a value like
-		// " \u00a0 " verbatim — its trailing space makes it undeliverable,
-		// so every ping 401s against an endpoint that reports itself gated.
-		token = strings.Trim(token, asciiWhitespace)
-		if token == "" {
-			// Nothing survives the wire: the token cannot be presented at
-			// all, so it fails startup like a present-but-empty BEAT_TOKEN
-			// and a blank BEAT_TOKEN_FILE. Keeping it armed reported a gated
-			// endpoint that rejected every ping.
-			return "", errors.New("BEAT_TOKEN is set but contains only whitespace: HTTP strips the leading and trailing spaces and tabs from a header value and forbids CR, LF and the other control bytes outright, so no sender can present this token and POST /beat/{id} would reject every ping while the endpoint reports itself gated; set it to a long random token, or unset the variable entirely to serve /beat/{id} open on purpose")
+		normalized, normErr := normalizeBeatToken(token)
+		if normErr != nil {
+			return "", normErr
 		}
-		if strings.TrimSpace(token) == "" {
-			// All whitespace by Unicode rules, but at least one rune
-			// survives the header (a non-ASCII space): the token IS
-			// presentable, so it is kept verbatim and the gate stays armed.
-			// Say so, because the only other signal is the length hint
-			// below, which reads as "your token is short" for a value the
-			// operator cannot see in `docker inspect` output.
-			slog.Warn("BEAT_TOKEN is whitespace only; the /beat/{id} gate is armed with a whitespace token every sender must send verbatim, so set a long random token, or unset the variable to serve the endpoint open")
-		}
+		token = normalized
 	case errors.As(err, new(*envx.MissingError)):
 		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE is set: the documented
 		// open-endpoint case, so the empty token stands and webapi's gate
@@ -347,7 +374,15 @@ func loadBeatToken() (string, error) {
 		// an open endpoint the operator meant to gate.
 		return "", fmt.Errorf("BEAT_TOKEN: %w", err)
 	}
-	if token != "" && !beatTokenFitsHeader(token) {
+	if token == "" {
+		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE was set (the only arm that
+		// reaches here empty): the documented open-endpoint case, so there is
+		// no token to shape-check and nothing to measure. Stated once here so a
+		// check added below cannot forget it and warn about a token that does
+		// not exist.
+		return "", nil
+	}
+	if !beatTokenFitsHeader(token) {
 		// Non-empty after trimming, yet still unpresentable: an interior
 		// control byte (a pasted newline, a \n that came through a compose
 		// value verbatim) is illegal in an HTTP field value, so no sender can
@@ -358,7 +393,7 @@ func loadBeatToken() (string, error) {
 		// and the shape of the problem only.
 		return "", errors.New("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it; use a token containing printable characters, or unset the variable entirely to serve /beat/{id} open on purpose")
 	}
-	if token != "" && len(token) < minTokenLength {
+	if len(token) < minTokenLength {
 		// The exact length is deliberately NOT logged: it is an attribute of a
 		// live credential, and knell's startup log is shipped to Loki where its
 		// audience is far wider than the age-encrypted file the token itself
@@ -483,6 +518,20 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 	}
 	if u.Host == "" {
 		return nil, errors.New("missing host")
+	}
+	if u.Path == "" || u.Path == "/" {
+		// The webhook's PATH is the credential, so a URL that carries none is
+		// not a webhook: every POST would go to the origin's root and Discord
+		// would refuse it forever while startup reported success.
+		return nil, errors.New("missing path (the webhook URL's own path carries the credential, so a host-only URL cannot deliver a notification)")
+	}
+	if strings.ContainsRune(raw, ' ') {
+		// An interior space survives url.Parse and is percent-encoded on every
+		// POST, so the path that reaches Discord is not the path the operator
+		// pasted and the switch can never ring. Edge padding is already
+		// trimmed by loadWebhook; what is left here is interior, which is the
+		// shape a folded YAML scalar produces when it joins a wrapped URL.
+		return nil, errors.New("contains a space (a space is percent-encoded on every request, so the webhook path that reaches the other end is not the configured one)")
 	}
 	return u, nil
 }

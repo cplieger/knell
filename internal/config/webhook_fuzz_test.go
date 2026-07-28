@@ -38,7 +38,9 @@ func FuzzParseWebhookURL(f *testing.F) {
 		switch err.Error() {
 		case "not a valid URL",
 			"scheme must be https (the webhook URL's own path is the credential, so plain http would send it in cleartext)",
-			"missing host":
+			"missing host",
+			"missing path (the webhook URL's own path carries the credential, so a host-only URL cannot deliver a notification)",
+			"contains a space (a space is percent-encoded on every request, so the webhook path that reaches the other end is not the configured one)":
 		default:
 			t.Fatalf("unexpected rejection message %q: a new message must be a fixed constant that cannot embed the operator-supplied URL", err)
 		}

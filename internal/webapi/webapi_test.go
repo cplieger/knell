@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -546,19 +547,6 @@ func TestBeatTokenGateAppliesToGet(t *testing.T) {
 	}
 }
 
-func TestHeadRejectionSetsAllowHeader(t *testing.T) {
-	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
-	req := httptest.NewRequest(http.MethodHead, "/beat/api", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("HEAD /beat/api = %d, want 405", rec.Code)
-	}
-	if got := rec.Header().Get("Allow"); got != "GET, POST" {
-		t.Errorf("Allow = %q, want \"GET, POST\" (a 405 must name the permitted methods so a HEAD-only prober learns how pings are recorded)", got)
-	}
-}
-
 // TestEveryRejectedMethodAnswersTheSameRefusal pins that the Allow header is
 // TRUE for every rejected method, not just for HEAD. Without the
 // method-agnostic /beat/{id} route, PUT/DELETE/PATCH/OPTIONS fall to
@@ -697,6 +685,63 @@ func TestLoggedPathMapsTheEmptyPathToRoot(t *testing.T) {
 	if got := loggedPath(req); got != "/" {
 		t.Errorf("loggedPath(empty) = %q, want \"/\": an empty return degrades to webhttp's redaction-failure placeholder", got)
 	}
+}
+
+// FuzzLoggedPathIsBounded fuzzes the untrusted text the access-log path policy
+// sanitizes. r.URL.Path is attacker-controlled, net/http accepts a megabyte of
+// it, and loggedPath runs BEFORE the token gate, so the transform is the only
+// thing bounding an unauthenticated caller's influence on knell's log lines --
+// the channel that carries the undelivered-notice warnings no counter backs.
+// TestAccessLogPathIsBounded pins named shapes; this pins the invariant set
+// over arbitrary bytes, including the class that table has none of: a path
+// carrying raw non-UTF-8 bytes (%80 decodes to one), where the rune-boundary
+// backoff can walk the cut all the way to zero.
+func FuzzLoggedPathIsBounded(f *testing.F) {
+	const marker = "...(truncated)"
+	f.Add("/beat/api")
+	f.Add("")
+	f.Add("/")
+	f.Add("/beat/" + strings.Repeat("a", maxLoggedPath-6))
+	f.Add("/beat/" + strings.Repeat("a", maxLoggedPath-5))
+	f.Add("/beat/" + strings.Repeat("\u20ac", 200))
+	f.Add("/beat/" + strings.Repeat("\U0001F600", 100))
+	f.Add("/beat/" + strings.Repeat("\x80", 200))
+	f.Add(strings.Repeat("\x80", 200))
+	f.Fuzz(func(t *testing.T, path string) {
+		got := loggedPath(&http.Request{URL: &url.URL{Path: path}})
+
+		// An empty return is read by webhttp as a FAILED redaction, which
+		// replaces the whole attribute with its placeholder: the operator
+		// then has no path at all, for any input.
+		if got == "" {
+			t.Fatalf("loggedPath(%q) = %q: an empty return degrades to webhttp's redaction-failure placeholder", path, got)
+		}
+		if len(got) > maxLoggedPath+len(marker) {
+			t.Fatalf("loggedPath(%q) is %d bytes, want at most %d: an unauthenticated caller must not size log lines", path, len(got), maxLoggedPath+len(marker))
+		}
+		// Truncating mid-rune would put invalid UTF-8 into the log stream.
+		if utf8.ValidString(path) && !utf8.ValidString(got) {
+			t.Fatalf("loggedPath(%q) = %q is not valid UTF-8: truncation must land on a rune boundary", path, got)
+		}
+		switch {
+		case path == "":
+			if got != "/" {
+				t.Fatalf("loggedPath(empty) = %q, want %q", got, "/")
+			}
+		case len(path) <= maxLoggedPath:
+			if got != path {
+				t.Fatalf("loggedPath(%q) = %q, want it logged verbatim: the bound must not cost an operator the beat id", path, got)
+			}
+		default:
+			kept, ok := strings.CutSuffix(got, marker)
+			if !ok {
+				t.Fatalf("loggedPath(%q) = %q, want the truncation marker so an operator can tell a bounded path from a real one", path, got)
+			}
+			if !strings.HasPrefix(path, kept) {
+				t.Fatalf("loggedPath(%q) kept %q, which is not a prefix of the request path: truncation must not alter what it keeps", path, kept)
+			}
+		}
+	})
 }
 
 // fakeClock is a manual clock for the shutdown tests. watch.Run reads it from
@@ -1206,5 +1251,96 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 	if grew := len(after) - len(before); grew > maxNewSeries {
 		t.Errorf("%d hostile requests added %d new series (want at most %d): the label set must be bounded by the route table, not by the caller\n%s",
 			len(hostile), grew, maxNewSeries, exposition)
+	}
+}
+
+// TestUnroutedRequestsAreCountedUnderTheCollapsedSeries pins the FIRST case of
+// recordHTTPMetric's contract: a request that matched no route is still
+// counted, under the single collapsed unmatched/unmatched label set.
+// TestRequestMetricLabelsBoundedByTheRouteTable only proves such a request
+// cannot MINT a caller-spelled series, so a hook that skipped unmatched
+// requests entirely passes it -- and then scanner floods and every misrouted
+// sender (a wrong-method scrape included) are invisible to the vantage point
+// knell's own alert rules read.
+func TestUnroutedRequestsAreCountedUnderTheCollapsedSeries(t *testing.T) {
+	const series = `knell_http_requests_total{method="unmatched",path="unmatched",status=`
+	tests := map[string]struct {
+		method, path string
+		wantStatus   string
+	}{
+		// Scanner traffic: no pattern matches at all, so net/http answers 404.
+		"off-route probe": {method: http.MethodGet, path: "/wp-admin/setup.php", wantStatus: "404"},
+		// A scrape aimed with the wrong method: /metrics is registered GET-only,
+		// so net/http's own 405 fires with no pattern matched.
+		"wrong-method scrape": {method: http.MethodPost, path: "/metrics", wantStatus: "405"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			b := &fakeBeater{known: map[string]bool{"api": true}}
+			h := newTestHandlerCtx(context.Background(), b, "")
+			want := series + `"` + tt.wantStatus + `"}`
+			// Deltas, not absolutes: the registry is a package-level singleton
+			// shared by the whole test binary (and by a -count=2 rerun).
+			before, _ := seriesValue(t, scrapeExposition(t, h), want)
+
+			if rec := beatRequest(t, h, tt.method, tt.path); rec.Code != http.StatusNotFound && rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("%s %s = %d, want an unrouted refusal (body %s)", tt.method, tt.path, rec.Code, rec.Body.String())
+			}
+			got, ok := seriesValue(t, scrapeExposition(t, h), want)
+			if !ok {
+				t.Fatalf("%s missing from the exposition after %s %s: unrouted traffic is unalertable without it", want, tt.method, tt.path)
+			}
+			if got != before+1 {
+				t.Errorf("%s = %v, want %v (one unrouted request, one increment)", want, got, before+1)
+			}
+		})
+	}
+}
+
+// TestAccessLogMethodIsBoundedForRefusedRequests pins boundMethod. The access
+// log's method is as caller-controlled as its path, and webhttp logs r.Method
+// verbatim with no transform hook, so the cap has to sit OUTSIDE Logging.
+// net/http accepts any RFC 9110 token as a method with no length cap of its
+// own, and the request line is bounded only by MaxHeaderBytes+4096 (1 MiB by
+// default), so without this cap one unauthenticated caller writes ~1 MiB of its
+// own text into a single access line and pushes knell's permanently-lost-notice
+// WARNs out of the retained log window -- the same consequence maxLoggedPath
+// exists to prevent, on a request the token gate never sees (Logging is
+// outermost). The metric side of the same request is already bounded
+// (otherMethodLabel), which is what left the log as the last unbounded sink.
+func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and must be installed BEFORE New, because webhttp.Logging
+	// resolves slog.Default() when the chain is built.
+	logs := capture.Default(t)
+	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
+
+	overlong := strings.Repeat("A", maxLoggedMethod+4)
+	rec := beatRequest(t, h, overlong, "/beat/api")
+
+	// The refusal itself is unchanged: the bogus method still routes to the
+	// method-agnostic catch-all, which answers 405 with a truthful Allow.
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("%d-byte bogus method = %d, want 405 (body %s)", len(overlong), rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Allow"); got != "GET, POST" {
+		t.Errorf("Allow = %q, want \"GET, POST\": bounding the logged method must not change the refusal", got)
+	}
+
+	// The logged method is the placeholder, never the caller's bytes.
+	if !logs.HasAttr("http", "method", overlongMethodLabel) {
+		t.Errorf("access line does not report method=%s; records = %v", overlongMethodLabel, logs.Records())
+	}
+	if logs.HasAttr("http", "method", overlong) {
+		t.Errorf("access line carries the caller's %d-byte method verbatim: an unauthenticated caller writes the text of knell's own log lines; records = %v",
+			len(overlong), logs.Records())
+	}
+
+	// A real method passes through untouched: this is a bound, not a rewrite.
+	if got := beatRequest(t, h, http.MethodPost, "/beat/api"); got.Code != http.StatusOK {
+		t.Fatalf("post known = %d, want 200 (body %s)", got.Code, got.Body.String())
+	}
+	if !logs.HasAttr("http", "method", http.MethodPost) {
+		t.Errorf("access line does not report method=POST for an ordinary ping; records = %v", logs.Records())
 	}
 }

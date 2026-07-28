@@ -33,6 +33,35 @@ const maxBeatBody = 1 << 20
 // out of the retained log window.
 const maxLoggedPath = 128
 
+// maxLoggedMethod bounds the request method the access log records. webhttp
+// logs r.Method verbatim and offers no transform hook, while net/http accepts
+// any RFC 9110 token up to the whole request-line limit (MaxHeaderBytes +
+// 4096, 1 MiB by default), so an unauthenticated caller chooses the text. 16
+// bytes keeps every IANA-registered method intact (the longest,
+// BASELINE-CONTROL, is exactly 16) and knell only ever serves GET and POST.
+const maxLoggedMethod = 16
+
+// overlongMethodLabel replaces a method too long to be a real one, the
+// method-side twin of maxLoggedPath. Such a request is refused either way (it
+// matches no method-bearing pattern, so /beat/{id} answers 405 and every other
+// path gets net/http's own 404/405), and the metric already records it as
+// otherMethodLabel, so nothing but the logged text changes.
+const overlongMethodLabel = "OVERLONG"
+
+// boundMethod caps the method before webhttp.Logging reads it. It is listed
+// FIRST in Chain so it wraps Logging; the request is shallow-copied rather
+// than mutated in place, the same way http.Request.WithContext does.
+func boundMethod(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(r.Method) > maxLoggedMethod {
+			r2 := *r
+			r2.Method = overlongMethodLabel
+			r = &r2
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // loggedPath is the access log's path policy: the request path, truncated on
 // a rune boundary. The empty case is mapped to "/" rather than left empty,
 // because webhttp coerces an empty return to its redaction-failure
@@ -117,6 +146,11 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 	mux.Handle("GET /metrics", routes.Metrics)
 
 	return webhttp.Chain(mux,
+		// boundMethod is FIRST so it is the OUTERMOST wrapper and caps
+		// r.Method before Logging reads it: webhttp logs the method verbatim
+		// with no transform hook, and the method is as caller-controlled as
+		// the path WithPathFunc bounds below.
+		boundMethod,
 		// /healthz and /metrics are machine probes, so they ride the
 		// fleet-standard ProbeLogLevel rather than a skip list: a HEALTHY
 		// probe logs at Debug (out of the shipped stream at the default
@@ -126,10 +160,11 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 		// stopped landing or a liveness probe answering 503 has to be
 		// greppable. Skip lists stay for streams, of which knell has none.
 		//
-		// WithPathFunc bounds the logged path: Logging is FIRST here and
-		// Chain applies its list in reverse, so this line is emitted for
-		// every request BEFORE beatHandler's token gate runs, which is why
-		// BEAT_TOKEN does not bound it and the policy has to.
+		// WithPathFunc bounds the logged path: Chain's FIRST entry is its
+		// OUTERMOST wrapper, and only boundMethod sits ahead of Logging here,
+		// so this line is emitted for every request BEFORE beatHandler's token
+		// gate runs, which is why BEAT_TOKEN does not bound it and the policy
+		// has to.
 		//
 		// WithRecordMetricRequest is the same story for the exposition: it is
 		// the only place a REFUSED ping (401, 404, 405, 503) becomes visible
@@ -260,42 +295,24 @@ func beatHandler(appCtx context.Context, b Beater, token string) http.HandlerFun
 		// reusable; the payload itself is deliberately ignored. The cap is
 		// webhttp.LimitBody (an http.MaxBytesReader over r.Body) rather than a
 		// bare io.LimitReader, because a LimitReader ends the read SILENTLY at
-		// the cap: an over-limit body is indistinguishable from one that just
-		// ended, so nothing — not the sender, not the log — ever says a sender
-		// is shipping payloads knell refuses to read. MaxBytesReader surfaces
-		// the overrun as an *http.MaxBytesError, which is what the WARN below
-		// reports.
+		// the cap: an over-limit body would be indistinguishable from one that
+		// just ended, so nothing would ever say a sender is shipping payloads
+		// knell refuses to read. MaxBytesReader surfaces the overrun as an
+		// *http.MaxBytesError, which is what the WARN below reports.
 		//
-		// No overrun STATUS is reported to the sender: the ping still answers
-		// 200. The connection under it, however, is now closed.
-		// MaxBytesReader tells net/http a request was too large by
-		// type-asserting an UNEXPORTED net/http interface on the
-		// ResponseWriter it was handed, which no third-party wrapper can
-		// satisfy — and every handler here runs behind the StatusRecorder
-		// webhttp.Logging and Recoverer wrap the writer in. webhttp v1.18.1
-		// closed that gap: LimitBody now walks the writer's Unwrap chain and
-		// hands MaxBytesReader net/http's own writer, and StatusRecorder
-		// implements Unwrap, so the signal reaches net/http through this chain
-		// (measured over a real socket: Connection: close on an over-cap POST,
-		// absent on an in-cap one, both answered 200 {"ok":true}).
+		// The overrun is reported, never acted on: the ping still answers 200
+		// and the beat below is recorded whether the body fit, overran, or the
+		// sender hung up mid-send, because a heartbeat's payload is irrelevant
+		// and a dropped ping is what this whole app exists to notice. Only the
+		// overrun warns; a mid-body disconnect is ordinary.
 		//
-		// It is still absent, with nothing this app can do about it, behind a
-		// wrapper that does not implement Unwrap, under webhttp.RouteTimeout
-		// (which knell does not use), and against an
-		// httptest.ResponseRecorder — the last is why knell's own handler
-		// tests cannot observe the close and pin the WARN below instead.
-		//
-		// That WARN stays either way, and is deliberately kept now that the
-		// connection closes too: the close is observable only on the SENDER's
-		// side of the wire and the 200 says nothing, so the log line remains
-		// the only channel through which a knell OPERATOR ever learns a sender
-		// is shipping payloads knell refuses to read.
-		//
-		// A ping is never lost to its own payload: the error is reported, not
-		// acted on. The beat below is recorded whether the body fit, overran,
-		// or the sender hung up mid-send, because a heartbeat's payload is
-		// irrelevant and a dropped ping is what this whole app exists to
-		// notice. Only the overrun warns; a mid-body disconnect is ordinary.
+		// net/http does close the connection under that 200 (LimitBody reaches
+		// net/http's own ResponseWriter through the StatusRecorder Unwrap chain
+		// webhttp.Logging and Recoverer wrap this handler in). The close is
+		// observable only on the SENDER's side of the wire, and an
+		// httptest.ResponseRecorder cannot observe it at all, so the WARN stays
+		// both the only channel through which a knell OPERATOR learns a sender
+		// is over the cap and the thing the handler tests pin.
 		webhttp.LimitBody(w, r, maxBeatBody)
 		if _, err := io.Copy(io.Discard, r.Body); err != nil {
 			var tooLarge *http.MaxBytesError

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"os"
@@ -172,5 +174,56 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "verysecrettoken") {
 		t.Errorf("bind error leaks the webhook URL: %v", err)
+	}
+}
+
+// TestClassifyServeErrorNamesADrainThatOutlivedTheGrace pins the one ERROR
+// line a container emits when its drain runs out of budget. webhttp.Run
+// reports the expired shutdown deadline as a bare context.DeadlineExceeded,
+// which on its own tells an operator nothing about WHICH deadline expired;
+// classifyServeError is what turns it into a line naming the drain and the
+// grace constant that bounds it. If the branch were dropped, a container
+// SIGKILLed mid-drain would exit 1 with "context deadline exceeded" and the
+// operator would have no way to tell a stuck drain from any other expired
+// context; if the classification went the other way, an accept failure would
+// be reported as a drain overrun that never happened.
+func TestClassifyServeErrorNamesADrainThatOutlivedTheGrace(t *testing.T) {
+	t.Parallel()
+
+	serveFailure := errors.New("accept tcp [::]:9190: use of closed network connection")
+	tests := map[string]struct {
+		in        error
+		wantNamed bool
+	}{
+		"clean shutdown":               {in: nil, wantNamed: false},
+		"bare drain deadline":          {in: context.DeadlineExceeded, wantNamed: true},
+		"wrapped drain deadline":       {in: fmt.Errorf("shutting down: %w", context.DeadlineExceeded), wantNamed: true},
+		"serve failure":                {in: serveFailure, wantNamed: false},
+		"cancellation, not a deadline": {in: context.Canceled, wantNamed: false},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := classifyServeError(tt.in)
+			if !tt.wantNamed {
+				if got != tt.in {
+					t.Errorf("classifyServeError(%v) = %v, want it returned unchanged: only the drain overrun may be renamed, or an accept failure is reported as a shutdown that never happened", tt.in, got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("classifyServeError(%v) = nil, want the drain overrun surfaced so the process exits 1", tt.in)
+			}
+			if !errors.Is(got, context.DeadlineExceeded) {
+				t.Errorf("classifyServeError(%v) = %v, want the deadline still unwrappable", tt.in, got)
+			}
+			if !strings.Contains(got.Error(), "shutdown grace") {
+				t.Errorf("classifyServeError(%v) = %q, want the drain named", tt.in, got)
+			}
+			if !strings.Contains(got.Error(), shutdownGrace.String()) {
+				t.Errorf("classifyServeError(%v) = %q, want the grace budget %s named so the ERROR line points at the constant to raise", tt.in, got, shutdownGrace)
+			}
+		})
 	}
 }

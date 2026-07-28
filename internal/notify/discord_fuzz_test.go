@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 
@@ -82,8 +83,9 @@ func assertDeliveryErrorHidesWebhookURL(t *testing.T, rawURL string, status int,
 	t.Helper()
 
 	const controlURL = "https://control.example/hooks/controlsegment"
+	needles := webhookNeedles(rawURL)
 	gotErr, requested := attemptAgainstStub(t, rawURL, status, body)
-	controlErr, _ := attemptAgainstStub(t, controlURL, status, body)
+	controlErr, _ := attemptAgainstStub(t, controlURL, status, controlBody(body, needles))
 	if gotErr == nil {
 		// A nil error is only correct when nothing was delivered-checked (an
 		// unusable fuzzed URL never reached the transport) or the status was
@@ -95,7 +97,43 @@ func assertDeliveryErrorHidesWebhookURL(t *testing.T, rawURL string, status int,
 		}
 		return
 	}
-	for _, needle := range webhookNeedles(rawURL) {
+	assertNoNeedleLeaked(t, gotErr, controlErr, needles,
+		fmt.Sprintf("%q (status %d)", rawURL, status))
+	assertTypedStatusError(t, gotErr, requested, status)
+}
+
+// controlBody blanks every webhook-derived text in the fuzzed body, byte for
+// byte, so the control attempt renders the same template from an input that
+// does NOT carry the credential. Without it the control shares the fuzzed body
+// verbatim, and a body echoing the request URI -- the shape both real leaks in
+// this file's history came from, and what half the seeds above are -- lands the
+// same text in BOTH errors, so the skip above swallows exactly the leak this
+// target exists to find. Blanking is length-preserving so the control keeps the
+// byte counts and the JSON-with-a-code branch of the real attempt.
+func controlBody(body string, needles []string) string {
+	blanked := slices.Clone(needles)
+	// Longest first, so a needle nested in a longer one cannot leave the
+	// longer one half-blanked and unmatched.
+	slices.SortFunc(blanked, func(a, b string) int { return len(b) - len(a) })
+	for _, needle := range blanked {
+		if len(needle) < 8 {
+			continue
+		}
+		body = strings.ReplaceAll(body, needle, strings.Repeat("z", len(needle)))
+	}
+	return body
+}
+
+// assertNoNeedleLeaked fails for every needle that reached gotErr without also
+// reaching controlErr, which is what a real leak looks like: text present in
+// BOTH errors came from knell's own message template, not from the URL or the
+// header. subject names what the attempt was made against, for the failure
+// message. Both fuzz targets share it so the min-needle length and the
+// control-skip rule cannot drift apart between them.
+func assertNoNeedleLeaked(t *testing.T, gotErr, controlErr error, needles []string, subject string) {
+	t.Helper()
+
+	for _, needle := range needles {
 		// A handful of bytes can occur in the surrounding message text, where
 		// its presence proves nothing.
 		if len(needle) < 8 {
@@ -105,10 +143,9 @@ func assertDeliveryErrorHidesWebhookURL(t *testing.T, rawURL string, status int,
 			continue
 		}
 		if strings.Contains(gotErr.Error(), needle) {
-			t.Errorf("delivery error for %q (status %d) kept %q: %v", rawURL, status, needle, gotErr)
+			t.Errorf("delivery error for %s kept %q: %v", subject, needle, gotErr)
 		}
 	}
-	assertTypedStatusError(t, gotErr, requested, status)
 }
 
 // assertTypedStatusError checks the other half of the contract the status
@@ -261,19 +298,8 @@ func FuzzRedirectResponsesNeverCarryLocationText(f *testing.F) {
 			t.Fatalf("postAttempt against a %d response returned nil, want a non-delivery error", status)
 		}
 		needles := append(webhookNeedles(rawURL), locationNeedles(location)...)
-		for _, needle := range needles {
-			// A handful of bytes can occur in the surrounding message text,
-			// where its presence proves nothing.
-			if len(needle) < 8 {
-				continue
-			}
-			if controlErr != nil && strings.Contains(controlErr.Error(), needle) {
-				continue
-			}
-			if strings.Contains(gotErr.Error(), needle) {
-				t.Errorf("delivery error for Location %q (status %d) kept %q: %v", location, status, needle, gotErr)
-			}
-		}
+		assertNoNeedleLeaked(t, gotErr, controlErr, needles,
+			fmt.Sprintf("Location %q (status %d)", location, status))
 	})
 }
 
