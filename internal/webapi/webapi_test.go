@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -589,15 +588,18 @@ func TestEveryRejectedMethodAnswersTheSameRefusal(t *testing.T) {
 	}
 }
 
-// TestAccessLogPathIsBounded pins the access log's path policy. r.URL.Path is
-// attacker-controlled and reaches the log line BEFORE the token gate runs
-// (webhttp.Logging is outermost), so an unauthenticated caller would otherwise
-// size knell's log lines at will and could push the undelivered-notice
-// warnings — the only trace of a permanently lost notice, which has no counter
-// behind it — out of the retained log window. Two halves: every legitimate
-// path is logged UNCHANGED (the fix must not cost an operator the beat id), and
-// an over-long one is truncated on a rune boundary (never mid-rune, which
-// would put invalid UTF-8 into the log stream).
+// TestAccessLogPathIsBounded pins the access log's path bound, which knell now
+// gets from webhttp (WithMaxLoggedPath(loggedPathCap)) rather than from a local
+// transform. r.URL.Path is attacker-controlled and reaches the log line BEFORE
+// the token gate runs (webhttp.Logging is outermost), so an unauthenticated
+// caller would otherwise size knell's log lines at will and could push the
+// undelivered-notice warnings — the only trace of a permanently lost notice,
+// which has no counter behind it — out of the retained log window. This test
+// covers the WIRING, which is the half that is still knell's: every legitimate
+// path is logged UNCHANGED (the bound must not cost an operator the beat id),
+// and an over-long one is truncated at knell's 128-byte figure rather than the
+// library's 512-byte default, on a rune boundary (never mid-rune, which would
+// put invalid UTF-8 into the log stream).
 func TestAccessLogPathIsBounded(t *testing.T) {
 	// A 3-byte rune after a 6-byte prefix guarantees the byte at the cap
 	// lands MID-RUNE (6 + 3k never equals 128), which is exactly the case a
@@ -619,11 +621,11 @@ func TestAccessLogPathIsBounded(t *testing.T) {
 		},
 		// Exactly at the cap: still verbatim (the bound is inclusive).
 		"path exactly at the cap unchanged": {
-			path:      "/beat/" + strings.Repeat("a", maxLoggedPath-6),
-			wantExact: "/beat/" + strings.Repeat("a", maxLoggedPath-6),
+			path:      "/beat/" + strings.Repeat("a", loggedPathCap-6),
+			wantExact: "/beat/" + strings.Repeat("a", loggedPathCap-6),
 		},
 		"one byte over the cap is truncated": {
-			path: "/beat/" + strings.Repeat("a", maxLoggedPath-5),
+			path: "/beat/" + strings.Repeat("a", loggedPathCap-5),
 		},
 		"megabyte path is truncated":  {path: "/beat/" + strings.Repeat("a", 1<<20)},
 		"multibyte path is truncated": {path: longMultibyte},
@@ -644,11 +646,11 @@ func TestAccessLogPathIsBounded(t *testing.T) {
 			if !ok {
 				t.Fatalf("no path attribute on the access line; records = %v", rec.Records())
 			}
-			// Fail-closed placeholder: webhttp substitutes it when the
-			// transform returns "" or panics. Seeing it means the policy
-			// broke, and the raw path is then lost to the operator entirely.
+			// The fail-closed placeholder belongs to webhttp's path-POLICY hook
+			// (WithPathFunc), which knell no longer installs — seeing it would
+			// mean a policy crept back in and broke.
 			if logged == "(path-redaction-failed)" {
-				t.Fatalf("path = %q: the path policy failed instead of truncating", logged)
+				t.Fatalf("path = %q: a path policy failed instead of the cap truncating", logged)
 			}
 			if tt.wantExact != "" {
 				if logged != tt.wantExact {
@@ -656,11 +658,11 @@ func TestAccessLogPathIsBounded(t *testing.T) {
 				}
 				return
 			}
-			if len(logged) > maxLoggedPath+len("...(truncated)") {
+			if len(logged) > loggedPathCap+len(truncationMarker) {
 				t.Errorf("logged path is %d bytes, want it bounded by the %d-byte cap plus the marker: an unauthenticated caller must not size log lines",
-					len(logged), maxLoggedPath)
+					len(logged), loggedPathCap)
 			}
-			if !strings.HasSuffix(logged, "...(truncated)") {
+			if !strings.HasSuffix(logged, truncationMarker) {
 				t.Errorf("path = %q, want a truncation marker so an operator can tell a bounded path from a real one", logged)
 			}
 			if !utf8.ValidString(logged) {
@@ -668,78 +670,88 @@ func TestAccessLogPathIsBounded(t *testing.T) {
 			}
 			// The kept prefix must be a genuine prefix of the request path,
 			// so the beat id an operator needs is still readable.
-			if !strings.HasPrefix(tt.path, strings.TrimSuffix(logged, "...(truncated)")) {
+			if !strings.HasPrefix(tt.path, strings.TrimSuffix(logged, truncationMarker)) {
 				t.Errorf("path = %q is not a prefix of the request path: truncation must not alter what it keeps", logged)
 			}
 		})
 	}
 }
 
-// TestLoggedPathMapsTheEmptyPathToRoot covers the one case an
-// httptest.NewRequest cannot express: r.URL.Path == "". The transform must not
-// return "", because webhttp reads an empty return as a FAILED redaction and
-// records its placeholder instead, losing the access record's path entirely.
-func TestLoggedPathMapsTheEmptyPathToRoot(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
-	req.URL.Path = ""
-	if got := loggedPath(req); got != "/" {
-		t.Errorf("loggedPath(empty) = %q, want \"/\": an empty return degrades to webhttp's redaction-failure placeholder", got)
-	}
-}
+// truncationMarker is what webhttp appends to a path its cap cut. It is the
+// library's text, restated here because the tests assert on the access line an
+// operator reads: if a version bump changed the marker, these assertions are
+// where knell finds out.
+const truncationMarker = "...(truncated)"
 
-// FuzzLoggedPathIsBounded fuzzes the untrusted text the access-log path policy
-// sanitizes. r.URL.Path is attacker-controlled, net/http accepts a megabyte of
-// it, and loggedPath runs BEFORE the token gate, so the transform is the only
-// thing bounding an unauthenticated caller's influence on knell's log lines --
-// the channel that carries the undelivered-notice warnings no counter backs.
-// TestAccessLogPathIsBounded pins named shapes; this pins the invariant set
-// over arbitrary bytes, including the class that table has none of: a path
-// carrying raw non-UTF-8 bytes (%80 decodes to one), where the rune-boundary
-// backoff can walk the cut all the way to zero.
+// FuzzLoggedPathIsBounded fuzzes the untrusted text the access line records as
+// its path. r.URL.Path is attacker-controlled, net/http accepts a megabyte of
+// it, and the access line is emitted BEFORE the token gate (webhttp.Logging is
+// outermost), so the bound is the only thing limiting an unauthenticated
+// caller's influence on knell's log lines -- the channel that carries the
+// undelivered-notice warnings no counter backs.
+//
+// The bound itself is webhttp's now, so what this pins is knell's WIRING of it:
+// that every request really does travel through a logger carrying
+// WithMaxLoggedPath(loggedPathCap), for arbitrary bytes rather than only for the
+// shapes TestAccessLogPathIsBounded names -- including the class that table has
+// none of, a path carrying raw non-UTF-8 bytes (%80 decodes to one), where the
+// rune-boundary backoff can walk the cut all the way to zero. It drives the real
+// assembled handler because there is no local transform left to call, which
+// also means a future middleware that re-wrote the path before Logging saw it
+// would be caught here.
 func FuzzLoggedPathIsBounded(f *testing.F) {
-	const marker = "...(truncated)"
 	f.Add("/beat/api")
 	f.Add("")
 	f.Add("/")
-	f.Add("/beat/" + strings.Repeat("a", maxLoggedPath-6))
-	f.Add("/beat/" + strings.Repeat("a", maxLoggedPath-5))
+	f.Add("/beat/" + strings.Repeat("a", loggedPathCap-6))
+	f.Add("/beat/" + strings.Repeat("a", loggedPathCap-5))
 	f.Add("/beat/" + strings.Repeat("\u20ac", 200))
 	f.Add("/beat/" + strings.Repeat("\U0001F600", 100))
 	f.Add("/beat/" + strings.Repeat("\x80", 200))
 	f.Add(strings.Repeat("\x80", 200))
 	f.Fuzz(func(t *testing.T, path string) {
-		got := loggedPath(&http.Request{URL: &url.URL{Path: path}})
+		// Serial by construction (the fuzz function runs one input at a time):
+		// capture.Default swaps the process-global slog default, and the
+		// handler must be built after it because webhttp.Logging resolves
+		// slog.Default() when the chain is built.
+		logs := capture.Default(t)
+		h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
 
-		// An empty return is read by webhttp as a FAILED redaction, which
-		// replaces the whole attribute with its placeholder: the operator
-		// then has no path at all, for any input.
-		if got == "" {
-			t.Fatalf("loggedPath(%q) = %q: an empty return degrades to webhttp's redaction-failure placeholder", path, got)
+		// Built by hand rather than via a target string: httptest.NewRequest
+		// panics on a target it cannot parse, and arbitrary bytes are exactly
+		// the input this target exists for.
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.URL.Path = path
+		h.ServeHTTP(httptest.NewRecorder(), req)
+
+		got, ok := logs.AttrValue("http", "path")
+		if !ok {
+			t.Fatalf("path %q produced no access line with a path attribute: records = %v", path, logs.Records())
 		}
-		if len(got) > maxLoggedPath+len(marker) {
-			t.Fatalf("loggedPath(%q) is %d bytes, want at most %d: an unauthenticated caller must not size log lines", path, len(got), maxLoggedPath+len(marker))
+		// The placeholder means a path POLICY broke. knell installs none, so
+		// it must never appear whatever arrives.
+		if got == "(path-redaction-failed)" {
+			t.Fatalf("path %q logged the redaction-failure placeholder: knell installs no path policy, so nothing can fail", path)
+		}
+		if len(got) > loggedPathCap+len(truncationMarker) {
+			t.Fatalf("path %q logged %d bytes, want at most %d: an unauthenticated caller must not size log lines", path, len(got), loggedPathCap+len(truncationMarker))
 		}
 		// Truncating mid-rune would put invalid UTF-8 into the log stream.
 		if utf8.ValidString(path) && !utf8.ValidString(got) {
-			t.Fatalf("loggedPath(%q) = %q is not valid UTF-8: truncation must land on a rune boundary", path, got)
+			t.Fatalf("path %q logged %q, which is not valid UTF-8: truncation must land on a rune boundary", path, got)
 		}
-		switch {
-		case path == "":
-			if got != "/" {
-				t.Fatalf("loggedPath(empty) = %q, want %q", got, "/")
-			}
-		case len(path) <= maxLoggedPath:
+		if len(path) <= loggedPathCap {
 			if got != path {
-				t.Fatalf("loggedPath(%q) = %q, want it logged verbatim: the bound must not cost an operator the beat id", path, got)
+				t.Fatalf("path %q logged as %q, want it verbatim: the bound must not cost an operator the beat id", path, got)
 			}
-		default:
-			kept, ok := strings.CutSuffix(got, marker)
-			if !ok {
-				t.Fatalf("loggedPath(%q) = %q, want the truncation marker so an operator can tell a bounded path from a real one", path, got)
-			}
-			if !strings.HasPrefix(path, kept) {
-				t.Fatalf("loggedPath(%q) kept %q, which is not a prefix of the request path: truncation must not alter what it keeps", path, kept)
-			}
+			return
+		}
+		kept, cut := strings.CutSuffix(got, truncationMarker)
+		if !cut {
+			t.Fatalf("path %q logged as %q, want the truncation marker so an operator can tell a bounded path from a real one", path, got)
+		}
+		if !strings.HasPrefix(path, kept) {
+			t.Fatalf("path %q logged a kept prefix %q that is not a prefix of the request path: truncation must not alter what it keeps", path, kept)
 		}
 	})
 }
@@ -1100,12 +1112,16 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 			wantSeries: `knell_http_requests_total{method="HEAD",path="/beat/{id}",status="405"}`,
 		},
 		// PUT falls to the method-AGNOSTIC /beat/{id} route, which names no
-		// method — so the method label collapses to "other" rather than
-		// echoing a caller-chosen token. See recordHTTPMetric.
+		// method — the case knell's own derivation used to collapse to
+		// "other". webhttp's derivation keeps a STANDARD method real (PUT is
+		// one of nine) and buckets only a non-standard token, so a
+		// method-probing scanner stays bounded while an operator can still see
+		// which real method a sender is misconfigured to use. See
+		// TestRequestMetricLabelsBoundedByTheRouteTable for the bucket half.
 		"disallowed method refused": {
 			ctx: context.Background(), method: http.MethodPut, path: "/beat/" + id,
 			wantStatus: http.StatusMethodNotAllowed,
-			wantSeries: `knell_http_requests_total{method="other",path="/beat/{id}",status="405"}`,
+			wantSeries: `knell_http_requests_total{method="PUT",path="/beat/{id}",status="405"}`,
 		},
 		// A ping arriving during the drain, after watch.Run already took its
 		// undelivered-work snapshot.
@@ -1147,30 +1163,37 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 }
 
 // TestRequestMetricLabelsBoundedByTheRouteTable is the cardinality guard on the
-// new counter, and the reason recordHTTPMetric derives BOTH labels from the
-// matched route instead of from the request. webhttp.Logging is outermost, so
-// this hook fires before beatHandler's token gate: the inputs below arrive from
-// an UNAUTHENTICATED caller, and a Prometheus series once minted is permanent
-// for the process lifetime here and in every observer scraping knell. So the
-// label set must be bounded by the ROUTE TABLE and by nothing the caller sends.
+// request counter, and the reason knell hands webhttp.WithRecordRouteMetric the
+// job of deriving both labels instead of deriving them itself.
+// webhttp.Logging is outermost, so the hook fires before beatHandler's token
+// gate: the inputs below arrive from an UNAUTHENTICATED caller, and a Prometheus
+// series once minted is permanent for the process lifetime here and in every
+// observer scraping knell. So the label set must be bounded by the ROUTE TABLE
+// plus a closed method vocabulary, and by nothing the caller sends.
 //
 // Two attack shapes, and knell is uniquely exposed to the second. The path is
-// the obvious one. The METHOD is the one the fleet siblings do not face:
-// registry-stats and subflux register only method-bearing patterns, so their
-// r.Method is bounded by the mux, while knell deliberately registers a
-// method-agnostic /beat/{id} catch-all (so a 405 can carry a truthful Allow),
-// and net/http routes ANY valid token there — "XYZZY" and friends reach it and
-// answer 405. Recording r.Method there would hand a scanner an unbounded label.
+// the obvious one, and it collapses onto registered templates (or the single
+// "unmatched" marker). The METHOD is the one the fleet siblings do not face:
+// registry-stats and subflux register only method-bearing patterns, while knell
+// deliberately registers a method-agnostic /beat/{id} catch-all (so a 405 can
+// carry a truthful Allow), and net/http routes ANY valid token there — "XYZZY"
+// and friends reach it and answer 405. The bound is no longer a collapse of that
+// route's method but webhttp's closed set: the nine standard methods stay
+// themselves and every other token, at any length, buckets into "other".
 func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
-	// The complete label vocabulary knell's route table can produce. Anything
+	// The complete label vocabulary knell's surface can produce: webhttp's
+	// closed method set (nine standard methods plus the "other" bucket) crossed
+	// with this route table's templates plus the "unmatched" marker. Anything
 	// outside this is a caller-controlled value that reached a label.
 	allowedMethods := map[string]bool{
-		"GET": true, "POST": true, "HEAD": true,
-		otherMethodLabel: true, unmatchedLabel: true,
+		http.MethodGet: true, http.MethodHead: true, http.MethodPost: true,
+		http.MethodPut: true, http.MethodDelete: true, http.MethodConnect: true,
+		http.MethodOptions: true, http.MethodTrace: true, http.MethodPatch: true,
+		otherMethodLabel: true,
 	}
 	allowedPaths := map[string]bool{
 		"/beat/{id}": true, "/healthz": true, "/metrics": true,
-		unmatchedLabel: true,
+		unmatchedPathLabel: true,
 	}
 
 	b := &fakeBeater{known: map[string]bool{"api": true}}
@@ -1202,6 +1225,14 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 	add(http.MethodGet, "/beat/a%2Fb")
 	add(http.MethodGet, "//healthz")
 	add(http.MethodGet, "/./metrics")
+	// A 300-byte method token: LENGTH must not widen the label set either, and
+	// no local middleware caps it any more — the closed method set is what
+	// buckets it, exactly as it buckets a short bogus token.
+	add(strings.Repeat("A", 300), "/beat/api")
+	// A lowercase spelling of a standard method is NOT that method (methods are
+	// case-sensitive, RFC 9110 §9.1), so it must bucket rather than hand a
+	// caller a second spelling of the GET series.
+	add("get", "/beat/api")
 
 	for _, req := range hostile {
 		beatRequest(t, h, req.method, req.path)
@@ -1243,10 +1274,11 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 		}
 	}
 
-	// The route table can produce at most 5 methods x 4 paths x the handful of
-	// statuses knell answers; 52 hostile requests must land inside that, not
-	// grow it. The bound is deliberately loose — the membership checks above are
-	// the precise guard, this catches unbounded GROWTH regardless of spelling.
+	// The vocabulary can produce at most 10 methods x 4 paths x the handful of
+	// statuses knell answers; the hostile requests above must land inside that,
+	// not grow it. The bound is deliberately loose — the membership checks above
+	// are the precise guard, this catches unbounded GROWTH regardless of
+	// spelling.
 	const maxNewSeries = 8
 	if grew := len(after) - len(before); grew > maxNewSeries {
 		t.Errorf("%d hostile requests added %d new series (want at most %d): the label set must be bounded by the route table, not by the caller\n%s",
@@ -1254,31 +1286,52 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 	}
 }
 
-// TestUnroutedRequestsAreCountedUnderTheCollapsedSeries pins the FIRST case of
-// recordHTTPMetric's contract: a request that matched no route is still
-// counted, under the single collapsed unmatched/unmatched label set.
+// TestUnroutedRequestsAreCountedUnderTheCollapsedSeries pins the unmatched case
+// of webhttp's label derivation as knell wires it: a request that matched no
+// route is still counted, with its PATH collapsed onto the single "unmatched"
+// marker and its real method kept.
 // TestRequestMetricLabelsBoundedByTheRouteTable only proves such a request
 // cannot MINT a caller-spelled series, so a hook that skipped unmatched
 // requests entirely passes it -- and then scanner floods and every misrouted
 // sender (a wrong-method scrape included) are invisible to the vantage point
 // knell's own alert rules read.
+//
+// Only the path collapses. knell's own derivation used to collapse the method
+// here too, because an unrouted request's method was caller-chosen text; the
+// closed method set removes that reason, so a 404 flood stays visible per method
+// (GET scanners vs POST senders) at no cardinality cost. That is a label change:
+// the method="unmatched" value no longer exists in this exposition.
 func TestUnroutedRequestsAreCountedUnderTheCollapsedSeries(t *testing.T) {
-	const series = `knell_http_requests_total{method="unmatched",path="unmatched",status=`
 	tests := map[string]struct {
 		method, path string
+		wantMethod   string
 		wantStatus   string
 	}{
 		// Scanner traffic: no pattern matches at all, so net/http answers 404.
-		"off-route probe": {method: http.MethodGet, path: "/wp-admin/setup.php", wantStatus: "404"},
+		"off-route probe": {
+			method: http.MethodGet, path: "/wp-admin/setup.php",
+			wantMethod: http.MethodGet, wantStatus: "404",
+		},
 		// A scrape aimed with the wrong method: /metrics is registered GET-only,
 		// so net/http's own 405 fires with no pattern matched.
-		"wrong-method scrape": {method: http.MethodPost, path: "/metrics", wantStatus: "405"},
+		"wrong-method scrape": {
+			method: http.MethodPost, path: "/metrics",
+			wantMethod: http.MethodPost, wantStatus: "405",
+		},
+		// An unrouted request whose METHOD is also caller-chosen text: the path
+		// collapses and the method buckets, so the pair stays bounded on both
+		// axes without either one disappearing.
+		"off-route probe with a bogus method": {
+			method: "XYZZY", path: "/nope",
+			wantMethod: otherMethodLabel, wantStatus: "404",
+		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			b := &fakeBeater{known: map[string]bool{"api": true}}
 			h := newTestHandlerCtx(context.Background(), b, "")
-			want := series + `"` + tt.wantStatus + `"}`
+			want := `knell_http_requests_total{method="` + tt.wantMethod +
+				`",path="` + unmatchedPathLabel + `",status="` + tt.wantStatus + `"}`
 			// Deltas, not absolutes: the registry is a package-level singleton
 			// shared by the whole test binary (and by a -count=2 rerun).
 			before, _ := seriesValue(t, scrapeExposition(t, h), want)
@@ -1297,17 +1350,17 @@ func TestUnroutedRequestsAreCountedUnderTheCollapsedSeries(t *testing.T) {
 	}
 }
 
-// TestAccessLogMethodIsBoundedForRefusedRequests pins boundMethod. The access
-// log's method is as caller-controlled as its path, and webhttp logs r.Method
-// verbatim with no transform hook, so the cap has to sit OUTSIDE Logging.
-// net/http accepts any RFC 9110 token as a method with no length cap of its
-// own, and the request line is bounded only by MaxHeaderBytes+4096 (1 MiB by
-// default), so without this cap one unauthenticated caller writes ~1 MiB of its
-// own text into a single access line and pushes knell's permanently-lost-notice
-// WARNs out of the retained log window -- the same consequence maxLoggedPath
+// TestAccessLogMethodIsBoundedForRefusedRequests pins the access line's method
+// bound, which is webhttp's and carries no knob (its ceiling follows from the
+// IANA method registry, whose longest entry is UPDATEREDIRECTREF at 17
+// characters, not from anything knell serves). The bound has to exist
+// somewhere: net/http accepts any RFC 9110 token as a method with no length cap
+// of its own, and the request line is bounded only by MaxHeaderBytes+4096 (1 MiB
+// by default), so without it one unauthenticated caller writes ~1 MiB of its own
+// text into a single access line and pushes knell's permanently-lost-notice
+// WARNs out of the retained log window — the same consequence the path cap
 // exists to prevent, on a request the token gate never sees (Logging is
-// outermost). The metric side of the same request is already bounded
-// (otherMethodLabel), which is what left the log as the last unbounded sink.
+// outermost).
 func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and must be installed BEFORE New, because webhttp.Logging
@@ -1315,7 +1368,7 @@ func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 	logs := capture.Default(t)
 	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
 
-	overlong := strings.Repeat("A", maxLoggedMethod+4)
+	overlong := strings.Repeat("A", 300)
 	rec := beatRequest(t, h, overlong, "/beat/api")
 
 	// The refusal itself is unchanged: the bogus method still routes to the
@@ -1328,8 +1381,8 @@ func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 	}
 
 	// The logged method is the placeholder, never the caller's bytes.
-	if !logs.HasAttr("http", "method", overlongMethodLabel) {
-		t.Errorf("access line does not report method=%s; records = %v", overlongMethodLabel, logs.Records())
+	if !logs.HasAttr("http", "method", overlongMethodMarker) {
+		t.Errorf("access line does not report method=%s; records = %v", overlongMethodMarker, logs.Records())
 	}
 	if logs.HasAttr("http", "method", overlong) {
 		t.Errorf("access line carries the caller's %d-byte method verbatim: an unauthenticated caller writes the text of knell's own log lines; records = %v",
@@ -1344,3 +1397,20 @@ func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 		t.Errorf("access line does not report method=POST for an ordinary ping; records = %v", logs.Records())
 	}
 }
+
+// The label and marker vocabulary webhttp produces, restated here because these
+// tests assert on the exposition and the access line an operator reads. The
+// library exports the derivation (RouteMetricLabels), not the strings, so if a
+// version bump ever changed one of them, these assertions are where knell finds
+// out — which is the point of naming them rather than inlining the literals.
+const (
+	// otherMethodLabel is the bucket every non-standard method collapses into.
+	otherMethodLabel = "other"
+	// unmatchedPathLabel is the path label for a request that matched no route.
+	// There is deliberately no method twin: only the path collapses.
+	unmatchedPathLabel = "unmatched"
+	// overlongMethodMarker replaces a method over webhttp's 24-byte log cap.
+	// Unforgeable: parentheses are not token characters, so net/http answers a
+	// request line spelling it 400 before a handler runs.
+	overlongMethodMarker = "(overlong)"
+)

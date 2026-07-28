@@ -292,7 +292,7 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 			},
 			want: []string{
 				"had 3 outages", "longest 47m0s",
-				"2 had an undelivered alert", "1 ended before a sweep detected it", webhookClause,
+				"2 had an earlier report attempt go undelivered", "1 ended before a sweep detected it", webhookClause,
 			},
 			forbid: []string{
 				// Neither single-reason clause may stand in for a mixed batch.

@@ -10,3 +10,5 @@ require (
 	github.com/cplieger/slogx v1.4.0
 	github.com/cplieger/webhttp v1.18.1
 )
+
+replace github.com/cplieger/webhttp => /workspace/webhttp

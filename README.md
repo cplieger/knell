@@ -103,7 +103,7 @@ A live incident and one that is already over are reported differently: nothing a
 
   Several become one summary. When the batch mixes the two reasons, it reports both counts rather than blaming one for all of them:
 
-  > 🕓 [knell server-1] beat **cron-backup** had 3 outages: longest 47m0s, last recovered at 2026-07-23 14:07 UTC. 2 had an undelivered alert (check the webhook), 1 ended before a sweep detected it.
+  > 🕓 [knell server-1] beat **cron-backup** had 3 outages: longest 47m0s, last recovered at 2026-07-23 14:07 UTC. 2 had an earlier report attempt go undelivered (check the webhook), 1 ended before a sweep detected it.
 
   The whole run of ended outages goes out in a single sweep, so a genuinely live outage queued behind it waits one sweep rather than one sweep per stale record. Because the notice states the outages are over, no recovered notice follows for them.
 - **Queued outages**: each beat queues up to 8 records and reports them oldest first. When a beat's queue is full, the newest record is not queued, and the two cases that can arise differ in consequence:

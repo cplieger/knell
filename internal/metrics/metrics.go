@@ -45,11 +45,13 @@
 // so it is outside the contract above and adding it did not widen the set of
 // packages allowed to mint a per-beat series. It has its own bounded-label
 // contract instead, and the same reasoning drives it — its method and path
-// labels must be derived from the MATCHED ROUTE, never from the request line,
-// because /beat/{id} is served to unauthenticated callers (webhttp.Logging is
-// the outermost middleware, so its hook fires before the BEAT_TOKEN gate
-// runs). internal/webapi.recordHTTPMetric is the single place that derivation
-// lives; read its comment before changing either label.
+// labels must be bounded by the ROUTE TABLE and a closed method set, never by
+// the request line, because /beat/{id} is served to unauthenticated callers
+// (webhttp.Logging is the outermost middleware, so its metric hook fires before
+// the BEAT_TOKEN gate runs). The derivation lives in webhttp
+// (RouteMetricLabels): internal/webapi.New passes this function straight to
+// webhttp.WithRecordRouteMetric, so the library computes the pair and knell has
+// none of its own to get wrong.
 //
 // Runtime enforcement inside this package is deliberately NOT the answer: it
 // would add state plus an init-order dependency on config to defend against a
@@ -221,9 +223,10 @@ var notificationsDropped = metricslib.NewLabeledCounter(
 // beat request never reaches beatsReceived, so without this series a sender
 // whose token was rotated or whose beat id is misspelled stays invisible
 // until the beat goes missing a full deadline later — on an app whose whole
-// job is being alertable. Labels are bounded by the CALLER, which must pass a
-// route template and a routed method rather than anything off the request
-// line (see the package doc's RecordHTTP contract).
+// job is being alertable. Labels are bounded by the CALLER, which passes the
+// pair webhttp derives from the matched route and a closed method set rather
+// than anything off the request line (see the package doc's RecordHTTP
+// contract).
 var httpRequests = metricslib.NewLabeledCounter(
 	"http_requests_total",
 	"Served HTTP requests by matched route template, method and status.",
@@ -312,10 +315,12 @@ func RecordOutage(id string) {
 }
 
 // RecordHTTP records one served HTTP request: its latency, and one increment
-// on the method/path/status combination. method and path must be derived from
-// the MATCHED ROUTE, not from the request line — see the package doc's
-// RecordHTTP contract and internal/webapi.recordHTTPMetric, which is the only
-// production caller. Unlike the beat counters this series is not pre-minted:
+// on the method/path/status combination. method and path must be bounded by the
+// route table and a closed method vocabulary, not taken off the request line —
+// see the package doc's RecordHTTP contract. Its only production caller is
+// webhttp's WithRecordRouteMetric hook, wired in internal/webapi.New: the
+// library derives the pair (webhttp.RouteMetricLabels) and calls this function
+// with it. Unlike the beat counters this series is not pre-minted:
 // an HTTP counter has no known-in-advance status set, so alerts on it should
 // sum over the label set rather than select a single status.
 func RecordHTTP(method, path string, status int, d time.Duration) {

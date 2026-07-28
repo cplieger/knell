@@ -200,9 +200,12 @@ func lateClause(reason watch.LateReason) string {
 // back while short outages keep ending between sweeps, which is exactly how a
 // flapping beat behaves during a Discord outage — so a mixed batch reports
 // BOTH counts instead of picking the majority reason and stating something
-// false about the rest. It keeps the webhook pointer: one undelivered alert is
-// reason enough to look at delivery, while naming the outages that ended before
-// a sweep saw them stops the count from reading as that many webhook failures.
+// false about the rest. It keeps the webhook pointer: one failed report attempt
+// is reason enough to look at delivery, while naming the outages that ended
+// before a sweep saw them stops the count from reading as that many webhook
+// failures. Like lateClause, the undelivered half names a failed ATTEMPT to
+// report rather than a pending live alert, because a record upgraded to
+// LateUndelivered by a failed history post never had a live alert due.
 func batchLateClause(outages []watch.Outage) string {
 	ended := 0
 	for _, o := range outages {
@@ -220,7 +223,7 @@ func batchLateClause(outages []watch.Outage) string {
 	case len(outages):
 		return "Each ended before a sweep detected it - nothing was wrong with delivery."
 	default:
-		return fmt.Sprintf("%d had an undelivered alert (check the webhook), %d ended before a sweep detected it.",
+		return fmt.Sprintf("%d had an earlier report attempt go undelivered (check the webhook), %d ended before a sweep detected it.",
 			len(outages)-ended, ended)
 	}
 }
