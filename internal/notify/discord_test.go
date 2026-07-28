@@ -148,7 +148,6 @@ func TestBeatOutageHistoryReportsOneEndedOutageInThePastTense(t *testing.T) {
 	outages := []watch.Outage{{
 		Started:   recovered.Add(-12 * time.Minute),
 		Recovered: recovered,
-		Silence:   11 * time.Minute,
 		// The case the history path was built for: a sweep raised the alert
 		// and the webhook was unreachable, so the notice arrives after the
 		// outage it reports.
@@ -192,11 +191,11 @@ func TestBeatOutageHistorySummarizesSeveralEndedOutages(t *testing.T) {
 	base := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
 	last := time.Date(2026, 7, 23, 14, 7, 0, 0, time.UTC)
 	outages := []watch.Outage{
-		{Started: base, Recovered: base.Add(12 * time.Minute), Silence: 11 * time.Minute},
+		{Started: base, Recovered: base.Add(12 * time.Minute)},
 		// The longest outage is deliberately in the middle, so a summary
 		// that just reports the last or first span fails here.
-		{Started: base.Add(20 * time.Minute), Recovered: base.Add(67 * time.Minute), Silence: 11 * time.Minute},
-		{Started: last.Add(-15 * time.Minute), Recovered: last, Silence: 11 * time.Minute},
+		{Started: base.Add(20 * time.Minute), Recovered: base.Add(67 * time.Minute)},
+		{Started: last.Add(-15 * time.Minute), Recovered: last},
 	}
 	if err := d.BeatOutageHistory(context.Background(), "api", outages); err != nil {
 		t.Fatalf("BeatOutageHistory: %v", err)
@@ -238,7 +237,6 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 		return watch.Outage{
 			Started:    recovered.Add(-span),
 			Recovered:  recovered,
-			Silence:    span - time.Minute,
 			LateReason: reason,
 		}
 	}

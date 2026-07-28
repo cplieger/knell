@@ -146,12 +146,6 @@ type Outage struct {
 	// Recovered is the first accepted ping after the outage: the instant it
 	// ended. Always after Started.
 	Recovered time.Time
-	// Silence is how long the beat had been quiet when the deadline crossing
-	// was detected: the live Transition's own DownFor, frozen at the last
-	// observation before a ping sealed the record. It is a reading taken
-	// during the outage, so it is at or below the outage's full span; DownFor
-	// is the span itself.
-	Silence time.Duration
 	// LateReason says why this outage is reported after the fact instead of
 	// as a live incident. The renderer must not guess it: the two reasons
 	// lead an operator to opposite next steps.
@@ -368,7 +362,6 @@ func (st *beatState) closedRun() []Outage {
 		run = append(run, Outage{
 			Started:    rec.silence.Started,
 			Recovered:  rec.recoveredAt,
-			Silence:    rec.silence.DownFor(),
 			LateReason: rec.late,
 		})
 	}

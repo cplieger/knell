@@ -72,9 +72,8 @@ func checkSwitchStaysArmed(t *testing.T, w *Watcher, id string, now time.Time, o
 
 // checkHistoryPayloads asserts the Notifier contract on what the notifier
 // actually RECEIVED, across every history notice delivered so far: outages is
-// never empty, every reported outage is closed with a positive detected
-// silence, and the outages form one chronological, non-overlapping sequence
-// across notices. The last clause is the one the queue's structural
+// never empty, every reported outage is closed with a positive span, and the
+// outages form one chronological, non-overlapping sequence across notices. The last clause is the one the queue's structural
 // invariants cannot express: an outage reported in two different notices
 // (a delivered run that was not consumed) shows up as a notice whose first
 // outage starts before the previously reported one recovered. That clause
@@ -91,12 +90,13 @@ func checkHistoryPayloads(t *testing.T, n *fakeNotifier, ops string) {
 			t.Fatalf("ops %q: history notice %d reported no outages at all, but the contract says outages is never empty", ops, i)
 		}
 		for j, o := range outages {
-			if !o.Recovered.After(o.Started) {
-				t.Fatalf("ops %q: history notice %d outage %d recovered at %s, not after its start %s: a past-tense notice must only report ended outages",
-					ops, i, j, o.Recovered, o.Started)
-			}
-			if o.Silence <= 0 {
-				t.Fatalf("ops %q: history notice %d outage %d reports a detected silence of %s", ops, i, j, o.Silence)
+			// One clause covers both halves of the old pair: DownFor is
+			// Recovered.Sub(Started), so "closed and ordered" and "reports a
+			// positive span" are the same predicate, and stating it through
+			// DownFor keeps the span check on the field the notice renders.
+			if o.DownFor() <= 0 {
+				t.Fatalf("ops %q: history notice %d outage %d reports a span of %s (started %s, recovered %s): a past-tense notice must only report ended outages, each with a positive span",
+					ops, i, j, o.DownFor(), o.Started, o.Recovered)
 			}
 			if !lastRecovered.IsZero() && o.Started.Before(lastRecovered) {
 				t.Fatalf("ops %q: history notice %d outage %d starts at %s, before the previously reported outage recovered at %s: the same outage was reported twice, or two notices overlap",
