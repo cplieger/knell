@@ -644,34 +644,75 @@ func TestLoadTrimsPaddedPlainSecrets(t *testing.T) {
 	}
 }
 
-func TestLoadKeepsAWhitespaceOnlyBeatTokenArmed(t *testing.T) {
-	// A whitespace-only BEAT_TOKEN is a misconfigured credential, but an
-	// EMPTY BeatToken is webapi's open-endpoint sentinel: trimming this
-	// value to "" would silently disarm the /beat/{id} gate the operator
-	// set (and skip the short-token warning too), while the same value via
-	// BEAT_TOKEN_FILE fails startup. Keep it non-empty so the gate arms.
+func TestLoadRejectsAnASCIIWhitespaceOnlyBeatToken(t *testing.T) {
+	// Where this shape comes from: a compose quoting accident or a padded
+	// interpolation (BEAT_TOKEN="${TOKEN} " with TOKEN undefined) hands the
+	// process a token made only of spaces and tabs.
+	//
+	// Such a token can never be PRESENTED: net/textproto strips leading and
+	// trailing spaces and tabs from every header value, so "Bearer   " is
+	// read back as "Bearer" and webhttp's sha256 + ConstantTimeCompare
+	// verifier (no normalization) rejects it. Keeping it armed was the worst
+	// outcome available for a dead-man switch: knell started, reported
+	// itself gated, 401'd every ping, and one deadline later posted a
+	// MISSING notice for every configured beat. So it fails startup, like
+	// the two adjacent accidents this package already refuses (a
+	// present-but-empty BEAT_TOKEN and a blank BEAT_TOKEN_FILE).
+	tests := map[string]string{
+		"spaces":             "   ",
+		"tab":                "\t",
+		"spaces and tabs":    " \t \t ",
+		"carriage return lf": "\r\n",
+	}
+	for name, token := range tests {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			t.Setenv("BEAT_TOKEN", token)
+			unsetEnv(t, "BEAT_TOKEN_FILE")
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() with BEAT_TOKEN=%q = nil, want error: the token cannot survive into a header value, so every ping 401s against an endpoint that reports itself gated", token)
+			}
+			if !strings.Contains(err.Error(), "BEAT_TOKEN") {
+				t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which variable to fix", err)
+			}
+		})
+	}
+}
+
+func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
+	// The boundary of the refusal above, and the one place a naive
+	// strings.TrimSpace check would be wrong. TrimSpace follows
+	// unicode.IsSpace and treats NBSP (U+00A0) as blank, but net/textproto
+	// strips only spaces and tabs: an NBSP-only token IS presented verbatim
+	// and DOES authenticate, so refusing it would fail startup on a working
+	// configuration, and trimming it to "" would silently serve /beat/{id}
+	// open. Accepted verbatim, gate armed, with the warning — it is still
+	// almost certainly an accident.
+	//
+	// Serial (t.Setenv forbids t.Parallel): swaps the process-global slog
+	// default to assert the warning.
+	const token = "\u00a0"
 	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "   ")
+	t.Setenv("BEAT_TOKEN", token)
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 
 	rec := capture.Default(t)
 
 	cfg, err := Load()
 	if err != nil {
-		t.Fatalf("Load() error: %v", err)
+		t.Fatalf("Load() with an NBSP-only BEAT_TOKEN = %v, want accepted: textproto keeps a non-ASCII space, so the token is presentable and the gate must stay armed", err)
 	}
-	if cfg.BeatToken == "" {
-		t.Fatal("BeatToken is empty for a present whitespace-only BEAT_TOKEN: webapi would serve /beat/{id} ungated (fail-open)")
-	}
-	if cfg.BeatToken != "   " {
-		t.Errorf("BeatToken = %q, want the value preserved verbatim", cfg.BeatToken)
+	if cfg.BeatToken != token {
+		t.Errorf("BeatToken = %q, want %q preserved verbatim: an empty BeatToken is webapi's open-endpoint sentinel, so trimming would disarm the gate the operator set", cfg.BeatToken, token)
 	}
 	// The shape, not just the length: the generic short-token warning fires
-	// for "   " too (it is 3 bytes), so without this assertion the one
-	// warning that names the actual misconfiguration can be dropped and the
-	// log still looks populated.
+	// for a 2-byte token too, so without this assertion the one warning that
+	// names the actual misconfiguration can be dropped and the log still
+	// looks populated.
 	if !rec.Contains("whitespace only") {
-		t.Errorf("log output %v never says the token is whitespace only; the only other signal is the length hint, which reads as \"your token is short\" while every sender 401s", rec.Messages())
+		t.Errorf("log output %v never says the token is whitespace only; the only other signal is the length hint, which reads as \"your token is short\" while senders must reproduce an invisible character", rec.Messages())
 	}
 }
 

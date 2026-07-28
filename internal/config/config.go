@@ -35,6 +35,21 @@ const minDeadline = 30 * time.Second
 // still arms).
 const minTokenLength = 16
 
+// asciiWhitespace is the cutset of characters that can never carry a bearer
+// token through an HTTP header, and therefore the definition of "whitespace
+// only" loadBeatToken refuses: net/textproto strips leading and trailing
+// SPACE and TAB from every header value, and CR, LF, VT and FF are illegal
+// bytes in a field value, so a token built only from these characters reaches
+// the verifier as the empty string (or not at all) no matter what the sender
+// puts on the wire.
+//
+// Non-ASCII spaces (NBSP U+00A0, NEL U+0085, U+2000…) are deliberately NOT in
+// the set: textproto keeps them, so a token made of them IS presented verbatim
+// and DOES authenticate. strings.TrimSpace (unicode.IsSpace) would treat them
+// as blank, so using it as the refusal test would fail startup on a working
+// configuration.
+const asciiWhitespace = " \t\r\n\v\f"
+
 // maxNodeNameBytes caps NODE_NAME so every notification stays inside
 // Discord's 2000-character `content` limit. The node name is interpolated
 // into EVERY notice (missing, recovered, history), so an unbounded value
@@ -238,10 +253,11 @@ func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
 
 // loadBeatToken reads the optional BEAT_TOKEN bearer gate for
 // POST/GET /beat/{id}; an empty return disables the check. Optional means
-// ABSENT, not blank: a present-but-empty BEAT_TOKEN fails startup, like an
-// empty BEAT_TOKEN_FILE. BEAT_TOKEN_FILE points at a mounted secret file
-// instead (the same convention DISCORD_WEBHOOK_URL uses), keeping the
-// credential out of `docker inspect` output.
+// ABSENT, not blank: a present-but-empty BEAT_TOKEN fails startup, and so
+// does one that is only ASCII whitespace (a token no sender could ever
+// present), like an empty BEAT_TOKEN_FILE. BEAT_TOKEN_FILE points at a
+// mounted secret file instead (the same convention DISCORD_WEBHOOK_URL uses),
+// keeping the credential out of `docker inspect` output.
 func loadBeatToken() (string, error) {
 	if err := rejectBlankFileVar("BEAT_TOKEN"); err != nil {
 		return "", err
@@ -251,18 +267,22 @@ func loadBeatToken() (string, error) {
 	case err == nil:
 		warnPlainVarIgnored("BEAT_TOKEN", "token", tokenSrc)
 		// Same reason as the webhook: a padded token makes every sender 401
-		// and every beat cross its deadline. A value that is ENTIRELY
-		// whitespace is kept verbatim instead: an empty token is the
-		// documented open-endpoint sentinel (webapi builds no verifier for
-		// it), so trimming would silently disarm the gate the operator did
-		// set — while the same value via BEAT_TOKEN_FILE fails startup.
-		trimmed := strings.TrimSpace(token)
-		if trimmed != "" {
+		// and every beat cross its deadline, so padding is trimmed. A value
+		// that is ENTIRELY ASCII whitespace cannot be presented at all (see
+		// asciiWhitespace), so it fails startup like a present-but-empty
+		// BEAT_TOKEN and a blank BEAT_TOKEN_FILE: keeping it armed reported
+		// a gated endpoint that rejected every ping.
+		switch trimmed := strings.TrimSpace(token); {
+		case trimmed != "":
 			token = trimmed
-		} else {
-			// Kept verbatim above so the gate stays armed. Say so: the only
-			// other signal is the length hint below, which reads as "your
-			// token is short" while every sender 401s against a value the
+		case strings.Trim(token, asciiWhitespace) == "":
+			return "", errors.New("BEAT_TOKEN is set but contains only whitespace: HTTP strips the leading and trailing spaces and tabs from a header value, so no sender can present this token and POST /beat/{id} would reject every ping while the endpoint reports itself gated; set it to a long random token, or unset the variable entirely to serve /beat/{id} open on purpose")
+		default:
+			// All whitespace by Unicode rules, but at least one rune
+			// survives the header (a non-ASCII space): the token IS
+			// presentable, so it is kept verbatim and the gate stays armed.
+			// Say so, because the only other signal is the length hint
+			// below, which reads as "your token is short" for a value the
 			// operator cannot see in `docker inspect` output.
 			slog.Warn("BEAT_TOKEN is whitespace only; the /beat/{id} gate is armed with a whitespace token every sender must send verbatim, so set a long random token, or unset the variable to serve the endpoint open")
 		}
