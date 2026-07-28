@@ -36,12 +36,12 @@ const minDeadline = 30 * time.Second
 const minTokenLength = 16
 
 // asciiWhitespace is the cutset of characters that can never carry a bearer
-// token through an HTTP header, and therefore the definition of "whitespace
-// only" loadBeatToken refuses: net/textproto strips leading and trailing
+// token through an HTTP header, and therefore the definition of the edge
+// padding loadBeatToken REFUSES: net/textproto strips leading and trailing
 // SPACE and TAB from every header value, and CR, LF, VT and FF are illegal
-// bytes in a field value, so a token built only from these characters reaches
-// the verifier as the empty string (or not at all) no matter what the sender
-// puts on the wire.
+// bytes in a field value, so a token whose edges are built from these
+// characters cannot reach the verifier as the operator wrote it no matter what
+// the sender puts on the wire.
 //
 // Non-ASCII spaces (NBSP U+00A0, NEL U+0085, U+2000…) are deliberately NOT in
 // the set: textproto keeps them, so a token made of them IS presented verbatim
@@ -256,9 +256,11 @@ func rejectBlankFileVar(key string) error {
 // plain KEY was also set, so the plain variable was ignored. envx documents
 // this composition as the caller's policy (SecretWithSource reports the
 // source on its error paths too); subject names the credential in the
-// operator's own vocabulary. Call it only once the secret read SUCCEEDED — on
-// an error path the file supplied nothing, so there is no winner to report and
-// the plain variable was never consulted. The message is static and the
+// operator's own vocabulary. Call it only once the secret read SUCCEEDED and
+// the value it produced has PASSED validation — on an error path the file
+// supplied nothing, so there is no winner to report and the plain variable was
+// never consulted, and on a validation failure the advice would describe a
+// configuration that never ran. The message is static and the
 // variable names ride attributes, so one Loki query covers both credentials
 // and can filter on which variable was ignored.
 func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
@@ -270,16 +272,16 @@ func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
 }
 
 // beatTokenFitsHeader reports whether value can be carried verbatim in an HTTP
-// field value, ASSUMING it has already been trimmed of edge ASCII whitespace
-// (see asciiWhitespace). It answers the byte-legality question only: a value
-// with a trailing SP or HTAB passes it, yet the wire would strip that byte and
-// the exact-match verifier would then reject every ping — so it is not a
-// substitute for the trim, it runs after it. HTTP permits SP, HTAB, visible
-// ASCII and obs-text (bytes >= 0x80, which is why a non-ASCII space token stays
-// legal), but rejects every other ASCII control byte and DEL. Go's own HTTP
-// client refuses to write such a value and its server rejects a handcrafted one
-// before the handler runs, so a token containing one is unpresentable no matter
-// what the sender does.
+// field value, ASSUMING edge ASCII whitespace has already been REFUSED (see
+// checkBeatToken and asciiWhitespace). It answers the byte-legality question
+// only: a value with a trailing SP or HTAB passes it, yet the wire would strip
+// that byte and the exact-match verifier would then reject every ping — so it
+// is not a substitute for the padding refusal, it runs after it. HTTP permits
+// SP, HTAB, visible ASCII and obs-text (bytes >= 0x80, which is why a
+// non-ASCII space token stays legal), but rejects every other ASCII control
+// byte and DEL. Go's own HTTP client refuses to write such a value and its
+// server rejects a handcrafted one before the handler runs, so a token
+// containing one is unpresentable no matter what the sender does.
 func beatTokenFitsHeader(value string) bool {
 	for i := range len(value) {
 		b := value[i]
@@ -290,52 +292,57 @@ func beatTokenFitsHeader(value string) bool {
 	return true
 }
 
-// normalizeBeatToken turns a configured BEAT_TOKEN into the form that reaches
-// the verifier on the wire, or refuses it.
+// checkBeatToken validates a configured BEAT_TOKEN as the exact credential
+// senders must present, or refuses it. It never rewrites the value.
 //
-// Same reason as the webhook: a padded token makes every sender 401
-// and every beat cross its deadline, so padding is trimmed. Trim
-// FIRST, with the ASCII cutset, and classify what is left: an
-// expected header value that ENDS in a cutset byte can never reach
-// the verifier intact (the wire strips trailing SP/TAB and refuses
-// CR, LF, VT and FF outright — see asciiWhitespace), so the trimmed
-// form is the deliverable shape of this token. Deciding on
-// strings.TrimSpace first instead would keep a value like
-// " \u00a0 " verbatim — its trailing space makes it undeliverable,
-// so every ping 401s against an endpoint that reports itself gated.
-func normalizeBeatToken(token string) (string, error) {
-	token = strings.Trim(token, asciiWhitespace)
+// Edge ASCII whitespace is REFUSED rather than trimmed. Silently rewriting a
+// credential is what split "the value you configured" from "the value that
+// authenticates": the verifier compares "Bearer "+token (see internal/webapi),
+// so a LEADING whitespace run is INTERIOR to the Authorization value and the
+// wire does NOT strip it — a sender using the configured value sends
+// "Bearer  secret" and gets 401 while startup reports the gate armed. A
+// TRAILING run is stripped on the wire, so the sender's value and the
+// verifier's differ the other way round. Either way the two disagree, and a
+// dead-man switch should refuse to start rather than report itself gated while
+// rejecting every sender: a 401'd ping is an undetectable ping, and one
+// deadline later every configured beat goes falsely missing.
+func checkBeatToken(token string) error {
+	if strings.Trim(token, asciiWhitespace) != token {
+		// The value is never echoed: the message names the variable and the
+		// shape of the problem only (the startup log ships to Loki).
+		return errors.New("BEAT_TOKEN has leading or trailing whitespace: the token is used verbatim as the bearer credential and knell will not silently rewrite it, because a leading run of spaces or tabs sits INSIDE the \"Bearer <token>\" header value and reaches the verifier while a trailing one is stripped on the wire — so the value you configured and the value that authenticates would differ and POST /beat/{id} would reject every ping while the endpoint reports itself gated; remove the surrounding whitespace, or unset the variable entirely to serve /beat/{id} open on purpose")
+	}
 	if token == "" {
-		// Nothing survives the wire: the token cannot be presented at
-		// all, so it fails startup like a present-but-empty BEAT_TOKEN
-		// and a blank BEAT_TOKEN_FILE. Keeping it armed reported a gated
-		// endpoint that rejected every ping.
-		return "", errors.New("BEAT_TOKEN is set but contains only whitespace: HTTP strips the leading and trailing spaces and tabs from a header value and forbids CR, LF and the other control bytes outright, so no sender can present this token and POST /beat/{id} would reject every ping while the endpoint reports itself gated; set it to a long random token, or unset the variable entirely to serve /beat/{id} open on purpose")
+		// Nothing to present at all: fails startup like a present-but-empty
+		// BEAT_TOKEN and a blank BEAT_TOKEN_FILE. Keeping it armed reported a
+		// gated endpoint that rejected every ping.
+		return errors.New("BEAT_TOKEN is set but empty: set it to a long random token, or unset the variable entirely to serve /beat/{id} open on purpose")
 	}
 	if strings.TrimSpace(token) == "" {
-		// All whitespace by Unicode rules, but at least one rune
-		// survives the header (a non-ASCII space): the token IS
-		// presentable, so it is kept verbatim and the gate stays armed.
-		// Say so, because the only other signal is the length hint
-		// below, which reads as "your token is short" for a value the
-		// operator cannot see in `docker inspect` output.
-		slog.Warn("BEAT_TOKEN is whitespace only; the /beat/{id} gate is armed with a whitespace token every sender must send verbatim, so set a long random token, or unset the variable to serve the endpoint open")
+		// All whitespace by Unicode rules, yet free of ASCII edge padding, so
+		// every rune survives the header (a non-ASCII space): the token IS
+		// presentable, so it is kept verbatim and the gate stays armed. Say
+		// so, because the only other signal is the length hint below, which
+		// reads as "your token is short" for a value the operator cannot see
+		// in `docker inspect` output. The wording deliberately does NOT name
+		// the value's character class: the startup log is shipped to Loki,
+		// where describing a live credential's alphabet narrows a guess.
+		slog.Warn("BEAT_TOKEN is armed with a value that is easy to mistake for absent; the /beat/{id} gate requires it and every sender must present it verbatim, so set a long random token, or unset the variable to serve the endpoint open")
 	}
-	return token, nil
+	return nil
 }
 
 // loadBeatToken reads the optional BEAT_TOKEN bearer gate for
 // POST/GET /beat/{id}; an empty return disables the check. Optional means
 // ABSENT, not blank: a present-but-empty BEAT_TOKEN fails startup, and so does
-// any value no sender could ever present — one that is only ASCII whitespace,
-// or one that still carries an HTTP-forbidden control byte after the ASCII
-// padding is trimmed — like an empty BEAT_TOKEN_FILE. What survives the ASCII
-// trim is what is stored, so a token set through the VARIABLE is armed as
-// exactly the value that reaches the verifier on the wire. A file-sourced token
-// arrives already unicode-trimmed (envx.SecretWithSource trims the file's bytes
-// with strings.TrimSpace before returning them), so an edge non-ASCII space in
-// a secret file is stripped from the stored token even though the wire would
-// carry it — the ASCII trim here cannot restore it. BEAT_TOKEN_FILE points at a
+// any value no sender could present as configured — one carrying leading or
+// trailing ASCII whitespace, or one carrying an HTTP-forbidden control byte —
+// like an empty BEAT_TOKEN_FILE. The value is stored EXACTLY as configured, so
+// the token knell verifies is the one the operator wrote; nothing is rewritten.
+// A file-sourced token arrives already unicode-trimmed (envx.SecretWithSource
+// trims the file's bytes with strings.TrimSpace before returning them), so a
+// secret file's own edge whitespace is stripped by envx before this function
+// sees it and cannot trip the padding refusal. BEAT_TOKEN_FILE points at a
 // mounted secret file instead (the same convention DISCORD_WEBHOOK_URL uses),
 // keeping the credential out of `docker inspect` output.
 func loadBeatToken() (string, error) {
@@ -345,12 +352,15 @@ func loadBeatToken() (string, error) {
 	token, tokenSrc, err := envx.SecretWithSource("BEAT_TOKEN")
 	switch {
 	case err == nil:
-		warnPlainVarIgnored("BEAT_TOKEN", "token", tokenSrc)
-		normalized, normErr := normalizeBeatToken(token)
-		if normErr != nil {
-			return "", normErr
+		// The ignored-plain-variable advisory is deliberately NOT emitted
+		// here: the checks below can still fail startup (a control byte in a
+		// file-sourced token), and advising the operator to unset a variable
+		// in the same breath as exiting on the winning one is advice about a
+		// configuration that never ran. It is emitted once the token is fully
+		// validated, below.
+		if tokenErr := checkBeatToken(token); tokenErr != nil {
+			return "", tokenErr
 		}
-		token = normalized
 	case errors.As(err, new(*envx.MissingError)):
 		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE is set: the documented
 		// open-endpoint case, so the empty token stands and webapi's gate
@@ -383,16 +393,18 @@ func loadBeatToken() (string, error) {
 		return "", nil
 	}
 	if !beatTokenFitsHeader(token) {
-		// Non-empty after trimming, yet still unpresentable: an interior
-		// control byte (a pasted newline, a \n that came through a compose
-		// value verbatim) is illegal in an HTTP field value, so no sender can
-		// deliver this token. Trimming cannot help — the byte is not at an
-		// edge — so refuse at startup rather than arm a gate that 401s every
-		// ping and turns every configured beat falsely missing one deadline
-		// later. The value is never echoed: the message names the variable
-		// and the shape of the problem only.
+		// Free of edge padding, yet still unpresentable: a control byte (a
+		// pasted newline, a \n that came through a compose value verbatim, a
+		// stray second line in a secret file) is illegal in an HTTP field
+		// value, so no sender can deliver this token. Refuse at startup rather
+		// than arm a gate that 401s every ping and turns every configured beat
+		// falsely missing one deadline later. The value is never echoed: the
+		// message names the variable and the shape of the problem only.
 		return "", errors.New("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it; use a token containing printable characters, or unset the variable entirely to serve /beat/{id} open on purpose")
 	}
+	// The token is now fully validated, so the winning-source advisory cannot
+	// be followed by a startup failure about the credential it just described.
+	warnPlainVarIgnored("BEAT_TOKEN", "token", tokenSrc)
 	if len(token) < minTokenLength {
 		// The exact length is deliberately NOT logged: it is an attribute of a
 		// live credential, and knell's startup log is shipped to Loki where its

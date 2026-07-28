@@ -166,7 +166,7 @@ func TestBeatOutageHistoryReportsOneEndedOutageInThePastTense(t *testing.T) {
 	// late by construction — see historyTimeFormat).
 	for _, want := range []string{
 		"node-1", "api", "was missing for 12m0s", "recovered at 2026-07-23 14:07 UTC",
-		"still undelivered", "check the webhook",
+		"went undelivered", "check the webhook",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("content %q missing %q", content, want)
@@ -174,7 +174,7 @@ func TestBeatOutageHistoryReportsOneEndedOutageInThePastTense(t *testing.T) {
 	}
 	// The whole point of the history notice: an outage that is over must
 	// never read like the live alarm for a beat that is down right now.
-	for _, forbidden := range []string{"MISSING", "The sender is down", "recovered: pings arriving again"} {
+	for _, forbidden := range []string{"MISSING", "check the sender", "recovered: pings arriving again"} {
 		if strings.Contains(content, forbidden) {
 			t.Errorf("content %q reports an ended outage with live-incident wording %q", content, forbidden)
 		}
@@ -212,7 +212,7 @@ func TestBeatOutageHistorySummarizesSeveralEndedOutages(t *testing.T) {
 		"last recovered at 2026-07-23 14:07 UTC",
 		// Every entry above carries the zero LateReason (LateUndelivered),
 		// which is also what a producer that names no reason gets.
-		"still undelivered", "check the webhook",
+		"went undelivered", "check the webhook",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("content %q missing %q", content, want)
@@ -296,7 +296,7 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 			},
 			forbid: []string{
 				// Neither single-reason clause may stand in for a mixed batch.
-				"Their alerts were still undelivered", "Each " + selfResolved,
+				"An earlier attempt to report them went undelivered", "Each " + selfResolved,
 			},
 		},
 	}

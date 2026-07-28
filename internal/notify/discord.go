@@ -108,9 +108,17 @@ func (d *Discord) Close() {
 }
 
 // BeatMissing announces that a beat's deadline of silence has passed.
+//
+// The wording names what to check without presuming the beat ever pinged: a
+// beat configured in BEATS but never wired to a sender (a typo, a wrong id)
+// fires this very notice one deadline after start, and notify cannot tell that
+// case from a sender that pinged for weeks and stopped — watch.Transition
+// carries only Started and Observed, and Started deliberately collapses "last
+// accepted ping" and the process-start baseline into one field. So the sentence
+// must fit both, and "never pinged at all" is one of the causes it names.
 func (d *Discord) BeatMissing(ctx context.Context, id string, live watch.Transition) error {
 	msg := fmt.Sprintf(
-		"🚨 [knell %s] beat **%s** MISSING: silent for %s. The sender is down, or nothing on its path can reach this observer.",
+		"🚨 [knell %s] beat **%s** MISSING: silent for %s. Nothing has pinged it in time: check the sender, its path to this observer, and that anything is pinging this beat id at all.",
 		d.node, id, live.DownFor().Truncate(time.Second),
 	)
 	return d.post(ctx, "missing "+id, msg)
@@ -173,11 +181,18 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 // because delivery is what lagged; the other case says delivery was fine, so
 // nobody spends an evening on a webhook that posted this very message on its
 // first try.
+//
+// The undelivered wording deliberately does NOT claim the live alert was still
+// pending when the beat returned, because watch reaches this reason two ways: a
+// live missing alert that never got through, and an outage that ended before
+// any sweep saw it whose HISTORY notice then failed to post (blameDelivery
+// upgrades that record to LateUndelivered). Naming a failed attempt instead of
+// a pending live alert is true for both, and still points at the webhook.
 func lateClause(reason watch.LateReason) string {
 	if reason == watch.LateEndedBeforeDetection {
 		return "This notice is late only because the outage ended before a sweep detected it - nothing was wrong with delivery."
 	}
-	return "This notice is late: its alert was still undelivered when the beat returned - check the webhook."
+	return "This notice is late because an earlier attempt to report it went undelivered - check the webhook."
 }
 
 // batchLateClause explains why a whole run of ended outages is reported after
@@ -201,7 +216,7 @@ func batchLateClause(outages []watch.Outage) string {
 	// Blaming delivery is the direction a reason-less batch must fall through
 	// to, like watch.LateUndelivered being the zero value.
 	case 0:
-		return "Their alerts were still undelivered when it returned - check the webhook."
+		return "An earlier attempt to report them went undelivered - check the webhook."
 	case len(outages):
 		return "Each ended before a sweep detected it - nothing was wrong with delivery."
 	default:

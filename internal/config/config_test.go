@@ -554,6 +554,36 @@ func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileReadFails(t *testing.T
 	})
 }
 
+// TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileTokenIsInvalid pins the
+// remaining fatal path after the file read SUCCEEDS: the advisory must not
+// advise unsetting the plain variable and then exit over the winning value.
+// The reachable case is a file-sourced token carrying an interior control byte
+// while the plain BEAT_TOKEN is also set — the file wins, the advisory used to
+// fire, and startup then failed on the token, so the operator was told to
+// delete the only other token in the environment by a process that never ran.
+// (The whitespace path cannot reach here: envx unicode-trims the file's bytes,
+// so a blank file errors earlier.)
+func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileTokenIsInvalid(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	tokenFile := filepath.Join(t.TempDir(), "beat-token")
+	if err := os.WriteFile(tokenFile, []byte("alpha\nbeta\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", "fallback-beat-token")
+	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+
+	rec := capture.Default(t)
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with a two-line BEAT_TOKEN_FILE = nil, want error: the interior newline is illegal in a header value")
+	}
+	if rec.Contains("the plain variable is ignored") {
+		t.Errorf("a fatal token validation warned that the plain variable is ignored: %v; the advice describes a configuration that never ran", rec.Messages())
+	}
+}
+
 func TestLoadRejectsUnreadableBeatTokenFile(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing-beat-token")
 	setValidLoadEnv(t)
@@ -625,10 +655,10 @@ func TestLoadRejectsBlankWebhookFileVar(t *testing.T) {
 	}
 }
 
-func TestLoadTrimsPaddedPlainSecrets(t *testing.T) {
+func TestLoadTrimsPaddedPlainWebhook(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook ")
-	t.Setenv("BEAT_TOKEN", "  unit-test-beat-token  ")
+	t.Setenv("BEAT_TOKEN", "unit-test-beat-token")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 
 	cfg, err := Load()
@@ -636,13 +666,56 @@ func TestLoadTrimsPaddedPlainSecrets(t *testing.T) {
 		t.Fatalf("Load() error: %v", err)
 	}
 	// A trailing space survives url.Parse and is escaped as %20 on every
-	// POST, so an untrimmed webhook 404s forever; a padded token 401s every
-	// sender. envx trims only its _FILE branch, so both are trimmed here.
+	// POST, so an untrimmed webhook 404s forever. envx trims only its _FILE
+	// branch, so the plain variable is trimmed here. The webhook is trimmed
+	// rather than refused because knell is its only sender: trimming makes it
+	// deliverable, and there is no second party that must reproduce the value.
+	// BEAT_TOKEN is the opposite case (see the test below) — senders must
+	// reproduce it byte for byte, so rewriting it is what breaks the gate.
 	if cfg.WebhookURL != "https://discord.example/hook" {
 		t.Errorf("WebhookURL = %q, want the padding trimmed", cfg.WebhookURL)
 	}
 	if cfg.BeatToken != "unit-test-beat-token" {
-		t.Errorf("BeatToken = %q, want the padding trimmed", cfg.BeatToken)
+		t.Errorf("BeatToken = %q, want the configured token verbatim", cfg.BeatToken)
+	}
+}
+
+// TestLoadRejectsAPaddedPlainBeatToken pins that a BEAT_TOKEN carrying edge
+// ASCII whitespace FAILS STARTUP instead of being silently trimmed. Trimming
+// (the behaviour through cycle 8) was justified as "HTTP strips leading and
+// trailing spaces and tabs, so the trimmed form is what arrives on the wire" —
+// which is false for the LEADING edge: webapi verifies "Bearer "+token, so a
+// leading run is INTERIOR to the Authorization value and is delivered intact.
+// Configuring " secret" armed the gate for "secret", so a sender using the
+// configured value sent "Bearer  secret" and got 401 while startup reported the
+// gate armed and every beat went falsely missing one deadline later. Refusing
+// keeps "the value you configured" and "the value that authenticates" the same
+// string: a dead-man switch must not silently rewrite a credential.
+func TestLoadRejectsAPaddedPlainBeatToken(t *testing.T) {
+	tests := map[string]string{
+		"leading space":    " unit-test-beat-token",
+		"trailing space":   "unit-test-beat-token ",
+		"both edges":       "  unit-test-beat-token  ",
+		"leading tab":      "\tunit-test-beat-token",
+		"trailing newline": "unit-test-beat-token\n",
+	}
+	for name, token := range tests {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			t.Setenv("BEAT_TOKEN", token)
+			unsetEnv(t, "BEAT_TOKEN_FILE")
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() with BEAT_TOKEN=%q = nil, want error: rewriting the credential would arm the gate for a value the sender that uses the configured one cannot present", token)
+			}
+			if !strings.Contains(err.Error(), "BEAT_TOKEN") {
+				t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which variable to fix", err)
+			}
+			if strings.Contains(err.Error(), "unit-test-beat-token") {
+				t.Errorf("error = %q embeds the token value; the startup error is shipped to Loki, so it must describe the shape and never echo the credential", err)
+			}
+		})
 	}
 }
 
@@ -651,12 +724,13 @@ func TestLoadRejectsAnASCIIWhitespaceOnlyBeatToken(t *testing.T) {
 	// interpolation (BEAT_TOKEN="${TOKEN} " with TOKEN undefined) hands the
 	// process a token made only of spaces and tabs.
 	//
-	// Such a token can never be PRESENTED: net/textproto strips leading and
-	// trailing spaces and tabs from every header value, so "Bearer   " is
-	// read back as "Bearer" and webhttp's sha256 + ConstantTimeCompare
-	// verifier (no normalization) rejects it. Keeping it armed was the worst
-	// outcome available for a dead-man switch: knell started, reported
-	// itself gated, 401'd every ping, and one deadline later posted a
+	// Such a token has nothing but edge whitespace, so it is refused by the
+	// padding rule above: its every byte is either stripped on the wire
+	// (trailing SP/HTAB), illegal in a field value (CR, LF, VT, FF), or
+	// delivered as an invisible leading run inside "Bearer <token>" that the
+	// sender using the configured value cannot reproduce. Keeping it armed was
+	// the worst outcome available for a dead-man switch: knell started,
+	// reported itself gated, 401'd every ping, and one deadline later posted a
 	// MISSING notice for every configured beat. So it fails startup, like
 	// the two adjacent accidents this package already refuses (a
 	// present-but-empty BEAT_TOKEN and a blank BEAT_TOKEN_FILE).
@@ -712,32 +786,36 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 	// The shape, not just the length: the generic short-token warning fires
 	// for a 2-byte token too, so without this assertion the one warning that
 	// names the actual misconfiguration can be dropped and the log still
-	// looks populated.
-	if !rec.Contains("whitespace only") {
-		t.Errorf("log output %v never says the token is whitespace only; the only other signal is the length hint, which reads as \"your token is short\" while senders must reproduce an invisible character", rec.Messages())
+	// looks populated. The asserted text deliberately does not describe the
+	// token's character class — the startup log ships to Loki, so it must not
+	// narrow a guess at a live credential's alphabet.
+	if !rec.Contains("mistake for absent") {
+		t.Errorf("log output %v never says the gate is armed with a value that looks absent; the only other signal is the length hint, which reads as \"your token is short\" while senders must reproduce an invisible character", rec.Messages())
+	}
+	if rec.Contains("whitespace") {
+		t.Errorf("log output %v describes the token's character class; the startup log is shipped to Loki, so it must say the gate is armed without disclosing the credential's alphabet", rec.Messages())
 	}
 }
 
-func TestLoadNormalizesASCIIPaddingAroundANonASCIISpaceBeatToken(t *testing.T) {
-	// The mixed shape between the two rules above, and the reason the ASCII
-	// trim must run BEFORE any classification. net/textproto strips the outer
-	// spaces from the header value but keeps the NBSP, so the sender presents
-	// "Bearer \u00a0". Storing the padded value verbatim would leave the
-	// verifier holding "Bearer \u00a0 " with its padding: startup succeeds,
-	// the log reports the gate armed, and every ping 401s until each beat
-	// crosses its deadline and posts a false MISSING notice. Store what the
-	// wire delivers.
-	const presented = "\u00a0"
+// TestLoadRejectsASCIIPaddingAroundANonASCIISpaceBeatToken is the mixed shape
+// between the two rules above. Trimming the outer spaces (the cycle-8
+// behaviour) armed the gate for "\u00a0" while the operator configured
+// " \u00a0 ": startup succeeded, the log reported the gate armed, and a sender
+// presenting the configured value sent "Bearer  \u00a0 " and got 401 until every
+// beat crossed its deadline and posted a false MISSING notice. The padding is
+// refused instead, so the configured value and the verified value are the same
+// string or knell does not start.
+func TestLoadRejectsASCIIPaddingAroundANonASCIISpaceBeatToken(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", " \u00a0 ")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() with an ASCII-padded NBSP BEAT_TOKEN = %v, want accepted: the NBSP survives the header, so the token is presentable once the padding is trimmed", err)
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() with an ASCII-padded NBSP BEAT_TOKEN = nil, want error: silently trimming the padding arms the gate for a value the sender using the configured one cannot present")
 	}
-	if cfg.BeatToken != presented {
-		t.Errorf("BeatToken = %q, want %q: HTTP strips the outer spaces, so keeping them would make the verifier compare a padded token against the unpadded value every sender can actually send", cfg.BeatToken, presented)
+	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
+		t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which variable to fix", err)
 	}
 }
 
@@ -1234,6 +1312,15 @@ func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
 		"host only":              {raw: "https://discord.example", wantErr: "missing path"},
 		"root path only":         {raw: "https://discord.example/", wantErr: "missing path"},
 		"interior space in path": {raw: "https://discord.example/api/webhooks/1/ab c", wantErr: "contains a space"},
+		// Deliberate scope decision, not an oversight: knell posts to Discord
+		// only, and a Discord webhook always carries its credential in the
+		// path (/api/webhooks/{id}/{token}). A query-carried credential is out
+		// of scope, so a URL whose only credential-bearing part is its query
+		// string is refused by the same missing-path rule rather than being
+		// admitted as a second supported shape. Pins the decision so a later
+		// "relax the path check, the query has the token" change has to argue
+		// with a test instead of a silent guard.
+		"query-only credential": {raw: "https://relay.example?token=abc", wantErr: "missing path"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -1245,8 +1332,10 @@ func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("error = %q, want it to name %q", err, tt.wantErr)
 			}
-			if strings.Contains(err.Error(), "discord.example") {
-				t.Errorf("error = %q embeds the URL; the webhook URL is a secret and startup errors are shipped to Loki", err)
+			for _, secret := range []string{"discord.example", "relay.example", "token=abc"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("error = %q embeds %q from the URL; the webhook URL is a secret and startup errors are shipped to Loki", err, secret)
+				}
 			}
 		})
 	}
