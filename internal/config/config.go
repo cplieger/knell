@@ -254,13 +254,32 @@ func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
 		"variable", key, "file_variable", key+"_FILE", "credential", subject)
 }
 
+// beatTokenFitsHeader reports whether value can be carried verbatim in an HTTP
+// field value. HTTP permits SP, HTAB, visible ASCII and obs-text (bytes >=
+// 0x80, which is why a non-ASCII space token stays legal), but rejects every
+// other ASCII control byte and DEL. Go's own HTTP client refuses to write such
+// a value and its server rejects a handcrafted one before the handler runs, so
+// a token containing one is unpresentable no matter what the sender does.
+func beatTokenFitsHeader(value string) bool {
+	for i := range len(value) {
+		b := value[i]
+		if (b < ' ' && b != '\t') || b == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 // loadBeatToken reads the optional BEAT_TOKEN bearer gate for
 // POST/GET /beat/{id}; an empty return disables the check. Optional means
-// ABSENT, not blank: a present-but-empty BEAT_TOKEN fails startup, and so
-// does one that is only ASCII whitespace (a token no sender could ever
-// present), like an empty BEAT_TOKEN_FILE. BEAT_TOKEN_FILE points at a
-// mounted secret file instead (the same convention DISCORD_WEBHOOK_URL uses),
-// keeping the credential out of `docker inspect` output.
+// ABSENT, not blank: a present-but-empty BEAT_TOKEN fails startup, and so does
+// any value no sender could ever present — one that is only ASCII whitespace,
+// or one that still carries an HTTP-forbidden control byte after the ASCII
+// padding is trimmed — like an empty BEAT_TOKEN_FILE. What survives trimming
+// is what is stored, so the armed token is exactly the value that reaches the
+// verifier on the wire. BEAT_TOKEN_FILE points at a mounted secret file
+// instead (the same convention DISCORD_WEBHOOK_URL uses), keeping the
+// credential out of `docker inspect` output.
 func loadBeatToken() (string, error) {
 	if err := rejectBlankFileVar("BEAT_TOKEN"); err != nil {
 		return "", err
@@ -270,17 +289,23 @@ func loadBeatToken() (string, error) {
 	case err == nil:
 		warnPlainVarIgnored("BEAT_TOKEN", "token", tokenSrc)
 		// Same reason as the webhook: a padded token makes every sender 401
-		// and every beat cross its deadline, so padding is trimmed. A value
-		// that is ENTIRELY ASCII whitespace cannot be presented at all (see
-		// asciiWhitespace), so it fails startup like a present-but-empty
-		// BEAT_TOKEN and a blank BEAT_TOKEN_FILE: keeping it armed reported
-		// a gated endpoint that rejected every ping.
-		switch trimmed := strings.TrimSpace(token); {
-		case trimmed != "":
-			token = trimmed
-		case strings.Trim(token, asciiWhitespace) == "":
+		// and every beat cross its deadline, so padding is trimmed. Trim
+		// FIRST, with the ASCII cutset, and classify what is left: the
+		// cutset is exactly what the wire removes (see asciiWhitespace), so
+		// the stored token is the value a sender actually presents. Deciding
+		// on strings.TrimSpace first instead would keep a value like
+		// " \u00a0 " verbatim — the wire strips its outer spaces, the
+		// verifier still holds them, and every ping 401s against an endpoint
+		// that reports itself gated.
+		token = strings.Trim(token, asciiWhitespace)
+		if token == "" {
+			// Nothing survives the wire: the token cannot be presented at
+			// all, so it fails startup like a present-but-empty BEAT_TOKEN
+			// and a blank BEAT_TOKEN_FILE. Keeping it armed reported a gated
+			// endpoint that rejected every ping.
 			return "", errors.New("BEAT_TOKEN is set but contains only whitespace: HTTP strips the leading and trailing spaces and tabs from a header value, so no sender can present this token and POST /beat/{id} would reject every ping while the endpoint reports itself gated; set it to a long random token, or unset the variable entirely to serve /beat/{id} open on purpose")
-		default:
+		}
+		if strings.TrimSpace(token) == "" {
 			// All whitespace by Unicode rules, but at least one rune
 			// survives the header (a non-ASCII space): the token IS
 			// presentable, so it is kept verbatim and the gate stays armed.
@@ -311,6 +336,17 @@ func loadBeatToken() (string, error) {
 		// used (unreadable or blank _FILE): fail closed rather than serving
 		// an open endpoint the operator meant to gate.
 		return "", fmt.Errorf("BEAT_TOKEN: %w", err)
+	}
+	if token != "" && !beatTokenFitsHeader(token) {
+		// Non-empty after trimming, yet still unpresentable: an interior
+		// control byte (a pasted newline, a \n that came through a compose
+		// value verbatim) is illegal in an HTTP field value, so no sender can
+		// deliver this token. Trimming cannot help — the byte is not at an
+		// edge — so refuse at startup rather than arm a gate that 401s every
+		// ping and turns every configured beat falsely missing one deadline
+		// later. The value is never echoed: the message names the variable
+		// and the shape of the problem only.
+		return "", errors.New("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it; use a token containing printable characters, or unset the variable entirely to serve /beat/{id} open on purpose")
 	}
 	if token != "" && len(token) < minTokenLength {
 		// The exact length is deliberately NOT logged: it is an attribute of a

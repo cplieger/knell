@@ -193,21 +193,11 @@ func run() error {
 	onShutdown := func(teardownCtx context.Context) {
 		awaitWatchLoop(teardownCtx, watcherDone)
 	}
-	// The other exit: srv.Serve returns on its own (the listener or the accept
-	// loop is gone) before any signal arrives. webhttp.Run runs NO part of the
-	// graceful sequence there — ctx is still live and there is nothing left to
-	// drain — so without this hook the marker would still read healthy and the
-	// watch loop would never log the notices this process will never deliver,
-	// the operator's only trace of them. Run guarantees exactly one of the two
-	// paths per call, so onShutdown cannot run twice.
-	//
-	// stop() is this hook's own job and not a duplicate of main's defer: the
-	// watch loop is keyed to the signal context, which nothing has cancelled on
-	// this path, so without the cancel awaitWatchLoop would wait out the whole
-	// grace for a loop nobody asked to stop (webhttp documents exactly this for
-	// WithServeExit). The hook's context carries the full grace, and Run does
-	// not call srv.Shutdown after Serve has ended, so no second budget exists
-	// to push the process past Docker's SIGKILL.
+	// Handle the non-graceful exit where Serve returns before a signal:
+	// webhttp skips the drain hooks on this path, so mark the process
+	// unhealthy, cancel the watcher, and wait for it under the one grace
+	// budget carried by exitCtx. Run invokes either this hook or the
+	// graceful shutdown hooks, never both.
 	serveExit := webhttp.WithServeExit(func(exitCtx context.Context) {
 		marker.Set(false)
 		stop()

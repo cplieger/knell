@@ -2,6 +2,8 @@ package config
 
 import (
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -713,6 +715,121 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 	// looks populated.
 	if !rec.Contains("whitespace only") {
 		t.Errorf("log output %v never says the token is whitespace only; the only other signal is the length hint, which reads as \"your token is short\" while senders must reproduce an invisible character", rec.Messages())
+	}
+}
+
+func TestLoadNormalizesASCIIPaddingAroundANonASCIISpaceBeatToken(t *testing.T) {
+	// The mixed shape between the two rules above, and the reason the ASCII
+	// trim must run BEFORE any classification. net/textproto strips the outer
+	// spaces from the header value but keeps the NBSP, so the sender presents
+	// "Bearer \u00a0". Storing the padded value verbatim would leave the
+	// verifier holding "Bearer \u00a0 " with its padding: startup succeeds,
+	// the log reports the gate armed, and every ping 401s until each beat
+	// crosses its deadline and posts a false MISSING notice. Store what the
+	// wire delivers.
+	const presented = "\u00a0"
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", " \u00a0 ")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with an ASCII-padded NBSP BEAT_TOKEN = %v, want accepted: the NBSP survives the header, so the token is presentable once the padding is trimmed", err)
+	}
+	if cfg.BeatToken != presented {
+		t.Errorf("BeatToken = %q, want %q: HTTP strips the outer spaces, so keeping them would make the verifier compare a padded token against the unpadded value every sender can actually send", cfg.BeatToken, presented)
+	}
+}
+
+func TestLoadRejectsABeatTokenHTTPCannotCarry(t *testing.T) {
+	// Distinct from the whitespace-only refusal: these values are non-empty
+	// after the ASCII trim, so trimming cannot rescue them, yet HTTP forbids
+	// the byte they carry in a field value. Go's client refuses to write the
+	// header and Go's server rejects a handcrafted one before beatHandler, so
+	// the gate would be armed with a token no sender could ever present —
+	// knell starts, reports healthy, records no ping, and one deadline later
+	// declares every configured beat missing.
+	tests := map[string]string{
+		"interior newline":        "alpha\nbeta",
+		"interior carriage":       "alpha\rbeta",
+		"trailing newline inside": "alpha\nbeta\n",
+		"delete byte":             "alpha\x7fbeta",
+		"vertical tab interior":   "alpha\vbeta",
+	}
+	for name, token := range tests {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			t.Setenv("BEAT_TOKEN", token)
+			unsetEnv(t, "BEAT_TOKEN_FILE")
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() with BEAT_TOKEN=%q = nil, want error: HTTP forbids that byte in a field value, so every ping 401s against an endpoint that reports itself gated", token)
+			}
+			if !strings.Contains(err.Error(), "BEAT_TOKEN") {
+				t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which variable to fix", err)
+			}
+			if strings.Contains(err.Error(), token) {
+				t.Errorf("error = %q embeds the token value; the startup error is shipped to Loki, so it must describe the shape and never echo the credential", err)
+			}
+		})
+	}
+}
+
+func TestBeatTokenFitsHeaderMatchesWhatHTTPActuallyCarries(t *testing.T) {
+	// The oracle for the refusal above: the predicate is only worth anything
+	// if it agrees with the transport it claims to model. Every accepted value
+	// must survive a real request verbatim (a value the wire alters is just as
+	// unpresentable as one it rejects), and every rejected value must be one
+	// Go's HTTP client refuses to send.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Echo", r.Header.Get("Authorization"))
+	}))
+	t.Cleanup(srv.Close)
+
+	tests := map[string]string{
+		"printable":       "plain-token-1234567",
+		"non-ascii space": "\u00a0",
+		"obs-text":        "tökén-with-hïgh-bytes",
+		"interior tab":    "alpha\tbeta",
+		"interior spaces": "alpha  beta",
+		"interior nl":     "alpha\nbeta",
+		"interior cr":     "alpha\rbeta",
+		"nul":             "alpha\x00beta",
+		"del":             "alpha\x7fbeta",
+		"vertical tab":    "alpha\vbeta",
+		"form feed":       "alpha\fbeta",
+	}
+	for name, token := range tests {
+		t.Run(name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+			if err != nil {
+				t.Fatalf("NewRequestWithContext: %v", err)
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+
+			resp, doErr := srv.Client().Do(req)
+			echoed := ""
+			if doErr == nil {
+				echoed = resp.Header.Get("X-Echo")
+				if err := resp.Body.Close(); err != nil {
+					t.Errorf("closing body: %v", err)
+				}
+			}
+
+			if beatTokenFitsHeader(token) {
+				if doErr != nil {
+					t.Fatalf("beatTokenFitsHeader(%q) = true but the HTTP client refused to send it: %v — the predicate accepts a token startup would arm and no sender could present", token, doErr)
+				}
+				if echoed != "Bearer "+token {
+					t.Errorf("server read %q, want %q: the predicate accepts a token the wire alters, so the exact-match verifier would reject every ping", echoed, "Bearer "+token)
+				}
+				return
+			}
+			if doErr == nil {
+				t.Errorf("beatTokenFitsHeader(%q) = false but the client sent it fine (server read %q); the refusal would fail startup on a working configuration", token, echoed)
+			}
+		})
 	}
 }
 

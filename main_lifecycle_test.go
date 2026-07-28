@@ -15,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cplieger/health"
@@ -553,22 +554,24 @@ func TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace(t *testing.T) {
 	// default.
 	rec := capture.Default(t)
 
-	const stopAfter = 50 * time.Millisecond
-	stopping := make(chan struct{})
-	teardownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	start := time.Now()
-	timer := time.AfterFunc(stopAfter, func() { close(stopping) })
-	defer timer.Stop()
+	synctest.Test(t, func(t *testing.T) {
+		const stopAfter = 50 * time.Millisecond
+		stopping := make(chan struct{})
+		teardownCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		start := time.Now()
+		timer := time.AfterFunc(stopAfter, func() { close(stopping) })
+		defer timer.Stop()
 
-	awaitWatchLoop(teardownCtx, stopping)
-	waited := time.Since(start)
+		awaitWatchLoop(teardownCtx, stopping)
 
-	if waited < stopAfter {
-		t.Errorf("awaitWatchLoop returned after %s, want at least %s: it must wait for the watch loop so the sender's abandoned-delivery lines land before exit",
-			waited, stopAfter)
-	}
-	if rec.Contains(stillRunningWarn) {
+		if waited := time.Since(start); waited != stopAfter {
+			t.Errorf("awaitWatchLoop waited %s, want %s: it must wait for the watch loop so the sender's abandoned-delivery lines land before exit",
+				waited, stopAfter)
+		}
+	})
+
+	if rec.CountLevel(slog.LevelWarn, stillRunningWarn) != 0 {
 		t.Errorf("messages = %v, want no still-running warning for a loop that stopped inside the grace", rec.Messages())
 	}
 }
