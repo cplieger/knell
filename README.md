@@ -79,7 +79,7 @@ A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling b
 | `GET /healthz` | liveness (`{"status":"OK"}`) |
 | `GET /metrics` | Prometheus exposition |
 
-Request bodies on `/beat/{id}` are ignored, so webhook-shaped senders (an Alertmanager `webhook_configs` target, a CI notification hook) can point at it unchanged.
+Request bodies on `/beat/{id}` are ignored, so webhook-shaped senders (an Alertmanager `webhook_configs` target, a CI notification hook) can point at it unchanged. Up to 1 MiB of the body is read and discarded so the connection stays reusable; a payload larger than that still records the ping and answers `{"ok":true}`, and logs one `warn` line saying the body was not fully read. A ping is never refused for its payload: the body is not what the switch is listening for.
 
 Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away from anything that fetches links automatically: a chat client's URL preview, a crawler, an uptime prober. An automated fetch feeds the switch and can mask a dead sender. `HEAD` requests are rejected with 405 and never record a ping, so a HEAD-only prober cannot feed the switch.
 

@@ -325,6 +325,13 @@ func TestBeatBodyDrainIsBounded(t *testing.T) {
 	// The handler drains the ignored body so keep-alive connections stay
 	// reusable, but only up to maxBeatBody: a hostile endless body must
 	// not tie the handler goroutine to an unbounded read.
+	//
+	// The exact-read oracle is one byte PAST the cap, and that byte is the
+	// point of the http.MaxBytesReader the drain is built on
+	// (webhttp.LimitBody): it is what distinguishes a body that ended exactly
+	// at the cap from one that runs past it, so the overrun can be detected
+	// instead of read as a clean end-of-body. A bare io.LimitReader stops at
+	// 1 MiB exactly and cannot tell the two apart.
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	h := newTestHandler(b, "")
 	body := &unboundedReader{}
@@ -334,8 +341,67 @@ func TestBeatBodyDrainIsBounded(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
 	}
-	if body.n != 1<<20 {
-		t.Errorf("drained %d bytes, want exactly 1 MiB (drain must happen for connection reuse and stop at the documented cap)", body.n)
+	if body.n != 1<<20+1 {
+		t.Errorf("drained %d bytes, want exactly 1 MiB + 1 (drain must happen for connection reuse, stop at the documented cap, and read one byte past it to detect the overrun)", body.n)
+	}
+	// An over-limit body is refused as a body, never as a ping: the payload is
+	// irrelevant to a heartbeat, so the beat is still recorded.
+	if len(b.seen) != 1 {
+		t.Errorf("recorded beats = %v, want exactly one: an oversized payload must not cost a legitimate sender its ping", b.seen)
+	}
+}
+
+// TestBeatOverLimitBodyWarnsAndStillRecords pins what an over-limit payload is
+// observable as, which is the whole reason the drain caps with
+// webhttp.LimitBody (http.MaxBytesReader) instead of io.LimitReader: the
+// overrun becomes an *http.MaxBytesError the handler can report, where a
+// LimitReader would have ended the read as if the body simply stopped there and
+// nothing would ever say a sender is shipping payloads knell refuses to read.
+//
+// The report is a WARN and nothing else. The sender still gets its 200 and the
+// beat is still recorded, because a heartbeat's payload is irrelevant and an
+// oversized body must never turn a legitimate ping into a lost one — on a
+// dead-man's switch a lost ping is a false alert or, worse, a false all-clear.
+// An in-cap ping is silent, so the line means what it says.
+func TestBeatOverLimitBodyWarnsAndStillRecords(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default.
+	logs := capture.Default(t)
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	h := newTestHandler(b, "")
+	const warning = "beat body exceeded the cap"
+
+	// A normal-sized payload is drained without a word about it.
+	inCap := httptest.NewRecorder()
+	h.ServeHTTP(inCap, httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(strings.Repeat("x", 4096))))
+	if inCap.Code != http.StatusOK {
+		t.Fatalf("in-cap ping = %d, want 200 (body %s)", inCap.Code, inCap.Body.String())
+	}
+	if got := logs.CountLevel(slog.LevelWarn, warning); got != 0 {
+		t.Errorf("in-cap ping produced %d body warnings, want 0: an ordinary payload must not warn, or the line means nothing when it fires: %v", got, logs.Messages())
+	}
+
+	// One byte past the cap is enough: the endless reader runs the drain into
+	// the limit.
+	over := httptest.NewRecorder()
+	h.ServeHTTP(over, httptest.NewRequest(http.MethodPost, "/beat/api", &unboundedReader{}))
+	if over.Code != http.StatusOK {
+		t.Fatalf("over-limit ping = %d, want 200: an oversized payload must not cost a legitimate sender its ping (body %s)",
+			over.Code, over.Body.String())
+	}
+	if got := logs.CountLevel(slog.LevelWarn, warning); got != 1 {
+		t.Errorf("over-limit body warnings at Warn = %d, want exactly 1 (the overrun must be reported, not silently swallowed): %v", got, logs.Messages())
+	}
+	if !logs.HasAttr(warning, "limit_bytes", strconv.Itoa(1<<20)) {
+		t.Errorf("warning does not report the 1 MiB cap that was exceeded; records = %v", logs.Records())
+	}
+	// The line carries no beat id (the id is still an unvalidated path segment
+	// at that point), so the request id is what ties it to the access line.
+	if id, ok := logs.AttrValue(warning, "request_id"); !ok || id == "" {
+		t.Errorf("warning has no request_id (%q, present=%v); without it an operator cannot tie the overrun to the access line that names the path", id, ok)
+	}
+	if len(b.seen) != 2 {
+		t.Errorf("recorded beats = %v, want both pings recorded", b.seen)
 	}
 }
 

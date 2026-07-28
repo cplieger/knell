@@ -5,7 +5,9 @@ package webapi
 
 import (
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -18,6 +20,8 @@ import (
 // maxBeatBody caps how much of a ping request body is drained. Senders like
 // an Alertmanager webhook attach JSON payloads knell ignores; draining keeps
 // connections reusable, the cap keeps a hostile body from tying the handler.
+// An over-limit body is refused as a BODY, never as a ping: see the drain in
+// beatHandler.
 const maxBeatBody = 1 << 20
 
 // maxLoggedPath bounds the path attribute of an access-log line. Every path
@@ -245,9 +249,43 @@ func beatHandler(appCtx context.Context, b Beater, token string) http.HandlerFun
 			writeShuttingDown(w, r)
 			return
 		}
-		// Drain a bounded amount of body so keep-alive connections stay
-		// reusable; the payload itself is deliberately ignored.
-		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxBeatBody))
+		// Cap the body, then drain what fits so keep-alive connections stay
+		// reusable; the payload itself is deliberately ignored. The cap is
+		// webhttp.LimitBody (an http.MaxBytesReader over r.Body) rather than a
+		// bare io.LimitReader, because a LimitReader ends the read SILENTLY at
+		// the cap: an over-limit body is indistinguishable from one that just
+		// ended, so nothing — not the sender, not the log — ever says a sender
+		// is shipping payloads knell refuses to read. MaxBytesReader surfaces
+		// the overrun as an *http.MaxBytesError, which is what the WARN below
+		// reports.
+		//
+		// The overrun is NOT reported to the sender. MaxBytesReader also asks
+		// net/http to close the connection, but only by type-asserting an
+		// unexported interface on the ResponseWriter, and every handler here
+		// runs behind webhttp.Logging's StatusRecorder wrapper, which no
+		// third-party type can satisfy — so that half of the mechanism does not
+		// reach net/http (measured: Connection: close appears on a bare
+		// handler, not on a chained one). The overrun is therefore
+		// operator-visible only, in the log.
+		//
+		// A ping is never lost to its own payload: the error is reported, not
+		// acted on. The beat below is recorded whether the body fit, overran,
+		// or the sender hung up mid-send, because a heartbeat's payload is
+		// irrelevant and a dropped ping is what this whole app exists to
+		// notice. Only the overrun warns; a mid-body disconnect is ordinary.
+		webhttp.LimitBody(w, r, maxBeatBody)
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				// No beat id and no sender-supplied text: the id here is still
+				// an unvalidated path segment (the 404 gate is below), and the
+				// request id ties this line to the access line that does carry
+				// the truncated path.
+				slog.WarnContext(r.Context(), "beat body exceeded the cap and was not fully read",
+					"limit_bytes", maxBeatBody,
+					"request_id", webhttp.RequestIDFromContext(r.Context()))
+			}
+		}
 		id := r.PathValue("id")
 		// Re-check on the far side of the body read: this is the check that
 		// closes the window that matters, because the read above can block for
