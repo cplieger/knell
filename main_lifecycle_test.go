@@ -605,8 +605,7 @@ func TestRunServesTheMarkerVerdictOnHealthz(t *testing.T) {
 	// registry is a package-level singleton shared by the whole test binary.
 	addr := prepareLifecycleRun(t, "healthz-probe")
 
-	done := make(chan error, 1)
-	go func() { done <- run() }()
+	r := startLifecycleRun(t)
 	waitForMarkerWithin(t, true, 10*time.Second)
 
 	if status, body := getHealthz(t, addr); status != http.StatusOK || !strings.Contains(body, `"status":"OK"`) {
@@ -627,14 +626,7 @@ func TestRunServesTheMarkerVerdictOnHealthz(t *testing.T) {
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatalf("signalling self: %v", err)
 	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("run() = %v, want nil after a shutdown signal", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("run() did not return after a shutdown signal")
-	}
+	r.waitForReturn(t, 10*time.Second, "after a shutdown signal")
 }
 
 // getHealthz probes the liveness endpoint of a serving knell, returning the

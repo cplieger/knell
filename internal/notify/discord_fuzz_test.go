@@ -110,18 +110,71 @@ func assertDeliveryErrorHidesWebhookURL(t *testing.T, rawURL string, status int,
 // same text in BOTH errors, so the skip above swallows exactly the leak this
 // target exists to find. Blanking is length-preserving so the control keeps the
 // byte counts and the JSON-with-a-code branch of the real attempt.
+//
+// One fixed fill byte is not enough: a credential fragment made entirely of
+// that byte blanks to ITSELF (rawURL ending in /zzzzzzzz against a body
+// carrying zzzzzzzz), leaving the needle in the control body and re-opening the
+// skip. So each candidate fill is VERIFIED to leave no active needle behind --
+// which also covers a needle re-formed across a blank's boundary -- and the
+// next candidate is tried until one holds.
 func controlBody(body string, needles []string) string {
-	blanked := slices.Clone(needles)
-	// Longest first, so a needle nested in a longer one cannot leave the
-	// longer one half-blanked and unmatched.
-	slices.SortFunc(blanked, func(a, b string) int { return len(b) - len(a) })
-	for _, needle := range blanked {
+	active := make([]string, 0, len(needles))
+	for _, needle := range needles {
 		if len(needle) < 8 {
 			continue
 		}
-		body = strings.ReplaceAll(body, needle, strings.Repeat("z", len(needle)))
+		active = append(active, needle)
 	}
-	return body
+	if len(active) == 0 {
+		return body
+	}
+	// Longest first, so a needle nested in a longer one cannot leave the
+	// longer one half-blanked and unmatched.
+	slices.SortFunc(active, func(a, b string) int { return len(b) - len(a) })
+	for _, fill := range controlFillBytes {
+		candidate := body
+		for _, needle := range active {
+			candidate = strings.ReplaceAll(candidate, needle, strings.Repeat(string(fill), len(needle)))
+		}
+		if !containsAnyNeedle(candidate, active) {
+			return candidate
+		}
+	}
+	// Unreachable with the fills above unless a needle is present in every
+	// single-byte blank of its own length; give up length preservation rather
+	// than the guarantee, since a control body that still carries the needle
+	// disables the leak oracle silently.
+	return ""
+}
+
+// controlFillBytes are the length-preserving blanks controlBody tries, in
+// order. Distinct bytes, so a credential made entirely of one of them is
+// blanked by the next.
+const controlFillBytes = "zq0w1"
+
+// containsAnyNeedle reports whether s still carries any of the needles, the
+// guarantee controlBody's blanked body has to meet.
+func containsAnyNeedle(s string, needles []string) bool {
+	return slices.ContainsFunc(needles, func(needle string) bool {
+		return strings.Contains(s, needle)
+	})
+}
+
+// TestControlBodyLeavesNoNeedleBehind pins the guarantee the leak oracle rests
+// on: an all-'z' credential fragment used to blank to itself, so the control
+// error carried the same needle as the real one and assertNoNeedleLeaked took
+// its control skip on a genuine leak.
+func TestControlBodyLeavesNoNeedleBehind(t *testing.T) {
+	t.Parallel()
+
+	const body = "upstream rejected zzzzzzzz"
+	got := controlBody(body, []string{"zzzzzzzz"})
+	if len(got) != len(body) {
+		t.Errorf("controlBody(%q) = %q, want the same length: the control attempt has to keep the real attempt's byte counts", body, got)
+	}
+	if strings.Contains(got, "zzzzzzzz") {
+		t.Errorf("controlBody(%q) = %q, still carries the needle: the control error then matches a real leak and the fuzz target skips it", body, got)
+	}
 }
 
 // assertNoNeedleLeaked fails for every needle that reached gotErr without also

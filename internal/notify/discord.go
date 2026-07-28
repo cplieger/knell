@@ -196,10 +196,14 @@ func batchLateClause(outages []watch.Outage) string {
 		}
 	}
 	switch ended {
-	case len(outages):
-		return "Each ended before a sweep detected it - nothing was wrong with delivery."
+	// Order matters: for an empty batch (which BeatOutageHistory rejects and
+	// historyMessage never reaches) both cases equal 0, and the first one wins.
+	// Blaming delivery is the direction a reason-less batch must fall through
+	// to, like watch.LateUndelivered being the zero value.
 	case 0:
 		return "Their alerts were still undelivered when it returned - check the webhook."
+	case len(outages):
+		return "Each ended before a sweep detected it - nothing was wrong with delivery."
 	default:
 		return fmt.Sprintf("%d had an undelivered alert (check the webhook), %d ended before a sweep detected it.",
 			len(outages)-ended, ended)

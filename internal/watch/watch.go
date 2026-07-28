@@ -516,9 +516,10 @@ func (w *Watcher) Beat(id string) bool {
 	// A late ping ends an outage. When the sweep already recorded that
 	// outage, seal the record it has not delivered yet; when the crossing
 	// is one no sweep has seen at all, record the whole closed outage so
-	// this ping cannot erase it. Recording is independent of the queue's
-	// contents, so an outage that both begins AND ends while an earlier
-	// notice is undelivered still reaches Discord instead of vanishing.
+	// this ping cannot erase it. Recording does not depend on the queue being
+	// empty, so an outage that both begins AND ends while an earlier notice
+	// is undelivered still reaches Discord instead of vanishing; a FULL queue
+	// is the one loss, counted and warned by recordEndedOutage.
 	//
 	// The two arms are the two reasons a history notice is late, and they are
 	// only distinguishable here: sealing an open record leaves the reason the

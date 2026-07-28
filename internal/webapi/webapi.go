@@ -36,16 +36,19 @@ const maxLoggedPath = 128
 // maxLoggedMethod bounds the request method the access log records. webhttp
 // logs r.Method verbatim and offers no transform hook, while net/http accepts
 // any RFC 9110 token up to the whole request-line limit (MaxHeaderBytes +
-// 4096, 1 MiB by default), so an unauthenticated caller chooses the text. 16
-// bytes keeps every IANA-registered method intact (the longest,
-// BASELINE-CONTROL, is exactly 16) and knell only ever serves GET and POST.
+// 4096, 1 MiB by default), so an unauthenticated caller chooses the text. The
+// bound is set by what knell SERVES, not by the IANA registry (whose longest
+// entry, UPDATEREDIRECTREF, is 17): 16 bytes carries GET and POST and every
+// common method a prober tries, and anything longer is a method knell refuses
+// with 405 whatever the log keeps.
 const maxLoggedMethod = 16
 
 // overlongMethodLabel replaces a method too long to be a real one, the
 // method-side twin of maxLoggedPath. Such a request is refused either way (it
 // matches no method-bearing pattern, so /beat/{id} answers 405 and every other
-// path gets net/http's own 404/405), and the metric already records it as
-// otherMethodLabel, so nothing but the logged text changes.
+// path gets net/http's own 404/405), and the metric already collapses it
+// (otherMethodLabel on the /beat/{id} match, unmatchedLabel elsewhere), so
+// nothing but the logged text changes.
 const overlongMethodLabel = "OVERLONG"
 
 // boundMethod caps the method before webhttp.Logging reads it. It is listed

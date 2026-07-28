@@ -1218,6 +1218,44 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 	}
 }
 
+// TestParseWebhookURLRejectsUndeliverableShapes pins the two refusals that
+// separate a TRANSPORTABLE URL from a DELIVERABLE one. Both are invisible at
+// runtime: startup succeeds, /healthz is healthy, outages are detected, and
+// only the notice fails — forever. Nothing else asserts them
+// (FuzzParseWebhookURL only constrains what a rejection message may SAY), so
+// dropping either guard leaves the whole suite green.
+func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		raw     string
+		wantErr string
+	}{
+		"host only":              {raw: "https://discord.example", wantErr: "missing path"},
+		"root path only":         {raw: "https://discord.example/", wantErr: "missing path"},
+		"interior space in path": {raw: "https://discord.example/api/webhooks/1/ab c", wantErr: "contains a space"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := parseWebhookURL(tt.raw)
+			if err == nil {
+				t.Fatalf("parseWebhookURL(%q) = nil, want an error: the webhook path is the credential, so this value can never deliver a notice and startup is the only moment the operator is watching", tt.raw)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want it to name %q", err, tt.wantErr)
+			}
+			if strings.Contains(err.Error(), "discord.example") {
+				t.Errorf("error = %q embeds the URL; the webhook URL is a secret and startup errors are shipped to Loki", err)
+			}
+		})
+	}
+
+	if _, err := parseWebhookURL("https://discord.example/api/webhooks/1/abc"); err != nil {
+		t.Errorf("parseWebhookURL(a well-formed webhook) = %v, want nil: the deliverability checks must not refuse a working configuration", err)
+	}
+}
+
 // TestLoadWarnsOnlyWhenLogLevelIsUnparseable pins the ONLY signal that a
 // mistyped LOG_LEVEL was ignored. slogx.ParseLevel returns ok=true for an unset
 // value and ok=false only for a non-empty unparseable one, so this WARN is what
@@ -1233,17 +1271,23 @@ func TestLoadWarnsOnlyWhenLogLevelIsUnparseable(t *testing.T) {
 	// default, and t.Setenv forbids parallel tests anyway.
 	tests := map[string]struct {
 		raw      string
+		unset    bool
 		want     string
 		wantWarn bool
 	}{
-		"unparseable value warns":   {raw: "chatty", want: "INFO", wantWarn: true},
-		"unset does not warn":       {raw: "", want: "INFO", wantWarn: false},
-		"valid value does not warn": {raw: "debug", want: "DEBUG", wantWarn: false},
+		"unparseable value warns":         {raw: "chatty", want: "INFO", wantWarn: true},
+		"present but blank does not warn": {raw: "", want: "INFO", wantWarn: false},
+		"unset does not warn":             {unset: true, want: "INFO", wantWarn: false},
+		"valid value does not warn":       {raw: "debug", want: "DEBUG", wantWarn: false},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			setValidLoadEnv(t)
-			t.Setenv("LOG_LEVEL", tt.raw)
+			if tt.unset {
+				unsetEnv(t, "LOG_LEVEL")
+			} else {
+				t.Setenv("LOG_LEVEL", tt.raw)
+			}
 
 			rec := capture.Default(t)
 
