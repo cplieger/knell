@@ -1040,10 +1040,11 @@ func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 	// acts on -- a webhook that no longer accepts this knell (recreate it) vs
 	// a payload Discord refused -- and an unmapped code must report the bare
 	// number rather than invent a meaning. 50035 is Discord's content-length
-	// rejection, and config caps NODE_NAME (the only operator-set text in a
-	// notice) at 256 bytes on startup, so its wording must say that no
-	// configuration causes it rather than sending the operator to re-check a
-	// setting startup already validated.
+	// rejection, which config's startup validation makes unreachable, so its
+	// wording must report a knell bug and name NO operator setting: pointing
+	// at an input startup already accepted would send the operator to inspect
+	// the one value the app proved innocent. The notWant on "NODE_NAME" pins
+	// that, because this wording has drifted toward naming it twice before.
 	//
 	// All cases use a non-transient status so each runs exactly one attempt.
 	for name, tc := range map[string]struct {
@@ -1070,11 +1071,11 @@ func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 			want:    []string{"HTTP 400", "Discord error code 50006", "knell bug"},
 			notWant: []string{"Cannot send an empty message", "recreate the webhook"},
 		},
-		"invalid request body is a knell bug and says config cannot cause it": {
+		"invalid request body is a knell bug and names no operator setting": {
 			status:  http.StatusBadRequest,
 			body:    `{"message": "Invalid Form Body", "code": 50035, "errors": {"content": {"_errors": [{"code": "BASE_TYPE_MAX_LENGTH", "message": "Must be 2000 or fewer in length."}]}}}`,
-			want:    []string{"Discord error code 50035", "NODE_NAME", "knell bug"},
-			notWant: []string{"Invalid Form Body", "BASE_TYPE_MAX_LENGTH", "2000 or fewer"},
+			want:    []string{"Discord error code 50035", "knell bug"},
+			notWant: []string{"Invalid Form Body", "BASE_TYPE_MAX_LENGTH", "2000 or fewer", "NODE_NAME"},
 		},
 		"unmapped code is reported bare": {
 			status: http.StatusBadRequest,

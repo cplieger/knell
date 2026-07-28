@@ -632,14 +632,12 @@ func discordErrorCode(body []byte) (int, bool) {
 // operator can do about them: 10015 and 50027 mean the webhook this knell
 // posts to no longer accepts it, which only an operator can fix; 50006 and
 // 50035 mean Discord refused the payload knell built, which no configuration
-// change helps. 50035 is Discord's answer to a payload past its
-// 2000-character content limit, which is why the wording says so explicitly:
-// NODE_NAME is the only operator-set text in a notice, config caps it at 256
-// bytes on startup (see internal/config maxNodeNameBytes), and the longest
-// notice is ~540 characters at that cap — so an operator reading this code
-// must NOT be sent to re-check a setting startup already validated. Values
-// are phrased as that verdict rather than as a translation of Discord's
-// message, which is never read.
+// change helps — so both are reported as knell bugs, and neither names a
+// setting for the operator to re-check: config validates every operator-set
+// value at startup, so a rejected payload is knell's own doing and pointing
+// at an input startup already accepted would only send the operator to
+// inspect the wrong thing. Values are phrased as that verdict rather than as
+// a translation of Discord's message, which is never read.
 func discordCodeMeaning(code int) string {
 	switch code {
 	case 10015:
@@ -649,7 +647,7 @@ func discordCodeMeaning(code int) string {
 	case 50006:
 		return "cannot send an empty message: knell built a payload with no content, which is a knell bug, not an operator problem"
 	case 50035:
-		return "invalid request body: Discord rejected knell's payload - no configuration causes this (startup caps NODE_NAME at 256 bytes, which keeps every notice far inside Discord's 2000-character content limit), so this is a knell bug"
+		return "invalid request body: Discord rejected the payload knell built, which no configuration change helps, so this is a knell bug worth reporting"
 	}
 	return ""
 }
