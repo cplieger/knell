@@ -222,13 +222,16 @@ func listenAddr() string {
 }
 
 // rejectBlankFileVar fails startup when a `_FILE` variable is PRESENT but
-// empty. envx gates its file channel on a non-empty value, so an empty
+// blank. envx gates its file channel on a non-empty value, so an empty
 // `_FILE` is indistinguishable from unset and silently falls back to the
 // plain variable — which for BEAT_TOKEN is fail-OPEN (an unauthenticated
 // /beat/{id}). Compose interpolation of an unset variable produces exactly
-// this shape, so it is checked here rather than delegated to envx.
+// this shape. envx.IsBlankSecretFilePath reports the state (it owns the
+// `_FILE` suffix and the blank rule, and deliberately leaves the verdict to
+// the caller because only knell knows that a missing beat token means an open
+// endpoint); the refusal and its wording are knell's policy and stay here.
 func rejectBlankFileVar(key string) error {
-	if path, ok := os.LookupEnv(key + "_FILE"); ok && strings.TrimSpace(path) == "" {
+	if envx.IsBlankSecretFilePath(key) {
 		return fmt.Errorf("%s_FILE is set but empty: unset it to configure %s directly, or point it at a secret file", key, key)
 	}
 	return nil

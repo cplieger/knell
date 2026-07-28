@@ -165,12 +165,6 @@ func run() error {
 		watcher.Run(ctx, watch.DefaultTick)
 	}()
 
-	// shutdownHooksRan separates "Run never reached the shutdown sequence"
-	// (a fatal serve error) from "the sequence ran and Shutdown reported an
-	// error" (a drain that outlived the grace). webhttp calls preDrain
-	// inline on Run's own goroutine, and only after ctx is cancelled, so
-	// this is a plain same-goroutine write.
-	shutdownHooksRan := false
 	// The marker flip rides the PRE-DRAIN phase, not onShutdown: webhttp.Run
 	// spends ONE shutdown budget on pre-drain -> srv.Shutdown -> onShutdown, so
 	// a flip in onShutdown lands only after the drain has finished, and the
@@ -183,7 +177,6 @@ func run() error {
 	// Flipping before logging makes the probe fail closed even if either
 	// shutdown log then blocks.
 	preDrain := webhttp.WithPreDrain(func(context.Context) {
-		shutdownHooksRan = true
 		marker.Set(false)
 		// No cause attribute: signal.NotifyContext cancels through a plain
 		// context.WithCancel and nothing here uses context.WithCancelCause, so
@@ -200,27 +193,34 @@ func run() error {
 	onShutdown := func(teardownCtx context.Context) {
 		awaitWatchLoop(teardownCtx, watcherDone)
 	}
-	err = webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(shutdownGrace), preDrain)
-	if err != nil && !shutdownHooksRan {
-		// A fatal serve error returns from Run without invoking either hook, so
-		// the marker still reads healthy and the watch loop has not logged the
-		// notices this process will never deliver -- the operator's only trace of
-		// them. Flip the marker, cancel the loop and wait for it, bounded by the
-		// same grace. The graceful path is excluded by shutdownHooksRan: there
-		// Run already spent the single budget on pre-drain -> Shutdown ->
-		// onShutdown, and a second full grace here would push the process past
-		// Docker's SIGKILL - the exact failure the 8s budget exists to avoid.
+	// The other exit: srv.Serve returns on its own (the listener or the accept
+	// loop is gone) before any signal arrives. webhttp.Run runs NO part of the
+	// graceful sequence there — ctx is still live and there is nothing left to
+	// drain — so without this hook the marker would still read healthy and the
+	// watch loop would never log the notices this process will never deliver,
+	// the operator's only trace of them. Run guarantees exactly one of the two
+	// paths per call, so onShutdown cannot run twice.
+	//
+	// stop() is this hook's own job and not a duplicate of main's defer: the
+	// watch loop is keyed to the signal context, which nothing has cancelled on
+	// this path, so without the cancel awaitWatchLoop would wait out the whole
+	// grace for a loop nobody asked to stop (webhttp documents exactly this for
+	// WithServeExit). The hook's context carries the full grace, and Run does
+	// not call srv.Shutdown after Serve has ended, so no second budget exists
+	// to push the process past Docker's SIGKILL.
+	serveExit := webhttp.WithServeExit(func(exitCtx context.Context) {
 		marker.Set(false)
 		stop()
-		teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), shutdownGrace)
-		defer cancelTeardown()
-		onShutdown(teardownCtx)
-	}
-	if err != nil && shutdownHooksRan && errors.Is(err, context.DeadlineExceeded) {
+		onShutdown(exitCtx)
+	})
+	err = webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
+	if err != nil && errors.Is(err, context.DeadlineExceeded) {
 		// The shutdown sequence ran and Shutdown reported its own deadline:
 		// in-flight requests outlived the single grace budget. Name that, so
 		// the one ERROR line points at the drain and at the constant that
-		// bounds it instead of at an anonymous expired context.
+		// bounds it instead of at an anonymous expired context. Only the
+		// graceful path can produce this error: the other one returns
+		// srv.Serve's own failure, an accept error that carries no deadline.
 		return fmt.Errorf("the shutdown sequence outlived the %s shutdown grace (in-flight requests still draining, or a stalled pre-drain hook): %w", shutdownGrace, err)
 	}
 	return err

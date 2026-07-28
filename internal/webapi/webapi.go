@@ -212,13 +212,20 @@ func recordHTTPMetric(r *http.Request, status int, d time.Duration) {
 }
 
 // writeMethodNotAllowed refuses a beat request whose method is not GET or
-// POST: 405 in this file's standard coded envelope. Two methods are permitted,
-// so Allow is set here rather than by webhttp.RequireMethod (single-method
-// Allow), and it is the single home of the refusal EVERY rejected method
-// answers with -- HEAD included -- so no response can tell a sender that a
-// method which does not record a beat is allowed to.
+// POST: 405 in this file's standard coded envelope. It is the single home of
+// the refusal EVERY rejected method answers with -- HEAD included -- so no
+// response can tell a sender that a method which does not record a beat is
+// allowed to.
+//
+// webhttp.SetAllow renders the Allow field (two methods, so
+// webhttp.RequireMethod's single-method guard does not fit), and knell keeps
+// its own message: webhttp.MethodNotAllowed would write the library's generic
+// "method not allowed" body, while this one names the two methods a sender
+// should use instead. HEAD is deliberately absent from the set even though
+// ServeMux would serve it from the GET pattern -- New registers it separately
+// to refuse it, so advertising it would contradict the refusal.
 func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Allow", "GET, POST")
+	webhttp.SetAllow(w, http.MethodGet, http.MethodPost)
 	webhttp.WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed",
 		"use GET or POST to record a beat")
 }

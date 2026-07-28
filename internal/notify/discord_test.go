@@ -580,16 +580,18 @@ func TestNestedURLErrorsAreFullyReducedBeforeClassification(t *testing.T) {
 	}
 }
 
-func TestLogSafeFailsClosedWhenReductionYieldsNoError(t *testing.T) {
+func TestLogSafeNeverReducesAFailureToNil(t *testing.T) {
 	t.Parallel()
 
-	// httpx.LogSafeError returns a *url.Error's inner Err verbatim, so a
-	// *url.Error carrying a nil cause reduces to nil. postAttempt's return IS
-	// httpx.Do's success signal, so a nil there would report an UNDELIVERED
-	// notification as delivered: watch would flip the beat to alerted and the
-	// missing notice this app exists to send would never be retried. logSafe
-	// must fail closed instead, and its substitute message must still be
-	// URL-free.
+	// A *url.Error carrying a nil cause must not reduce to nil: postAttempt's
+	// return IS httpx.Do's success signal, so a nil there would report an
+	// UNDELIVERED notification as delivered — watch would flip the beat to
+	// alerted and the missing notice this app exists to send would never be
+	// retried. httpx v4.2.0 guarantees this at the source (LogSafeError
+	// substitutes a contentless, URL-free stand-in), which is why knell no
+	// longer carries its own fail-closed guard; this pins the contract knell
+	// depends on, so a regression in the library fails here rather than
+	// silently disarming the switch.
 	const secret = "verysecretclosedtoken"
 	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
 
@@ -598,7 +600,7 @@ func TestLogSafeFailsClosedWhenReductionYieldsNoError(t *testing.T) {
 		t.Fatal("logSafe(*url.Error with a nil cause) = nil, want an error (a nil reports an undelivered notification as delivered)")
 	}
 	if strings.Contains(got.Error(), secret) {
-		t.Errorf("fail-closed error leaks the webhook credential: %v", got)
+		t.Errorf("the reduced error leaks the webhook credential: %v", got)
 	}
 	// The nil-in/nil-out half of the contract: post and postAttempt call
 	// logSafe only on a real failure, so a nil must not become an error.
@@ -1341,14 +1343,13 @@ func TestTransportPhraseClassifiesStructurally(t *testing.T) {
 func TestAttemptTimeoutIsRetried(t *testing.T) {
 	t.Parallel()
 
-	// A per-attempt child deadline is a retryable condition, but
-	// httpx.IsTransient rejects anything that unwraps to
-	// context.DeadlineExceeded before it consults the Transient
-	// interface, so postAttempt translates the timeout into a
-	// dedicated no-Unwrap error. Giving that type an Unwrap method
-	// makes httpx treat it as terminal again and silently reduces
-	// every notification to one attempt; a recovered notice is
-	// best-effort-once and would be lost outright.
+	// A per-attempt deadline is a retryable condition, but httpx.IsTransient
+	// rejects a bare context.DeadlineExceeded as terminal caller cancellation
+	// before it consults the Transient interface. httpx.WithAttemptTimeout is
+	// what tells it apart: the retry loop installs the bound itself and marks
+	// an expiry that fired while the CALLER's context was still live. Without
+	// the option every notification silently reduces to one attempt, and a
+	// recovered notice is best-effort-once and would be lost outright.
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if hits.Add(1) == 1 {
@@ -1372,7 +1373,7 @@ func TestAttemptTimeoutIsRetried(t *testing.T) {
 	d := New(srv.URL, "node-1")
 	t.Cleanup(d.Close)
 	// Shorten only this notifier's per-attempt deadline: the branch under
-	// test cares that a CHILD deadline fired while the caller's budget is
+	// test cares that the ATTEMPT's bound fired while the caller's budget is
 	// still live, not how long it took to fire.
 	d.attemptTimeout = 100 * time.Millisecond
 
@@ -1383,8 +1384,10 @@ func TestAttemptTimeoutIsRetried(t *testing.T) {
 		t.Errorf("delivery attempts = %d, want 2 (an attempt timeout must be retried)", got)
 	}
 	// The production constants must keep the attempt context as the effective
-	// bound: a Client.Timeout error does not unwrap to context.DeadlineExceeded,
-	// so an inverted ordering would silently disable the translation above.
+	// bound: a Client.Timeout error does not carry context.DeadlineExceeded, so
+	// an inverted ordering would preempt the attempt deadline and report the
+	// failure as an anonymous client timeout instead of the classified phrase
+	// (it is still retried, but the diagnostic is the point).
 	if d.client.Timeout <= attemptTimeout {
 		t.Errorf("client timeout %s <= per-attempt timeout %s: the transport bound would preempt the attempt context", d.client.Timeout, attemptTimeout)
 	}
@@ -1393,43 +1396,49 @@ func TestAttemptTimeoutIsRetried(t *testing.T) {
 func TestAttemptTimeoutReportsSafeDiagnostic(t *testing.T) {
 	t.Parallel()
 
-	// postAttempt translates a fired per-attempt deadline into
-	// attemptTimeoutError so httpx.Do retries it, and that error is the whole
-	// incident record an operator reads (httpx.Do returns it verbatim on
-	// exhaustion, watch logs it at Error). Four properties keep it useful and
-	// safe, and only driving the real request path exercises them: the bound
-	// that fired is named, the classified cause is carried, httpx must
-	// classify it transient, and it must NOT unwrap to
-	// context.DeadlineExceeded -- httpx rejects context errors as terminal
-	// BEFORE consulting IsTransient, so adding an Unwrap would silently
-	// restore the single-attempt loss this type exists to fix.
+	// The exhausted attempt timeout is the whole incident record an operator
+	// reads (httpx.Do returns it verbatim, watch logs it at Error). Four
+	// properties keep it useful and safe, and only driving the real retry loop
+	// exercises them: the classified cause is carried, httpx classifies it
+	// transient (so every attempt is spent, not just the first), the deadline
+	// stays visible to errors.Is for knell's own callers, and no part of the
+	// webhook URL reaches the message.
 	const secret = "verysecrettimeouttoken"
 	d := New("https://discord.example/api/webhooks/1234567890/"+secret, "node-1")
 	t.Cleanup(d.Close)
 	d.attemptTimeout = time.Millisecond
+	var hits atomic.Int32
 	d.client.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		hits.Add(1)
 		<-r.Context().Done()
 		return nil, r.Context().Err()
 	})
 
-	_, err := d.postAttempt(context.Background(), []byte(`{"content":"probe"}`))
+	err := d.post(context.Background(), "missing probe", "body")
 	if err == nil {
-		t.Fatal("postAttempt after its private deadline = nil, want error")
+		t.Fatal("post() with every attempt timing out = nil, want error")
+	}
+	if got := hits.Load(); got != maxAttempts {
+		t.Errorf("delivery attempts = %d, want %d (an attempt timeout must be retried, not terminal)", got, maxAttempts)
 	}
 	// "a deadline expired" is safeTransportError's classified phrase for the
 	// cause; the cause's own text is never rendered, because a transport cause
 	// can be written from a response header (see
 	// TestRedirectDerivedTransportErrorsCarryNoRemoteText).
-	for _, want := range []string{"webhook attempt timed out after 1ms", "a deadline expired"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("timeout error = %q, want it to contain %q", err, want)
-		}
+	if !strings.Contains(err.Error(), "a deadline expired") {
+		t.Errorf("timeout error = %q, want it to contain the classified phrase", err)
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("timeout error = %v, want an opaque retryable error rather than caller cancellation", err)
+	if !httpx.IsAttemptTimeout(err) {
+		t.Errorf("httpx.IsAttemptTimeout(%v) = false, want the per-attempt bound to be marked", err)
 	}
 	if !httpx.IsTransient(err) {
 		t.Errorf("httpx.IsTransient(%v) = false, want a retryable attempt timeout", err)
+	}
+	// The mark WRAPS instead of replacing, so the timeout stays legible to
+	// knell's own callers. The old hand-rolled error deliberately hid this to
+	// stay retryable; WithAttemptTimeout does not have to.
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("timeout error = %v, want the expired deadline to remain visible to errors.Is", err)
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Errorf("timeout error leaks the webhook credential: %v", err)

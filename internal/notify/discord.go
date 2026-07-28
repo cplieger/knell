@@ -29,8 +29,10 @@ import (
 	"github.com/cplieger/knell/internal/watch"
 )
 
-// attemptTimeout bounds each delivery attempt when the caller's context
-// carries no deadline of its own.
+// attemptTimeout bounds each delivery attempt. httpx.WithAttemptTimeout
+// installs it inside the retry loop, so its expiry is retryable and the
+// caller's own budget is never extended (a nearer caller deadline still
+// governs).
 const attemptTimeout = 10 * time.Second
 
 // maxAttempts is the total delivery attempts per notification (httpx
@@ -225,6 +227,15 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 	_, err = httpx.Do(ctx, func(ctx context.Context) (struct{}, error) {
 		return d.postAttempt(ctx, body)
 	}, httpx.WithLabel("discord webhook "+label), httpx.WithMaxAttempts(maxAttempts),
+		// Bound EACH attempt and make that bound's expiry retryable. httpx
+		// classifies a bare context deadline as terminal (it cannot tell the
+		// caller's budget from a per-attempt bound), so the bound has to be
+		// installed by the loop that owns the retries: WithAttemptTimeout
+		// derives the attempt context itself, marks only an expiry that fired
+		// while the caller's context was still live, and keeps the deadline
+		// visible to errors.Is — which is what makes the timeout classifiable
+		// by httpx AND transparent to knell's own callers.
+		httpx.WithAttemptTimeout(d.attemptTimeout),
 		httpx.WithRateLimitRetry(30*time.Second),
 		// watch publishes the terminal verdict for every failed delivery
 		// (sendMissing/sendHistory/sendRecovered log at Error with the beat,
@@ -241,7 +252,11 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 // logSafe reduces err to a form that cannot carry the webhook URL. The
 // reduction is purely STRUCTURAL: httpx.LogSafeError unwraps the *url.Error
 // net/http builds around a transport failure, which is the one error shape
-// that embeds the full request URL, and returns everything else untouched.
+// that embeds the full request URL, and returns everything else untouched. A
+// *url.Error carrying NO cause reduces to httpx's own contentless stand-in
+// rather than to nil (v4.2.0 fixed that at the source), so a real failure can
+// never be reduced to a success signal here — nil in, nil out, and non-nil in,
+// non-nil out.
 // There is deliberately no string search-and-replace backstop: text-matching
 // redaction can only defend text knell chose to publish, and this package
 // publishes none (see post for that invariant).
@@ -250,24 +265,19 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 // redirect causes is written from a response header, so postAttempt's
 // transport path does not return this error as-is: safeTransportError adds the
 // classification step that keeps remote text out of the message. This function
-// is the reduction those callers share, plus the fail-closed guard below.
+// is the reduction those callers share.
 //
 // The reduced error is returned as-is rather than re-wrapped, which keeps
 // errors.Is/As intact: the sweep relies on it for context.Canceled and
 // httpx.Do for transient classification. httpx.RedactSecret cannot be used
 // here — it returns a bare errors.New and would break both.
+//
+// It is a thin wrapper over one library call and stays for two reasons: it is
+// the named home of the invariant above (three call sites, one place to read
+// why), and safeTransportError's reduction loop is written against its
+// "reduce, never nil" contract.
 func logSafe(err error) error {
-	if err == nil {
-		return nil
-	}
-	if safe := httpx.LogSafeError(err); safe != nil {
-		return safe
-	}
-	// LogSafeError returns urlErr.Err verbatim, so a *url.Error whose own Err
-	// is nil would reduce a real failure to nil. postAttempt's return IS
-	// httpx.Do's success signal, so a nil there would report an undelivered
-	// notification as delivered and suppress the alert; fail closed instead.
-	return errors.New("webhook delivery failed")
+	return httpx.LogSafeError(err)
 }
 
 // safeTransportError reports a failed transport call in knell's own words.
@@ -296,7 +306,7 @@ func safeTransportError(err error) error {
 	// let it unwrap past this wrapper and render that error's cause instead of
 	// the phrase below — in httpx.Do's attempt lines and in post's own
 	// logSafe. The loop terminates: each pass either strips a url.Error or
-	// (for one with a nil Err) substitutes logSafe's fail-closed error, which
+	// (for one with a nil Err) substitutes httpx's contentless stand-in, which
 	// is not a url.Error.
 	cause := logSafe(err)
 	for {
@@ -400,42 +410,11 @@ func isProxyConnectError(err error) bool {
 	return errors.As(err, &opErr) && opErr.Op == "proxyconnect"
 }
 
-// attemptTimeoutError reports that a single delivery attempt exceeded
-// postAttempt's private per-attempt deadline while the caller's context was
-// still live, which is a retryable condition. It intentionally has no Unwrap
-// method: exposing context.DeadlineExceeded would make httpx.Do treat it as a
-// terminal caller-cancellation decision before consulting IsTransient. Its
-// message carries no URL.
-type attemptTimeoutError struct {
-	// cause is knell's own phrase for the transport error the expired
-	// deadline produced, and after is the bound that expired. A string, not
-	// an error: the type must still not unwrap to context.DeadlineExceeded
-	// (httpx classifies that terminal before consulting IsTransient), and the
-	// text is exactly what the non-timeout transport path already returns
-	// through safeTransportError — a classified phrase naming the failure and
-	// its stage, never the URL and never remote bytes. The zero value stays
-	// valid and renders the bare message.
-	cause string
-	after time.Duration
-}
-
-func (e attemptTimeoutError) Error() string {
-	msg := "webhook attempt timed out"
-	if e.after > 0 {
-		msg += " after " + e.after.String()
-	}
-	if e.cause != "" {
-		msg += ": " + e.cause
-	}
-	return msg
-}
-func (attemptTimeoutError) IsTransient() bool { return true }
-
 // postAttempt performs one delivery attempt of an already-encoded payload:
-// per-attempt deadline, request construction, transport call, and response
-// cleanup, leaving the verdict on the response to deliveryError. It is the
-// retry callback post hands to httpx.Do, which owns the retry policy and
-// terminal wrapping.
+// request construction, transport call, and response cleanup, leaving the
+// verdict on the response to deliveryError. It is the retry callback post
+// hands to httpx.Do, which owns the retry policy, the per-attempt deadline
+// (WithAttemptTimeout, so ctx already carries it) and terminal wrapping.
 // Every error it returns is URL-free by CONSTRUCTION rather than by
 // filtering: a transport error is reduced and classified by
 // safeTransportError, and a rejected response contributes only statusDetail's
@@ -443,9 +422,7 @@ func (attemptTimeoutError) IsTransient() bool { return true }
 // than in post's logSafe because httpx.Do logs each attempt's error before
 // post ever sees it.
 func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error) {
-	attemptCtx, cancel := httpx.ContextWithDefaultTimeout(ctx, d.attemptTimeout)
-	defer cancel()
-	req, reqErr := http.NewRequestWithContext(attemptCtx, http.MethodPost, d.url, bytes.NewReader(body))
+	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, d.url, bytes.NewReader(body))
 	if reqErr != nil {
 		// The raw error would embed the URL; report the cause only.
 		return struct{}{}, fmt.Errorf("building webhook request: %w", logSafe(reqErr))
@@ -454,24 +431,12 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 	req.Header.Set("User-Agent", userAgent)
 	resp, doErr := d.client.Do(req) //nolint:bodyclose // closed via the deferred drainClose below
 	if doErr != nil {
-		// A child attempt deadline is retryable while the caller's budget is
-		// still live. httpx deliberately treats context deadline errors as
-		// terminal, so translate only this per-attempt timeout into its
-		// Transient contract; caller cancellation/deadlines stay terminal.
-		if errors.Is(doErr, context.DeadlineExceeded) && ctx.Err() == nil {
-			// Carry the classified cause and the bound that fired: a stalled
-			// dial and a bare expired deadline after the connection was
-			// established are different incidents (egress/DNS blocked vs
-			// Discord answering slowly), and this error is the whole incident
-			// record — httpx.Do returns it verbatim on exhaustion and watch
-			// logs that at Error. safeTransportError supplies knell's own
-			// phrase for the cause, so neither the webhook URL nor any
-			// response-authored text can reach the record.
-			return struct{}{}, attemptTimeoutError{cause: safeTransportError(doErr).Error(), after: d.attemptTimeout}
-		}
 		// *url.Error embeds the full webhook URL and its cause can be written
-		// from a response's Location header; report knell's own phrase for it
-		// (transient classification survives through Unwrap).
+		// from a response's Location header; report knell's own phrase for it.
+		// The chain survives Unwrap, which is what both classifications read:
+		// httpx's transient check, and its own per-attempt-deadline mark (the
+		// expiry of the bound WithAttemptTimeout installed is retried, while
+		// the caller's own expired budget stays terminal).
 		return struct{}{}, safeTransportError(doErr)
 	}
 	defer drainClose(resp.Body)
