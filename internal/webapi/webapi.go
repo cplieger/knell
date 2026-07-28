@@ -266,14 +266,30 @@ func beatHandler(appCtx context.Context, b Beater, token string) http.HandlerFun
 		// the overrun as an *http.MaxBytesError, which is what the WARN below
 		// reports.
 		//
-		// The overrun is NOT reported to the sender. MaxBytesReader also asks
-		// net/http to close the connection, but only by type-asserting an
-		// unexported interface on the ResponseWriter, and every handler here
-		// runs behind webhttp.Logging's StatusRecorder wrapper, which no
-		// third-party type can satisfy — so that half of the mechanism does not
-		// reach net/http (measured: Connection: close appears on a bare
-		// handler, not on a chained one). The overrun is therefore
-		// operator-visible only, in the log.
+		// No overrun STATUS is reported to the sender: the ping still answers
+		// 200. The connection under it, however, is now closed.
+		// MaxBytesReader tells net/http a request was too large by
+		// type-asserting an UNEXPORTED net/http interface on the
+		// ResponseWriter it was handed, which no third-party wrapper can
+		// satisfy — and every handler here runs behind the StatusRecorder
+		// webhttp.Logging and Recoverer wrap the writer in. webhttp v1.18.1
+		// closed that gap: LimitBody now walks the writer's Unwrap chain and
+		// hands MaxBytesReader net/http's own writer, and StatusRecorder
+		// implements Unwrap, so the signal reaches net/http through this chain
+		// (measured over a real socket: Connection: close on an over-cap POST,
+		// absent on an in-cap one, both answered 200 {"ok":true}).
+		//
+		// It is still absent, with nothing this app can do about it, behind a
+		// wrapper that does not implement Unwrap, under webhttp.RouteTimeout
+		// (which knell does not use), and against an
+		// httptest.ResponseRecorder — the last is why knell's own handler
+		// tests cannot observe the close and pin the WARN below instead.
+		//
+		// That WARN stays either way, and is deliberately kept now that the
+		// connection closes too: the close is observable only on the SENDER's
+		// side of the wire and the 200 says nothing, so the log line remains
+		// the only channel through which a knell OPERATOR ever learns a sender
+		// is shipping payloads knell refuses to read.
 		//
 		// A ping is never lost to its own payload: the error is reported, not
 		// acted on. The beat below is recorded whether the body fit, overran,

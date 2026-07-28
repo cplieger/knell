@@ -889,16 +889,26 @@ func TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError(t *testing.T)
 	// Deliberately NOT t.Parallel: slog.Default() is process-global.
 	//
 	// The third path remote-authored text can reach the logs by, and the only
-	// one no status-side guard covers: the drain of a SUCCESSFUL response.
-	// httpx.DrainClose logs its read error at Debug through the PACKAGE-level
-	// slog.Default() (loop.go's WithLogger cannot redirect it), and that
-	// error's text is written by the other end — net/http renders a malformed
+	// one no status-side guard covers: the drain of a SUCCESSFUL response. A
+	// 2xx reaches the drain with no other error in play, so statusDetail
+	// never sees it.
+	//
+	// The guard now lives in the LIBRARY, not in knell: httpx.DrainClose logs
+	// a failed drain at Debug through the PACKAGE-level slog.Default() (no
+	// httpx option can redirect or silence it), and as of v4.2.1 it logs a
+	// bare line carrying no error value. Before that it attached the error,
+	// whose text is written by the other end — net/http renders a malformed
 	// chunked trailer as `malformed MIME header line: <remote bytes>`, the
-	// same class readFailure classifies structurally on the status path. A 2xx
-	// reaches the drain with no other error in play, so statusDetail never
-	// sees it. drainClose closes the path by never handing the error to a
-	// logger, pinned here at the Debug level an operator raises precisely
-	// while diagnosing failing deliveries.
+	// same class readFailure classifies structurally on the status path — so
+	// knell carried a local drain helper to keep that error away from a
+	// logger, and this test pinned the helper.
+	//
+	// knell keeps the assertion anyway, now against the real httpx.DrainClose:
+	// the invariant it defends is knell's (no remote-authored text in knell's
+	// own logs) even though the code enforcing it no longer is, and an httpx
+	// regression would silently reopen the leak in knell's log stream with
+	// nothing else in this package left to catch it. Pinned at the Debug level
+	// an operator raises precisely while diagnosing failing deliveries.
 	const secret = "verysecrettrailertoken"
 	const secretPath = "/api/webhooks/1234567890/" + secret
 	malformedTrailer := "this-is-not-a-header" + secretPath
@@ -956,10 +966,27 @@ func TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError(t *testing.T)
 	if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err != nil {
 		t.Fatalf("BeatMissing against a 200 with a malformed trailer = %v, want nil (a 2xx is delivered)", err)
 	}
-	for _, leak := range []string{secret, "/api/webhook", "MIME", "this-is-not-a-header", "drain"} {
+	// The remote-authored text must be absent. "drain" is deliberately NOT in
+	// this list any more: httpx v4.2.1 logs a bare `msg="failed to drain
+	// response body"` line with no attributes, and that line is the library's
+	// own fixed wording, not remote input. The token belonged here only while
+	// knell's local helper logged NOTHING at all, where its appearance meant
+	// the library's drain had run instead; asserting it now would forbid the
+	// very design that closed the leak. "MIME" is the load-bearing proxy that
+	// replaces it — it is net/textproto's own wording for the read error, so
+	// any regression that renders that error's text again trips on it, whether
+	// or not the remote bytes happen to look like a credential.
+	for _, leak := range []string{secret, "/api/webhook", "MIME", "this-is-not-a-header"} {
 		if got := buf.String(); strings.Contains(got, leak) {
 			t.Errorf("delivery logs carry %q from the body drain's read error: %s", leak, got)
 		}
+	}
+	// The invariant stated directly rather than by proxy: the drain's error
+	// VALUE reaches no log attribute. Pre-v4.2.1 httpx rendered it as
+	// error="malformed MIME header ..."; nothing else in a first-attempt
+	// delivery logs at all, so any error attribute here is that value.
+	if got := buf.String(); strings.Contains(got, "error=") {
+		t.Errorf("delivery logs carry an error attribute from the body drain: %s", got)
 	}
 }
 
@@ -990,17 +1017,24 @@ func (b *countingBody) Close() error {
 	return nil
 }
 
-// TestDrainCloseReadsUpToTheDrainLimitThenCloses pins that drainClose actually
-// DRAINS, not just closes. Its sibling
+// drainLimit is httpx.DrainClose's own drain bound (v4.2.1 `drainLimit`,
+// unexported there), restated for the assertions below.
+const drainLimit = 64 << 10
+
+// TestDrainCloseReadsUpToTheDrainLimitThenCloses pins that the drain knell's
+// delivery path defers actually DRAINS, not just closes. Its sibling
 // TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError pins the other
 // half of the contract (a drain read error never reaches a logger, because its
-// text is remote-authored) and cannot pin this one: with the CopyN deleted the
+// text is remote-authored) and cannot pin this one: with the read skipped the
 // response is still a delivered 2xx and no read error is produced, so every
 // assertion there still passes while keep-alive reuse is silently forfeited for
-// every successful response carrying a body. Byte counts are the oracle, and
-// the local helper exists to preserve httpx.DrainClose's read-then-close
-// behavior verbatim (drainClose replaces it only to keep the read error away
-// from slog.Default()).
+// every successful response carrying a body. Byte counts are the oracle.
+//
+// The subject is httpx.DrainClose because knell no longer owns the helper: it
+// carried a local copy only while the library's drain logged the remote-authored
+// read error (closed at the source in httpx v4.2.1), and the bound and the
+// read-then-close order are the properties knell's connection reuse depends on
+// whoever implements them.
 func TestDrainCloseReadsUpToTheDrainLimitThenCloses(t *testing.T) {
 	t.Parallel()
 
@@ -1009,21 +1043,21 @@ func TestDrainCloseReadsUpToTheDrainLimitThenCloses(t *testing.T) {
 		wantRead int
 	}{
 		"shorter than the limit is read through EOF": {size: 1024, wantRead: 1024},
-		"exactly the limit is read whole":            {size: drainBytes, wantRead: drainBytes},
-		"longer than the limit stops at it":          {size: drainBytes + 4096, wantRead: drainBytes},
+		"exactly the limit is read whole":            {size: drainLimit, wantRead: drainLimit},
+		"longer than the limit stops at it":          {size: drainLimit + 4096, wantRead: drainLimit},
 		"empty body reads nothing and still closes":  {size: 0, wantRead: 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			body := &countingBody{remaining: tc.size}
-			drainClose(body)
+			httpx.DrainClose(body)
 
 			if body.read != tc.wantRead {
-				t.Errorf("drainClose read %d bytes of a %d-byte body, want %d: an undrained connection cannot be reused, so every notice pays a fresh TLS handshake", body.read, tc.size, tc.wantRead)
+				t.Errorf("httpx.DrainClose read %d bytes of a %d-byte body, want %d: an undrained connection cannot be reused, so every notice pays a fresh TLS handshake", body.read, tc.size, tc.wantRead)
 			}
 			if body.closed != 1 {
-				t.Errorf("drainClose closed the body %d times, want exactly 1: an unclosed body leaks the connection outright", body.closed)
+				t.Errorf("httpx.DrainClose closed the body %d times, want exactly 1: an unclosed body leaks the connection outright", body.closed)
 			}
 		})
 	}

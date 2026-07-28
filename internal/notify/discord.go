@@ -49,10 +49,6 @@ const maxAttempts = 3
 // reported as the fact it is and the detail is dropped.
 const maxErrorBodyBytes = 512
 
-// drainBytes caps how much of a response body is read purely so the
-// connection can be reused. It matches httpx's own drain bound.
-const drainBytes = 64 << 10
-
 // userAgent identifies this client to Discord's edge. Go sends
 // "Go-http-client/1.1" when the header is unset, which an edge or WAF in
 // front of a webhook commonly refuses; that refusal would arrive as a
@@ -429,7 +425,7 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", userAgent)
-	resp, doErr := d.client.Do(req) //nolint:bodyclose // closed via the deferred drainClose below
+	resp, doErr := d.client.Do(req) //nolint:bodyclose // closed via the deferred httpx.DrainClose below
 	if doErr != nil {
 		// *url.Error embeds the full webhook URL and its cause can be written
 		// from a response's Location header; report knell's own phrase for it.
@@ -439,7 +435,18 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 		// the caller's own expired budget stays terminal).
 		return struct{}{}, safeTransportError(doErr)
 	}
-	defer drainClose(resp.Body)
+	// Drain up to 64 KiB and close, so the connection can be reused. The
+	// library helper is safe to use directly as of httpx v4.2.1: its drain
+	// logs a bare Debug line and no longer passes the body-read error VALUE
+	// to it. That error's text is remote-authored (net/http renders a
+	// malformed chunked trailer as `malformed MIME header: missing colon:
+	// "<remote bytes>"`, and a webhook edge echoing the request URI puts the
+	// path that IS the credential in those bytes), which is why knell carried
+	// a local drain until the library dropped the attribute at the source.
+	// TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError keeps
+	// asserting it here, because a regression in httpx would reopen the leak
+	// in knell's own log stream.
+	defer httpx.DrainClose(resp.Body)
 	return struct{}{}, deliveryError(resp)
 }
 
@@ -504,24 +511,6 @@ func deliveryError(resp *http.Response) error {
 		return fmt.Errorf("%w%s", statusErr, detail)
 	}
 	return statusErr
-}
-
-// drainClose discards up to drainBytes of what is left of a response body so
-// the connection can be reused, then closes it. It stands in for
-// httpx.DrainClose for one reason: that helper LOGS its read error
-// (slog.Debug "failed to drain response body", through the package-level
-// slog.Default(), so no httpx option can redirect or silence it), and a
-// body-read error's TEXT is remote-authored — net/http renders a malformed
-// chunked trailer as `malformed MIME header: missing colon: "<remote bytes>"`,
-// and for a webhook edge that echoes the request URI those bytes are the path
-// that IS the credential. Every other remote-text path in this package is
-// reduced structurally (safeTransportError, statusDetail, readFailure); this
-// one is closed by never giving the error to a logger. Dropping it costs
-// nothing knell reports: a failed drain only forfeits connection reuse, and
-// everything said about a rejected body comes from statusDetail.
-func drainClose(body io.ReadCloser) {
-	_, _ = io.CopyN(io.Discard, body, drainBytes)
-	_ = body.Close()
 }
 
 // statusDetail renders what a rejected response adds to its status code,
