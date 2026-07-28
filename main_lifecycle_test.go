@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
@@ -404,6 +405,19 @@ func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 		if runStopped {
 			return
 		}
+		// Arm our own SIGTERM guard BEFORE checking whether run has stopped:
+		// run() can have returned (its deferred stop() already unregistering
+		// its NotifyContext) without the wrapper goroutine having reached
+		// `done <- run()` yet. In that window the nonblocking receive below
+		// sees nothing, and a SIGTERM with no handler registered takes the
+		// process's default termination path — killing the test binary mid-run
+		// instead of stopping run(), with no failure report. While run is
+		// alive both registrations receive the signal, so the guard only ever
+		// adds safety.
+		signalGuard := make(chan os.Signal, 1)
+		signal.Notify(signalGuard, syscall.SIGTERM)
+		defer signal.Stop(signalGuard)
+
 		select {
 		case <-done:
 			return

@@ -779,9 +779,10 @@ func TestLoadRejectsABeatTokenHTTPCannotCarry(t *testing.T) {
 func TestBeatTokenFitsHeaderMatchesWhatHTTPActuallyCarries(t *testing.T) {
 	// The oracle for the refusal above: the predicate is only worth anything
 	// if it agrees with the transport it claims to model. Every accepted value
-	// must survive a real request verbatim (a value the wire alters is just as
-	// unpresentable as one it rejects), and every rejected value must be one
-	// Go's HTTP client refuses to send.
+	// ALREADY TRIMMED OF EDGE ASCII WHITESPACE (the predicate's precondition,
+	// and all loadBeatToken ever hands it) must survive a real request verbatim
+	// (a value the wire alters is just as unpresentable as one it rejects), and
+	// every rejected value must be one Go's HTTP client refuses to send.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Echo", r.Header.Get("Authorization"))
 	}))

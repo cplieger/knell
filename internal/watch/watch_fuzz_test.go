@@ -73,13 +73,13 @@ func checkSwitchStaysArmed(t *testing.T, w *Watcher, id string, now time.Time, o
 // checkHistoryPayloads asserts the Notifier contract on what the notifier
 // actually RECEIVED, across every history notice delivered so far: outages is
 // never empty, every reported outage is closed with a positive span, and the
-// outages form one chronological, non-overlapping sequence across notices. The last clause is the one the queue's structural
-// invariants cannot express: an outage reported in two different notices
-// (a delivered run that was not consumed) shows up as a notice whose first
-// outage starts before the previously reported one recovered. That clause
-// assumes a SINGLE beat: fakeNotifier.histories is not keyed by beat and two
-// beats' outages may legitimately overlap, so only call this on a one-beat
-// watcher.
+// outages form one chronological, non-overlapping sequence across notices. The
+// last clause is the one the queue's structural invariants cannot express: an
+// outage reported in two different notices (a delivered run that was not
+// consumed) shows up as a notice whose first outage starts before the
+// previously reported one recovered. That clause assumes a SINGLE beat:
+// fakeNotifier.histories is not keyed by beat and two beats' outages may
+// legitimately overlap, so only call this on a one-beat watcher.
 func checkHistoryPayloads(t *testing.T, n *fakeNotifier, ops string) {
 	t.Helper()
 	n.mu.Lock()
@@ -90,10 +90,11 @@ func checkHistoryPayloads(t *testing.T, n *fakeNotifier, ops string) {
 			t.Fatalf("ops %q: history notice %d reported no outages at all, but the contract says outages is never empty", ops, i)
 		}
 		for j, o := range outages {
-			// One clause covers both halves of the old pair: DownFor is
-			// Recovered.Sub(Started), so "closed and ordered" and "reports a
-			// positive span" are the same predicate, and stating it through
-			// DownFor keeps the span check on the field the notice renders.
+			// DownFor is Recovered.Sub(Started), so this preserves the old
+			// closed-and-ordered predicate through the span the notice renders.
+			// The separate positive-Silence predicate became inapplicable when
+			// that unread detection-time field was removed; its stronger
+			// internal counterpart remains in checkMissingQueueInvariants.
 			if o.DownFor() <= 0 {
 				t.Fatalf("ops %q: history notice %d outage %d reports a span of %s (started %s, recovered %s): a past-tense notice must only report ended outages, each with a positive span",
 					ops, i, j, o.DownFor(), o.Started, o.Recovered)

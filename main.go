@@ -198,6 +198,10 @@ func run() error {
 	// unhealthy, cancel the watcher, and wait for it under the one grace
 	// budget carried by exitCtx. Run invokes either this hook or the
 	// graceful shutdown hooks, never both.
+	//
+	// The stop() is this hook's own, not a duplicate of main's defer: ctx is
+	// still live here (no signal arrived), so without it awaitWatchLoop would
+	// wait out the whole grace for a watch loop nobody asked to stop.
 	serveExit := webhttp.WithServeExit(func(exitCtx context.Context) {
 		marker.Set(false)
 		stop()

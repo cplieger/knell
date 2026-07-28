@@ -990,76 +990,53 @@ func TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError(t *testing.T)
 	}
 }
 
-// countingBody is an io.ReadCloser that reports how many bytes were read from
-// it and how many times it was closed. It stands in for a response body
-// because the drain contract is about read VOLUME, which no httptest server
-// can report: the bytes are discarded, and the only observable difference
-// between draining and not draining on a real socket is connection reuse,
-// a timing experiment.
-type countingBody struct {
-	remaining int
-	read      int
-	closed    int
-}
-
-func (b *countingBody) Read(p []byte) (int, error) {
-	if b.remaining == 0 {
-		return 0, io.EOF
+func TestSuccessfulResponsesAreDrainedForConnectionReuse(t *testing.T) {
+	// NOT t.Parallel(): the oracle is idle-connection reuse, and
+	// httpx.NewClient's client rides the process-wide http.DefaultTransport
+	// whose idle pool every other test in this package shares. Run
+	// concurrently, their churn evicts this notifier's idle connection between
+	// the two notices and the second one dials again -- a failure about the
+	// suite's parallelism, not about knell's drain (measured: passes alone,
+	// fails in the full package with connections = 2). Serial execution makes
+	// the reuse observation belong to this test alone.
+	// The drain's other half, and the one no absence assertion can reach: that
+	// knell's delivery path actually DRAINS a successful response rather than
+	// just closing it. Read VOLUME is not observable from a handler, so the
+	// oracle is the consequence -- an undrained body makes net/http discard the
+	// connection, so two notices open two connections instead of reusing one,
+	// and every notice pays a fresh TLS handshake. Driving the public
+	// BeatMissing keeps httpx.DrainClose's own bound and read-then-close order
+	// the library's business to test, and pins only what knell depends on.
+	var connections atomic.Int64
+	var requests atomic.Int64
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, 1024))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
 	}
-	n := min(len(p), b.remaining)
-	b.remaining -= n
-	b.read += n
-	return n, nil
-}
+	srv.Start()
+	t.Cleanup(srv.Close)
 
-func (b *countingBody) Close() error {
-	b.closed++
-	return nil
-}
+	d := New(srv.URL, "node-1")
+	t.Cleanup(d.Close)
+	live := liveSilence(time.Hour)
 
-// drainLimit is httpx.DrainClose's own drain bound (v4.2.1 `drainLimit`,
-// unexported there), restated for the assertions below.
-const drainLimit = 64 << 10
-
-// TestDrainCloseReadsUpToTheDrainLimitThenCloses pins that the drain knell's
-// delivery path defers actually DRAINS, not just closes. Its sibling
-// TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError pins the other
-// half of the contract (a drain read error never reaches a logger, because its
-// text is remote-authored) and cannot pin this one: with the read skipped the
-// response is still a delivered 2xx and no read error is produced, so every
-// assertion there still passes while keep-alive reuse is silently forfeited for
-// every successful response carrying a body. Byte counts are the oracle.
-//
-// The subject is httpx.DrainClose because knell no longer owns the helper: it
-// carried a local copy only while the library's drain logged the remote-authored
-// read error (closed at the source in httpx v4.2.1), and the bound and the
-// read-then-close order are the properties knell's connection reuse depends on
-// whoever implements them.
-func TestDrainCloseReadsUpToTheDrainLimitThenCloses(t *testing.T) {
-	t.Parallel()
-
-	for name, tc := range map[string]struct {
-		size     int
-		wantRead int
-	}{
-		"shorter than the limit is read through EOF": {size: 1024, wantRead: 1024},
-		"exactly the limit is read whole":            {size: drainLimit, wantRead: drainLimit},
-		"longer than the limit stops at it":          {size: drainLimit + 4096, wantRead: drainLimit},
-		"empty body reads nothing and still closes":  {size: 0, wantRead: 0},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			body := &countingBody{remaining: tc.size}
-			httpx.DrainClose(body)
-
-			if body.read != tc.wantRead {
-				t.Errorf("httpx.DrainClose read %d bytes of a %d-byte body, want %d: an undrained connection cannot be reused, so every notice pays a fresh TLS handshake", body.read, tc.size, tc.wantRead)
-			}
-			if body.closed != 1 {
-				t.Errorf("httpx.DrainClose closed the body %d times, want exactly 1: an unclosed body leaks the connection outright", body.closed)
-			}
-		})
+	if err := d.BeatMissing(context.Background(), "api", live); err != nil {
+		t.Fatalf("first BeatMissing: %v", err)
+	}
+	if err := d.BeatMissing(context.Background(), "db", live); err != nil {
+		t.Fatalf("second BeatMissing: %v", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("requests = %d, want 2", got)
+	}
+	if got := connections.Load(); got != 1 {
+		t.Errorf("connections = %d, want 1 (a successful response body must be drained so the connection is reusable)", got)
 	}
 }
 

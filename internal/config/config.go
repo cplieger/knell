@@ -255,11 +255,16 @@ func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
 }
 
 // beatTokenFitsHeader reports whether value can be carried verbatim in an HTTP
-// field value. HTTP permits SP, HTAB, visible ASCII and obs-text (bytes >=
-// 0x80, which is why a non-ASCII space token stays legal), but rejects every
-// other ASCII control byte and DEL. Go's own HTTP client refuses to write such
-// a value and its server rejects a handcrafted one before the handler runs, so
-// a token containing one is unpresentable no matter what the sender does.
+// field value, ASSUMING it has already been trimmed of edge ASCII whitespace
+// (see asciiWhitespace). It answers the byte-legality question only: a value
+// with a trailing SP or HTAB passes it, yet the wire would strip that byte and
+// the exact-match verifier would then reject every ping — so it is not a
+// substitute for the trim, it runs after it. HTTP permits SP, HTAB, visible
+// ASCII and obs-text (bytes >= 0x80, which is why a non-ASCII space token stays
+// legal), but rejects every other ASCII control byte and DEL. Go's own HTTP
+// client refuses to write such a value and its server rejects a handcrafted one
+// before the handler runs, so a token containing one is unpresentable no matter
+// what the sender does.
 func beatTokenFitsHeader(value string) bool {
 	for i := range len(value) {
 		b := value[i]
@@ -275,11 +280,15 @@ func beatTokenFitsHeader(value string) bool {
 // ABSENT, not blank: a present-but-empty BEAT_TOKEN fails startup, and so does
 // any value no sender could ever present — one that is only ASCII whitespace,
 // or one that still carries an HTTP-forbidden control byte after the ASCII
-// padding is trimmed — like an empty BEAT_TOKEN_FILE. What survives trimming
-// is what is stored, so the armed token is exactly the value that reaches the
-// verifier on the wire. BEAT_TOKEN_FILE points at a mounted secret file
-// instead (the same convention DISCORD_WEBHOOK_URL uses), keeping the
-// credential out of `docker inspect` output.
+// padding is trimmed — like an empty BEAT_TOKEN_FILE. What survives the ASCII
+// trim is what is stored, so a token set through the VARIABLE is armed as
+// exactly the value that reaches the verifier on the wire. A file-sourced token
+// arrives already unicode-trimmed (envx.SecretWithSource trims the file's bytes
+// with strings.TrimSpace before returning them), so an edge non-ASCII space in
+// a secret file is stripped from the stored token even though the wire would
+// carry it — the ASCII trim here cannot restore it. BEAT_TOKEN_FILE points at a
+// mounted secret file instead (the same convention DISCORD_WEBHOOK_URL uses),
+// keeping the credential out of `docker inspect` output.
 func loadBeatToken() (string, error) {
 	if err := rejectBlankFileVar("BEAT_TOKEN"); err != nil {
 		return "", err
@@ -290,20 +299,21 @@ func loadBeatToken() (string, error) {
 		warnPlainVarIgnored("BEAT_TOKEN", "token", tokenSrc)
 		// Same reason as the webhook: a padded token makes every sender 401
 		// and every beat cross its deadline, so padding is trimmed. Trim
-		// FIRST, with the ASCII cutset, and classify what is left: the
-		// cutset is exactly what the wire removes (see asciiWhitespace), so
-		// the stored token is the value a sender actually presents. Deciding
-		// on strings.TrimSpace first instead would keep a value like
-		// " \u00a0 " verbatim — the wire strips its outer spaces, the
-		// verifier still holds them, and every ping 401s against an endpoint
-		// that reports itself gated.
+		// FIRST, with the ASCII cutset, and classify what is left: an
+		// expected header value that ENDS in a cutset byte can never reach
+		// the verifier intact (the wire strips trailing SP/TAB and refuses
+		// CR, LF, VT and FF outright — see asciiWhitespace), so the trimmed
+		// form is the deliverable shape of this token. Deciding on
+		// strings.TrimSpace first instead would keep a value like
+		// " \u00a0 " verbatim — its trailing space makes it undeliverable,
+		// so every ping 401s against an endpoint that reports itself gated.
 		token = strings.Trim(token, asciiWhitespace)
 		if token == "" {
 			// Nothing survives the wire: the token cannot be presented at
 			// all, so it fails startup like a present-but-empty BEAT_TOKEN
 			// and a blank BEAT_TOKEN_FILE. Keeping it armed reported a gated
 			// endpoint that rejected every ping.
-			return "", errors.New("BEAT_TOKEN is set but contains only whitespace: HTTP strips the leading and trailing spaces and tabs from a header value, so no sender can present this token and POST /beat/{id} would reject every ping while the endpoint reports itself gated; set it to a long random token, or unset the variable entirely to serve /beat/{id} open on purpose")
+			return "", errors.New("BEAT_TOKEN is set but contains only whitespace: HTTP strips the leading and trailing spaces and tabs from a header value and forbids CR, LF and the other control bytes outright, so no sender can present this token and POST /beat/{id} would reject every ping while the endpoint reports itself gated; set it to a long random token, or unset the variable entirely to serve /beat/{id} open on purpose")
 		}
 		if strings.TrimSpace(token) == "" {
 			// All whitespace by Unicode rules, but at least one rune
