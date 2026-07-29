@@ -468,7 +468,7 @@ func beatRecorder(appCtx context.Context, b Beater) http.HandlerFunc {
 		// before the body is touched, so a ping arriving during the drain
 		// cannot hold a handler goroutine (and with it the drain) open by
 		// trickling a payload. A refused request is left undrained exactly
-		// like the 401 one below.
+		// like the 401 one in beatHandler.
 		if appCtx.Err() != nil {
 			writeShuttingDown(w, r)
 			return

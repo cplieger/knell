@@ -1832,14 +1832,20 @@ func TestBeatRefusesPageInitiatedBrowserRequests(t *testing.T) {
 		// documented sender still sends neither header, so it stays accepted.
 		{name: "plain-http cross-origin fetch POST", method: http.MethodPost, origin: "http://evil.example", wantStatus: 403},
 		{name: "plain-http form POST with a nulled origin", method: http.MethodPost, origin: "null", wantStatus: 403},
+		// A cors-mode fetch GET: an Origin with no Sec-Fetch header at all. This
+		// is the leg browserPageRequest's doc names that the POST rows above
+		// cannot express, and the only row that fails a rewrite keying the
+		// Origin check on the method.
+		{name: "plain-http cors-mode fetch GET", origin: "http://evil.example", wantStatus: 403},
 		{name: "documented POST sender sends no Origin either", method: http.MethodPost, wantStatus: 200, wantSeen: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			before := len(b.seen)
 			// Default GET: every Sec-Fetch row above is a browser GET. The
-			// Origin rows are POSTs, the method Origin is appended for
-			// unconditionally and knell's canonical ping.
+			// Origin rows name their method because Origin is appended
+			// unconditionally for POST -- knell's canonical ping -- and only
+			// for a cors-mode GET, so both methods need a row.
 			method := tt.method
 			if method == "" {
 				method = http.MethodGet

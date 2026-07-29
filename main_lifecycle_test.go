@@ -236,9 +236,16 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 }
 
 // TestRunPublishesTheBootArmedBaselineFromProcessStart pins that every first
-// deadline counts from run entry, including time spent loading mounted
-// secrets. A FIFO holds config.Load across a whole-second boundary because
-// the published last-seen metric intentionally has second precision.
+// deadline counts from BEFORE configuration, so the time spent reading a
+// mounted secret is charged to the deadline rather than to the sender. A FIFO
+// holds config.Load across a whole-second boundary because the published
+// last-seen metric intentionally has second precision.
+//
+// The oracle's reach is the config boundary, not the exact instruction: a
+// capture moved anywhere earlier than config.Load - to the slogx.Setup or
+// marker-probe lines - still lands on the process-start side and still passes.
+// Covering the marker probe too would need a second controllable delay at
+// health.DefaultPath, which is a fixed path this test cannot gate.
 //
 // This is the one half of knell's boot-armed clock that main owns: the
 // processStart baseline run() captures BEFORE config parsing and hands to
