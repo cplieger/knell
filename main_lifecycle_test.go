@@ -235,33 +235,70 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 	}
 }
 
-// TestRunPublishesTheBootArmedBaselineFromProcessStart pins the one half of
-// knell's boot-armed clock that main owns: the processStart baseline run()
-// captures before config parsing and hands to watch.New, which publishes it
-// as every beat's initial last-seen sample. If that argument degrades -
-// dropped, zeroed, or replaced by a far-past value - every configured beat
-// boots already overdue and the first sweep fires a false missing notice on
-// every container restart, which is the exact failure the boot-armed clock
-// exists to prevent. The watch package's own tests supply their own start
-// value, so nothing outside main can catch it.
+// TestRunPublishesTheBootArmedBaselineFromProcessStart pins that every first
+// deadline counts from run entry, including time spent loading mounted
+// secrets. A FIFO holds config.Load across a whole-second boundary because
+// the published last-seen metric intentionally has second precision.
 //
-// The oracle is a range, so it pins that the published baseline is a real
-// boot-window instant, not the exact instruction that captured it: moving the
-// capture from run()'s entry to the watch.New call site shifts it by under a
-// second and this test still passes. The degradation class it does catch is
-// the one that breaks the switch - a dropped, zeroed, or far-past baseline.
+// This is the one half of knell's boot-armed clock that main owns: the
+// processStart baseline run() captures BEFORE config parsing and hands to
+// watch.New, which publishes it as every beat's initial last-seen sample. If
+// that argument degrades - dropped, zeroed, replaced by a far-past value, or
+// re-captured after configuration - the first deadline no longer covers the
+// whole boot, and in the degraded-baseline cases every configured beat boots
+// already overdue and the first sweep fires a false missing notice on every
+// container restart. The watch package's own tests supply their own start
+// value, so nothing outside main can catch it.
 func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal, and the shared health-marker path.
 	addr := prepareLifecycleRun(t, "api")
 
-	// Captured before the boot: the published baseline must sit between this
-	// floor and the scrape. 2s of slack absorbs a slow bind on a loaded host
-	// without admitting a zeroed or epoch baseline.
-	bootFloor := time.Now().Add(-2 * time.Second).Unix()
+	fifo := t.TempDir() + "/webhook"
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("cannot create a FIFO to delay configuration loading: %v", err)
+	}
+	t.Setenv("DISCORD_WEBHOOK_URL_FILE", fifo)
+	bootFloor := time.Now().Add(-2 * time.Second)
 	r := startLifecycleRun(t)
-	waitForMarkerWithin(t, true, 10*time.Second)
 
+	var secret *os.File
+	openDeadline := time.Now().Add(5 * time.Second)
+	for secret == nil {
+		f, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		switch {
+		case err == nil:
+			secret = f
+		case errors.Is(err, syscall.ENXIO):
+			select {
+			case runErr := <-r.done:
+				r.stopped = true
+				t.Fatalf("run() returned before reading the delayed webhook secret: %v", runErr)
+			default:
+			}
+			if time.Now().After(openDeadline) {
+				t.Fatal("run() never started reading the delayed webhook secret")
+			}
+			time.Sleep(5 * time.Millisecond)
+		default:
+			t.Fatalf("opening delayed webhook secret: %v", err)
+		}
+	}
+	t.Cleanup(func() { _ = secret.Close() })
+
+	// The FIFO writer can open only after config.Load has opened its reader.
+	// Hold that read across this boundary so a baseline captured after config
+	// cannot fall on the process-start side of it.
+	configBoundary := time.Now().Truncate(time.Second).Add(time.Second)
+	time.Sleep(time.Until(configBoundary) + 10*time.Millisecond)
+	if _, err := secret.WriteString(testWebhookURL + "\n"); err != nil {
+		t.Fatalf("writing delayed webhook secret: %v", err)
+	}
+	if err := secret.Close(); err != nil {
+		t.Fatalf("closing delayed webhook secret: %v", err)
+	}
+
+	waitForMarkerWithin(t, true, 10*time.Second)
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/metrics", nil)
 	if err != nil {
 		t.Fatalf("building the /metrics request: %v", err)
@@ -283,9 +320,10 @@ func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	if !found {
 		t.Fatalf("%s missing from /metrics; a beat with no published baseline has no quorum signal at all:\n%s", series, body)
 	}
-	if ceiling := time.Now().Unix(); int64(baseline) < bootFloor || int64(baseline) > ceiling {
-		t.Errorf("boot-armed baseline = %v, want it inside [%d, %d]; a baseline outside the boot window makes every beat overdue at startup and fires a false missing notice on every restart",
-			baseline, bootFloor, ceiling)
+	floorSeconds := float64(bootFloor.UnixNano()) / float64(time.Second)
+	boundarySeconds := float64(configBoundary.UnixNano()) / float64(time.Second)
+	if baseline < floorSeconds || baseline >= boundarySeconds {
+		t.Errorf("boot-armed baseline = %.9f, want it before the delayed configuration boundary %.9f: capturing it after config shortens every beat's first deadline by the secret-read delay", baseline, boundarySeconds)
 	}
 
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {

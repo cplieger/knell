@@ -756,21 +756,12 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		// then fail as a transport error exactly when the switch must ring.
 		return nil, errors.New("missing host")
 	}
-	if port := u.Port(); port != "" {
-		// url.Parse validates a port's SYNTAX (digits only), never its RANGE, so
-		// "https://discord.example:99999/hook" parses, passes every gate here,
-		// and starts the process healthy — while net/http refuses the address on
-		// every POST ("invalid port"), httpx retries the transport failure and
-		// the sweep retries forever. A permanently undeliverable webhook is the
-		// one failure a dead-man switch cannot afford, and startup is the only
-		// moment the operator is watching. The number is the operator's own
-		// value, not part of the credential, but the message still omits it for
-		// the same reason every refusal here does: the startup error ships to
-		// Loki, and a fixed constant cannot leak a mis-parsed secret.
-		n, convErr := strconv.Atoi(port)
-		if convErr != nil || n < 1 || n > 65535 {
-			return nil, errors.New("port must be between 1 and 65535")
-		}
+	if !webhookPortValid(u.Port()) {
+		// The number is the operator's own value, not part of the credential,
+		// but the message still omits it for the same reason every refusal here
+		// does: the startup error ships to Loki, and a fixed constant cannot
+		// leak a mis-parsed secret.
+		return nil, errors.New("port must be between 1 and 65535")
 	}
 	if u.Path == "" || u.Path == "/" {
 		// The webhook's PATH is the credential, so a URL that carries none is
@@ -803,4 +794,20 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		return nil, errors.New("contains a space or an invisible character (it is percent-encoded on every request, so the webhook host and path that reach the other end are not the configured ones; remove it, or percent-encode it yourself if it really belongs to the credential)")
 	}
 	return u, nil
+}
+
+// webhookPortValid reports whether an authority's optional port is in range.
+// url.Parse validates a port's SYNTAX (digits only), never its RANGE, so
+// "https://discord.example:99999/hook" parses, passes every other gate in
+// parseWebhookURL, and starts the process healthy — while net/http refuses the
+// address on every POST ("invalid port"), httpx retries the transport failure
+// and the sweep retries forever. A permanently undeliverable webhook is the one
+// failure a dead-man switch cannot afford, and startup is the only moment the
+// operator is watching.
+func webhookPortValid(port string) bool {
+	if port == "" {
+		return true
+	}
+	n, err := strconv.Atoi(port)
+	return err == nil && n >= 1 && n <= 65535
 }

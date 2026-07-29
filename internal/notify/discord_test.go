@@ -1439,6 +1439,23 @@ func TestAttemptTimeoutIsRetried(t *testing.T) {
 	}
 }
 
+// TestNewUsesProductionAttemptTimeout pins the per-attempt bound against a
+// LITERAL, because every other assertion on it compares the wired field with
+// the same production constant and therefore moves with any change to it. The
+// value is a policy an operator depends on: shrinking it turns a slow-but-
+// working webhook into a retried failure, and growing it lets a stalled POST
+// eat the client timeout before the retries are spent.
+func TestNewUsesProductionAttemptTimeout(t *testing.T) {
+	t.Parallel()
+
+	d := New("https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
+	t.Cleanup(d.Close)
+
+	if got, want := d.attemptTimeout, 10*time.Second; got != want {
+		t.Errorf("New() attempt timeout = %s, want %s", got, want)
+	}
+}
+
 func TestAttemptTimeoutReportsSafeDiagnostic(t *testing.T) {
 	t.Parallel()
 
@@ -1643,6 +1660,50 @@ func TestNoticesEscapeDiscordMarkdownInConfiguredValues(t *testing.T) {
 				if !strings.Contains(content, want) {
 					t.Errorf("the %s notice = %q, want it to carry %q: Discord eats an unescaped markup character instead of styling it, so the operator cannot copy the beat id or the node name out of the notice", name, content, want)
 				}
+			}
+		})
+	}
+}
+
+// TestBeatMissingEscapesEveryDiscordMarkdownCharacterInNodeName gives each
+// markdownEscaper mapping its own named oracle. The test above pins only the
+// asterisk, the brackets and the beat-id underscore, so deleting the
+// backslash, tilde, backtick or pipe entry leaves the suite green while the
+// configured observer identity is rendered as something else — NODE_NAME is
+// only trimmed and byte-capped, so it can carry any of them.
+func TestBeatMissingEscapesEveryDiscordMarkdownCharacterInNodeName(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		node string
+		want string
+	}{
+		"backslash":       {node: `a\b`, want: `a\\b`},
+		"asterisk":        {node: "a*b", want: `a\*b`},
+		"underscore":      {node: "a_b", want: `a\_b`},
+		"tilde":           {node: "a~b", want: `a\~b`},
+		"backtick":        {node: "a`b", want: "a\\`b"},
+		"pipe":            {node: "a|b", want: `a\|b`},
+		"opening bracket": {node: "a[b", want: `a\[b`},
+		"closing bracket": {node: "a]b", want: `a\]b`},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := newWebhookRecorder(http.StatusNoContent)
+			srv := httptest.NewServer(rec.handler(t))
+			t.Cleanup(srv.Close)
+
+			d := New(srv.URL, tc.node)
+			t.Cleanup(d.Close)
+
+			if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err != nil {
+				t.Fatalf("BeatMissing: %v", err)
+			}
+			content := <-rec.contents
+			if want := "[knell " + tc.want + "]"; !strings.Contains(content, want) {
+				t.Errorf("BeatMissing node = %q, want %q", content, want)
 			}
 		})
 	}

@@ -382,7 +382,7 @@ func writeBrowserPageRefused(w http.ResponseWriter, r *http.Request) {
 // file's standard coded envelope. It names no beat id — not even an unknown one
 // — so the refusal leaks as little as the 404 path does about which ids are
 // configured, and it is the single home of the refusal all three admission
-// checks in record answer with (the two context checks and the watcher's
+// checks in beatRecorder answer with (the two context checks and the watcher's
 // authoritative accepting result).
 func writeShuttingDown(w http.ResponseWriter, r *http.Request) {
 	webhttp.WriteError(w, r, http.StatusServiceUnavailable, "shutting_down",
@@ -419,7 +419,42 @@ func drainBeatBody(w http.ResponseWriter, r *http.Request) {
 // requires senders to present Authorization: Bearer <token>. Once appCtx is
 // cancelled the endpoint accepts nothing more (see New).
 func beatHandler(appCtx context.Context, b Beater, token string) http.HandlerFunc {
-	record := func(w http.ResponseWriter, r *http.Request) {
+	record := beatRecorder(appCtx, b)
+	if token == "" {
+		// Open endpoint: skip the gate explicitly (an armed verifier must
+		// never exist for the empty-token configuration).
+		return record
+	}
+	// The verifier is built once, outside the request path, over the full
+	// expected header value so acceptance stays exactly
+	// "Authorization: Bearer <token>".
+	verifier := webhttp.NewStaticTokenVerifier("Bearer " + token)
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Authorize before touching the body: a rejected sender must not
+		// be able to hold the handler open by trickling a payload. The
+		// credential gate therefore stays outermost, so an unauthorized ping
+		// arriving during the drain answers 401 rather than 503 — either way
+		// nothing is recorded, and the gate's verdict does not depend on the
+		// lifecycle phase.
+		if !verifier.Verify(r.Header.Get("Authorization")) {
+			// RFC 9110 §11.6.1: a 401 MUST name at least one challenge, so a
+			// sender learns the scheme from the protocol and not only from the
+			// README. No realm: the endpoint has exactly one credential.
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			webhttp.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
+			return
+		}
+		record(w, r)
+	}
+}
+
+// beatRecorder builds the unauthenticated recording half of the beat endpoint:
+// browser refusal, the two lifecycle checks around the body drain, watcher
+// admission and the unknown-id 404. beatHandler composes it with the optional
+// bearer gate, so this constructor holds the request-ordering decisions and
+// beatHandler holds the credential one.
+func beatRecorder(appCtx context.Context, b Beater) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		// A ping the operator's browser was tricked into sending is not a
 		// heartbeat: refuse it before anything else, so it can neither record
 		// nor learn which phase the process is in. Only a navigation the user
@@ -474,31 +509,5 @@ func beatHandler(appCtx context.Context, b Beater, token string) http.HandlerFun
 			return
 		}
 		webhttp.Ok(w)
-	}
-	if token == "" {
-		// Open endpoint: skip the gate explicitly (an armed verifier must
-		// never exist for the empty-token configuration).
-		return record
-	}
-	// The verifier is built once, outside the request path, over the full
-	// expected header value so acceptance stays exactly
-	// "Authorization: Bearer <token>".
-	verifier := webhttp.NewStaticTokenVerifier("Bearer " + token)
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Authorize before touching the body: a rejected sender must not
-		// be able to hold the handler open by trickling a payload. The
-		// credential gate therefore stays outermost, so an unauthorized ping
-		// arriving during the drain answers 401 rather than 503 — either way
-		// nothing is recorded, and the gate's verdict does not depend on the
-		// lifecycle phase.
-		if !verifier.Verify(r.Header.Get("Authorization")) {
-			// RFC 9110 §11.6.1: a 401 MUST name at least one challenge, so a
-			// sender learns the scheme from the protocol and not only from the
-			// README. No realm: the endpoint has exactly one credential.
-			w.Header().Set("WWW-Authenticate", "Bearer")
-			webhttp.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
-			return
-		}
-		record(w, r)
 	}
 }
