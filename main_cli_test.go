@@ -39,7 +39,12 @@ func runMain(t *testing.T, env []string, args ...string) (int, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	cmd := exec.CommandContext(ctx, os.Args[0], args...)
-	cmd.Env = append(os.Environ(), "KNELL_TEST_REEXEC_MAIN=1")
+	// Pin the level: several cases use an INFO line ("listening") as the
+	// no-boot oracle, and an inherited LOG_LEVEL=warn would filter it out
+	// whether or not the child booted. A caller's own LOG_LEVEL entry is
+	// appended after this one and os/exec keeps the last duplicate, so an
+	// explicit per-test level still wins.
+	cmd.Env = append(os.Environ(), "KNELL_TEST_REEXEC_MAIN=1", "LOG_LEVEL=info")
 	// An entry "KEY=" removes KEY from the child environment entirely:
 	// config.Load rejects a PRESENT-but-empty _FILE variable, so blanking one
 	// would fail the boot at the blank-_FILE gate instead of the gate under

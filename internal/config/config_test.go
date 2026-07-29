@@ -1553,13 +1553,14 @@ func TestLoadRejectsAFileBorneBeatTokenHTTPCannotCarry(t *testing.T) {
 // back silently: NODE_NAME and LISTEN_ADDR. Both warn ONLY when the operator
 // set the variable and this process threw the value away; an unset variable is
 // the documented default and must stay silent. Neither half is asserted
-// anywhere else - the existing tests pin the resulting VALUE (the hostname
-// fallback, the :9190 default) and capture no log - so dropping the `if
-// present` guard makes every default deployment log two warnings about
-// variables nobody set, and dropping the warning lets a value the operator set
-// be discarded with no signal at all, on the two settings that decide which
-// observer a Discord notice names and whether /metrics answers at the scraped
-// address.
+// anywhere else - TestLoadFallsBackToTheHostnameWhenNodeNameIsUnset pins the
+// hostname fallback and captures no log, and the :9190 fallback is pinned by
+// this test's own 'names the default' subtest below and nowhere else - so
+// dropping the `if present` guard makes every default deployment log two
+// warnings about variables nobody set, and dropping the warning lets a value
+// the operator set be discarded with no signal at all, on the two settings
+// that decide which observer a Discord notice names and whether /metrics
+// answers at the scraped address.
 func TestLoadWarnsOnlyWhenAnOptionalVariableIsPresentButBlank(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and t.Setenv forbids parallel tests anyway.

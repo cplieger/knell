@@ -280,7 +280,7 @@ func secretFileError(key string, err error) error {
 		// pathErr.Err is the bare reason ("no such file or directory",
 		// "permission denied"); pathErr.Path is the operator-supplied value and
 		// stays out of the message.
-		return fmt.Errorf("%s_FILE could not be %s: %v", key, pathErr.Op, pathErr.Err)
+		return fmt.Errorf("%s_FILE could not be read (%s failed): %v", key, pathErr.Op, pathErr.Err)
 	}
 	// envx's path policy (unclean path, ".."), the size limit and the
 	// grew-during-read guard all embed the path in an untyped error, so none of

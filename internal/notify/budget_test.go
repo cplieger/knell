@@ -32,8 +32,9 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 
 	// Every interpolated field at its maximum: the node name at the cap, a
 	// 64-byte beat id (config's beatIDPattern ceiling) and a 200-year silence,
-	// which renders 12 characters against the 32 the budget reserves for a
-	// truncated duration (the widest a time.Duration can render is 15).
+	// long enough to exercise a wide multi-year duration. The assertion below
+	// measures the final rendered message directly rather than duplicating its
+	// template budget in prose.
 	d := New(srv.URL, strings.Repeat("n", MaxNodeNameBytes))
 	defer d.Close()
 	id := strings.Repeat("b", 64)

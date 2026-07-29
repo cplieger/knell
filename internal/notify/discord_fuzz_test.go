@@ -203,8 +203,9 @@ func assertNoNeedleLeaked(t *testing.T, gotErr, controlErr error, needles []stri
 }
 
 // assertTypedStatusError checks the other half of the contract the status
-// branch must keep: every non-2xx stays %w-wrapped around CheckHTTPStatus's
-// typed error, which is what lets httpx.Do classify 502/503/504 as transient
+// branch must keep: every non-2xx keeps CheckHTTPStatus's typed error
+// reachable in its chain -- by %w, or by webhookCredentialError's own Unwrap
+// on the 401/403 path -- which is what lets httpx.Do classify 502/503/504 as transient
 // and find the 429's *RateLimitError. A run where the request was never made
 // (an unusable fuzzed URL) reaches no status at all, and a 2xx is a delivery.
 //

@@ -60,30 +60,37 @@ type Routes struct {
 // token optionally gates the beat endpoint (empty = open).
 //
 // appCtx is the shared application context: the one main cancels on SIGTERM,
-// and the very same one watch.Run stops on. Beat ACCEPTANCE closes the instant
-// it is cancelled — from then on /beat/{id} refuses with 503 and records
-// nothing at all.
+// and the very same one watch.Run stops on. Cancelling it closes the beat
+// endpoint's two EARLY refusal points at once — a ping that arrives after
+// cancellation is refused with 503 before its body is touched, and one already
+// draining a body is refused when that read returns — so a shutting-down
+// endpoint does no recording work it does not have to.
 //
-// The gate is the context itself rather than a flag flipped by the server's
-// pre-drain hook, and that is the whole point: pre-drain runs on
-// webhttp.Run's goroutine while watch.Run returns on its own, so which of the
-// two happens first is a race. A ping accepted in that window is fully
-// recorded — lastSeen moves, the received counter and the freshness gauge move,
-// and a recovery event is queued onto a channel whose only reader has already
-// returned — AFTER watch.Run took its undelivered-work snapshot, so the notice
-// is lost with no counter and no warning to show it. Cancellation is the one
-// instant both goroutines observe, so gating on it closes acceptance at that
-// same instant whatever order they run in, instead of leaving the endpoint
-// fully live for the rest of the drain.
+// Those checks read the context rather than a flag flipped by the server's
+// pre-drain hook because pre-drain runs on webhttp.Run's goroutine while
+// watch.Run returns on its own, so which of the two happens first is a race,
+// and a flag one of them owns leaves /beat/{id} fully live for the rest of the
+// drain. Cancellation is the one instant both goroutines observe.
 //
-// Those context checks are the EARLY refusal, not the boundary: no repetition
-// of them can be atomic with the recording, because a handler can pass one and
-// be descheduled while watch.Run reports and abandons its undelivered work.
-// The authoritative gate is the watcher's own admission state, decided under
-// the mutex that guards the beat mutation and returned as Beat's accepting
-// result (see watch.Watcher.Beat); the checks here just refuse the long drain
-// window before a body is read, so a shutting-down endpoint cannot be held
-// open by a trickled payload.
+// What cancellation does NOT do is decide acceptance. A ping that passes the
+// final context check can still be descheduled and then win the watcher mutex
+// before watch.Run reaches its ctx.Done arm and calls stopAccepting; that ping
+// is accepted and fully recorded. That is safe, and it is why the boundary
+// lives there: Beat decides admission under the same mutex that guards the
+// state change, so such a ping completes before admission closes and is
+// therefore counted in the shutdown tally logUndelivered reports (see
+// watch.Watcher.Beat) rather than landing behind a tally already taken.
+//
+// Those context checks are not the atomic boundary: no repetition of them can
+// be atomic with the recording, because a handler can pass one and be
+// descheduled while watch.Run reports and abandons its undelivered work. The
+// authoritative gate is the watcher's own admission state, decided under the
+// mutex that guards the beat mutation and returned as Beat's accepting result
+// (see watch.Watcher.Beat). The checks here remain necessary for two windows
+// the accepting result does not cover: the long drain read, so a
+// shutting-down endpoint cannot be held open by a trickled payload, and the
+// interval between cancellation and watch.Run reaching its ctx.Done arm,
+// during which the watcher is still accepting.
 //
 // Only the beat endpoint refuses. /healthz and /metrics keep serving through
 // the whole drain: the orchestrator has to see the liveness marker flip, and a
@@ -270,14 +277,17 @@ func beatHandler(appCtx context.Context, b Beater, token string) http.HandlerFun
 		// for the whole 30s read timeout, so a request ADMITTED while the app
 		// was still live routinely arrives here after cancellation — that is
 		// the window srv.Shutdown keeps open by design, since it waits for
-		// in-flight requests. Refusing here answers 503 without paying for a
-		// Beat call, but it is not the boundary that has to hold: a context
-		// check cannot be atomic with the recording, because this goroutine
-		// can be descheduled between the two while watch.Run reports and
-		// abandons its undelivered work. Beat itself decides admission under
-		// the mutex that guards the state change (see watch.Watcher.Beat), so
-		// the accepting result below is the authoritative refusal and this
-		// check is only the early one.
+		// in-flight requests. This check is not atomic with the recording - a
+		// context check never can be, because this goroutine can be
+		// descheduled between the two while watch.Run reports and abandons its
+		// undelivered work - so Beat decides admission under the mutex that
+		// guards the state change (see watch.Watcher.Beat) and its accepting
+		// result is the authoritative refusal. This check is still not
+		// redundant: watch.Run only closes admission when its ctx.Done arm
+		// runs, so for the whole interval between cancellation and that arm
+		// Beat still reports accepting=true, and this is the only refusal
+		// covering a ping admitted pre-cancel that resumes in it. Do not
+		// delete it as duplicated by the accepting result below.
 		if appCtx.Err() != nil {
 			writeShuttingDown(w, r)
 			return

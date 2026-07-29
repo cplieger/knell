@@ -18,14 +18,18 @@ func FuzzParseWebhookURL(f *testing.F) {
 	f.Add("://")
 	f.Add("https://host/secret\x00token")
 	f.Add("credentialmaterial:rest")
+	f.Add("https://:443/api/webhooks/1/abc")
 	f.Fuzz(func(t *testing.T, raw string) {
 		u, err := parseWebhookURL(raw)
 		if err == nil {
 			if u.Scheme != "https" {
 				t.Fatalf("accepted scheme %q, want https only", u.Scheme)
 			}
-			if u.Host == "" {
-				t.Fatal("accepted URL without host")
+			if u.Hostname() == "" {
+				// Hostname(), not Host: an authority of nothing but a port
+				// (":443") has a NON-EMPTY Host, so a Host-based assertion
+				// cannot catch a revert of parseWebhookURL's own gate.
+				t.Fatal("accepted URL without a hostname")
 			}
 			return
 		}

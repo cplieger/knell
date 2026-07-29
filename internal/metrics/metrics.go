@@ -292,11 +292,10 @@ func Handler() http.Handler {
 // increase() needs an earlier sample to diff against. deadline is published as
 // beat_deadline_seconds, the one per-beat series that is configuration rather
 // than state: this is the only place it is written, and it is what lets an
-// operator read how long an overdue beat has left (last-seen plus the deadline)
-// and see whether the observers one quorum rule aggregates agree on it. Only
-// configured ids
-// reach here, which is what keeps the beat label bounded (see the package
-// doc's label-cardinality contract).
+// operator compute when a beat goes overdue (last-seen plus the deadline) and
+// see whether the observers one quorum rule aggregates agree on it. Only
+// configured ids reach here, which is what keeps the beat label bounded (see
+// the package doc's label-cardinality contract).
 func InitBeat(id string, deadline time.Duration, start time.Time) {
 	beatDeadline.Set(deadline.Seconds(), id)
 	beatFresh.Set(1, id)

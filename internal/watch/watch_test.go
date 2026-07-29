@@ -2046,6 +2046,84 @@ func TestRunServicesRecoveriesAfterABudgetLimitedSweep(t *testing.T) {
 	})
 }
 
+func TestRunPrioritizesQueuedRecoveryWhenASendOverrunsTheTick(t *testing.T) {
+	t.Parallel()
+
+	// The race the ticker-arm drain closes: a send overruns the next tick, so
+	// when sweep returns BOTH the ticker and the queued recovery are ready.
+	// An unbiased select may pick the ticker; the drain inside that arm must
+	// still deliver the recovery before the next sweep's sends.
+	//
+	// The notifier's mutex is held across onMissing, so the test must not
+	// touch the notifier (snapshot) until Run has exited: a mutex wait is not
+	// a durable block, and contending n.mu against a sleeping send would
+	// stall the synctest bubble forever.
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			storm       = 12
+			perSend     = 2 * time.Second
+			stormWindow = 10 * time.Minute
+			recoverID   = "overrun-recovery-probe"
+			tick        = 5 * time.Millisecond
+		)
+		clock := newFakeClock()
+		n := &fakeNotifier{}
+		beats := append(
+			[]Beat{{ID: recoverID, Deadline: time.Minute}},
+			budgetProbeBeats("overrun-recovery-storm", storm, stormWindow)...,
+		)
+		w := New(beats, n, clock.Now, clock.Now())
+
+		clock.Advance(2 * time.Minute)
+		w.sweep(t.Context())
+		if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" || got[0].id != recoverID {
+			t.Fatalf("calls = %v, want one missing notice for %s before the storm", got, recoverID)
+		}
+
+		clock.Advance(stormWindow)
+		sends := 0
+		n.onMissing = func() {
+			sends++
+			if sends == 1 {
+				w.Beat(recoverID)
+			}
+			clock.Advance(perSend) // spends the sweep budget
+			time.Sleep(2 * tick)   // overruns the tick: ticker.C is ready when sweep returns
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			w.Run(ctx, tick)
+		}()
+
+		// Give Run enough virtual time to drain the whole storm across its
+		// budget-limited sweeps, then stop it before reading the notifier.
+		time.Sleep(time.Second)
+		synctest.Wait()
+		cancel()
+		<-done
+
+		got := n.snapshot()
+		stormsBefore, found := 0, false
+		for _, c := range got[1:] {
+			if c.kind == "recovered" && c.id == recoverID {
+				found = true
+				break
+			}
+			stormsBefore++
+		}
+		if !found {
+			t.Fatalf("calls = %v, want the queued recovered notice delivered before the next sweep's sends", got)
+		}
+		if want := sendsBeforeBudgetCut(perSend); stormsBefore != want {
+			t.Errorf("storm notices ahead of the recovery = %d, want %d: with the ticker ready at sweep return, the drain must deliver the recovery before the next sweep starts",
+				stormsBefore, want)
+		}
+	})
+}
+
 // anchorNotifier records the live Transition of every missing and recovered
 // notice verbatim. fakeNotifier collapses both to DownFor, which is why a
 // Transition with the right span and the wrong instants passes every other
