@@ -255,9 +255,14 @@ func TestNonCanonicalBeatPathsAnswerTheCodedNotFound(t *testing.T) {
 // TestNonCanonicalBeatPathsAnswerTheCodedNotFound pins five NAMED spellings.
 // This target pins the CLASS for arbitrary bytes, which is what a rewrite of
 // sanitizedPath, inBeatNamespace, or the chain's ordering can break in a
-// spelling no table names (an encoded dot segment, a repeated slash behind a
-// long id, a non-UTF-8 byte, a path that only ENTERS the namespace after
-// cleaning). Three invariants, all decided from the request alone:
+// spelling no table names (a repeated slash behind a long id, a non-UTF-8 byte,
+// a path that only ENTERS the namespace after cleaning). It drives the DECODED
+// path only: the harness assigns r.URL.Path and leaves RawPath empty, so
+// EscapedPath re-escapes every '%' and no percent-encoded segment reaches the
+// mux — the "/beat/%2e%2e/ghost" seed is a literal-percent path here, not the
+// encoded dot segment a real request carries (that spelling answers the same
+// coded 404 either way; see canonicalBeatPath's own doc). Three invariants, all
+// decided from the request alone:
 //
 //   - a request in (or cleaning into) the /beat namespace never answers a
 //     redirect, so no sender can be told "success" without recording;
@@ -1799,6 +1804,7 @@ func TestBeatRefusesPageInitiatedBrowserRequests(t *testing.T) {
 
 	tests := []struct {
 		name       string
+		method     string
 		site       string
 		mode       string
 		origin     string
@@ -1824,14 +1830,21 @@ func TestBeatRefusesPageInitiatedBrowserRequests(t *testing.T) {
 		// trustworthy URL). Origin is the signal that survives, so these cases
 		// are the ones the Sec-Fetch-Site half cannot express — and a
 		// documented sender still sends neither header, so it stays accepted.
-		{name: "plain-http cross-origin fetch POST", origin: "http://evil.example", wantStatus: 403},
-		{name: "plain-http form POST with a nulled origin", origin: "null", wantStatus: 403},
-		{name: "documented sender sends no Origin either", wantStatus: 200, wantSeen: 1},
+		{name: "plain-http cross-origin fetch POST", method: http.MethodPost, origin: "http://evil.example", wantStatus: 403},
+		{name: "plain-http form POST with a nulled origin", method: http.MethodPost, origin: "null", wantStatus: 403},
+		{name: "documented POST sender sends no Origin either", method: http.MethodPost, wantStatus: 200, wantSeen: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			before := len(b.seen)
-			req := httptest.NewRequest(http.MethodGet, "/beat/api", nil)
+			// Default GET: every Sec-Fetch row above is a browser GET. The
+			// Origin rows are POSTs, the method Origin is appended for
+			// unconditionally and knell's canonical ping.
+			method := tt.method
+			if method == "" {
+				method = http.MethodGet
+			}
+			req := httptest.NewRequest(method, "/beat/api", nil)
 			if tt.site != "" {
 				req.Header.Set("Sec-Fetch-Site", tt.site)
 			}

@@ -1145,6 +1145,40 @@ func TestLoadFallsBackToTheHostnameWhenNodeNameIsUnset(t *testing.T) {
 	}
 }
 
+// TestHostnameNodeFallsBackWhenTheOSCannotAnswer drives the two branches the
+// osHostname seam exists to reach: neither is reachable through the
+// environment, and both decide the name that prefixes every Discord notice, so
+// a regression that returned "" or dropped the warning would leave a
+// three-observer set unattributable with nothing failing.
+func TestHostnameNodeFallsBackWhenTheOSCannotAnswer(t *testing.T) {
+	// Serial (no t.Parallel): the osHostname seam and capture.Default are both
+	// process-global.
+	tests := map[string]struct {
+		host string
+		err  error
+		warn string
+	}{
+		"hostname error": {err: os.ErrPermission, warn: "failed to determine hostname"},
+		"blank hostname": {host: "   ", warn: "hostname is blank"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			orig := osHostname
+			t.Cleanup(func() { osHostname = orig })
+			osHostname = func() (string, error) { return tt.host, tt.err }
+
+			rec := capture.Default(t)
+
+			if got := hostnameNode(); got != "unknown" {
+				t.Errorf("hostnameNode() = %q, want \"unknown\": every notice is prefixed with this name, so an empty one names no observer at all", got)
+			}
+			if !rec.Contains(tt.warn) {
+				t.Errorf("hostnameNode() did not warn %q; the warning is the only signal that the notices name a fallback rather than this host: %v", tt.warn, rec.Messages())
+			}
+		})
+	}
+}
+
 func TestLoadTrimsPaddedListenAddr(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("LISTEN_ADDR", "  0.0.0.0:9999  ")
@@ -1530,6 +1564,12 @@ func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
 		// the path, so startup succeeds and no notice can ever be delivered.
 		"non-breaking space in path": {raw: "https://discord.example/api/webhooks/1/ab\u00a0c", wantErr: "invisible character"},
 		"zero-width space in host":   {raw: "https://discord.\u200bexample/api/webhooks/1/abc", wantErr: "invisible character"},
+		// The byte-level twin of the two rows above: an invalid UTF-8 byte
+		// decodes to U+FFFD, which unicode.IsPrint accepts, so only the
+		// utf8.ValidString gate refuses it — and the committed fuzz seeds are
+		// all valid UTF-8, so without this row no per-PR test fails when that
+		// gate is reverted (the weekly fuzz corpus does not persist).
+		"invalid UTF-8 byte in path": {raw: "https://discord.example/api/webhooks/1/ab\x80c", wantErr: "invisible character"},
 		// url.Parse checks a port's syntax, not its range: an out-of-range port
 		// starts the process healthy and then fails EVERY POST inside net/http
 		// ("invalid port"), so the switch arms and can never ring. Both edges of
@@ -1796,7 +1836,12 @@ func TestLoadWarnsOnlyWhenAnOptionalVariableIsPresentButBlank(t *testing.T) {
 		warnSub  string
 		wantWarn bool
 	}{
-		"node name blank warns":       {key: "NODE_NAME", value: "  ", warnSub: "NODE_NAME is set but blank", wantWarn: true},
+		"node name blank warns": {key: "NODE_NAME", value: "  ", warnSub: "NODE_NAME is set but blank", wantWarn: true},
+		// TrimSpace does not see these: an all-invisible NODE_NAME (zero-width
+		// space, BOM) is blank to the operator reading it, so it takes the same
+		// warn-and-fall-back-to-hostname path. Without this row nothing pins that,
+		// and the notices silently go back to reading "[knell ]".
+		"node name invisible warns":   {key: "NODE_NAME", value: "\u200b\ufeff", warnSub: "NODE_NAME is set but blank", wantWarn: true},
 		"node name unset stays quiet": {key: "NODE_NAME", unset: true, warnSub: "NODE_NAME is set but blank", wantWarn: false},
 		"node name set stays quiet":   {key: "NODE_NAME", value: "observer-1", warnSub: "NODE_NAME is set but blank", wantWarn: false},
 		"listen addr blank warns":     {key: "LISTEN_ADDR", value: "   ", warnSub: "LISTEN_ADDR is set but blank", wantWarn: true},

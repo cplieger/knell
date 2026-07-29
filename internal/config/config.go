@@ -226,16 +226,16 @@ func nodeName(maxNodeNameBytes int) (string, error) {
 	return node, nil
 }
 
-// hostnameNode is the NODE_NAME fallback: the hostname, else "unknown". A
-// missing or blank hostname is a warning rather than a startup failure — the
-// notices stay deliverable and attributable to something, which beats not
-// arming the switch at all.
 // osHostname is the seam over the one OS call this package cannot reach
 // through the environment: every other read is os.LookupEnv, which t.Setenv
 // already controls, so without this var the two fallback branches below are
 // unreachable from any test. Reassigned by tests in this package only.
 var osHostname = os.Hostname
 
+// hostnameNode is the NODE_NAME fallback: the hostname, else "unknown". A
+// missing or blank hostname is a warning rather than a startup failure — the
+// notices stay deliverable and attributable to something, which beats not
+// arming the switch at all.
 func hostnameNode() string {
 	host, err := osHostname()
 	if err != nil {

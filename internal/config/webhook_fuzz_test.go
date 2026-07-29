@@ -32,6 +32,7 @@ func FuzzParseWebhookURL(f *testing.F) {
 	f.Add("https://discord.\u200bcom/api/webhooks/1/abc")
 	f.Add("https://discord.com/api/webhooks/1/ab\u00adc")
 	f.Add("https://discord.com/api/webhooks/1/ab\ufeffc")
+	f.Add("https://discord.com/api/webhooks/1/ab\x80c")
 	f.Fuzz(func(t *testing.T, raw string) {
 		u, err := parseWebhookURL(raw)
 		if err == nil {
