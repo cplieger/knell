@@ -1526,6 +1526,18 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 	var attempts atomic.Int64
 	d := New("https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
 	t.Cleanup(d.Close)
+	// The seam is a test affordance, not the policy, so pin the production
+	// wiring BEFORE shortening it: a New that drops the assignment leaves the
+	// field zero and httpx falls back to its own 60s cap, and a ceiling raised
+	// past two sweep ticks parks the single sender across sweeps. Neither
+	// shows up in the timing assertions below, which run against this
+	// notifier's shortened ceiling.
+	if d.rateLimitMaxWait != rateLimitMaxWait {
+		t.Fatalf("New() rateLimitMaxWait = %s, want %s: httpx falls back to its own 60s cap for a non-positive ceiling", d.rateLimitMaxWait, rateLimitMaxWait)
+	}
+	if rateLimitMaxWait <= 0 || rateLimitMaxWait > 2*watch.DefaultTick {
+		t.Errorf("rateLimitMaxWait = %s, want a positive ceiling within two %s sweep ticks: the sweep is the single sender, so a longer wait holds every other beat's notice", rateLimitMaxWait, watch.DefaultTick)
+	}
 	// Shorten only this notifier's ceiling: the branch under test cares that
 	// knell's own ceiling bounds the wait, not how long the production one is.
 	const ceiling = 50 * time.Millisecond
@@ -1567,6 +1579,62 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 	// reduced to zero would spend the attempts with no back-pressure at all.
 	if elapsed < 2*ceiling {
 		t.Errorf("delivery took %s, want at least %s (one ceiling-long wait before each of the %d retries)", elapsed, 2*ceiling, maxAttempts-1)
+	}
+}
+
+// TestNoticesEscapeDiscordMarkdownInConfiguredValues is the oracle for the
+// escaping every notice depends on. Without it, dropping escapeMarkdown at any
+// of the three call sites leaves the whole suite green.
+func TestNoticesEscapeDiscordMarkdownInConfiguredValues(t *testing.T) {
+	t.Parallel()
+
+	// The two values a notice interpolates that knell did not write itself: a
+	// beat id (config's grammar admits "_") and a node name (arbitrary, only
+	// trimmed and byte-capped, so it can carry Discord's masked-link
+	// delimiters). Left literal, Discord CONSUMES the markup characters, so the
+	// notice names a beat matching nothing in BEATS and nothing on /beat/{id},
+	// and the node reads as something other than the configured identity.
+	const (
+		id       = "db_backup_nightly"
+		node     = "obs*1[x](https://example)"
+		wantID   = `db\_backup\_nightly`
+		wantNode = `obs\*1\[x\](https://example)`
+	)
+	outage := watch.Outage{
+		Started:    time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC),
+		Recovered:  time.Date(2026, 7, 23, 12, 30, 0, 0, time.UTC),
+		LateReason: watch.LateUndelivered,
+	}
+	sends := map[string]func(*Discord) error{
+		"missing":   func(d *Discord) error { return d.BeatMissing(context.Background(), id, liveSilence(time.Hour)) },
+		"recovered": func(d *Discord) error { return d.BeatRecovered(context.Background(), id, liveSilence(time.Hour)) },
+		"history one": func(d *Discord) error {
+			return d.BeatOutageHistory(context.Background(), id, []watch.Outage{outage})
+		},
+		"history several": func(d *Discord) error {
+			return d.BeatOutageHistory(context.Background(), id, []watch.Outage{outage, outage})
+		},
+	}
+	for name, send := range sends {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := newWebhookRecorder(http.StatusNoContent)
+			srv := httptest.NewServer(rec.handler(t))
+			defer srv.Close()
+			d := New(srv.URL, node)
+			defer d.Close()
+
+			if err := send(d); err != nil {
+				t.Fatalf("sending the %s notice: %v", name, err)
+			}
+			content := <-rec.contents
+			for _, want := range []string{wantID, wantNode} {
+				if !strings.Contains(content, want) {
+					t.Errorf("the %s notice = %q, want it to carry %q: Discord eats an unescaped markup character instead of styling it, so the operator cannot copy the beat id or the node name out of the notice", name, content, want)
+				}
+			}
+		})
 	}
 }
 

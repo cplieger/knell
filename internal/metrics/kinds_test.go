@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"os"
 	"slices"
 	"strconv"
@@ -44,6 +45,38 @@ func TestEveryKindConstantIsPreMinted(t *testing.T) {
 	}
 	if len(notificationKinds) != len(declared) {
 		t.Errorf("notificationKinds has %d entries for %d declared Kind constants %v: the pre-minting loop and the advertised HELP kind list must cover exactly the declared set", len(notificationKinds), len(declared), declared)
+	}
+}
+
+// TestDeclaredKindConstantsSeesTheConversionShape is the oracle for the untyped
+// `Name = Kind("x")` branch. Every kind the committed package declares is
+// explicitly typed, so TestEveryKindConstantIsPreMinted's real-source scan never
+// reaches collectKindConversions: a regression that stops recognizing the
+// conversion shape stays green until someone declares a kind that way - the
+// exact day the guard is needed, when the kind would slip through un-minted and
+// the pre-minting test would still pass. The source is synthetic so the real
+// package files are never mutated.
+func TestDeclaredKindConstantsSeesTheConversionShape(t *testing.T) {
+	t.Parallel()
+
+	const src = `package metrics
+
+const (
+	KindProbe = Kind("probe")
+	KindTyped Kind = "typed"
+	unrelatedTimeout = 5
+)
+`
+	file, err := parser.ParseFile(token.NewFileSet(), "synthetic.go", src, 0)
+	if err != nil {
+		t.Fatalf("parsing the synthetic source: %v", err)
+	}
+
+	declared := declaredKindConstants(t, []*ast.File{file})
+
+	want := map[string]string{"KindProbe": "probe", "KindTyped": "typed"}
+	if !maps.Equal(declared, want) {
+		t.Errorf("declaredKindConstants() = %v, want %v: a kind this scan cannot see keeps its sent/failed/dropped series un-minted while the pre-minting contract reports itself satisfied", declared, want)
 	}
 }
 

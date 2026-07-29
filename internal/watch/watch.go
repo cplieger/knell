@@ -668,17 +668,24 @@ func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
 		case ev := <-w.recoveries:
 			w.sendRecovered(ctx, ev)
 		case <-ticker.C:
-			// A send may overrun the next tick while a recovery queues. Preserve
-			// the consumed tick, but let the queued recovery go first.
-			select {
-			case ev := <-w.recoveries:
-				w.sendRecovered(ctx, ev)
-			default:
-			}
-			if ctx.Err() == nil {
-				w.sweep(ctx)
-			}
+			w.handleTick(ctx)
 		}
+	}
+}
+
+// handleTick is the ticker arm of Run, extracted so the drain-before-sweep
+// ordering can be tested without racing Run's own select: a send may overrun
+// the next tick while a recovery queues, so the consumed tick is preserved but
+// the queued recovery goes first. Called only from Run, so it inherits the
+// single-sender guarantee.
+func (w *Watcher) handleTick(ctx context.Context) {
+	select {
+	case ev := <-w.recoveries:
+		w.sendRecovered(ctx, ev)
+	default:
+	}
+	if ctx.Err() == nil {
+		w.sweep(ctx)
 	}
 }
 
@@ -877,9 +884,13 @@ func (w *Watcher) sweep(ctx context.Context) {
 // A deferred beat moves NO counter and keeps alerted where it was: nothing was
 // attempted for it, so it is neither a failed delivery (which would promise a
 // retry that is already the plain behavior here) nor a dropped notice (which
-// would claim it will never arrive). Its state is exactly what it was before
-// the sweep, down to the queued record the next sweep picks up — which is also
-// why a cut can never swallow an outage. DEBUG matches recordOngoingOutage:
+// would claim it will never arrive). Its outage survives the cut: the queued
+// record is still there for the next sweep, which is why a cut can never
+// swallow an outage. The one thing a cut does rewrite is the late reason of the
+// records behind a deferred HISTORY notice, upgraded to LateUndelivered
+// (blameDeferredHistory), because this budget only bites when delivery is slow
+// and a past-tense notice must not vouch for a webhook that is behind. DEBUG
+// matches recordOngoingOutage:
 // like a full pending queue during a webhook outage, this is back-pressure
 // that costs a tick, not a fault.
 //

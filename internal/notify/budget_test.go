@@ -30,14 +30,18 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
 
-	// Every interpolated field at its maximum: the node name at the cap, a
-	// 64-byte beat id (config's beatIDPattern ceiling) and a 200-year silence,
-	// long enough to exercise a wide multi-year duration. The assertion below
-	// measures the final rendered message directly rather than duplicating its
-	// template budget in prose.
-	d := New(srv.URL, strings.Repeat("n", MaxNodeNameBytes))
+	// Every interpolated field at its maximum, with MARKUP-heavy fillers so the
+	// escapeMarkdown expansion is inside the measured worst case: escaping
+	// doubles every markup character, so the widest rendered node is the
+	// 256-byte cap of "*" (512 runes) and the widest id config's grammar admits
+	// is "b" + 63 underscores (127 runes). Plain letters would measure a notice
+	// hundreds of characters shorter than the one the cap must cover. The
+	// silence is a 200-year span, long enough to exercise a wide multi-year
+	// duration. The assertion below measures the final rendered message directly
+	// rather than duplicating its template budget in prose.
+	d := New(srv.URL, strings.Repeat("*", MaxNodeNameBytes))
 	defer d.Close()
-	id := strings.Repeat("b", 64)
+	id := "b" + strings.Repeat("_", 63)
 	started := time.Date(1970, time.January, 1, 0, 0, 0, 0, time.UTC)
 	observed := started.Add(200 * 365 * 24 * time.Hour)
 	live := watch.Transition{Started: started, Observed: observed}

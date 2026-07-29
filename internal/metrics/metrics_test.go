@@ -79,9 +79,8 @@ func exposition(t *testing.T) string {
 // SetBeatFresh, the single door for the freshness verdict, because the
 // boundary belongs to the watch state machine (watch.New publishes the boot
 // verdict right after InitBeat, and internal/watch's own tests pin that it is
-// 1 at boot).
-// A counter whose first exposed sample is already nonzero
-// has no earlier sample for increase() to diff against, so a series dropped
+// 1 at boot). A counter whose first exposed sample is already nonzero has no
+// earlier sample for increase() to diff against, so a series dropped
 // from the declaration path is an alert that stays silent through the first
 // event of the beat's life; a missing last-seen baseline leaves the operator
 // no window to reconstruct after a dropped notice.
@@ -129,7 +128,7 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 	for _, name := range series {
 		got, ok := beatSeriesValue(t, name, id)
 		if !ok {
-			t.Errorf("%s{beat=%q} is absent after InitBeat: an increase() alert on it has no cold-start sample and misses the first event of the beat's life", name, id)
+			t.Errorf("%s{beat=%q} is absent after the beat is declared: an increase() alert on it has no cold-start sample and misses the first event of the beat's life", name, id)
 			continue
 		}
 		if got != want[name] {

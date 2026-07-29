@@ -50,10 +50,22 @@ func FuzzParseBeats(f *testing.F) {
 		// silent. That is the one failure a dead-man switch cannot report on
 		// itself.
 		configured := 0
+		configuredIDs := make(map[string]struct{})
 		for entry := range strings.SplitSeq(raw, ",") {
-			if strings.TrimSpace(entry) != "" {
-				configured++
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				continue
 			}
+			configured++
+			// The raw entry's FIRST colon is an oracle independent of
+			// parseBeatEntry's own Cut: a truncated id ("pi" from "api:20m") or
+			// a shifted boundary would still be a substring of raw, so a
+			// containment check cannot see either mutation.
+			id, _, found := strings.Cut(entry, ":")
+			if !found {
+				t.Fatalf("parseBeats accepted entry %q without an id:deadline separator", entry)
+			}
+			configuredIDs[strings.TrimSpace(id)] = struct{}{}
 		}
 		if len(beats) != configured {
 			t.Fatalf("accepted %d beats for %d non-blank entries in %q: an entry that parses but is not returned is a sender nobody watches", len(beats), configured, raw)
@@ -80,8 +92,8 @@ func FuzzParseBeats(f *testing.F) {
 				t.Fatalf("accepted duplicate id %q (duplicate ids collapse two beats onto one metric series)", b.ID)
 			}
 			seen[b.ID] = struct{}{}
-			if !strings.Contains(raw, b.ID) {
-				t.Fatalf("accepted id %q does not appear in the spec %q: an id the parser invented is a beat no sender can ping, so its first sweep declares a phantom outage", b.ID, raw)
+			if _, ok := configuredIDs[b.ID]; !ok {
+				t.Fatalf("accepted id %q is not one of the ids configured in %q: an id the parser invented or truncated is a beat no sender can ping, so its first sweep declares a phantom outage", b.ID, raw)
 			}
 		}
 	})

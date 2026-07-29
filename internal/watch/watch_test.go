@@ -1688,8 +1688,10 @@ func TestHistorySendsAreBoundedByTheSweepBudget(t *testing.T) {
 		delivered[c.id] = true
 	}
 
-	// Every beat the cut deferred is untouched: its record is still queued for
-	// the next sweep, and nothing about it was counted.
+	// Every beat the cut deferred keeps its outage: the record is still queued
+	// for the next sweep and nothing about it was counted. The one thing the cut
+	// changes is the record's late reason, which now blames delivery
+	// (blameDeferredHistory).
 	for _, b := range histBeats {
 		st := w.beats[b.ID]
 		if delivered[b.ID] {
@@ -1700,6 +1702,17 @@ func TestHistorySendsAreBoundedByTheSweepBudget(t *testing.T) {
 		}
 		if len(st.pendingMissing) != 1 {
 			t.Errorf("beat %s was deferred but holds %d record(s), want its ended-outage record retained for the next sweep", b.ID, len(st.pendingMissing))
+			continue
+		}
+		// The cut itself is the reason this notice is late, so the record must
+		// blame delivery: it was queued as LateEndedBeforeDetection (no sweep
+		// ever saw the outage), and the budget only bites when sends are slow
+		// enough to spend the whole window. A record left claiming that nothing
+		// was wrong with delivery points the operator away from the webhook that
+		// is actually behind.
+		if got := st.pendingMissing[0].late; got != LateUndelivered {
+			t.Errorf("beat %s deferred by the %s send budget reports %s, want %s: the retried past-tense notice would vouch for a webhook that is demonstrably behind",
+				b.ID, sweepSendBudget, reasonName(got), reasonName(LateUndelivered))
 		}
 	}
 	for _, b := range liveBeats {
@@ -2044,82 +2057,68 @@ func TestRunServicesRecoveriesAfterABudgetLimitedSweep(t *testing.T) {
 	})
 }
 
-func TestRunPrioritizesQueuedRecoveryWhenASendOverrunsTheTick(t *testing.T) {
+// TestHandleTickPrioritizesQueuedRecovery pins the drain-before-sweep ordering
+// of Run's ticker arm, on the helper that arm delegates to. Driving it through
+// Run cannot pin it: when a send overruns the tick, Run's top-level select has
+// BOTH ticker.C and the queued recovery ready, and an unbiased select may take
+// the recovery arm on its own — so a build with the ticker-arm drain DELETED
+// still passes a Run-driven test most of the time (measured 17 of 30 runs).
+// Calling handleTick directly removes the select randomness: with the drain
+// deleted, sweep runs while the recovery is still queued and this test fails
+// every run. TestRunServicesRecoveriesAfterABudgetLimitedSweep above stays the
+// Run-loop integration check.
+func TestHandleTickPrioritizesQueuedRecovery(t *testing.T) {
 	t.Parallel()
 
-	// The race the ticker-arm drain closes: a send overruns the next tick, so
-	// when sweep returns BOTH the ticker and the queued recovery are ready.
-	// An unbiased select may pick the ticker; the drain inside that arm must
-	// still deliver the recovery before the next sweep's sends.
-	//
-	// The notifier's mutex is held across onMissing, so the test must not
-	// touch the notifier (snapshot) until Run has exited: a mutex wait is not
-	// a durable block, and contending n.mu against a sleeping send would
-	// stall the synctest bubble forever.
-	synctest.Test(t, func(t *testing.T) {
-		const (
-			storm       = 12
-			perSend     = 2 * time.Second
-			stormWindow = 10 * time.Minute
-			recoverID   = "overrun-recovery-probe"
-			tick        = 5 * time.Millisecond
-		)
-		clock := newFakeClock()
-		n := &fakeNotifier{}
-		beats := append(
-			[]Beat{{ID: recoverID, Deadline: time.Minute}},
-			budgetProbeBeats("overrun-recovery-storm", storm, stormWindow)...,
-		)
-		w := New(beats, n, clock.Now, clock.Now())
+	const (
+		storm       = 12
+		perSend     = 2 * time.Second
+		stormWindow = 10 * time.Minute
+		recoverID   = "overrun-recovery-probe"
+	)
+	clock := newFakeClock()
+	n := &fakeNotifier{}
+	beats := append(
+		[]Beat{{ID: recoverID, Deadline: time.Minute}},
+		budgetProbeBeats("overrun-recovery-storm", storm, stormWindow)...,
+	)
+	w := New(beats, n, clock.Now, clock.Now())
 
-		clock.Advance(2 * time.Minute)
-		w.sweep(t.Context())
-		if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" || got[0].id != recoverID {
-			t.Fatalf("calls = %v, want one missing notice for %s before the storm", got, recoverID)
-		}
+	// Alert the recovering beat alone, on its own short deadline. An alerted
+	// beat yields no notice, so it takes no part in the storm sweep below and
+	// its recovery is the only thing competing with it.
+	clock.Advance(2 * time.Minute)
+	w.sweep(t.Context())
+	if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" || got[0].id != recoverID {
+		t.Fatalf("calls = %v, want one missing notice for %s before the storm", got, recoverID)
+	}
 
-		clock.Advance(stormWindow)
-		sends := 0
-		n.onMissing = func() {
-			sends++
-			if sends == 1 {
-				w.Beat(recoverID)
-			}
-			clock.Advance(perSend) // spends the sweep budget
-			time.Sleep(2 * tick)   // overruns the tick: ticker.C is ready when sweep returns
-		}
+	// The state the ticker arm sees when a send overran the tick: the whole
+	// storm fleet is due AND a recovery is already sitting in the queue.
+	clock.Advance(stormWindow)
+	if recorded, _ := w.Beat(recoverID); !recorded {
+		t.Fatalf("Beat(%s) = false, want the ping recorded so its recovery is queued", recoverID)
+	}
+	n.onMissing = func() { clock.Advance(perSend) } // spends the sweep budget
 
-		ctx, cancel := context.WithCancel(t.Context())
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			w.Run(ctx, tick)
-		}()
+	w.handleTick(t.Context())
 
-		// Give Run enough virtual time to drain the whole storm across its
-		// budget-limited sweeps, then stop it before reading the notifier.
-		time.Sleep(time.Second)
-		synctest.Wait()
-		cancel()
-		<-done
-
-		got := n.snapshot()
-		stormsBefore, found := 0, false
-		for _, c := range got[1:] {
-			if c.kind == "recovered" && c.id == recoverID {
-				found = true
-				break
-			}
-			stormsBefore++
+	got := n.snapshot()
+	stormsBefore, found := 0, false
+	for _, c := range got[1:] {
+		if c.kind == "recovered" && c.id == recoverID {
+			found = true
+			break
 		}
-		if !found {
-			t.Fatalf("calls = %v, want the queued recovered notice delivered before the next sweep's sends", got)
-		}
-		if want := sendsBeforeBudgetCut(perSend); stormsBefore != want {
-			t.Errorf("storm notices ahead of the recovery = %d, want %d: with the ticker ready at sweep return, the drain must deliver the recovery before the next sweep starts",
-				stormsBefore, want)
-		}
-	})
+		stormsBefore++
+	}
+	if !found {
+		t.Fatalf("calls = %v, want the queued recovered notice delivered by the tick's own drain", got)
+	}
+	if stormsBefore != 0 {
+		t.Errorf("storm notices ahead of the recovery = %d, want 0: the ticker arm must drain the queued recovery BEFORE the sweep it consumed that tick for",
+			stormsBefore)
+	}
 }
 
 // anchorNotifier records the live Transition of every missing and recovered

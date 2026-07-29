@@ -350,8 +350,11 @@ func RecordOutage(id string) {
 // has no earlier sample to diff against, so a lone refusal never satisfies
 // increase(...) > 0. Alert on the ABSOLUTE value instead
 // (knell_http_requests_total{status="401"} > 0, which simply does not fire
-// while the series is absent); increase() is only meaningful on a status that
-// is already being served.
+// while the series is absent). That expression latches: a counter never
+// returns to zero, so it keeps firing until knell restarts - read it as
+// "this has happened at least once on this process", not as a windowed rate
+// like the README's increase(...[15m]) rules. increase() is only meaningful
+// on a status that is already being served.
 func RecordHTTP(method, path string, status int, d time.Duration) {
 	metricslib.RecordHTTP(httpRequests, httpDuration, d, method, path, strconv.Itoa(status))
 }

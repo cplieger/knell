@@ -255,7 +255,12 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 // markdownEscaper quotes the characters Discord's markdown consumes. Every
 // entry IS a Discord formatting character, which matters: Discord strips a
 // backslash only in front of one of its own markup characters, so escaping
-// anything else (a "-", a "#") would publish the backslash itself.
+// anything else (a "-", a "#") would publish the backslash itself. The
+// masked-link delimiters "[" and "]" are in the set for the same reason as the
+// rest: NODE_NAME is only trimmed and byte-capped, so a name like
+// "a[b](https://example)c" would otherwise be consumed as a link and displayed
+// as "abc" — the operator could not read the configured observer identity off
+// the alert.
 var markdownEscaper = strings.NewReplacer(
 	`\`, `\\`,
 	"*", `\*`,
@@ -263,6 +268,8 @@ var markdownEscaper = strings.NewReplacer(
 	"~", `\~`,
 	"`", "\\`",
 	"|", `\|`,
+	"[", `\[`,
+	"]", `\]`,
 )
 
 // escapeMarkdown renders s literally in a Discord message. It is applied to

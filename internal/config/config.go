@@ -245,7 +245,12 @@ func listenAddr() string {
 // in-container client working under any allowlist.
 func allowedHosts() *webhttp.HostPolicy {
 	const key = "ALLOWED_HOSTS"
-	policy, invalid := webhttp.ParseHostList(strings.Split(os.Getenv(key), ","),
+	// LookupEnv, not Getenv: a PRESENT-but-blank value is the same compose
+	// accident listenAddr and nodeName already report, and here it leaves the
+	// rebinding guard OFF while the operator believes the allowlist is armed.
+	// Unset is the documented default and must stay silent.
+	raw, present := os.LookupEnv(key)
+	policy, invalid := webhttp.ParseHostList(strings.Split(raw, ","),
 		webhttp.WithLoopbackExempt(),
 		webhttp.WithHostAllowlistError("host_not_allowed",
 			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"))
@@ -257,6 +262,10 @@ func allowedHosts() *webhttp.HostPolicy {
 	if policy.Active() && policy.Size() == 0 {
 		slog.Warn(key+" has no usable entries; rejecting every non-loopback request (fail closed), so no sender can record a beat",
 			"hint", "fix the entries listed in the preceding warning, or unset the variable to accept every Host")
+	}
+	if present && !policy.Active() {
+		slog.Warn(key+" is set but blank and was ignored; every Host is accepted, so the DNS-rebinding guard is off",
+			"hint", "unset the variable to accept every Host on purpose, or list the hostnames knell is reached by, e.g. knell.internal,10.0.0.5")
 	}
 	return policy
 }
@@ -371,6 +380,18 @@ func beatTokenFitsHeader(value string) bool {
 	return true
 }
 
+// invisibleEdge reports whether value begins or ends with a rune the operator
+// cannot see. It shares the webhook URL guard's predicate (invisibleInURL)
+// because the misconfiguration is the same one: strings.TrimSpace alone covers
+// only Unicode SPACES, so a token carrying a zero-width space, a soft hyphen or
+// a BOM at an edge reads identical to its visible form and draws no warning at
+// all, while arming the gate for a value one rune longer than the one the
+// operator reads. The predicate's ASCII space is unreachable from
+// checkBeatToken: ASCII edge padding is refused before this runs.
+func invisibleEdge(value string) bool {
+	return strings.TrimFunc(value, invisibleInURL) != value
+}
+
 // errBeatTokenSetButEmpty is the refusal for a BEAT_TOKEN that is present and
 // carries no value. Two guards reach the same verdict — loadBeatToken's, because
 // envx cannot tell present-but-empty from unset, and checkBeatToken's, which stops
@@ -430,11 +451,12 @@ func checkBeatToken(token string) error {
 		// NOT name the value's character class: the startup log is shipped to
 		// Loki, where describing a live credential's alphabet narrows a guess.
 		slog.Warn("BEAT_TOKEN is armed with a value that is easy to mistake for absent; the /beat/{id} gate requires it and every sender must present it verbatim, so set a long random token, or unset the variable to serve the endpoint open")
-	} else if strings.TrimSpace(token) != token {
+	} else if invisibleEdge(token) {
 		// Presentable, non-blank, and carrying an edge rune the operator cannot
-		// see. ASCII edge padding was already REFUSED above, so the only way to
-		// reach here is a non-ASCII space (an NBSP pasted with the token out of
-		// a rendered page or a word processor) that textproto carries verbatim:
+		// see. ASCII edge padding was already REFUSED above, so what reaches
+		// here is a non-ASCII space, a zero-width space, a soft hyphen or a BOM
+		// (the shapes a token pasted out of a rendered page or a word processor
+		// carries) that textproto carries verbatim:
 		// the gate arms for a value one character longer than the one the
 		// operator reads, every sender presenting the visible token gets 401,
 		// and one deadline later every configured beat posts a false MISSING

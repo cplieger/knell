@@ -110,9 +110,14 @@ func TestBeatEndpoint(t *testing.T) {
 			if tt.wantStatus == http.StatusOK && !strings.Contains(rec.Body.String(), `"ok":true`) {
 				t.Errorf("ok body = %s", rec.Body.String())
 			}
-			if tt.wantStatus == http.StatusNotFound && tt.path == "/beat/ghost" &&
+			// EVERY 404 on this surface carries the coded envelope, the two
+			// ROUTE-level spellings included (/beat/ and /beat/{id}/...). That is
+			// the whole point of the /beat/{$} and /beat/{id}/{rest...} routes:
+			// without them net/http answers plain "404 page not found". Gating
+			// this on one path left both routes deletable with the suite green.
+			if tt.wantStatus == http.StatusNotFound &&
 				!strings.Contains(rec.Body.String(), "unknown_beat") {
-				t.Errorf("404 body = %s, want unknown_beat code", rec.Body.String())
+				t.Errorf("%s 404 body = %s, want the unknown_beat coded envelope", tt.path, rec.Body.String())
 			}
 		})
 	}
@@ -1224,6 +1229,21 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 			wantStatus: http.StatusNotFound,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="404"}`,
 		},
+		// A sender URL built from an unset variable: the empty id routes to
+		// /beat/{$}, so the refusal keeps the coded envelope and its own
+		// series instead of falling into net/http's unmatched-bucket 404.
+		"empty beat id": {
+			ctx: context.Background(), method: http.MethodPost, path: "/beat/",
+			wantStatus: http.StatusNotFound,
+			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{$}",status="404"}`,
+		},
+		// A trailing-slash or extra-segment URL join: routes to
+		// /beat/{id}/{rest...}, same coded 404, its own series.
+		"nested beat path": {
+			ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id + "/",
+			wantStatus: http.StatusNotFound,
+			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}/{rest...}",status="404"}`,
+		},
 		// HEAD has its own registered route (so a HEAD probe cannot record a
 		// ping), and that route NAMES the method, so the label is truthful.
 		"head refused": {
@@ -1430,7 +1450,7 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 	assertNoCallerTokens(t, exposition, hostile, allowedMethods, allowedPaths)
 	assertRequestSeriesVocabulary(t, after, allowedMethods, allowedPaths)
 
-	// The vocabulary can produce at most 10 methods x 4 paths x the handful of
+	// The vocabulary can produce at most 10 methods x 6 paths x the handful of
 	// statuses knell answers; the hostile requests above must land inside that,
 	// not grow it. The bound is deliberately loose — the membership checks above
 	// are the precise guard, this catches unbounded GROWTH regardless of
@@ -1755,9 +1775,11 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		"foreign host refused on healthz": {host: "attacker.example", path: "/healthz", wantStatus: http.StatusForbidden},
 		"allowed host serves metrics":     {host: "knell.example", path: "/metrics", method: http.MethodGet, wantStatus: http.StatusOK},
 		"allowed host serves healthz":     {host: "knell.example", path: "/healthz", method: http.MethodGet, wantStatus: http.StatusOK},
-		// The loopback carve-out is what keeps the baked `knell health` probe
-		// and any in-container client working under an allowlist of
-		// browser-facing names. Both halves must be loopback: a rebinding
+		// The loopback carve-out is what keeps in-container HTTP clients (a
+		// localhost curl, a sidecar probe) working under an allowlist of
+		// browser-facing names; the baked `knell health` probe stats the
+		// marker file and never speaks HTTP, so it needs no exemption.
+		// Both halves must be loopback: a rebinding
 		// request carries the attacker's hostname, and a remote client forging
 		// Host: 127.0.0.1 is not a loopback socket peer.
 		"loopback probe exempt":         {host: "127.0.0.1:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
@@ -1816,5 +1838,64 @@ func TestNilHostPolicyAcceptsEveryHost(t *testing.T) {
 	}
 	if len(b.seen) != 4 {
 		t.Errorf("recorded beats = %d, want 4", len(b.seen))
+	}
+}
+
+// scrapeAs is scrapeExposition with an explicit Host, so a handler under an
+// ACTIVE allowlist can still be scraped by the test: scrapeExposition sends
+// httptest's default Host, which the allowlist refuses.
+func scrapeAs(t *testing.T, h http.Handler, host string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Host = host
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /metrics as %q = %d, want 200", host, rec.Code)
+	}
+	return rec.Body.String()
+}
+
+// TestHostRefusalKeepsTheStandardEnvelope pins WHERE the Host allowlist sits in
+// the chain, which New's own comment claims but nothing checked: innermost, so
+// the 403 still carries SecurityHeaders and Cache-Control: no-store, and still
+// rides webhttp.Logging -- so a rebinding attempt appears in the access log and
+// in the request counter. Hoisting the policy above webhttp.Logging keeps every
+// other test green while the refusal becomes invisible to both vantage points,
+// which is the same alertability gap TestRefusedPingIsVisibleInTheRequestCounter
+// exists to close for the other 403.
+func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	h := New(context.Background(), b, "", Routes{
+		Healthz: staticHealthz(http.StatusOK),
+		Metrics: metrics.Handler(),
+		Hosts:   hostPolicy(t, "knell.example"),
+	})
+
+	// The refusal happens before the mux routes, so the path label is the
+	// "unmatched" marker rather than a /beat template.
+	const series = `knell_http_requests_total{method="POST",path="unmatched",status="403"}`
+	before, _ := seriesValue(t, scrapeAs(t, h, "knell.example"), series)
+
+	req := httptest.NewRequest(http.MethodPost, "/beat/api", nil)
+	req.Host = "attacker.example"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body %s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store: the host refusal must stay INSIDE noStore", got)
+	}
+	if rec.Header().Get("X-Content-Type-Options") == "" {
+		t.Errorf("host refusal lost SecurityHeaders: %v", rec.Header())
+	}
+	if after, ok := seriesValue(t, scrapeAs(t, h, "knell.example"), series); !ok || after <= before {
+		t.Errorf("%s did not move (%v -> %v, present=%v): a refused Host must stay visible to a scrape",
+			series, before, after, ok)
+	}
+	if len(b.seen) != 0 {
+		t.Errorf("recorded beats = %v, want none", b.seen)
 	}
 }

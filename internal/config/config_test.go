@@ -648,6 +648,61 @@ func TestLoadRejectsEmptyBeatTokenFile(t *testing.T) {
 	}
 }
 
+// TestAllowedHostsGate pins the ALLOWED_HOSTS states knell itself owns, none of
+// which is asserted anywhere in this package: unset must stay INACTIVE (the
+// documented default that accepts every Host - an accidental deny-all here 403s
+// every beat in every default deployment and turns the whole switch silent),
+// blank entries must not engage the gate, and an allowlist whose entries are all
+// unusable must stay ACTIVE (fail closed) and SAY so, because that configuration
+// rejects every non-loopback sender. webapi's tests cover the policy's
+// request-time behaviour; this covers the env-to-policy mapping.
+func TestAllowedHostsGate(t *testing.T) {
+	tests := map[string]struct {
+		raw        string
+		set        bool
+		wantActive bool
+		wantSize   int
+		wantWarn   string
+	}{
+		"unset accepts every host":          {wantActive: false},
+		"one hostname engages the gate":     {set: true, raw: "knell.internal", wantActive: true, wantSize: 1},
+		"blank entries are skipped":         {set: true, raw: "knell.internal, ,10.0.0.5", wantActive: true, wantSize: 2},
+		"present but blank is reported":     {set: true, raw: "", wantActive: false, wantWarn: "is set but blank"},
+		"malformed entries are dropped":     {set: true, raw: "knell.internal,http://x/y", wantActive: true, wantSize: 1, wantWarn: "dropping malformed ALLOWED_HOSTS entries"},
+		"all entries unusable fails closed": {set: true, raw: ":9190", wantActive: true, wantSize: 0, wantWarn: "rejecting every non-loopback request"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Serial (no t.Parallel): capture.Default swaps the process-global
+			// slog default, and t.Setenv forbids parallel tests anyway.
+			if tt.set {
+				t.Setenv("ALLOWED_HOSTS", tt.raw)
+			} else {
+				unsetEnv(t, "ALLOWED_HOSTS")
+			}
+
+			rec := capture.Default(t)
+
+			policy := allowedHosts()
+			if policy.Active() != tt.wantActive {
+				t.Errorf("Active() = %v, want %v: an inactive policy accepts every Host and an active one rejects every Host it does not list, so this is the difference between the documented default and a deny-all", policy.Active(), tt.wantActive)
+			}
+			if policy.Size() != tt.wantSize {
+				t.Errorf("Size() = %d, want %d: every entry silently dropped is a hostname senders and browsers can no longer reach knell by", policy.Size(), tt.wantSize)
+			}
+			if tt.wantWarn == "" {
+				if rec.Contains("ALLOWED_HOSTS") {
+					t.Errorf("log output %v warns about ALLOWED_HOSTS for a usable configuration; a warning on the documented default trains operators to ignore the ones that matter", rec.Messages())
+				}
+				return
+			}
+			if !rec.Contains(tt.wantWarn) {
+				t.Errorf("log output %v never says %q; an allowlist knell could not use is invisible otherwise - every non-loopback ping 403s and one deadline later every beat posts a false MISSING notice", rec.Messages(), tt.wantWarn)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsBlankBeatTokenFileVar(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "env-fallback-token")
@@ -820,14 +875,6 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 	}
 }
 
-// TestLoadRejectsASCIIPaddingAroundANonASCIISpaceBeatToken is the mixed shape
-// between the two rules above. Trimming the outer spaces (the cycle-8
-// behaviour) armed the gate for "\u00a0" while the operator configured
-// " \u00a0 ": startup succeeded, the log reported the gate armed, and a sender
-// presenting the configured value sent "Bearer  \u00a0 " and got 401 until every
-// beat crossed its deadline and posted a false MISSING notice. The padding is
-// refused instead, so the configured value and the verified value are the same
-// string or knell does not start.
 // TestLoadWarnsWhenBeatTokenCarriesAnInvisibleEdgeCharacter pins the diagnostic
 // for the one unpresentable-in-practice token shape this package accepts. ASCII
 // edge padding is refused, and an all-invisible token draws the
@@ -841,31 +888,48 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 func TestLoadWarnsWhenBeatTokenCarriesAnInvisibleEdgeCharacter(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and t.Setenv forbids parallel tests anyway.
-	const token = "\u00a0unit-test-beat-token"
-	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", token)
-	unsetEnv(t, "BEAT_TOKEN_FILE")
+	// Every shape is a rune HTTP carries verbatim and the operator cannot see,
+	// so each arms the gate for a value longer than the one they read.
+	for name, token := range map[string]string{
+		"leading non-ASCII space":   "\u00a0unit-test-beat-token",
+		"trailing zero-width space": "unit-test-beat-token\u200b",
+		"leading byte-order mark":   "\ufeffunit-test-beat-token",
+	} {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			t.Setenv("BEAT_TOKEN", token)
+			unsetEnv(t, "BEAT_TOKEN_FILE")
 
-	rec := capture.Default(t)
+			rec := capture.Default(t)
 
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() with an NBSP-prefixed BEAT_TOKEN = %v, want accepted: textproto carries a non-ASCII space, so the token is presentable and the gate must stay armed", err)
-	}
-	if cfg.BeatToken != token {
-		t.Errorf("BeatToken = %q, want the configured value verbatim", cfg.BeatToken)
-	}
-	if !rec.Contains("invisible but part of the credential") {
-		t.Errorf("log output %v never says the armed token carries an invisible edge character; the operator reads a visible token, configures senders with it, and every ping 401s until every beat goes falsely missing", rec.Messages())
-	}
-	if rec.Contains("mistake for absent") {
-		t.Errorf("log output %v used the all-invisible wording for a token that has visible content: %q", rec.Messages(), token)
-	}
-	if rec.Contains("unit-test-beat-token") || rec.AttrContains("", "", "unit-test-beat-token") {
-		t.Errorf("log output leaks the token value: %v", rec.Messages())
+			cfg, err := Load(maxNodeNameBytes)
+			if err != nil {
+				t.Fatalf("Load() with an invisible-edge BEAT_TOKEN = %v, want accepted: HTTP carries every byte >= 0x80, so the token is presentable and the gate must stay armed", err)
+			}
+			if cfg.BeatToken != token {
+				t.Errorf("BeatToken = %q, want the configured value verbatim", cfg.BeatToken)
+			}
+			if !rec.Contains("invisible but part of the credential") {
+				t.Errorf("log output %v never says the armed token carries an invisible edge character; the operator reads a visible token, configures senders with it, and every ping 401s until every beat goes falsely missing", rec.Messages())
+			}
+			if rec.Contains("mistake for absent") {
+				t.Errorf("log output %v used the all-invisible wording for a token that has visible content: %q", rec.Messages(), token)
+			}
+			if rec.Contains("unit-test-beat-token") || rec.AttrContains("", "", "unit-test-beat-token") {
+				t.Errorf("log output leaks the token value: %v", rec.Messages())
+			}
+		})
 	}
 }
 
+// TestLoadRejectsASCIIPaddingAroundANonASCIISpaceBeatToken is the mixed shape
+// between the two rules above. Trimming the outer spaces (the cycle-8
+// behaviour) armed the gate for "\u00a0" while the operator configured
+// " \u00a0 ": startup succeeded, the log reported the gate armed, and a sender
+// presenting the configured value sent "Bearer  \u00a0 " and got 401 until every
+// beat crossed its deadline and posted a false MISSING notice. The padding is
+// refused instead, so the configured value and the verified value are the same
+// string or knell does not start.
 func TestLoadRejectsASCIIPaddingAroundANonASCIISpaceBeatToken(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", " \u00a0 ")
@@ -1347,9 +1411,10 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 // TestParseWebhookURLRejectsUndeliverableShapes pins the two refusals that
 // separate a TRANSPORTABLE URL from a DELIVERABLE one. Both are invisible at
 // runtime: startup succeeds, /healthz is healthy, outages are detected, and
-// only the notice fails — forever. Nothing else asserts them
-// (FuzzParseWebhookURL only constrains what a rejection message may SAY), so
-// dropping either guard leaves the whole suite green.
+// only the notice fails — forever. This table pins the representative exact
+// rejection shapes and their messages, while FuzzParseWebhookURL independently
+// asserts the same two invariants from the accepted side (an accepted URL
+// carries a non-root path and no invisible rune).
 func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
 	t.Parallel()
 
@@ -1610,8 +1675,9 @@ func TestLoadRejectsAFileBorneBeatTokenHTTPCannotCarry(t *testing.T) {
 // set the variable and this process threw the value away; an unset variable is
 // the documented default and must stay silent. Neither half is asserted
 // anywhere else - TestLoadFallsBackToTheHostnameWhenNodeNameIsUnset pins the
-// hostname fallback and captures no log, and the :9190 fallback is pinned by
-// this test's own 'names the default' subtest below and nowhere else - so
+// hostname fallback and captures no log, and the :9190 fallback VALUE is also
+// pinned by TestLoadDefaultsAndFailures while the warning that NAMES it is
+// asserted only by this test's own 'names the default' subtest - so
 // dropping the `if present` guard makes every default deployment log two
 // warnings about variables nobody set, and dropping the warning lets a value
 // the operator set be discarded with no signal at all, on the two settings
