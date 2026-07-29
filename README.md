@@ -84,7 +84,7 @@ A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling b
 
 Request bodies on `/beat/{id}` are ignored, so webhook-shaped senders (an Alertmanager `webhook_configs` target, a CI notification hook) can point at it unchanged. Up to 1 MiB of the body is read and discarded so the connection stays reusable; a payload larger than that still records the ping and answers `{"ok":true}`, logs one `warn` line saying the body was not fully read, and closes that connection instead of draining the rest (so an oversized sender loses keep-alive, never its ping). A ping is never refused for its payload: the body is not what the switch is listening for.
 
-Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away from anything that fetches links automatically: a chat client's URL preview, a crawler, an uptime prober. Inside a browser that hazard is now blocked — any request a page initiated (an `<img>`, a `fetch`, a prefetch, an iframe) carries `Sec-Fetch-Site` and is refused with 403 `browser_page_request` — so what still records is a machine client sending no `Sec-Fetch-*` headers at all, which is what every documented sender is, and a human opening the URL from the address bar or a bookmark. `HEAD` requests are rejected with 405 and never record a ping, so a HEAD-only prober cannot feed the switch.
+Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away from anything that fetches links automatically: a chat client's URL preview, a crawler, an uptime prober. Inside a browser that hazard is narrowed: a request a page initiated (an `<img>`, a `fetch`, a prefetch, an iframe) carries `Sec-Fetch-Site` and is refused with 403 `browser_page_request`, so what still records is a machine client sending no `Sec-Fetch-*` headers at all, which is what every documented sender is, and a human opening the URL from the address bar or a bookmark. Browsers send `Sec-Fetch-*` only to a URL they consider trustworthy — HTTPS, or a loopback host — so on a plain-HTTP LAN hostname the refusal does not engage and a page-initiated request looks exactly like a machine sender. Put knell behind TLS, or set `BEAT_TOKEN`, if a page inside your network is part of your threat model. `HEAD` requests are rejected with 405 and never record a ping, so a HEAD-only prober cannot feed the switch.
 
 `/healthz` and `/metrics` are logged as machine probes: a successful probe or scrape lands at `debug` (out of the log at the default level, visible under `LOG_LEVEL=debug` when the question is whether the prober arrives at all), while one answering 4xx or 5xx lands at `warn`/`error`. So a scrape that stopped landing shows up in the log without raising the level.
 
@@ -166,7 +166,7 @@ knell is itself the alert path for the things it watches, so alert rules about k
   labels:
     severity: warning
   annotations:
-    summary: "knell on {{ $labels.instance }} failed to deliver or dropped a notification"
+    summary: "knell on {{ $labels.instance }} failed to deliver a notification, or dropped a notification or an outage record"
 ```
 
 One caveat comes with the boot-armed clock: every restart re-arms each beat's full deadline, so an observer restarting more often than a beat's deadline never fires that beat's alert. The runtime metrics already expose this; alert on restart churn within your longest deadline window:

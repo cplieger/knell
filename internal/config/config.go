@@ -269,8 +269,12 @@ func listenAddr() string {
 // while a startup refusal takes the whole observer down and a dead-man switch
 // that does not run detects nothing. ParseHostList still fails CLOSED when every
 // entry was unusable (any non-blank entry engages the gate), which the second
-// warning names. WithLoopbackExempt keeps the baked `knell health` probe and any
-// in-container client working under any allowlist.
+// warning names. WithLoopbackExempt keeps an in-container client (a `curl
+// http://127.0.0.1:9190/healthz`) working under any allowlist: it admits a
+// request only when BOTH the socket peer and the Host are loopback, so a
+// rebinding request, which carries the attacker's hostname in Host, never
+// qualifies. The baked `knell health` probe needs no exemption at all — it
+// stats the marker file and sends no request (see main.go).
 func allowedHosts() *webhttp.HostPolicy {
 	const key = "ALLOWED_HOSTS"
 	// LookupEnv, not Getenv: a PRESENT-but-blank value is the same compose

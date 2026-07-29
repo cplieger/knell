@@ -7,20 +7,18 @@
 // Handler plus the knell-semantic recording functions below (InitBeat,
 // RecordBeat, SetBeatFresh, RecordOutage, RecordOutageRecordDropped,
 // RecordHTTP and the three RecordNotification* functions). Callers therefore
-// cannot register, rename or
-// delete a series, nor write a raw label position, which is what keeps the
-// metric names, label sets and cold-start zero samples the quorum and delivery
-// alerts read in one place.
+// cannot register, rename or delete a series, nor write a raw label
+// position, which is what keeps the metric names, label sets and cold-start
+// zero samples the quorum and delivery alerts read in one place.
 //
 // # Label-cardinality contract (read this before adding a caller)
 //
 // Label CARDINALITY is not structurally contained, and cannot be: Prometheus
 // creates the labelled child on first use, so InitBeat, RecordBeat,
 // SetBeatFresh, RecordOutage and RecordOutageRecordDropped mint a per-beat
-// series for whatever id they
-// are handed and this package has nothing to reject it with. A series, once
-// minted, is permanent for the process lifetime — in knell and in every
-// observer scraping it.
+// series for whatever id they are handed and this package has nothing to
+// reject it with. A series, once minted, is permanent for the process
+// lifetime — in knell and in every observer scraping it.
 //
 // Keeping the beat label bounded is therefore the CALLER's contract, enforced
 // by exactly three things upstream of here:
@@ -115,13 +113,12 @@ func joinKinds(kinds []Kind) string {
 // mintNotificationKinds pre-mints every notification counter series at zero
 // for every kind, so an increase() alert sees the very first failure or drop:
 // a counter series born at a nonzero value has no earlier sample to diff
-// against. Dropped is minted for all three kinds like
-// its siblings, so the alert's selector covers the whole set from a cold start
-// (only recovered has a drop path today, recovered being the one fire-once
-// kind; a failed missing or history send keeps its records and retries). Called
-// from init() below, after the
-// registrations, so the guarantee cannot be lost by a path that serves
-// /metrics without building a Watcher.
+// against. Dropped is minted for all three kinds like its siblings, so the
+// alert's selector covers the whole set from a cold start (only recovered has
+// a drop path today, recovered being the one fire-once kind; a failed missing
+// or history send keeps its records and retries). Called from init() below,
+// after the registrations, so the guarantee cannot be lost by a path that
+// serves /metrics without building a Watcher.
 func mintNotificationKinds() {
 	for _, kind := range notificationKinds {
 		notificationsSent.Add(0, string(kind))
@@ -372,8 +369,8 @@ func SetBeatFresh(id string, fresh bool) {
 
 // RecordOutage counts one detected outage for id, at detection time and
 // independent of whether its notice is ever delivered. It counts OUTAGES
-// rather than messages. id is a label: see the
-// package doc's label-cardinality contract.
+// rather than messages. id is a label: see the package doc's
+// label-cardinality contract.
 func RecordOutage(id string) {
 	beatOutages.Inc(id)
 }

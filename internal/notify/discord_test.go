@@ -1408,6 +1408,16 @@ func TestAttemptTimeoutIsRetried(t *testing.T) {
 
 	d := New(srv.URL, "node-1")
 	t.Cleanup(d.Close)
+	// The seam is a test affordance, not the policy, so pin the production
+	// wiring BEFORE shortening it: a New that drops the assignment leaves the
+	// field zero, which httpx reads as the option's ABSENCE (no per-attempt
+	// bound at all), so a stalled webhook is bounded only by the client
+	// timeout and its expiry is classified terminal instead of retryable.
+	// Nothing below notices, because the assertions run against this
+	// notifier's shortened deadline.
+	if d.attemptTimeout != attemptTimeout {
+		t.Fatalf("New() attemptTimeout = %s, want %s: a non-positive bound is httpx's option-absent path, so no attempt deadline is applied", d.attemptTimeout, attemptTimeout)
+	}
 	// Shorten only this notifier's per-attempt deadline: the branch under
 	// test cares that the ATTEMPT's bound fired while the caller's budget is
 	// still live, not how long it took to fire.

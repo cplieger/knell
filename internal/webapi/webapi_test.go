@@ -1902,15 +1902,19 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		wantStatus int
 		wantSeen   int
 	}{
-		"allowed host records a beat":     {host: "knell.example", path: "/beat/api", wantStatus: http.StatusOK, wantSeen: 1},
-		"allowed host with port":          {host: "knell.example:9190", path: "/beat/api", wantStatus: http.StatusOK, wantSeen: 1},
-		"allowed host case-insensitive":   {host: "KNELL.example", path: "/beat/api", wantStatus: http.StatusOK, wantSeen: 1},
-		"rebinding ping refused":          {host: "attacker.example", path: "/beat/api", site: "same-origin", wantStatus: http.StatusForbidden},
-		"foreign host refused on beat":    {host: "attacker.example", path: "/beat/api", wantStatus: http.StatusForbidden},
-		"foreign host refused on metrics": {host: "attacker.example", path: "/metrics", wantStatus: http.StatusForbidden},
-		"foreign host refused on healthz": {host: "attacker.example", path: "/healthz", wantStatus: http.StatusForbidden},
-		"allowed host serves metrics":     {host: "knell.example", path: "/metrics", method: http.MethodGet, wantStatus: http.StatusOK},
-		"allowed host serves healthz":     {host: "knell.example", path: "/healthz", method: http.MethodGet, wantStatus: http.StatusOK},
+		"allowed host records a beat":   {host: "knell.example", path: "/beat/api", wantStatus: http.StatusOK, wantSeen: 1},
+		"allowed host with port":        {host: "knell.example:9190", path: "/beat/api", wantStatus: http.StatusOK, wantSeen: 1},
+		"allowed host case-insensitive": {host: "KNELL.example", path: "/beat/api", wantStatus: http.StatusOK, wantSeen: 1},
+		"rebinding ping refused":        {host: "attacker.example", path: "/beat/api", site: "same-origin", wantStatus: http.StatusForbidden},
+		"foreign host refused on beat":  {host: "attacker.example", path: "/beat/api", wantStatus: http.StatusForbidden},
+		// A non-canonical spelling under a foreign Host: the Host policy answers
+		// FIRST, so this is host_not_allowed, not canonicalBeatPath's 404. Pins
+		// that canonicalBeatPath stays INSIDE routes.Hosts.Middleware() in Chain.
+		"foreign host refused on a non-canonical beat path": {host: "attacker.example", path: "/beat/api//", wantStatus: http.StatusForbidden},
+		"foreign host refused on metrics":                   {host: "attacker.example", path: "/metrics", wantStatus: http.StatusForbidden},
+		"foreign host refused on healthz":                   {host: "attacker.example", path: "/healthz", wantStatus: http.StatusForbidden},
+		"allowed host serves metrics":                       {host: "knell.example", path: "/metrics", method: http.MethodGet, wantStatus: http.StatusOK},
+		"allowed host serves healthz":                       {host: "knell.example", path: "/healthz", method: http.MethodGet, wantStatus: http.StatusOK},
 		// The loopback carve-out is what keeps in-container HTTP clients (a
 		// localhost curl, a sidecar probe) working under an allowlist of
 		// browser-facing names; the baked `knell health` probe stats the
@@ -1993,7 +1997,8 @@ func scrapeAs(t *testing.T, h http.Handler, host string) string {
 }
 
 // TestHostRefusalKeepsTheStandardEnvelope pins WHERE the Host allowlist sits in
-// the chain, which New's own comment claims but nothing checked: innermost, so
+// the chain, which New's own comment claims but nothing checked: inside the
+// standard wrappers and outside canonicalBeatPath, so
 // the 403 still carries SecurityHeaders and Cache-Control: no-store, and still
 // rides webhttp.Logging -- so a rebinding attempt appears in the access log and
 // in the request counter. Hoisting the policy above webhttp.Logging keeps every

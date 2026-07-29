@@ -188,10 +188,10 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 		webhttp.Recoverer(),
 		webhttp.SecurityHeaders(),
 		noStore,
-		// Innermost, so a rejected Host still answers with the standard
-		// security and no-store headers, but still ahead of every route and
-		// of beatHandler's token gate. Inactive when ALLOWED_HOSTS is unset:
-		// HostPolicy.Middleware then returns next unwrapped.
+		// Inside the standard wrappers, so a rejected Host still answers with
+		// security and no-store headers, but outside canonicalBeatPath, every
+		// route, and beatHandler's token gate. Inactive when ALLOWED_HOSTS is
+		// unset: HostPolicy.Middleware then returns next unwrapped.
 		routes.Hosts.Middleware(),
 		// Inside the Host policy, and inside nothing else: this guard answers
 		// for knell's own routes only, so a refused Host must still be refused
@@ -215,9 +215,15 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 //
 // The comparison is against the sanitation net/http itself performs
 // (path.Clean, with a trailing slash preserved — see net/http's cleanPath), so
-// the guard fires on exactly the spellings ServeMux would rewrite and on
-// nothing else: /beat/ and /beat/{id}/ are already canonical and keep routing
-// to their own patterns (which is what keeps their request-counter labels).
+// the guard covers every spelling ServeMux would rewrite. It is applied to the
+// DECODED r.URL.Path while ServeMux compares the ESCAPED one, so it is slightly
+// WIDER: an encoded dot segment (/beat/%2e%2e/ghost) draws no redirect from
+// net/http but is refused here. That costs those two spellings their route
+// label (a middleware refusal leaves r.Pattern empty, so the request counter
+// buckets them as "unmatched") and is accepted deliberately: the decoded path
+// is the one a sender believed it was pinging. /beat/ and /beat/{id}/ are
+// already canonical either way and keep routing to their own patterns (which
+// is what keeps their request-counter labels).
 // The guard fires only when the request is in (or cleans into) the /beat
 // namespace, so every other path keeps net/http's own behavior. The verdict is
 // writeUnknownBeat: a path that is not a canonical /beat/{id} names no
