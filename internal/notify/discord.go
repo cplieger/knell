@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"syscall"
 	"time"
 
@@ -53,6 +54,12 @@ const MaxNodeNameBytes = 256
 // semantics: total, including the first).
 const maxAttempts = 3
 
+// rateLimitMaxWait caps how long ONE rate-limited attempt may park the
+// sweep's single sender goroutine. httpx waits min(Retry-After, this ceiling)
+// before a 429 retry, so this number — never Discord's hint — bounds the delay
+// every OTHER beat's notice inherits from one rate-limited beat.
+const rateLimitMaxWait = 30 * time.Second
+
 // maxErrorBodyBytes caps how much of a rejected response's body is READ, and
 // nothing about it is ever printed. Discord names the cause in that body as a
 // numeric code (a deleted webhook vs a rejected payload), and knell reports
@@ -82,6 +89,11 @@ type Discord struct {
 	// a direct use of the constant only so a test can shorten it on its own
 	// notifier; New always sets it to attemptTimeout.
 	attemptTimeout time.Duration
+	// rateLimitMaxWait caps one rate-limit retry wait, a field for the same
+	// reason as attemptTimeout: a test shortens it on its own notifier so the
+	// ceiling is observable without waiting the production one. New always
+	// sets it to rateLimitMaxWait.
+	rateLimitMaxWait time.Duration
 }
 
 // Discord implements the transition contract the state machine consumes;
@@ -107,12 +119,23 @@ func New(webhookURL, node string) *Discord {
 	// by surfacing its 3xx response, which postAttempt then reports as
 	// non-delivery; TestMethodChangingRedirectIsNotDelivery pins that, and
 	// is also the only test pinning that a policy is installed at all.
-	client.CheckRedirect = httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
+	// CheckRedirect runs after net/http sets the header and before the request
+	// goes out, so deleting it here removes it from the wire; the policy then
+	// decides the hop. That header is the PREVIOUS request's full URL, and for a
+	// webhook the URL's path IS the credential, so an ordinary same-host hop (a
+	// relay that 307s /hooks/<token> to /api/v2/hooks) would hand the credential
+	// to the target path's access log and to anything that ships it.
+	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		req.Header.Del("Referer")
+		return policy(req, via)
+	}
 	return &Discord{
-		client:         client,
-		url:            webhookURL,
-		node:           node,
-		attemptTimeout: attemptTimeout,
+		client:           client,
+		url:              webhookURL,
+		node:             escapeMarkdown(node),
+		attemptTimeout:   attemptTimeout,
+		rateLimitMaxWait: rateLimitMaxWait,
 	}
 }
 
@@ -133,7 +156,7 @@ func (d *Discord) Close() {
 func (d *Discord) BeatMissing(ctx context.Context, id string, live watch.Transition) error {
 	msg := fmt.Sprintf(
 		"🚨 [knell %s] beat **%s** MISSING: silent for %s. Nothing has pinged it in time: check the sender, its path to this observer, and that anything is pinging this beat id at all.",
-		d.node, id, live.DownFor().Truncate(time.Second),
+		d.node, escapeMarkdown(id), live.DownFor().Truncate(time.Second),
 	)
 	return d.post(ctx, "missing "+id, msg)
 }
@@ -142,7 +165,7 @@ func (d *Discord) BeatMissing(ctx context.Context, id string, live watch.Transit
 func (d *Discord) BeatRecovered(ctx context.Context, id string, live watch.Transition) error {
 	msg := fmt.Sprintf(
 		"✅ [knell %s] beat **%s** recovered: pings arriving again after %s of silence.",
-		d.node, id, live.DownFor().Truncate(time.Second),
+		d.node, escapeMarkdown(id), live.DownFor().Truncate(time.Second),
 	)
 	return d.post(ctx, "recovered "+id, msg)
 }
@@ -167,25 +190,45 @@ func (d *Discord) BeatOutageHistory(ctx context.Context, id string, outages []wa
 		// caller cannot post a message that reports nothing.
 		return errors.New("delivering history notification: no ended outages to report")
 	}
-	// The contract's other half, guarded the same way: every entry carries its
+	// The contract's other clauses, guarded the same way: every entry carries its
 	// own recovery point. watch's closedRun stops at the first record whose
 	// recoveredAt is unset, so an open record never reaches here today - but
 	// one would render "recovered at 0001-01-01 00:00 UTC" and a negative
 	// silence, which is exactly the resolved-outage lie this package exists to
 	// prevent, so refuse it instead of publishing it.
+	var prevRecovered time.Time
 	for i := range outages {
-		if outages[i].Recovered.IsZero() || outages[i].Recovered.Before(outages[i].Started) {
+		if !outages[i].Ended() {
 			return fmt.Errorf(
 				"delivering history notification: outage %d of %d has no recovery point at or after its start",
 				i+1, len(outages))
 		}
+		// The span's other end, and what makes DownFor believable: a zero
+		// Started renders "was missing for 17752008h0m0s", the same
+		// unbelievable figure the guard above keeps out of a notice.
+		if outages[i].Started.IsZero() {
+			return fmt.Errorf(
+				"delivering history notification: outage %d of %d has no start, so its silence cannot be measured",
+				i+1, len(outages))
+		}
+		// The clause historyMessage reads the recovery point off: it takes the
+		// LAST entry as the most recent recovery, so a batch whose recovery
+		// points are not ascending would publish a stale instant as "last
+		// recovered at".
+		if i > 0 && outages[i].Recovered.Before(prevRecovered) {
+			return fmt.Errorf(
+				"delivering history notification: outage %d of %d recovered before outage %d, so the notice cannot report the most recent recovery",
+				i+1, len(outages), i)
+		}
+		prevRecovered = outages[i].Recovered
 	}
 	return d.post(ctx, "history "+id, d.historyMessage(id, outages))
 }
 
-// historyMessage renders the history notice for id. outages is chronological
-// and non-empty (BeatOutageHistory's contract), so the last entry is the most
-// recent recovery.
+// historyMessage renders the history notice for id. outages is non-empty, has
+// a measurable span per entry and ascends by recovery point - all three
+// enforced by BeatOutageHistory - so the last entry is the most recent
+// recovery.
 //
 // Every notice is two parts: WHAT happened, then why it is being read after
 // the fact. The second part comes from watch's LateReason and is never guessed
@@ -195,17 +238,46 @@ func (d *Discord) BeatOutageHistory(ctx context.Context, id string, outages []wa
 func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 	last := outages[len(outages)-1]
 	recovered := last.Recovered.UTC().Format(historyTimeFormat)
+	name := escapeMarkdown(id)
 	if len(outages) == 1 {
 		return fmt.Sprintf(
 			"🕓 [knell %s] beat **%s** was missing for %s, recovered at %s. %s",
-			d.node, id, last.DownFor().Truncate(time.Second), recovered, lateClause(last.LateReason),
+			d.node, name, last.DownFor().Truncate(time.Second), recovered, lateClause(last.LateReason),
 		)
 	}
 	return fmt.Sprintf(
 		"🕓 [knell %s] beat **%s** had %d outages: longest %s, last recovered at %s. %s",
-		d.node, id, len(outages),
+		d.node, name, len(outages),
 		watch.LongestOutage(outages).Truncate(time.Second), recovered, batchLateClause(outages),
 	)
+}
+
+// markdownEscaper quotes the characters Discord's markdown consumes. Every
+// entry IS a Discord formatting character, which matters: Discord strips a
+// backslash only in front of one of its own markup characters, so escaping
+// anything else (a "-", a "#") would publish the backslash itself.
+var markdownEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	"*", `\*`,
+	"_", `\_`,
+	"~", `\~`,
+	"`", "\\`",
+	"|", `\|`,
+)
+
+// escapeMarkdown renders s literally in a Discord message. It is applied to
+// the two values a notice interpolates that knell did not write itself — the
+// beat id and the node name — because Discord's markdown EATS characters
+// rather than merely styling them: a pair of underscores anywhere in a word
+// italicizes what sits between them and removes both, so a beat id the
+// operator configured as "db_backup_nightly" arrives as "dbbackupnightly",
+// matching nothing in BEATS and nothing on /beat/{id}. The notice's whole job
+// is to name the beat to act on, so the id has to survive rendering. A
+// backslash is Discord's own escape and is stripped before display, so an id
+// with no markup character (every hyphenated id, and every example in the
+// README) renders exactly as it does today.
+func escapeMarkdown(s string) string {
+	return markdownEscaper.Replace(s)
 }
 
 // lateClause explains why ONE ended outage is reported after the fact, and
@@ -287,7 +359,7 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 		// visible to errors.Is — which is what makes the timeout classifiable
 		// by httpx AND transparent to knell's own callers.
 		httpx.WithAttemptTimeout(d.attemptTimeout),
-		httpx.WithRateLimitRetry(30*time.Second),
+		httpx.WithRateLimitRetry(d.rateLimitMaxWait),
 		// watch publishes the terminal verdict for every failed delivery
 		// (sendMissing/sendHistory/sendRecovered log at Error with the beat,
 		// the silence and the retry plan), so httpx's own exhaustion WARN is a

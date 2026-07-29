@@ -72,14 +72,19 @@ func exposition(t *testing.T) string {
 }
 
 // TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat pins the per-beat
-// half of the cold-start guarantee: InitBeat must publish all five per-beat
-// series, with the two counters born at zero, the last-seen gauge carrying
-// the boot baseline and the deadline gauge carrying the configured deadline.
+// half of the cold-start guarantee: declaring a beat must publish all five
+// per-beat series, with the two counters born at zero, the last-seen gauge
+// carrying the boot baseline and the deadline gauge carrying the configured
+// deadline. Four of the five come from InitBeat; knell_beat_fresh comes from
+// SetBeatFresh, the single door for the freshness verdict, because the
+// boundary belongs to the watch state machine (watch.New publishes the boot
+// verdict right after InitBeat, and internal/watch's own tests pin that it is
+// 1 at boot).
 // A counter whose first exposed sample is already nonzero
 // has no earlier sample for increase() to diff against, so a series dropped
-// from InitBeat is an alert that stays silent through the first event of the
-// beat's life; a missing last-seen baseline leaves the operator no window to
-// reconstruct after a dropped notice.
+// from the declaration path is an alert that stays silent through the first
+// event of the beat's life; a missing last-seen baseline leaves the operator
+// no window to reconstruct after a dropped notice.
 func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 	// The registry is a package-level singleton shared by every test in this
 	// binary, so the probe id must be unique to this test for the values below
@@ -110,6 +115,9 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 	}
 
 	InitBeat(id, 20*time.Minute, time.Unix(1700000000, 0))
+	// The boot freshness verdict is the caller's to publish, exactly as
+	// watch.New does it.
+	SetBeatFresh(id, true)
 
 	want := map[string]string{
 		"knell_beat_fresh":                       "1",

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -15,9 +16,30 @@ import (
 
 	"github.com/cplieger/health"
 	"github.com/cplieger/knell/internal/config"
+	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/slogx/capture"
 )
+
+// testWebhookSecret is the credential half of the webhook every boot test
+// configures, and testWebhookURL is the URL that carries it -- the string every
+// leak assertion in this package greps for. They are ONE declaration on
+// purpose: a URL edited in one boot helper while an assertion kept the old
+// token leaves a secret-leak guard that still passes and can never fail again.
+const (
+	testWebhookSecret = "verysecrettoken"
+	testWebhookURL    = "https://discord.example/api/webhooks/1234567890/" + testWebhookSecret
+	// testPlainHTTPWebhookURL is the same webhook over the one scheme the
+	// config gate must refuse, so the rejection test cannot drift off the
+	// secret above.
+	testPlainHTTPWebhookURL = "http://discord.example/api/webhooks/1234567890/" + testWebhookSecret
+)
+
+// secretEnvKeys are the variables a boot test must CLEAR rather than blank:
+// config.Load rejects a PRESENT-but-empty _FILE variable, and one leaked from
+// another test (or the ambient environment) changes what run() reads. One home,
+// so a newly added _FILE gate is cleared everywhere at once.
+var secretEnvKeys = []string{"DISCORD_WEBHOOK_URL_FILE", "BEAT_TOKEN", "BEAT_TOKEN_FILE"}
 
 // unsetEnv removes key for the duration of the test. t.Setenv registers the
 // restore of the original value, so the following os.Unsetenv leaves the
@@ -42,10 +64,10 @@ func unsetEnv(t *testing.T, key string) {
 func installRunEnv(t *testing.T, beats, addr string) {
 	t.Helper()
 	t.Setenv("BEATS", beats)
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/api/webhooks/1234567890/verysecrettoken")
-	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
-	unsetEnv(t, "BEAT_TOKEN")
-	unsetEnv(t, "BEAT_TOKEN_FILE")
+	t.Setenv("DISCORD_WEBHOOK_URL", testWebhookURL)
+	for _, key := range secretEnvKeys {
+		unsetEnv(t, key)
+	}
 	t.Setenv("LISTEN_ADDR", addr)
 }
 
@@ -145,7 +167,7 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global
 	// slog default to inspect the startup summary.
 	cfg := config.Config{
-		WebhookURL: "https://discord.example/api/webhooks/1234567890/verysecrettoken",
+		WebhookURL: testWebhookURL,
 		Node:       "node-1",
 		ListenAddr: ":9190",
 		Beats:      []config.Beat{{ID: "api", Deadline: 20 * time.Minute}},
@@ -160,11 +182,21 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	if !rec.HasAttr("configuration loaded", "webhook", "configured") {
 		t.Error(`webhook attr must render as the literal presence marker "configured"`)
 	}
-	if rec.Contains("verysecrettoken") || rec.AttrContains("", "", "verysecrettoken") {
+	if rec.Contains(testWebhookSecret) || rec.AttrContains("", "", testWebhookSecret) {
 		t.Errorf("startup log leaks the webhook URL: %v", rec.Messages())
 	}
 	if !rec.HasAttr("configuration loaded", "beat_auth", "open") {
 		t.Errorf("beat_auth should report open when BeatToken is empty: %v", rec.Messages())
+	}
+	// Every attribute config.LogValue publishes must reach the shipped line:
+	// the hand-picked copy this call site used to build had already dropped
+	// log_level, so an operator diagnosing a level that "did not apply" had
+	// nothing in the configuration line to confirm it against.
+	if !rec.HasAttr("configuration loaded", "log_level", "INFO") {
+		t.Errorf("startup summary omits the effective log_level: %v", rec.Messages())
+	}
+	if !rec.HasAttr("configuration loaded", "beats", "1") {
+		t.Errorf("startup summary omits the beat count: %v", rec.Messages())
 	}
 	if !rec.Contains("watching beat") || !rec.AttrContains("watching beat", "beat", "api") {
 		t.Errorf("per-beat startup line missing: %v", rec.Messages())
@@ -192,6 +224,45 @@ func TestLogConfigReportsBeatAuthRequiredWithoutLeakingToken(t *testing.T) {
 	}
 }
 
+// TestRunEnforcesTheNodeNameCapNotifyOwns pins the second value main mediates
+// between two internal packages: notify owns the NODE_NAME bound (it renders
+// every template the Discord budget is measured over), config ENFORCES
+// whatever bound it is handed, and main is the only place the two meet.
+// notify's budget test proves the templates fit at MaxNodeNameBytes and the
+// config tests alias the same constant into their own local copy, so neither
+// can see what the composition root actually passes: a larger bound admits a
+// node name whose notices exceed Discord's content limit, where the switch
+// arms and every notice is refused with 400 -- the exact failure the constant
+// exists to prevent, and one that is invisible until an outage.
+//
+// The listen address is an OCCUPIED one so a bound passed too LARGE fails this
+// test instead of hanging it: the boot would then clear the configuration gate
+// and go on to serve, and the bind is the next thing run() does.
+func TestRunEnforcesTheNodeNameCapNotifyOwns(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, plus run() installs a process-global
+	// slog default of its own.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot bind a probe listener: %v", err)
+	}
+	t.Cleanup(func() { _ = occupied.Close() })
+
+	installRunEnv(t, "api:20m", occupied.Addr().String())
+	t.Setenv("NODE_NAME", strings.Repeat("n", notify.MaxNodeNameBytes+1))
+	capture.Default(t)
+
+	err = run()
+	if err == nil {
+		t.Fatal("run() = nil, want a NODE_NAME over notify's cap to fail the boot; a name past the cap renders notices over Discord's content limit, so the switch arms and every notice is refused")
+	}
+	if !strings.Contains(err.Error(), "configuration") || !strings.Contains(err.Error(), "NODE_NAME") {
+		t.Fatalf("run() = %v, want the configuration gate to reject an over-cap NODE_NAME; a composition root passing a LARGER bound than the render budget was measured against admits a name whose notices Discord refuses", err)
+	}
+	if want := strconv.Itoa(notify.MaxNodeNameBytes); !strings.Contains(err.Error(), want) {
+		t.Errorf("run() = %v, want the enforced cap %s named: config enforces whatever main passes, so a different constant here silently decouples the cap from the render budget it protects", err, want)
+	}
+}
+
 func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, plus run() installs a process-global
 	// slog default and touches the shared health-marker path.
@@ -211,7 +282,7 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	if !strings.Contains(err.Error(), "binding") {
 		t.Fatalf("run() = %v, want the bind failure surfaced to the caller", err)
 	}
-	if strings.Contains(err.Error(), "verysecrettoken") {
+	if strings.Contains(err.Error(), testWebhookSecret) {
 		t.Errorf("bind error leaks the webhook URL: %v", err)
 	}
 }

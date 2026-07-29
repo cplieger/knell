@@ -16,6 +16,7 @@ import (
 	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/webhttp"
 )
 
 // fakeBeater accepts a fixed id set and records what was recorded. closed
@@ -123,6 +124,9 @@ func TestMetricsExposition(t *testing.T) {
 	// series is recorded). The notification counters need no touch: the
 	// metrics package pre-mints every kind at init.
 	metrics.InitBeat("webapi-test", 20*time.Minute, time.Unix(0, 0))
+	// The freshness verdict is published by the watch state machine, not by
+	// InitBeat, so this test mints the gauge series itself.
+	metrics.SetBeatFresh("webapi-test", true)
 
 	h := newTestHandler(&fakeBeater{}, "")
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
@@ -280,9 +284,7 @@ func TestPanicUnderBeatHandlerAnswers500AndIsLogged(t *testing.T) {
 	// access log never reports a status for the endpoint that feeds the switch.
 	rec := capture.Default(t)
 	h := New(context.Background(), panicBeater{}, "", Routes{
-		Healthz: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		}),
+		Healthz: staticHealthz(http.StatusOK),
 		Metrics: metrics.Handler(),
 	})
 
@@ -465,6 +467,13 @@ func TestBeatTokenGate(t *testing.T) {
 			h.ServeHTTP(rec, req)
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			// RFC 9110 §11.6.1: every 401 names its challenge, so a sender
+			// reads the expected scheme off the protocol, not off the README.
+			if tt.wantStatus == http.StatusUnauthorized {
+				if got := rec.Header().Get("WWW-Authenticate"); got != "Bearer" {
+					t.Errorf("WWW-Authenticate = %q, want %q", got, "Bearer")
+				}
 			}
 			if got := len(b.seen) - before; got != tt.wantSeen {
 				t.Errorf("recorded beats = %d, want %d (unauthorized pings must not be recorded)", got, tt.wantSeen)
@@ -1188,6 +1197,7 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 		ctx        context.Context
 		method     string
 		path       string
+		headers    map[string]string
 		wantStatus int
 		wantSeries string
 		wantSeen   int
@@ -1233,6 +1243,16 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 			wantStatus: http.StatusMethodNotAllowed,
 			wantSeries: `knell_http_requests_total{method="PUT",path="/beat/{id}",status="405"}`,
 		},
+		// A browser tricked into the ping (the confused-deputy shape the
+		// Sec-Fetch guard refuses). Nothing else makes this class visible: it
+		// records no beat, so beatsReceived never moves, and an operator
+		// watching for forged pings has only this series to alert on.
+		"cross-site browser ping": {
+			ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id,
+			headers:    map[string]string{"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors"},
+			wantStatus: http.StatusForbidden,
+			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="403"}`,
+		},
 		// A ping arriving during the drain, after watch.Run already took its
 		// undelivered-work snapshot.
 		"ping during drain": {
@@ -1251,7 +1271,12 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 			// shared by the whole test binary (and by a -count=2 rerun).
 			before, _ := seriesValue(t, scrapeExposition(t, h), tt.wantSeries)
 
-			rec := beatRequest(t, h, tt.method, tt.path)
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(""))
+			for name, value := range tt.headers {
+				req.Header.Set(name, value)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("%s %s = %d, want %d (body %s)", tt.method, tt.path, rec.Code, tt.wantStatus, rec.Body.String())
 			}
@@ -1385,7 +1410,8 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 		otherMethodLabel: true,
 	}
 	allowedPaths := map[string]bool{
-		"/beat/{id}": true, "/healthz": true, "/metrics": true,
+		"/beat/{id}": true, "/beat/{$}": true, "/beat/{id}/{rest...}": true,
+		"/healthz": true, "/metrics": true,
 		unmatchedPathLabel: true,
 	}
 
@@ -1607,4 +1633,188 @@ func TestBeatRefusesCrossSiteBrowserSubresource(t *testing.T) {
 			t.Errorf("body = %s, want the cross_site_request coded envelope", code)
 		}
 	})
+}
+
+// TestCrossSiteGuardAppliesWithTokenGateConfigured pins the SCOPE of the
+// browser-origin guard: it lives in record, so it refuses in the token
+// configuration too, and the credential gate stays outside it. Every other
+// cross-site case builds an OPEN endpoint, so moving the check into
+// beatHandler's token == "" branch would leave a gated deployment with no
+// confused-deputy layer at all and the whole suite green.
+func TestCrossSiteGuardAppliesWithTokenGateConfigured(t *testing.T) {
+	const token = "s3cret"
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	h := newTestHandler(b, token)
+
+	tests := []struct {
+		name       string
+		auth       string
+		site       string
+		mode       string
+		wantStatus int
+		wantCode   string
+		wantSeen   int
+	}{
+		// An authorized sender is still not allowed to be a browser tricked
+		// into the ping: the credential proves who, not what.
+		{
+			name: "authorized cross-site subresource refused",
+			auth: "Bearer " + token, site: "cross-site", mode: "no-cors",
+			wantStatus: http.StatusForbidden, wantCode: "cross_site_request",
+		},
+		// The credential gate is outermost, so an unauthenticated cross-site
+		// ping answers 401 and never learns the guard exists.
+		{
+			name: "unauthorized cross-site subresource answers the credential refusal",
+			site: "cross-site", mode: "no-cors",
+			wantStatus: http.StatusUnauthorized, wantCode: "unauthorized",
+		},
+		// The documented senders carry no Sec-Fetch headers and keep working
+		// with the token set: the guard costs them nothing.
+		{
+			name:       "authorized documented sender still records",
+			auth:       "Bearer " + token,
+			wantStatus: http.StatusOK, wantSeen: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := len(b.seen)
+			req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
+			if tt.auth != "" {
+				req.Header.Set("Authorization", tt.auth)
+			}
+			if tt.site != "" {
+				req.Header.Set("Sec-Fetch-Site", tt.site)
+			}
+			if tt.mode != "" {
+				req.Header.Set("Sec-Fetch-Mode", tt.mode)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if tt.wantCode != "" && !strings.Contains(rec.Body.String(), tt.wantCode) {
+				t.Errorf("body = %s, want the %s coded envelope", rec.Body.String(), tt.wantCode)
+			}
+			if got := len(b.seen) - before; got != tt.wantSeen {
+				t.Errorf("recorded beats = %d, want %d", got, tt.wantSeen)
+			}
+		})
+	}
+}
+
+// hostPolicy builds the allowlist exactly as internal/config does, so this
+// file exercises the policy shape knell actually ships (loopback exempt, the
+// ALLOWED_HOSTS-naming 403).
+func hostPolicy(t *testing.T, entries string) *webhttp.HostPolicy {
+	t.Helper()
+	policy, invalid := webhttp.ParseHostList(strings.Split(entries, ","),
+		webhttp.WithLoopbackExempt(),
+		webhttp.WithHostAllowlistError("host_not_allowed",
+			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"))
+	if len(invalid) > 0 {
+		t.Fatalf("ParseHostList(%q) reported invalid entries %v; the fixture must be usable", entries, invalid)
+	}
+	return policy
+}
+
+// TestHostAllowlistBreaksDNSRebinding pins the one defense that stops a
+// rebinding page from re-arming the switch. The attack request is
+// indistinguishable from a legitimate one by every OTHER check knell runs: it
+// carries no Sec-Fetch mismatch (the page origin and the target authority are
+// identical, so the browser labels it same-origin and crossSiteSubresource
+// admits it), and on the documented default the endpoint is open. Only the
+// textual Host check refuses it, because the attacker controls what their
+// hostname resolves to but not what the browser puts in Host.
+func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	h := New(context.Background(), b, "", Routes{
+		Healthz: staticHealthz(http.StatusOK),
+		Metrics: metrics.Handler(),
+		Hosts:   hostPolicy(t, "knell.example"),
+	})
+
+	tests := map[string]struct {
+		host       string
+		path       string
+		method     string // empty = POST
+		remoteAddr string
+		site       string
+		wantStatus int
+		wantSeen   int
+	}{
+		"allowed host records a beat":     {host: "knell.example", path: "/beat/api", wantStatus: http.StatusOK, wantSeen: 1},
+		"allowed host with port":          {host: "knell.example:9190", path: "/beat/api", wantStatus: http.StatusOK, wantSeen: 1},
+		"allowed host case-insensitive":   {host: "KNELL.example", path: "/beat/api", wantStatus: http.StatusOK, wantSeen: 1},
+		"rebinding ping refused":          {host: "attacker.example", path: "/beat/api", site: "same-origin", wantStatus: http.StatusForbidden},
+		"foreign host refused on beat":    {host: "attacker.example", path: "/beat/api", wantStatus: http.StatusForbidden},
+		"foreign host refused on metrics": {host: "attacker.example", path: "/metrics", wantStatus: http.StatusForbidden},
+		"foreign host refused on healthz": {host: "attacker.example", path: "/healthz", wantStatus: http.StatusForbidden},
+		"allowed host serves metrics":     {host: "knell.example", path: "/metrics", method: http.MethodGet, wantStatus: http.StatusOK},
+		"allowed host serves healthz":     {host: "knell.example", path: "/healthz", method: http.MethodGet, wantStatus: http.StatusOK},
+		// The loopback carve-out is what keeps the baked `knell health` probe
+		// and any in-container client working under an allowlist of
+		// browser-facing names. Both halves must be loopback: a rebinding
+		// request carries the attacker's hostname, and a remote client forging
+		// Host: 127.0.0.1 is not a loopback socket peer.
+		"loopback probe exempt":         {host: "127.0.0.1:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
+		"forged loopback host refused":  {host: "127.0.0.1:9190", path: "/beat/api", remoteAddr: "203.0.113.7:44444", wantStatus: http.StatusForbidden},
+		"malformed host cannot match":   {host: "knell.example:notaport", path: "/beat/api", wantStatus: http.StatusForbidden},
+		"bracketed hostname is refused": {host: "[knell.example]", path: "/beat/api", wantStatus: http.StatusForbidden},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			before := len(b.seen)
+			method := tt.method
+			if method == "" {
+				method = http.MethodPost
+			}
+			req := httptest.NewRequest(method, tt.path, nil)
+			req.Host = tt.host
+			if tt.remoteAddr != "" {
+				req.RemoteAddr = tt.remoteAddr
+			}
+			if tt.site != "" {
+				req.Header.Set("Sec-Fetch-Site", tt.site)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if tt.wantStatus == http.StatusForbidden && !strings.Contains(rec.Body.String(), "host_not_allowed") {
+				t.Errorf("body = %s, want the host_not_allowed coded envelope naming ALLOWED_HOSTS", rec.Body.String())
+			}
+			if got := len(b.seen) - before; got != tt.wantSeen {
+				t.Errorf("recorded beats = %d, want %d: a refused Host must never feed the switch", got, tt.wantSeen)
+			}
+		})
+	}
+}
+
+// TestNilHostPolicyAcceptsEveryHost pins the backward-compatible default:
+// ALLOWED_HOSTS is unset in every documented deployment, so an inactive policy
+// must remove no capability. Without this, tightening the guard to fail closed
+// on an unset variable would brick every existing sender and leave the suite
+// green.
+func TestNilHostPolicyAcceptsEveryHost(t *testing.T) {
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	h := newTestHandler(b, "") // Routes.Hosts is nil, exactly like an unset ALLOWED_HOSTS
+
+	for _, host := range []string{"knell.example", "attacker.example", "192.0.2.9:9190", ""} {
+		req := httptest.NewRequest(http.MethodPost, "/beat/api", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("Host %q: status = %d, want 200 (a nil policy is a pass-through)", host, rec.Code)
+		}
+	}
+	if len(b.seen) != 4 {
+		t.Errorf("recorded beats = %d, want 4", len(b.seen))
+	}
 }

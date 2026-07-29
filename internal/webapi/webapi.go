@@ -54,6 +54,12 @@ type Routes struct {
 	Healthz http.Handler
 	// Metrics serves the Prometheus exposition.
 	Metrics http.Handler
+	// Hosts is the exact-match Host allowlist (ALLOWED_HOSTS). A nil or
+	// inactive policy accepts every Host, which is the documented default;
+	// an active one is what breaks DNS rebinding, since a rebinding request
+	// carries the ATTACKER's hostname in Host while its Sec-Fetch-Site reads
+	// same-origin and so passes crossSiteSubresource.
+	Hosts *webhttp.HostPolicy
 }
 
 // New assembles the routed and middleware-wrapped root handler.
@@ -116,6 +122,20 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 	// method-agnostic pattern is less specific than the three method-bearing
 	// ones, so GET, POST and HEAD still route above.
 	mux.HandleFunc("/beat/{id}", writeMethodNotAllowed)
+	// A /beat path that names no configured beat answers this file's coded 404
+	// rather than net/http's plain-text one. /beat/{$} is the EMPTY id a sender
+	// built from an unset variable sends; /beat/{id}/{rest...} is the
+	// trailing-slash or extra-segment URL join. Without a route both fall to
+	// net/http's own 404, which carries no code for a sender to parse and lands
+	// in the request counter's "unmatched" bucket beside scanner traffic -- so
+	// the one refusal class that means "this beat is never being pinged" cannot
+	// be told apart from a port scan. Two patterns rather than one /beat/
+	// subtree so the path label still says WHICH shape arrived. Both are less
+	// specific than the four /beat/{id} patterns above, so a real ping still
+	// routes there, and net/http answers a bare /beat with its implicit 307 to
+	// /beat/, which lands on this same coded 404 and records nothing.
+	mux.HandleFunc("/beat/{$}", writeUnknownBeat)
+	mux.HandleFunc("/beat/{id}/{rest...}", writeUnknownBeat)
 	mux.Handle("GET /healthz", routes.Healthz)
 	mux.Handle("GET /metrics", routes.Metrics)
 
@@ -155,6 +175,11 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 		webhttp.Recoverer(),
 		webhttp.SecurityHeaders(),
 		noStore,
+		// Innermost, so a rejected Host still answers with the standard
+		// security and no-store headers, but still ahead of every route and
+		// of beatHandler's token gate. Inactive when ALLOWED_HOSTS is unset:
+		// HostPolicy.Middleware then returns next unwrapped.
+		routes.Hosts.Middleware(),
 	)
 }
 
@@ -188,6 +213,17 @@ func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 	webhttp.SetAllow(w, http.MethodGet, http.MethodPost)
 	webhttp.WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed",
 		"use GET or POST to record a beat")
+}
+
+// writeUnknownBeat refuses a ping that names no configured beat: 404 in this
+// file's standard coded envelope. It is the single home of that refusal for
+// every /beat path a sender can produce -- an id the config does not carry, an
+// EMPTY id (/beat/, what a URL built from an unset variable sends), and a
+// nested path under one (/beat/{id}/, a trailing-slash URL join) -- so a sender
+// parsing knell's coded body never hits net/http's plain "404 page not found"
+// on exactly the spellings a misconfigured sender URL produces.
+func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
+	webhttp.WriteError(w, r, http.StatusNotFound, "unknown_beat", "unknown beat id")
 }
 
 // crossSiteSubresource reports whether a BROWSER initiated this request as a
@@ -300,7 +336,7 @@ func beatHandler(appCtx context.Context, b Beater, token string) http.HandlerFun
 			return
 		}
 		if !recorded {
-			webhttp.WriteError(w, r, http.StatusNotFound, "unknown_beat", "unknown beat id")
+			writeUnknownBeat(w, r)
 			return
 		}
 		webhttp.Ok(w)
@@ -322,6 +358,10 @@ func beatHandler(appCtx context.Context, b Beater, token string) http.HandlerFun
 		// nothing is recorded, and the gate's verdict does not depend on the
 		// lifecycle phase.
 		if !verifier.Verify(r.Header.Get("Authorization")) {
+			// RFC 9110 §11.6.1: a 401 MUST name at least one challenge, so a
+			// sender learns the scheme from the protocol and not only from the
+			// README. No realm: the endpoint has exactly one credential.
+			w.Header().Set("WWW-Authenticate", "Bearer")
 			webhttp.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
 			return
 		}

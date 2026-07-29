@@ -14,9 +14,11 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/cplieger/envx"
 	"github.com/cplieger/slogx"
+	"github.com/cplieger/webhttp"
 )
 
 // maxBeats caps how many beats one instance will watch. The cap keeps the
@@ -67,12 +69,15 @@ type Beat struct {
 
 // Config is the fully parsed runtime configuration.
 type Config struct {
-	WebhookURL string
-	Node       string
-	ListenAddr string
-	BeatToken  string
-	Beats      []Beat
-	LogLevel   slog.Level
+	// AllowedHosts is the exact-match Host allowlist webapi applies. A nil or
+	// inactive policy accepts every Host (the documented default).
+	AllowedHosts *webhttp.HostPolicy
+	WebhookURL   string
+	Node         string
+	ListenAddr   string
+	BeatToken    string
+	Beats        []Beat
+	LogLevel     slog.Level
 }
 
 // LogValue implements slog.LogValuer so a Config can never publish its own
@@ -142,6 +147,8 @@ func Load(maxNodeNameBytes int) (Config, error) {
 
 	cfg.ListenAddr = listenAddr()
 
+	cfg.AllowedHosts = allowedHosts()
+
 	beatToken, err := loadBeatToken()
 	if err != nil {
 		return cfg, err
@@ -154,13 +161,11 @@ func Load(maxNodeNameBytes int) (Config, error) {
 }
 
 // nodeName resolves the observer name: NODE_NAME when set to a non-blank value
-// (a blank one is warned about and ignored), else the
-// hostname, else "unknown". A NODE_NAME past maxNodeNameBytes fails startup
-// like any other malformed required value: the cap (owned by internal/notify,
-// which renders every template the budget is measured over, and passed down
-// from Load) is what guarantees no name can push a notification past
-// Discord's content limit, where the switch would arm and never ring. The
-// hostname fallback is not length-checked because the kernel
+// (a blank one is warned about and ignored), else the hostname, else
+// "unknown". A NODE_NAME past maxNodeNameBytes fails startup like any other
+// malformed required value: the cap is what guarantees no name can push a
+// notification past Discord's content limit, where the switch would arm and
+// never ring. The hostname fallback is not length-checked because the kernel
 // already bounds it far below the cap (HOST_NAME_MAX is 64 on Linux, 255 by
 // POSIX), and refusing to start over the machine's own hostname would trade a
 // deliverable notice for no notice at all.
@@ -222,6 +227,40 @@ func listenAddr() string {
 	return defaultListenAddr
 }
 
+// allowedHosts parses the ALLOWED_HOSTS exact-match Host allowlist. Unset (the
+// documented default) yields an inactive policy that accepts every Host, so the
+// guard ships permissive and removes no capability. An active allowlist is the
+// only defense that breaks DNS rebinding (CWE-346): a rebinding request reaches
+// knell carrying the ATTACKER's hostname in Host while its Sec-Fetch-Site reads
+// same-origin, so webapi's cross-site refusal admits it and the ping re-arms the
+// switch with no heartbeat behind it. Matching is textual on the Host header,
+// the one value the attacker cannot forge away, and no name is resolved.
+//
+// Malformed entries WARN rather than fail startup, unlike the required values
+// this package refuses: an allowlist knell cannot use degrades browser access,
+// while a startup refusal takes the whole observer down and a dead-man switch
+// that does not run detects nothing. ParseHostList still fails CLOSED when every
+// entry was unusable (any non-blank entry engages the gate), which the second
+// warning names. WithLoopbackExempt keeps the baked `knell health` probe and any
+// in-container client working under any allowlist.
+func allowedHosts() *webhttp.HostPolicy {
+	const key = "ALLOWED_HOSTS"
+	policy, invalid := webhttp.ParseHostList(strings.Split(os.Getenv(key), ","),
+		webhttp.WithLoopbackExempt(),
+		webhttp.WithHostAllowlistError("host_not_allowed",
+			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"))
+	if len(invalid) > 0 {
+		slog.Warn("dropping malformed "+key+" entries; they cannot match any Host a sender or browser sends",
+			"invalid", invalid,
+			"hint", "use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,10.0.0.5,knell.example.com; a lone port like :9190 belongs in LISTEN_ADDR")
+	}
+	if policy.Active() && policy.Size() == 0 {
+		slog.Warn(key+" has no usable entries; rejecting every non-loopback request (fail closed), so no sender can record a beat",
+			"hint", "fix the entries listed in the preceding warning, or unset the variable to accept every Host")
+	}
+	return policy
+}
+
 // logLevel resolves the log level: LOG_LEVEL when it parses, else info. A
 // present-but-blank value is warned about and ignored, the same accident
 // listenAddr and nodeName already report (compose interpolation of an
@@ -280,12 +319,16 @@ func secretFileError(key string, err error) error {
 		// pathErr.Err is the bare reason ("no such file or directory",
 		// "permission denied"); pathErr.Path is the operator-supplied value and
 		// stays out of the message.
-		return fmt.Errorf("%s_FILE could not be read (%s failed): %v", key, pathErr.Op, pathErr.Err)
+		return fmt.Errorf("%s_FILE could not be read (%s failed): %v: check that the path the variable names exists inside the container and is readable by knell's non-root user", key, pathErr.Op, pathErr.Err)
 	}
-	// envx's path policy (unclean path, ".."), the size limit and the
-	// grew-during-read guard all embed the path in an untyped error, so none of
-	// their reasons can be surfaced verbatim.
-	return fmt.Errorf("%s_FILE could not be read or validated: check that it names a clean path to a readable secret file no larger than envx's limit", key)
+	// Only envx's path policy (unclean path, "..") embeds the path in its
+	// message; its size-limit and grew-during-read errors carry byte counts
+	// only. All three are untyped, so they cannot be told apart without matching
+	// error text, and the fold is what keeps the path-policy reason out of the
+	// log. The wording therefore names every requirement the fold covers, in the
+	// operator's own terms rather than the dependency's: 1 MiB is envx's
+	// documented secret-file ceiling, restated here because it is not exported.
+	return fmt.Errorf("%s_FILE could not be read or validated: point it at a clean path (no \"..\") naming a readable secret file of at most 1 MiB; a secret file holds a few dozen bytes", key)
 }
 
 // warnPlainVarIgnored reports that KEY_FILE supplied the secret while the
@@ -328,6 +371,14 @@ func beatTokenFitsHeader(value string) bool {
 	return true
 }
 
+// errBeatTokenSetButEmpty is the refusal for a BEAT_TOKEN that is present and
+// carries no value. Two guards reach the same verdict — loadBeatToken's, because
+// envx cannot tell present-but-empty from unset, and checkBeatToken's, which stops
+// an empty token from reaching webapi where empty means "serve /beat/{id} open" —
+// so they share one message and cannot come to describe the misconfiguration
+// differently.
+var errBeatTokenSetButEmpty = errors.New("BEAT_TOKEN is set but empty: unset the variable entirely to serve /beat/{id} open on purpose, or set it to a long random token")
+
 // checkBeatToken validates a configured BEAT_TOKEN as the exact credential
 // senders must present, or refuses it. It never rewrites the value.
 //
@@ -352,7 +403,7 @@ func checkBeatToken(token string) error {
 		// Nothing to present at all: fails startup like a present-but-empty
 		// BEAT_TOKEN and a blank BEAT_TOKEN_FILE. Keeping it armed reported a
 		// gated endpoint that rejected every ping.
-		return errors.New("BEAT_TOKEN is set but empty: set it to a long random token, or unset the variable entirely to serve /beat/{id} open on purpose")
+		return errBeatTokenSetButEmpty
 	}
 	if !beatTokenFitsHeader(token) {
 		// Free of edge padding, yet still unpresentable: a control byte (a
@@ -379,6 +430,18 @@ func checkBeatToken(token string) error {
 		// NOT name the value's character class: the startup log is shipped to
 		// Loki, where describing a live credential's alphabet narrows a guess.
 		slog.Warn("BEAT_TOKEN is armed with a value that is easy to mistake for absent; the /beat/{id} gate requires it and every sender must present it verbatim, so set a long random token, or unset the variable to serve the endpoint open")
+	} else if strings.TrimSpace(token) != token {
+		// Presentable, non-blank, and carrying an edge rune the operator cannot
+		// see. ASCII edge padding was already REFUSED above, so the only way to
+		// reach here is a non-ASCII space (an NBSP pasted with the token out of
+		// a rendered page or a word processor) that textproto carries verbatim:
+		// the gate arms for a value one character longer than the one the
+		// operator reads, every sender presenting the visible token gets 401,
+		// and one deadline later every configured beat posts a false MISSING
+		// notice. Warn rather than refuse, because the value IS presentable and
+		// a token containing a non-ASCII space is documented as accepted. As
+		// above, the wording never names the character class.
+		slog.Warn("BEAT_TOKEN is armed with a value whose first or last character is invisible but part of the credential; every sender must present it verbatim, so retype the token from visible characters, or unset the variable to serve /beat/{id} open")
 	}
 	return nil
 }
@@ -426,7 +489,7 @@ func loadBeatToken() (string, error) {
 		// be mistaken for intent (the INFO beat_auth=open line looks
 		// identical either way).
 		if v, ok := os.LookupEnv("BEAT_TOKEN"); ok && v == "" {
-			return "", errors.New("BEAT_TOKEN is set but empty: unset the variable entirely to serve /beat/{id} open on purpose, or set it to a long random token")
+			return "", errBeatTokenSetButEmpty
 		}
 		token = ""
 	default:
@@ -559,6 +622,20 @@ func parseBeatEntry(entry string, seen map[string]struct{}) (Beat, error) {
 	return Beat{ID: id, Deadline: deadline}, nil
 }
 
+// invisibleInURL reports whether r is a rune an operator cannot see inside a
+// configured webhook URL: the ASCII space, and every rune outside Unicode's
+// printable set (the non-ASCII spaces NBSP/U+2000…/U+3000, the zero-width
+// space, the soft hyphen, and the format and control categories). url.Parse
+// accepts all of them and percent-encodes each one on every request, so the
+// host and path that reach the other end are not the configured ones and no
+// notification can ever be delivered — while startup succeeds and /healthz
+// reports ready. Printable runes are excluded on purpose: they are escaped the
+// same way, but the operator can read them, and refusing them would reject a
+// working non-Discord relay URL.
+func invisibleInURL(r rune) bool {
+	return r == ' ' || !unicode.IsPrint(r)
+}
+
 // parseWebhookURL validates that raw is an absolute HTTPS URL with a host.
 // Errors intentionally exclude operator-supplied text because the URL path
 // contains the webhook credential. This is a configuration shape check, not
@@ -591,13 +668,22 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		// would refuse it forever while startup reported success.
 		return nil, errors.New("missing path (the webhook URL's own path carries the credential, so a host-only URL cannot deliver a notification)")
 	}
-	if strings.ContainsRune(raw, ' ') {
+	if strings.IndexFunc(raw, invisibleInURL) >= 0 {
 		// An interior space survives url.Parse and is percent-encoded on every
 		// POST, so the path that reaches Discord is not the path the operator
 		// pasted and the switch can never ring. Edge padding is already
 		// trimmed by loadWebhook; what is left here is interior, which is the
 		// shape a folded YAML scalar produces when it joins a wrapped URL.
-		return nil, errors.New("contains a space (a space is percent-encoded on every request, so the webhook path that reaches the other end is not the configured one)")
+		//
+		// Every INVISIBLE rune is refused for the same reason, not just the
+		// ASCII space: a non-breaking space, an ideographic space, a
+		// zero-width space or a soft hyphen (the shapes a URL pasted out of a
+		// rendered page or a word processor carries) all survive url.Parse and
+		// are percent-encoded on every request exactly like a space, in the
+		// host as well as the path. Visible runes are deliberately NOT refused
+		// even though they are escaped too: the operator can see them, and
+		// refusing them would reject a working non-Discord relay URL.
+		return nil, errors.New("contains a space or an invisible character (it is percent-encoded on every request, so the webhook host and path that reach the other end are not the configured ones; remove it, or percent-encode it yourself if it really belongs to the credential)")
 	}
 	return u, nil
 }

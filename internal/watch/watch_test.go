@@ -1090,6 +1090,25 @@ func TestFailedHistoryDeliveryKeepsRecordsAndRetries(t *testing.T) {
 	}
 }
 
+// fillMissingQueue drives missingQueueSize outages that each begin AND end
+// between two sweeps, leaving the beat's pending-missing queue at its bound
+// with already-ended records none of which was delivered. It is the shared
+// precondition of every overflow test: one late ping past the deadline closes
+// one outage and queues one record, so that relationship and the resulting
+// count live here instead of in a copy per test.
+func fillMissingQueue(t *testing.T, w *Watcher, clock *fakeClock, id string) {
+	t.Helper()
+	for range missingQueueSize {
+		clock.Advance(11 * time.Minute)
+		if recorded, _ := w.Beat(id); !recorded {
+			t.Fatalf("Beat(%s) = false", id)
+		}
+	}
+	if got := len(w.beats[id].pendingMissing); got != missingQueueSize {
+		t.Fatalf("queued records = %d, want the full bound %d", got, missingQueueSize)
+	}
+}
+
 // queueOutageNoSweepEverSaw drives one full deadline of silence ended by a late
 // ping, the only producer of a LateEndedBeforeDetection record, and asserts the
 // beat is left holding exactly that. It is the precondition of the two tests
@@ -1241,15 +1260,7 @@ func TestPendingMissingQueueOverflowIsAccountedNotSilent(t *testing.T) {
 
 	// Fill the queue to its bound: every late ping past the deadline
 	// records one whole closed outage, and no sweep runs to drain them.
-	for range missingQueueSize {
-		clock.Advance(11 * time.Minute)
-		if recorded, _ := w.Beat(id); !recorded {
-			t.Fatalf("Beat(%s) = false", id)
-		}
-	}
-	if got := len(w.beats[id].pendingMissing); got != missingQueueSize {
-		t.Fatalf("queued outages = %d, want the full bound %d", got, missingQueueSize)
-	}
+	fillMissingQueue(t, w, clock, id)
 
 	// One more outage, of a distinctive length, overflows the queue. That
 	// outage already ended, so its record was its last trace: no notice for
@@ -1380,12 +1391,7 @@ func TestSweepDetectedCrossingSurvivesAQueueFullOverflow(t *testing.T) {
 	const id = "sweep-overflow-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
-	for range missingQueueSize {
-		clock.Advance(11 * time.Minute)
-		if recorded, _ := w.Beat(id); !recorded {
-			t.Fatalf("Beat(%s) = false", id)
-		}
-	}
+	fillMissingQueue(t, w, clock, id)
 
 	// The beat now goes silent with no ping to end it, so the sweep -- not
 	// Beat -- is the path that detects the crossing while the queue is at
@@ -1445,15 +1451,7 @@ func TestOutageDetectedWhileTheQueueWasFullBlamesDeliveryNotTheSweep(t *testing.
 	w.Beat(id)
 
 	// Fill the queue with outages no sweep ever sees.
-	for range missingQueueSize {
-		clock.Advance(11 * time.Minute)
-		if recorded, _ := w.Beat(id); !recorded {
-			t.Fatalf("Beat(%s) = false", id)
-		}
-	}
-	if got := len(w.beats[id].pendingMissing); got != missingQueueSize {
-		t.Fatalf("queued records = %d, want the full bound %d", got, missingQueueSize)
-	}
+	fillMissingQueue(t, w, clock, id)
 
 	// A new outage begins with the queue full: this sweep detects it and
 	// cannot queue it, then delivers the whole ended run as one notice.

@@ -27,6 +27,47 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// childEnv builds the environment a re-executed knell child runs with: the
+// parent environment, the re-exec marker, and a pinned level -- several cases
+// use an INFO line ("listening") as the no-boot oracle, and an inherited
+// LOG_LEVEL=warn would filter it out whether or not the child booted. Each
+// entry from env is then applied: "KEY=" removes KEY from the child
+// environment entirely (config.Load rejects a PRESENT-but-empty _FILE
+// variable, so blanking one would fail the boot at the blank-_FILE gate
+// instead of the gate under test), anything else overrides the parent's value.
+// A caller's own LOG_LEVEL entry is appended after the pinned one and os/exec
+// keeps the last duplicate, so an explicit per-test level still wins.
+func childEnv(env []string) []string {
+	out := append(os.Environ(), "KNELL_TEST_REEXEC_MAIN=1", "LOG_LEVEL=info")
+	for _, e := range env {
+		if key, val, _ := strings.Cut(e, "="); val == "" {
+			out = slices.DeleteFunc(out, func(entry string) bool {
+				return strings.HasPrefix(entry, key+"=")
+			})
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// bootEnv is one configuration knell boots from, as childEnv entries: the
+// beats spec, the webhook, the listen address, and every secret variable
+// CLEARED. Single home, so a newly required _FILE gate cannot leave one boot
+// test failing at the config gate while its sibling reaches the gate it means
+// to exercise -- the CLI half of main_test.go's installRunEnv.
+func bootEnv(beats, addr string) []string {
+	env := []string{
+		"BEATS=" + beats,
+		"DISCORD_WEBHOOK_URL=" + testWebhookURL,
+		"LISTEN_ADDR=" + addr,
+	}
+	for _, key := range secretEnvKeys {
+		env = append(env, key+"=")
+	}
+	return env
+}
+
 // runMain re-executes this test binary as knell with args and env, returning
 // the child's exit code and its combined output. An env entry "KEY=" removes
 // KEY from the child environment rather than blanking it.
@@ -39,25 +80,7 @@ func runMain(t *testing.T, env []string, args ...string) (int, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	cmd := exec.CommandContext(ctx, os.Args[0], args...)
-	// Pin the level: several cases use an INFO line ("listening") as the
-	// no-boot oracle, and an inherited LOG_LEVEL=warn would filter it out
-	// whether or not the child booted. A caller's own LOG_LEVEL entry is
-	// appended after this one and os/exec keeps the last duplicate, so an
-	// explicit per-test level still wins.
-	cmd.Env = append(os.Environ(), "KNELL_TEST_REEXEC_MAIN=1", "LOG_LEVEL=info")
-	// An entry "KEY=" removes KEY from the child environment entirely:
-	// config.Load rejects a PRESENT-but-empty _FILE variable, so blanking one
-	// would fail the boot at the blank-_FILE gate instead of the gate under
-	// test. Any other entry overrides the parent's value.
-	for _, e := range env {
-		if key, val, _ := strings.Cut(e, "="); val == "" {
-			cmd.Env = slices.DeleteFunc(cmd.Env, func(entry string) bool {
-				return strings.HasPrefix(entry, key+"=")
-			})
-			continue
-		}
-		cmd.Env = append(cmd.Env, e)
-	}
+	cmd.Env = childEnv(env)
 	out, err := cmd.CombinedOutput()
 	var exitErr *exec.ExitError
 	switch {
@@ -131,28 +154,13 @@ func TestSignalledKnellLogsTheCleanStopAsItsLastLineAndExitsZero(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)
 	cmd := exec.CommandContext(ctx, os.Args[0])
-	cmd.Env = append(os.Environ(),
-		"KNELL_TEST_REEXEC_MAIN=1",
-		"BEATS=cli-clean-stop:1m",
-		"DISCORD_WEBHOOK_URL=https://discord.example/api/webhooks/1234567890/verysecrettoken",
-		// Port 0: the child picks its own port, so this test never races
-		// another test for a reserved one.
-		"LISTEN_ADDR=127.0.0.1:0",
-		// The oracle is three INFO lines, and run() applies the parsed LOG_LEVEL
-		// before the listener is bound: an inherited LOG_LEVEL=warn would silence
-		// "listening", "shutting down" and "stopped" alike and report an ambient
-		// environment as a missing clean-stop contract.
-		"LOG_LEVEL=info")
-	// config.Load rejects a PRESENT-but-empty _FILE variable, so a value
-	// inherited from the parent environment must be removed, not blanked.
-	cmd.Env = slices.DeleteFunc(cmd.Env, func(entry string) bool {
-		for _, unset := range []string{"DISCORD_WEBHOOK_URL_FILE=", "BEAT_TOKEN=", "BEAT_TOKEN_FILE="} {
-			if strings.HasPrefix(entry, unset) {
-				return true
-			}
-		}
-		return false
-	})
+	// Port 0: the child picks its own port, so this test never races another
+	// test for a reserved one. childEnv pins LOG_LEVEL=info, which this test's
+	// oracle needs: run() applies the parsed level before the listener is bound,
+	// so an inherited LOG_LEVEL=warn would silence "listening", "shutting down"
+	// and "stopped" alike and report an ambient environment as a missing
+	// clean-stop contract.
+	cmd.Env = childEnv(bootEnv("cli-clean-stop:1m", "127.0.0.1:0"))
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		t.Fatalf("stderr pipe: %v", err)
@@ -199,7 +207,7 @@ func TestSignalledKnellLogsTheCleanStopAsItsLastLineAndExitsZero(t *testing.T) {
 func TestRejectedConfigExitsOneWithoutLeakingTheWebhook(t *testing.T) {
 	code, out := runMain(t, []string{
 		"BEATS=api:20m",
-		"DISCORD_WEBHOOK_URL=http://discord.example/api/webhooks/1234567890/verysecrettoken",
+		"DISCORD_WEBHOOK_URL=" + testPlainHTTPWebhookURL,
 		"DISCORD_WEBHOOK_URL_FILE=",
 		"BEAT_TOKEN=",
 		"BEAT_TOKEN_FILE=",
@@ -213,7 +221,7 @@ func TestRejectedConfigExitsOneWithoutLeakingTheWebhook(t *testing.T) {
 	if !strings.Contains(out, "scheme must be https") {
 		t.Errorf("output = %q, want the https-only webhook gate to be the rejection", out)
 	}
-	if strings.Contains(out, "verysecrettoken") {
+	if strings.Contains(out, testWebhookSecret) {
 		t.Errorf("the boot-failure output leaks the webhook URL: %s", out)
 	}
 }

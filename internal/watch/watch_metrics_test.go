@@ -302,12 +302,7 @@ func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
 	const id = "missing-overflow-log-probe"
 	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
-	for range missingQueueSize {
-		clock.Advance(11 * time.Minute)
-		if recorded, _ := w.Beat(id); !recorded {
-			t.Fatalf("Beat(%s) = false", id)
-		}
-	}
+	fillMissingQueue(t, w, clock, id)
 
 	rec := capture.Default(t)
 	clock.Advance(47 * time.Minute)
@@ -345,12 +340,7 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	const id = "missing-overflow-cadence-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
-	for range missingQueueSize {
-		clock.Advance(11 * time.Minute)
-		if recorded, _ := w.Beat(id); !recorded {
-			t.Fatalf("Beat(%s) = false", id)
-		}
-	}
+	fillMissingQueue(t, w, clock, id)
 
 	// The webhook is down, so nothing drains and the beat's current outage
 	// cannot be queued: three sweeps re-detect that one ongoing outage,
@@ -839,15 +829,7 @@ func TestLogUndeliveredCountsAnUnqueuedOngoingOutage(t *testing.T) {
 	// Fill the queue with missingQueueSize already-ended records: each late
 	// ping closes an outage and queues its record, none are delivered.
 	n.setFail(context.Canceled)
-	for range missingQueueSize {
-		clock.Advance(11 * time.Minute)
-		if recorded, _ := w.Beat(id); !recorded {
-			t.Fatalf("Beat(%s) = false", id)
-		}
-	}
-	if got := len(w.beats[id].pendingMissing); got != missingQueueSize {
-		t.Fatalf("queued records = %d, want %d (the test's own precondition)", got, missingQueueSize)
-	}
+	fillMissingQueue(t, w, clock, id)
 
 	// A further silence is detected by the sweep with no slot free: the
 	// outage lives in overflowAccounted only.

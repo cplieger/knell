@@ -605,8 +605,14 @@ func TestLoadRejectsUnreadableBeatTokenFile(t *testing.T) {
 	if err == nil {
 		t.Fatal("Load() with unreadable BEAT_TOKEN_FILE = nil, want error (the secret file must not silently fall back to the environment value, which would arm the gate with the wrong token)")
 	}
+	if !strings.Contains(err.Error(), "could not be read (open failed)") {
+		t.Errorf("error = %q, want the read-failure diagnosis naming the failed operation: envx embeds the path in its os.PathError and this sanitizer replaces it, so the operation plus the OS reason is all the operator has left to tell a missing mount from a permission problem", err)
+	}
 	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
 		t.Errorf("error = %q, want BEAT_TOKEN context", err)
+	}
+	if strings.Contains(err.Error(), missing) {
+		t.Errorf("error = %q embeds the BEAT_TOKEN_FILE value; os.PathError carries it and the sanitizer must drop it, because that value is the bearer token itself whenever the operator pasted the credential into the file variable", err)
 	}
 	if strings.Contains(err.Error(), "env-fallback-token") {
 		t.Errorf("error leaks the fallback token value: %v", err)
@@ -628,8 +634,14 @@ func TestLoadRejectsEmptyBeatTokenFile(t *testing.T) {
 	if err == nil {
 		t.Fatal("Load() with an empty BEAT_TOKEN_FILE = nil, want error (an empty secret file is a broken mount, not an open endpoint)")
 	}
+	if !strings.Contains(err.Error(), "blank secret file") {
+		t.Errorf("error = %q, want the blank-secret-file diagnosis: the three secretFileError classes exist so the operator is told WHICH failure happened, and the generic fallback sends someone whose mount produced an empty file to check the path instead of the content", err)
+	}
 	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
 		t.Errorf("error = %q, want BEAT_TOKEN context", err)
+	}
+	if strings.Contains(err.Error(), tokenFile) {
+		t.Errorf("error = %q embeds the BEAT_TOKEN_FILE value; envx names the path in its own blank-file error, and this sanitizer exists to drop it because that value is the credential itself whenever the operator pasted the secret into the file variable", err)
 	}
 	if strings.Contains(err.Error(), "env-fallback-token") {
 		t.Errorf("error leaks the fallback token value: %v", err)
@@ -816,6 +828,44 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 // beat crossed its deadline and posted a false MISSING notice. The padding is
 // refused instead, so the configured value and the verified value are the same
 // string or knell does not start.
+// TestLoadWarnsWhenBeatTokenCarriesAnInvisibleEdgeCharacter pins the diagnostic
+// for the one unpresentable-in-practice token shape this package accepts. ASCII
+// edge padding is refused, and an all-invisible token draws the
+// mistake-for-absent warning, but a REAL token carrying a non-ASCII space at an
+// edge (an NBSP pasted along with the value out of a rendered page) is
+// presentable, so the gate arms for a string one character longer than the one
+// the operator reads: every sender presenting the visible token gets 401, and
+// one deadline later every configured beat posts a false MISSING notice. Without
+// this warning that configuration starts, reports itself gated, and says
+// nothing.
+func TestLoadWarnsWhenBeatTokenCarriesAnInvisibleEdgeCharacter(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	const token = "\u00a0unit-test-beat-token"
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", token)
+	unsetEnv(t, "BEAT_TOKEN_FILE")
+
+	rec := capture.Default(t)
+
+	cfg, err := Load(maxNodeNameBytes)
+	if err != nil {
+		t.Fatalf("Load() with an NBSP-prefixed BEAT_TOKEN = %v, want accepted: textproto carries a non-ASCII space, so the token is presentable and the gate must stay armed", err)
+	}
+	if cfg.BeatToken != token {
+		t.Errorf("BeatToken = %q, want the configured value verbatim", cfg.BeatToken)
+	}
+	if !rec.Contains("invisible but part of the credential") {
+		t.Errorf("log output %v never says the armed token carries an invisible edge character; the operator reads a visible token, configures senders with it, and every ping 401s until every beat goes falsely missing", rec.Messages())
+	}
+	if rec.Contains("mistake for absent") {
+		t.Errorf("log output %v used the all-invisible wording for a token that has visible content: %q", rec.Messages(), token)
+	}
+	if rec.Contains("unit-test-beat-token") || rec.AttrContains("", "", "unit-test-beat-token") {
+		t.Errorf("log output leaks the token value: %v", rec.Messages())
+	}
+}
+
 func TestLoadRejectsASCIIPaddingAroundANonASCIISpaceBeatToken(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", " \u00a0 ")
@@ -1325,6 +1375,12 @@ func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
 		// "relax the path check, the query has the token" change has to argue
 		// with a test instead of a silent guard.
 		"query-only credential": {raw: "https://relay.example?token=abc", wantErr: "missing path"},
+		// The same defect class as the interior space above, one the ASCII-only
+		// check missed: url.Parse accepts a non-ASCII space or a zero-width
+		// rune and percent-encodes it on every request, in the host as well as
+		// the path, so startup succeeds and no notice can ever be delivered.
+		"non-breaking space in path": {raw: "https://discord.example/api/webhooks/1/ab\u00a0c", wantErr: "invisible character"},
+		"zero-width space in host":   {raw: "https://discord.\u200bexample/api/webhooks/1/abc", wantErr: "invisible character"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {

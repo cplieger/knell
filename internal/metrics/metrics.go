@@ -285,33 +285,34 @@ func Handler() http.Handler {
 	return registry.Handler()
 }
 
-// InitBeat declares a configured beat at process start: the beat begins fresh
-// with start as its last-seen baseline (the boot-armed clock every first
-// deadline counts from), and its per-beat counters are pre-minted at zero for
-// the same reason mintNotificationKinds pre-mints the notification counters —
-// increase() needs an earlier sample to diff against. deadline is published as
+// InitBeat declares a configured beat at process start with start as its
+// last-seen baseline (the boot-armed clock every first deadline counts from),
+// and pre-mints its per-beat counters at zero for the same reason
+// mintNotificationKinds pre-mints the notification counters — increase() needs
+// an earlier sample to diff against. deadline is published as
 // beat_deadline_seconds, the one per-beat series that is configuration rather
 // than state: this is the only place it is written, and it is what lets an
 // operator compute when a beat goes overdue (last-seen plus the deadline) and
-// see whether the observers one quorum rule aggregates agree on it. Only
-// configured ids reach here, which is what keeps the beat label bounded (see
-// the package doc's label-cardinality contract).
+// see whether the observers one quorum rule aggregates agree on it. The
+// beat's freshness verdict is NOT published here: the caller publishes it
+// through SetBeatFresh, the single door for that gauge. Only configured ids
+// reach here, which is what keeps the beat label bounded (see the package
+// doc's label-cardinality contract).
 func InitBeat(id string, deadline time.Duration, start time.Time) {
 	beatDeadline.Set(deadline.Seconds(), id)
-	beatFresh.Set(1, id)
 	beatLastSeen.Set(float64(start.Unix()), id)
 	beatsReceived.Add(0, id)
 	beatOutages.Add(0, id)
 }
 
 // RecordBeat records an accepted ping for id observed at now: the ping is
-// counted and the beat is published fresh with its new last-seen timestamp.
+// counted and its new last-seen timestamp published. The resulting freshness
+// verdict goes through SetBeatFresh, so this never decides freshness itself.
 // The caller publishes under its own lock so concurrent pings cannot write
 // the gauges out of state order. id is a label: see the package doc's
 // label-cardinality contract.
 func RecordBeat(id string, now time.Time) {
 	beatsReceived.Inc(id)
-	beatFresh.Set(1, id)
 	beatLastSeen.Set(float64(now.Unix()), id)
 }
 
@@ -342,9 +343,15 @@ func RecordOutage(id string) {
 // see the package doc's RecordHTTP contract. Its only production caller is
 // webhttp's WithRecordRouteMetric hook, wired in internal/webapi.New: the
 // library derives the pair (webhttp.RouteMetricLabels) and calls this function
-// with it. Unlike the beat counters this series is not pre-minted:
-// an HTTP counter has no known-in-advance status set, so alerts on it should
-// sum over the label set rather than select a single status.
+// with it. Unlike the beat counters this series is not pre-minted: an HTTP
+// counter has no known-in-advance status set, so a refusal series (401 after a
+// token rotation, 404 for a misspelled id) is BORN with the first refused ping.
+// increase() cannot see that birth — a series whose first sample is already 1
+// has no earlier sample to diff against, so a lone refusal never satisfies
+// increase(...) > 0. Alert on the ABSOLUTE value instead
+// (knell_http_requests_total{status="401"} > 0, which simply does not fire
+// while the series is absent); increase() is only meaningful on a status that
+// is already being served.
 func RecordHTTP(method, path string, status int, d time.Duration) {
 	metricslib.RecordHTTP(httpRequests, httpDuration, d, method, path, strconv.Itoa(status))
 }

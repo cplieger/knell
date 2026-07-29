@@ -61,7 +61,7 @@ func checkMissingQueueInvariants(t *testing.T, w *Watcher, id string, deadline t
 func checkSwitchStaysArmed(t *testing.T, w *Watcher, id string, now time.Time, ops string) {
 	t.Helper()
 	st := w.beats[id]
-	if !overdue(now.Sub(st.lastSeen), st.deadline) || st.recovering {
+	if !overdue(now.Sub(st.lastSeen), st.deadline) {
 		return
 	}
 	if st.alerted || st.openMissing() != nil || st.overflowAccounted {
@@ -129,6 +129,13 @@ func FuzzMissingQueue(f *testing.F) {
 	f.Add(strings.Repeat("Ap", missingQueueSize+2))
 	// The same, then drained in a single sweep and re-armed.
 	f.Add(strings.Repeat("Ap", missingQueueSize+2) + "ssAs")
+	// A crossing detected while an earlier recovery is still queued, then
+	// drained by the Run loop, interleaved with silences that stay inside the
+	// deadline: the recovering window and the partial-silence op are the two
+	// the corpus above never reaches, and the weekly runner discards whatever
+	// it explores, so only a committed seed covers them on every PR.
+	f.Add("pAspAsrsaspAs")
+	f.Add("pAsparAsrpaAsr")
 	f.Fuzz(func(t *testing.T, ops string) {
 		const (
 			id       = "fuzz-queue-probe"

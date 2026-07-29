@@ -154,6 +154,7 @@ func run() error {
 	handler := webapi.New(ctx, watcher, cfg.BeatToken, webapi.Routes{
 		Healthz: health.Handler(marker),
 		Metrics: metrics.Handler(),
+		Hosts:   cfg.AllowedHosts,
 	})
 	srv := webhttp.NewServer(handler,
 		webhttp.WithReadTimeout(requestTimeout),

@@ -42,6 +42,22 @@ func FuzzParseBeats(f *testing.F) {
 		if len(beats) == 0 || len(beats) > 64 {
 			t.Fatalf("accepted result has %d beats, want 1..64 (the documented cap)", len(beats))
 		}
+		// Completeness: an accepted BEATS spec must yield one watched beat per
+		// non-blank entry. Every other invariant here constrains the beats that
+		// come BACK, so a parser that silently discarded an entry would satisfy
+		// them all while leaving that sender unwatched for good - no state, no
+		// metric series, no deadline, and no notice however long it stays
+		// silent. That is the one failure a dead-man switch cannot report on
+		// itself.
+		configured := 0
+		for entry := range strings.SplitSeq(raw, ",") {
+			if strings.TrimSpace(entry) != "" {
+				configured++
+			}
+		}
+		if len(beats) != configured {
+			t.Fatalf("accepted %d beats for %d non-blank entries in %q: an entry that parses but is not returned is a sender nobody watches", len(beats), configured, raw)
+		}
 		seen := make(map[string]struct{}, len(beats))
 		for _, b := range beats {
 			if len(b.ID) == 0 || len(b.ID) > 64 {
@@ -64,6 +80,9 @@ func FuzzParseBeats(f *testing.F) {
 				t.Fatalf("accepted duplicate id %q (duplicate ids collapse two beats onto one metric series)", b.ID)
 			}
 			seen[b.ID] = struct{}{}
+			if !strings.Contains(raw, b.ID) {
+				t.Fatalf("accepted id %q does not appear in the spec %q: an id the parser invented is a beat no sender can ping, so its first sweep declares a phantom outage", b.ID, raw)
+			}
 		}
 	})
 }

@@ -168,6 +168,15 @@ func (o Outage) DownFor() time.Duration {
 	return Transition{Started: o.Started, Observed: o.Recovered}.DownFor()
 }
 
+// Ended reports whether the outage carries a usable recovery point: one that
+// is set and no earlier than Started. It is the executable form of the
+// invariant the Recovered field documents, and it lives here, next to the
+// type, so a renderer that refuses an unfinished record and the state machine
+// that builds them agree by construction rather than by comment.
+func (o Outage) Ended() bool {
+	return !o.Recovered.IsZero() && !o.Recovered.Before(o.Started)
+}
+
 // LongestOutage returns the longest span among outages, or zero for an empty
 // slice. It lives here, next to the type, so the notifier's summary and the
 // sender's log line report the same figure by construction.
@@ -415,7 +424,8 @@ func (st *beatState) recordEndedOutage(rec *overdueBeat) {
 	metrics.RecordNotificationDropped(metrics.KindMissing)
 	slog.Warn("pending missing queue full, ended outage dropped, its notification will never be delivered",
 		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.DownFor().String(),
-		"since", rec.silence.Started, "recovered", rec.recoveredAt)
+		"since", rec.silence.Started.UTC().Format(time.RFC3339),
+		"recovered", rec.recoveredAt.UTC().Format(time.RFC3339))
 }
 
 // recordOngoingOutage queues the missing transition of an outage that is still
@@ -437,7 +447,7 @@ func (st *beatState) recordOngoingOutage(rec *overdueBeat) {
 	st.overflowAccounted = true
 	slog.Debug("pending missing queue full, ongoing outage stays detected and is queued once a slot frees",
 		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.DownFor().String(),
-		"since", rec.silence.Started)
+		"since", rec.silence.Started.UTC().Format(time.RFC3339))
 }
 
 // lateReasonForUnqueuedOutage names why the notice for an outage that has NO
@@ -500,10 +510,14 @@ func New(beats []Beat, notifier Notifier, now func() time.Time, start time.Time)
 	}
 	for _, b := range beats {
 		w.beats[b.ID] = &beatState{lastSeen: start, deadline: b.Deadline}
-		// InitBeat publishes the beat's boot-armed baseline (fresh from
-		// start) and pre-mints its per-beat counters at zero, so increase()
-		// has an earlier sample from a cold start.
+		// InitBeat publishes the beat's boot-armed baseline (start as
+		// last-seen) and pre-mints its per-beat counters at zero, so
+		// increase() has an earlier sample from a cold start.
 		metrics.InitBeat(b.ID, b.Deadline, start)
+		// The boot-armed clock's own claim: a beat that has never pinged is
+		// fresh until its first deadline passes. It goes through the same
+		// door as every later verdict, so overdue stays its only source.
+		publishFreshness(b.ID, 0, b.Deadline)
 	}
 	return w
 }
@@ -576,6 +590,7 @@ func (w *Watcher) Beat(id string) (recorded, accepting bool) {
 	// Publish the gauges under the lock so concurrent pings cannot write
 	// them out of state order (an older timestamp overwriting a newer one).
 	metrics.RecordBeat(id, now)
+	publishFreshness(id, 0, st.deadline)
 	// Queue the recovered transition INSIDE the critical section that mutated
 	// the beat: admission closed under this same mutex, so a ping that got
 	// here is wholly visible to the shutdown tally. Enqueueing after the
@@ -800,9 +815,10 @@ func overdue(silence, deadline time.Duration) bool {
 
 // publishFreshness publishes the freshness gauge for id given its observed
 // silence and deadline, reporting whether the beat is still fresh. It is the
-// single home of the gauge mapping shared by sweep and refreshFreshness, and
-// it reads the boundary from overdue, so the quorum ground truth cannot drift
-// between the two writers. Callers hold w.mu.
+// ONLY writer of that gauge (New, Beat, refreshFreshness and collectBeatDue
+// all publish through it), and it reads the boundary from overdue, so the
+// quorum ground truth cannot drift between the paths that publish it. Callers
+// hold w.mu, except New, which publishes before the Watcher is shared.
 func publishFreshness(id string, silence, deadline time.Duration) bool {
 	fresh := !overdue(silence, deadline)
 	metrics.SetBeatFresh(id, fresh)
@@ -836,6 +852,7 @@ func (w *Watcher) sweep(ctx context.Context) {
 		// yields at most one notice per beat), so the whole remainder of both
 		// orderings is what a cut here defers.
 		if w.budgetSpent(budget, len(history)-i+len(live)) {
+			w.blameDeferredHistory(history[i:])
 			return
 		}
 		if w.sendHistory(ctx, past) {
@@ -1060,6 +1077,26 @@ func (w *Watcher) markHistoryUndelivered(id string, n int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.beats[id].blameDelivery(n)
+}
+
+// blameDeferredHistory blames delivery for the records of every history notice
+// this sweep's send budget cut deferred (see beatState.blameDelivery). The
+// budget only bites once sends are slow enough to spend 5s, so a notice it
+// defers IS late because delivery is behind: a record still claiming
+// LateEndedBeforeDetection would tell the operator "nothing was wrong with
+// delivery" about a notice a struggling webhook pushed to a later sweep. Each
+// entry's outage count is exactly the run collectDue took from that beat's
+// head, for the reason dropDelivered gives.
+//
+// Cancellation is deliberately NOT routed here (sendHistory returns before the
+// next budget check): a shutdown is not delivery falling behind, and those
+// records die with the process anyway.
+func (w *Watcher) blameDeferredHistory(deferred []beatOutages) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, past := range deferred {
+		w.beats[past.id].blameDelivery(len(past.outages))
+	}
 }
 
 // markDelivered records the outcome of a delivered missing send for id, given

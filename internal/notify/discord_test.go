@@ -1246,6 +1246,13 @@ func TestReadFailureIsClassifiedStructurally(t *testing.T) {
 			in:   fmt.Errorf("reading body: %w", context.DeadlineExceeded),
 			want: "the attempt deadline expired mid-body",
 		},
+		// Shutdown, not a fault on the path to Discord: the attempt context
+		// governs the body read too, so a canceled sweep surfaces here and
+		// must not read as a broken connection.
+		"canceled sweep": {
+			in:   fmt.Errorf("reading rejected response body: %w", context.Canceled),
+			want: "delivery was canceled before the body was complete",
+		},
 		"connection reset": {
 			in:   fmt.Errorf("reading body: %w", &net.OpError{Op: "read", Err: syscall.ECONNRESET}),
 			want: "the connection was reset",
@@ -1505,6 +1512,64 @@ func TestRateLimitRetriesAfterRetryAfter(t *testing.T) {
 	}
 }
 
+func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
+	t.Parallel()
+
+	// A 429's Retry-After is the OTHER end's number, and honoring it verbatim
+	// parks the sweep's single sender goroutine for as long as it says: no
+	// beat's notice is delivered during that window while /healthz stays
+	// green. httpx waits min(Retry-After, ceiling), so the ceiling knell hands
+	// WithRateLimitRetry is the whole bound. Nothing else pins it:
+	// TestRateLimitRetriesAfterRetryAfter asserts a >= 1s LOWER bound against
+	// a Retry-After of 1, which a ceiling of 30s, of 30 minutes, or of 0
+	// (httpx's own 60s fallback) all satisfy identically.
+	var attempts atomic.Int64
+	d := New("https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
+	t.Cleanup(d.Close)
+	// Shorten only this notifier's ceiling: the branch under test cares that
+	// knell's own ceiling bounds the wait, not how long the production one is.
+	const ceiling = 50 * time.Millisecond
+	d.rateLimitMaxWait = ceiling
+	d.client.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		attempts.Add(1)
+		if _, copyErr := io.Copy(io.Discard, r.Body); copyErr != nil {
+			t.Errorf("reading request body: %v", copyErr)
+		}
+		header := make(http.Header)
+		// An hour: the shape a global rate limit or an edge in front of the
+		// webhook answers with, and far past any wait this app can afford.
+		header.Set("Retry-After", "3600")
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header:     header,
+			Body:       http.NoBody,
+			Request:    r,
+		}, nil
+	})
+
+	// The caller's budget is bounded so an UNCAPPED wait fails this test in
+	// seconds instead of hanging the package for the hour the response asked
+	// for: httpx observes the dead context before its next retry, so the
+	// attempt count below is what reports the regression.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := d.post(ctx, "missing probe", "body")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("post() against a permanent 429 = nil, want error")
+	}
+	if got := attempts.Load(); got != int64(maxAttempts) {
+		t.Errorf("delivery attempts = %d, want %d: every rate-limited attempt must be spent within the caller's budget, which only knell's own ceiling on the wait guarantees", got, maxAttempts)
+	}
+	// The ceiling was the wait, and it was actually waited: a ceiling silently
+	// reduced to zero would spend the attempts with no back-pressure at all.
+	if elapsed < 2*ceiling {
+		t.Errorf("delivery took %s, want at least %s (one ceiling-long wait before each of the %d retries)", elapsed, 2*ceiling, maxAttempts-1)
+	}
+}
+
 func TestRequestBuildErrorNeverLeaksWebhookURL(t *testing.T) {
 	t.Parallel()
 
@@ -1737,6 +1802,9 @@ func TestSameHostRedirectIsFollowedAndDelivers(t *testing.T) {
 		finishHits.Add(1)
 		if r.Method != http.MethodPost {
 			t.Errorf("followed hop method = %s, want POST (body must survive the hop)", r.Method)
+		}
+		if ref := r.Header.Get("Referer"); ref != "" {
+			t.Errorf("followed hop Referer = %q, want none: net/http writes the previous request's full URL there, and for a webhook that path IS the credential", ref)
 		}
 		// io.ReadAll, not a single Read: one Read may return a short prefix of
 		// the replayed body and the payload assertion below would flake.

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -19,6 +20,10 @@ func FuzzParseWebhookURL(f *testing.F) {
 	f.Add("https://host/secret\x00token")
 	f.Add("credentialmaterial:rest")
 	f.Add("https://:443/api/webhooks/1/abc")
+	f.Add("https://discord.com")
+	f.Add("https://discord.com/")
+	f.Add("https://discord.com?token=abc")
+	f.Add("https://discord.com/api/webhooks/1/ab c")
 	f.Fuzz(func(t *testing.T, raw string) {
 		u, err := parseWebhookURL(raw)
 		if err == nil {
@@ -30,6 +35,20 @@ func FuzzParseWebhookURL(f *testing.F) {
 				// (":443") has a NON-EMPTY Host, so a Host-based assertion
 				// cannot catch a revert of parseWebhookURL's own gate.
 				t.Fatal("accepted URL without a hostname")
+			}
+			// DELIVERABILITY, not just transportability: the two remaining gates
+			// are the ones whose failure is invisible until an outage. A path-less
+			// URL posts every notice to the origin's root, and a space is
+			// percent-encoded on the wire, so the path that reaches Discord is not
+			// the configured one - in both cases startup succeeds, /healthz reports
+			// ready, and the bell never rings. Asserting them on the ACCEPTED side
+			// is what makes dropping either guard fail here as well as in the
+			// hand-written table.
+			if u.Path == "" || u.Path == "/" {
+				t.Fatalf("accepted a URL whose path is %q: the webhook path IS the Discord credential, so this URL delivers nothing", u.Path)
+			}
+			if strings.ContainsRune(raw, ' ') {
+				t.Fatal("accepted a URL containing a space: it is percent-encoded on every request, so the path that reaches the other end is not the configured one")
 			}
 			return
 		}
@@ -44,7 +63,7 @@ func FuzzParseWebhookURL(f *testing.F) {
 			"scheme must be https (the webhook URL's own path is the credential, so plain http would send it in cleartext)",
 			"missing host",
 			"missing path (the webhook URL's own path carries the credential, so a host-only URL cannot deliver a notification)",
-			"contains a space (a space is percent-encoded on every request, so the webhook path that reaches the other end is not the configured one)":
+			"contains a space or an invisible character (it is percent-encoded on every request, so the webhook host and path that reach the other end are not the configured ones; remove it, or percent-encode it yourself if it really belongs to the credential)":
 		default:
 			t.Fatalf("unexpected rejection message %q: a new message must be a fixed constant that cannot embed the operator-supplied URL", err)
 		}

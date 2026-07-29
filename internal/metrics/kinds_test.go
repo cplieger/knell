@@ -93,7 +93,11 @@ func collectKindDecls(t *testing.T, declared map[string]string, decls []ast.Decl
 	}
 }
 
-// collectKindSpecs narrows a const block's specs to those explicitly typed Kind.
+// collectKindSpecs narrows a const block's specs to those declaring a Kind, in
+// either shape Go allows: an explicitly typed `Name Kind = "x"`, or an untyped
+// `Name = Kind("x")` conversion. Both mint a Kind constant this contract
+// covers, so recognizing only the typed shape would let a kind declared the
+// other way pass unnoticed with its three counters never pre-minted.
 func collectKindSpecs(t *testing.T, declared map[string]string, specs []ast.Spec) {
 	t.Helper()
 	for _, spec := range specs {
@@ -101,10 +105,11 @@ func collectKindSpecs(t *testing.T, declared map[string]string, specs []ast.Spec
 		if !ok {
 			continue
 		}
-		ident, ok := value.Type.(*ast.Ident)
-		if ok && ident.Name == "Kind" {
+		if ident, typed := value.Type.(*ast.Ident); typed && ident.Name == "Kind" {
 			collectKindValues(t, declared, value)
+			continue
 		}
+		collectKindConversions(t, declared, value)
 	}
 }
 
@@ -117,16 +122,58 @@ func collectKindValues(t *testing.T, declared map[string]string, value *ast.Valu
 			t.Errorf("Kind constant %s has no explicit value, so this test cannot verify it is pre-minted", name.Name)
 			continue
 		}
-		lit, ok := value.Values[i].(*ast.BasicLit)
-		if !ok || lit.Kind != token.STRING {
-			t.Errorf("Kind constant %s is not a string literal, so this test cannot verify it is pre-minted", name.Name)
-			continue
+		if unquoted, ok := kindLiteralValue(t, name.Name, value.Values[i]); ok {
+			declared[name.Name] = unquoted
 		}
-		unquoted, unquoteErr := strconv.Unquote(lit.Value)
-		if unquoteErr != nil {
-			t.Errorf("Kind constant %s value %s: %v", name.Name, lit.Value, unquoteErr)
-			continue
-		}
-		declared[name.Name] = unquoted
 	}
+}
+
+// kindLiteralValue decodes a kind's string-literal value, failing the test for
+// any value shape this contract cannot verify.
+func kindLiteralValue(t *testing.T, name string, expr ast.Expr) (string, bool) {
+	t.Helper()
+	lit, ok := expr.(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		t.Errorf("Kind constant %s is not a string literal, so this test cannot verify it is pre-minted", name)
+		return "", false
+	}
+	unquoted, err := strconv.Unquote(lit.Value)
+	if err != nil {
+		t.Errorf("Kind constant %s value %s: %v", name, lit.Value, err)
+		return "", false
+	}
+	return unquoted, true
+}
+
+// collectKindConversions decodes the other legal shape of a kind declaration:
+// an untyped const whose value is a Kind("...") conversion. Without it such a
+// kind is invisible to this contract, so its sent/failed/dropped series are
+// never pre-minted and the test written to catch exactly that passes anyway.
+func collectKindConversions(t *testing.T, declared map[string]string, value *ast.ValueSpec) {
+	t.Helper()
+	for i, name := range value.Names {
+		if i >= len(value.Values) {
+			continue
+		}
+		inner, ok := kindConversionArg(value.Values[i])
+		if !ok {
+			continue
+		}
+		if unquoted, ok := kindLiteralValue(t, name.Name, inner); ok {
+			declared[name.Name] = unquoted
+		}
+	}
+}
+
+// kindConversionArg returns the argument of a Kind("...") conversion.
+func kindConversionArg(expr ast.Expr) (ast.Expr, bool) {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return nil, false
+	}
+	fn, ok := call.Fun.(*ast.Ident)
+	if !ok || fn.Name != "Kind" {
+		return nil, false
+	}
+	return call.Args[0], true
 }
