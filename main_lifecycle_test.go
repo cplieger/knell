@@ -151,7 +151,10 @@ func (r *lifecycleRun) waitForReturn(t *testing.T, timeout time.Duration, after 
 
 // startHeldBeatRequest opens a beat request against a serving knell and stops
 // with the handler already inside the body read, leaving the request in flight
-// for the caller to complete or abandon. The Expect: 100-continue exchange is
+// for the caller to complete or abandon. It presents the required credential:
+// the gate runs before the body is touched, so an unauthenticated request would
+// answer 401 and never reach the handler this helper exists to hold open. The
+// Expect: 100-continue exchange is
 // the oracle: net/http emits the interim response on the first Read of the
 // body, so receiving it proves the request was accepted AND the handler
 // entered, without sending any body bytes. The returned reader holds whatever
@@ -166,6 +169,7 @@ func startHeldBeatRequest(t *testing.T, addr, beat string, contentLength int) (n
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	headers := "POST /beat/" + beat + " HTTP/1.1\r\nHost: " + addr +
+		"\r\nAuthorization: Bearer " + testBeatToken +
 		"\r\nContent-Length: " + strconv.Itoa(contentLength) + "\r\nExpect: 100-continue\r\n\r\n"
 	if _, err := io.WriteString(conn, headers); err != nil {
 		t.Fatalf("start slow beat request: %v", err)
@@ -464,10 +468,11 @@ func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
 // TestRunGatesTheBeatEndpointWithTheConfiguredToken pins the one half of the
 // beat-token gate main owns: the wiring of cfg.BeatToken into webapi.New. The
 // webapi tests receive the token as an argument, so they cannot catch a
-// composition root that passes "" (or the wrong field): the endpoint would be
-// open to anyone who can reach the port while the operator's BEAT_TOKEN
-// suggests it is gated, and every existing lifecycle test boots WITHOUT a token
-// so an ungated boot looks identical to them.
+// composition root that passes the wrong field — the gate would then refuse the
+// operator's real senders while admitting whatever value was wired instead, and
+// one deadline later every configured beat would post a false MISSING notice.
+// This test pins the whole verdict set against the value the environment
+// actually carried: refused unauthenticated, refused wrong, admitted correct.
 func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal, and the shared health-marker path.
@@ -475,10 +480,12 @@ func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 	// A beat id no other test in this package pings, since the metrics
 	// registry is a package-level singleton shared by the whole test binary.
 	const beat = "token-gate"
-	const token = "unit-test-beat-token"
+	// A token no other boot in this package uses, so the gate cannot pass by
+	// admitting the value installRunEnv installs for every other test.
+	const token = "lifecycle-token-gate-token"
 	addr := prepareLifecycleRun(t, beat)
-	// After prepareLifecycleRun, which clears BEAT_TOKEN: this is the variable
-	// under test.
+	// prepareLifecycleRun installs the shared testBeatToken; this overrides it
+	// with the value under test.
 	t.Setenv("BEAT_TOKEN", token)
 
 	r := startLifecycleRun(t)

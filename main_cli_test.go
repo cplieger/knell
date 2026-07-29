@@ -66,6 +66,10 @@ func bootEnv(beats, addr string) []string {
 	for _, key := range secretEnvKeys {
 		env = append(env, key+"=")
 	}
+	// After the clearing sweep, because BEAT_TOKEN is in it: the token is
+	// REQUIRED, so a child that cleared it exits at the configuration gate
+	// instead of booting.
+	env = append(env, "BEAT_TOKEN="+testBeatToken)
 	return env
 }
 

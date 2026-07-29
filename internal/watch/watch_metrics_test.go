@@ -358,20 +358,13 @@ func TestQueueFullDropKeepsTimestampAttrsTyped(t *testing.T) {
 	rec := capture.Default(t)
 	w.Beat(id)
 
-	got := make(map[string]slog.Value, 2)
-	for _, record := range rec.Records() {
-		if !strings.HasPrefix(record.Message, "pending missing queue full") {
-			continue
-		}
-		record.Attrs(func(attr slog.Attr) bool {
-			if attr.Key == "since" || attr.Key == "recovered" {
-				got[attr.Key] = attr.Value
-			}
-			return true
-		})
-	}
 	for key, want := range map[string]time.Time{"since": wantSince, "recovered": wantRecovered} {
-		value, ok := got[key]
+		// capture.Recorder.Attr is the typed member of the attr-assertion
+		// family: it hands back the slog.Value itself, so the KIND stays
+		// assertable. The rendered accessors (AttrValue/HasAttr) cannot express
+		// this contract at all — slog.Time("since", t) and
+		// slog.String("since", t.String()) render identically.
+		value, ok := rec.Attr("pending missing queue full", key)
 		if !ok {
 			t.Errorf("queue-full warning has no %s attribute: %v", key, rec.Records())
 			continue

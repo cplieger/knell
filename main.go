@@ -163,13 +163,14 @@ func run() error {
 		// budget that stops every beat from being received -- default to the
 		// standard logger, i.e. an unstructured, level-less line in an
 		// otherwise structured stderr stream. Level-based Loki rules cannot
-		// match it.
-		webhttp.WithErrorLog(slog.NewLogLogger(slog.Default().Handler(), slog.LevelError)))
+		// match it. ERROR because knell's only job is answering pings: an
+		// accept failure is a whole-service outage here, not a degradation.
+		webhttp.WithSlogErrorLog(slog.LevelError))
 
 	// Bind up front so a port-in-use error surfaces synchronously.
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ListenAddr)
 	if err != nil {
-		return classifyBindError(ctx.Err(), cfg.ListenAddr, err)
+		return classifyBindError(ctx, cfg.ListenAddr, err)
 	}
 	slog.Info("listening", "addr", ln.Addr().String())
 	marker.Set(true)
@@ -242,11 +243,15 @@ func teardownAfterServeExit(exitCtx context.Context, marker *health.Marker, stop
 // A signal that arrives before the bind cancels the Listen itself, so that
 // error IS the shutdown, not a port conflict: report the stop and return nil
 // (run's contract for a clean signal-driven shutdown) instead of an ERROR line
-// naming an address that was never the problem. ctxErr is the app context's
-// error at the moment of the failure, so a nil ctxErr means the bind itself
-// failed and the caller must see it.
-func classifyBindError(ctxErr error, addr string, err error) error {
-	if ctxErr != nil {
+// naming an address that was never the problem.
+//
+// webhttp.CausedByCancellation PROVES that reading instead of assuming it: the
+// error must actually carry ctx's cancellation (or its cause). A cancelled
+// context alone is not evidence — a port conflict that happens to coincide with
+// a SIGTERM is still a port conflict, and swallowing it would leave knell
+// exiting 0 having never bound the listener a whole quorum depends on.
+func classifyBindError(ctx context.Context, addr string, err error) error {
+	if webhttp.CausedByCancellation(ctx, err) {
 		slog.Info("shutting down before the listener was bound")
 		return nil
 	}
@@ -266,14 +271,14 @@ func watchBeats(cfg []config.Beat) []watch.Beat {
 
 // classifyServeError turns webhttp.Run's outcome into run's own contract.
 //
-// A shutdown sequence that ran and reported its own deadline means in-flight
-// requests outlived the single grace budget. Name that, so the one ERROR line
-// points at the drain and at the constant that bounds it instead of at an
-// anonymous expired context. Only the graceful path can produce this error:
-// the other one returns srv.Serve's own failure, an accept error that carries
-// no deadline. Every other outcome, nil included, passes through untouched.
+// webhttp wraps the grace-expiry outcome in ErrShutdownGraceExpired, so this
+// names the drain from the origin webhttp reported rather than from a bare
+// context.DeadlineExceeded — a value a caller-supplied deadline produces just
+// as readily. Name it, so the one ERROR line points at the drain and at the
+// constant that bounds it instead of at an anonymous expired context. Every
+// other outcome, nil included, passes through untouched.
 func classifyServeError(err error) error {
-	if errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, webhttp.ErrShutdownGraceExpired) {
 		return fmt.Errorf("the shutdown sequence outlived the %s shutdown grace (in-flight requests still draining, or a stalled pre-drain hook): %w", shutdownGrace, err)
 	}
 	return err
@@ -283,31 +288,30 @@ func classifyServeError(err error) error {
 // teardown budget runs out — at which point it says so, since the loop's
 // abandoned deliveries are then the operator's only trace of the notices this
 // process will never send.
+//
+// webhttp.AwaitDone owns the wait itself, including the recheck the naive
+// two-case select gets wrong: webhttp.Run derives teardownCtx from the SAME
+// deadline srv.Shutdown just spent, so a drain that used the whole grace hands
+// this function an already-expired context, and a select with both cases ready
+// picks pseudo-randomly — reporting a watch loop that DID stop as hung half the
+// time. AwaitDone re-checks completion after ctx fires, so completion wins.
+// The policy stays here: what to log, at which level, and which constant to
+// name.
 func awaitWatchLoop(teardownCtx context.Context, watcherDone <-chan struct{}) {
 	start := time.Now()
-	select {
-	case <-watcherDone:
-	case <-teardownCtx.Done():
-		// webhttp.Run derives teardownCtx from the SAME deadline srv.Shutdown
-		// just spent, so a drain that used the whole grace hands this function an
-		// already-expired context, and a select with both cases ready picks
-		// pseudo-randomly. Re-check before declaring the loop still running,
-		// or a watch loop that DID stop is reported as hung half the time.
-		select {
-		case <-watcherDone:
-		default:
-			// Report how much of the SHARED budget this phase actually got:
-			// pre-drain -> srv.Shutdown -> here all spend one shutdownGrace, so a
-			// waited value near zero says the drain consumed the budget and the loop
-			// was never given a chance, while one near the grace says the loop
-			// itself is wedged. Without both figures the line reads as an
-			// accusation against the loop either way, and nothing names the
-			// constant to raise — the same reason classifyServeError names it.
-			slog.Warn("watch loop still running at the end of the shutdown grace",
-				"waited", time.Since(start).Truncate(time.Millisecond).String(),
-				"grace", shutdownGrace.String())
-		}
+	if webhttp.AwaitDone(teardownCtx, watcherDone) {
+		return
 	}
+	// Report how much of the SHARED budget this phase actually got:
+	// pre-drain -> srv.Shutdown -> here all spend one shutdownGrace, so a
+	// waited value near zero says the drain consumed the budget and the loop
+	// was never given a chance, while one near the grace says the loop
+	// itself is wedged. Without both figures the line reads as an
+	// accusation against the loop either way, and nothing names the
+	// constant to raise — the same reason classifyServeError names it.
+	slog.Warn("watch loop still running at the end of the shutdown grace",
+		"waited", time.Since(start).Truncate(time.Millisecond).String(),
+		"grace", shutdownGrace.String())
 }
 
 // logConfig logs the active configuration at startup. The webhook URL is a

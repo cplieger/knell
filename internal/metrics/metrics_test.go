@@ -32,7 +32,7 @@ func TestMintNotificationKindsPremintsEveryCounterAndKind(t *testing.T) {
 	// real cold start, so it pins the init() call itself. Deleting
 	// mintNotificationKinds() from init() leaves every series absent here,
 	// while the explicit re-mint below would still pass.
-	assertNotificationSeries(t, want, "at cold start")
+	assertExpositionLines(t, want, "at cold start")
 
 	// Three counters x every legal kind: keyed off notificationKinds so a new
 	// kind fails the guard below until its want lines are added, rather than
@@ -48,10 +48,99 @@ func TestMintNotificationKindsPremintsEveryCounterAndKind(t *testing.T) {
 
 	mintNotificationKinds()
 
-	assertNotificationSeries(t, want, "after an explicit re-mint")
+	assertExpositionLines(t, want, "after an explicit re-mint")
 }
 
-func assertNotificationSeries(t *testing.T, want []string, when string) {
+// TestMintRefusalReasonsPremintsEveryReason is the pre-route refusal counter's
+// half of the same cold-start contract, and it is the assertion the counter
+// exists for: its predecessor was a path label on the request counter, minted on
+// its FIRST refusal, so increase() could never see the first event of the class
+// and the separation bought nothing. A reason missing from the minting loop
+// reproduces exactly that, and every other test in the tree asserts DELTAS, so
+// nothing else would notice.
+func TestMintRefusalReasonsPremintsEveryReason(t *testing.T) {
+	want := []string{
+		`knell_pre_route_refusals_total{reason="non_canonical_beat_path"} 0`,
+		`knell_pre_route_refusals_total{reason="host_not_allowed"} 0`,
+		`knell_pre_route_refusals_total{reason="auth_throttled"} 0`,
+	}
+
+	// Before this test touches the counter: the real cold start, so it pins
+	// init()'s own mintRefusalReasons() call and not just the function.
+	assertExpositionLines(t, want, "at cold start")
+
+	// Keyed off refusalReasons so a new reason fails here until its cold-start
+	// line is added, rather than silently dropping out of the contract.
+	if len(want) != len(refusalReasons) {
+		t.Fatalf("want has %d lines for %d refusal reasons: add the new reason's cold-start line", len(want), len(refusalReasons))
+	}
+	for _, reason := range refusalReasons {
+		preRouteRefusals.Delete(string(reason))
+	}
+
+	mintRefusalReasons()
+
+	assertExpositionLines(t, want, "after an explicit re-mint")
+}
+
+// TestRecordPreRouteRefusalMovesOnlyItsOwnReason pins the label wiring: each
+// reason is its own series, so an operator can tell a sender pinging a malformed
+// URL from a forgotten hostname from a guessing run. A helper that dropped the
+// argument, or passed a constant, would leave every knell test green while the
+// three causes collapsed into one number that answers none of the three
+// questions.
+func TestRecordPreRouteRefusalMovesOnlyItsOwnReason(t *testing.T) {
+	// The registry is a package-level singleton that outlives one iteration, so
+	// restore the cold-start zeros: without this, `go test -count=2` fails in
+	// TestMintRefusalReasonsPremintsEveryReason above instead of pinning
+	// production behavior.
+	t.Cleanup(func() {
+		for _, reason := range refusalReasons {
+			preRouteRefusals.Delete(string(reason))
+		}
+		mintRefusalReasons()
+	})
+	for _, recorded := range refusalReasons {
+		before := refusalReasonValues(t)
+
+		RecordPreRouteRefusal(recorded)
+
+		after := refusalReasonValues(t)
+		for _, reason := range refusalReasons {
+			want := before[reason]
+			if reason == recorded {
+				want++
+			}
+			if after[reason] != want {
+				t.Errorf("recording %q: reason %q = %v, want %v", recorded, reason, after[reason], want)
+			}
+		}
+	}
+}
+
+// refusalReasonValues reads every refusal reason's current sample, so a test can
+// assert that one reason moved and the others did not.
+func refusalReasonValues(t *testing.T) map[Refusal]float64 {
+	t.Helper()
+	values := make(map[Refusal]float64, len(refusalReasons))
+	for _, reason := range refusalReasons {
+		rendered, ok := rawSeriesValue(t, `knell_pre_route_refusals_total{reason="`+string(reason)+`"} `)
+		if !ok {
+			t.Fatalf("knell_pre_route_refusals_total{reason=%q} is absent: the pre-minting contract is broken, so increase() misses the first refusal of that reason", reason)
+		}
+		value, err := strconv.ParseFloat(rendered, 64)
+		if err != nil {
+			t.Fatalf("parsing the %q sample %q: %v", reason, rendered, err)
+		}
+		values[reason] = value
+	}
+	return values
+}
+
+// assertExpositionLines checks that every want line is present in the rendered
+// exposition verbatim. Shared by the two cold-start tests, so both read the
+// series the same way an alert's selector does: off the exposition text.
+func assertExpositionLines(t *testing.T, want []string, when string) {
 	t.Helper()
 	body := exposition(t)
 	for _, line := range want {

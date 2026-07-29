@@ -19,6 +19,7 @@ import (
 	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/webhttp"
 )
 
 // testWebhookSecret is the credential half of the webhook every boot test
@@ -33,6 +34,10 @@ const (
 	// config gate must refuse, so the rejection test cannot drift off the
 	// secret above.
 	testPlainHTTPWebhookURL = "http://discord.example/api/webhooks/1234567890/" + testWebhookSecret
+	// testBeatToken is the required beat credential every boot test configures.
+	// It clears config's minTokenLength floor, so a boot test fails on the gate
+	// it means to exercise rather than on a too-short token.
+	testBeatToken = "unit-test-beat-token"
 )
 
 // secretEnvKeys are the variables a boot test must CLEAR rather than blank:
@@ -68,6 +73,10 @@ func installRunEnv(t *testing.T, beats, addr string) {
 	for _, key := range secretEnvKeys {
 		unsetEnv(t, key)
 	}
+	// After the clearing sweep, because BEAT_TOKEN is in it: the token is
+	// REQUIRED, so a boot test that cleared it would fail at the configuration
+	// gate instead of reaching the one it means to exercise.
+	t.Setenv("BEAT_TOKEN", testBeatToken)
 	t.Setenv("LISTEN_ADDR", addr)
 }
 
@@ -185,9 +194,6 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	if rec.Contains(testWebhookSecret) || rec.AttrContains("", "", testWebhookSecret) {
 		t.Errorf("startup log leaks the webhook URL: %v", rec.Messages())
 	}
-	if !rec.HasAttr("configuration loaded", "beat_auth", "open") {
-		t.Errorf("beat_auth should report open when BeatToken is empty: %v", rec.Messages())
-	}
 	// Every attribute config.LogValue publishes must reach the shipped line:
 	// the hand-picked copy this call site used to build had already dropped
 	// log_level, so an operator diagnosing a level that "did not apply" had
@@ -211,24 +217,29 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	}
 }
 
-func TestLogConfigReportsBeatAuthRequiredWithoutLeakingToken(t *testing.T) {
+// TestLogConfigNeverPublishesTheBeatToken pins the startup summary's silence
+// about the credential. BEAT_TOKEN is required, so a presence attr could only
+// ever read "required" and would report no state at all — and the summary is the
+// one line that renders a whole Config, so it is where a rendering of the value
+// itself would surface. Neither the token nor an attr naming it may appear.
+func TestLogConfigNeverPublishesTheBeatToken(t *testing.T) {
 	// Serial (no t.Parallel): swaps the process-global slog default.
 	cfg := config.Config{
 		WebhookURL: "https://discord.example/hook",
 		Node:       "node-1",
 		ListenAddr: ":9190",
-		BeatToken:  "unit-test-beat-token",
+		BeatToken:  testBeatToken,
 		Beats:      []config.Beat{{ID: "api", Deadline: 20 * time.Minute}},
 	}
 
 	rec := capture.Default(t)
 	logConfig(&cfg)
 
-	if !rec.HasAttr("configuration loaded", "beat_auth", "required") {
-		t.Errorf("beat_auth should report required when BeatToken is set: %v", rec.Messages())
-	}
-	if rec.Contains("unit-test-beat-token") || rec.AttrContains("", "", "unit-test-beat-token") {
+	if rec.Contains(testBeatToken) || rec.AttrContains("", "", testBeatToken) {
 		t.Errorf("startup log leaks the beat token: %v", rec.Messages())
+	}
+	if _, reported := rec.AttrValue("configuration loaded", "beat_auth"); reported {
+		t.Errorf("startup summary carries a beat_auth attr: %v; the token is required, so the attr reports no state and only gives a future edit a place to render the value", rec.Records())
 	}
 }
 
@@ -301,7 +312,9 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 // reported as a bind failure it would exit 1 (a restart loop) and name an
 // address that was never the problem. The inverse matters just as much: a real
 // port conflict must still surface, or knell idles as a dead switch behind a
-// listener nothing can reach.
+// listener nothing can reach — including when it coincides with a signal, which
+// is why the classification turns on webhttp.CausedByCancellation PROVING the
+// error is the cancellation rather than on the context merely being cancelled.
 func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default.
@@ -309,9 +322,9 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 
 	bindFailure := errors.New("listen tcp :9190: bind: address already in use")
 
-	got := classifyBindError(nil, ":9190", bindFailure)
+	got := classifyBindError(context.Background(), ":9190", bindFailure)
 	if got == nil {
-		t.Fatal("classifyBindError(nil ctxErr) = nil, want the bind failure surfaced so the boot fails instead of running as a switch nothing can reach")
+		t.Fatal("classifyBindError(live ctx) = nil, want the bind failure surfaced so the boot fails instead of running as a switch nothing can reach")
 	}
 	if !errors.Is(got, bindFailure) {
 		t.Errorf("classifyBindError = %v, want the bind failure still unwrappable", got)
@@ -323,37 +336,55 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 		t.Errorf("a port conflict reported itself as a clean stop: %v", rec.Messages())
 	}
 
-	if got := classifyBindError(context.Canceled, ":9190", bindFailure); got != nil {
-		t.Errorf("classifyBindError(canceled) = %v, want nil: a signal arriving before the bind is a clean stop, not a boot failure", got)
+	stopped, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// A bind the signal itself cancelled: the error carries the cancellation, so
+	// this is the clean stop.
+	cancelledListen := fmt.Errorf("listen tcp :9190: %w", context.Canceled)
+	if got := classifyBindError(stopped, ":9190", cancelledListen); got != nil {
+		t.Errorf("classifyBindError(cancelled listen) = %v, want nil: a signal arriving before the bind is a clean stop, not a boot failure", got)
 	}
 	if !rec.Contains("shutting down before the listener was bound") {
 		t.Errorf("messages = %v, want the pre-bind stop reported; otherwise a container stopped mid-boot leaves no trace of why it never served", rec.Messages())
 	}
+
+	// A port conflict that merely COINCIDED with the signal is still a port
+	// conflict: the cancelled context is not evidence about this error, and
+	// swallowing it would exit 0 having never bound the listener a quorum
+	// depends on.
+	if got := classifyBindError(stopped, ":9190", bindFailure); got == nil {
+		t.Error("classifyBindError(cancelled ctx, genuine bind failure) = nil, want the failure surfaced: a cancelled context is not evidence that THIS error was the shutdown")
+	}
 }
 
 // TestClassifyServeErrorNamesADrainThatOutlivedTheGrace pins the one ERROR
-// line a container emits when its drain runs out of budget. webhttp.Run
-// reports the expired shutdown deadline as a bare context.DeadlineExceeded,
-// which on its own tells an operator nothing about WHICH deadline expired;
-// classifyServeError is what turns it into a line naming the drain and the
-// grace constant that bounds it. If the branch were dropped, a container
-// SIGKILLed mid-drain would exit 1 with "context deadline exceeded" and the
-// operator would have no way to tell a stuck drain from any other expired
-// context; if the classification went the other way, an accept failure would
+// line a container emits when its drain runs out of budget. webhttp.Run wraps
+// that outcome in ErrShutdownGraceExpired, which is the only thing that
+// identifies WHICH deadline expired; classifyServeError is what turns it into a
+// line naming the drain and the grace constant that bounds it. If the branch
+// were dropped, a container SIGKILLed mid-drain would exit 1 with "context
+// deadline exceeded" and the operator would have no way to tell a stuck drain
+// from any other expired context; if the classification keyed on a bare
+// context.DeadlineExceeded instead, a deadline of the caller's own making would
 // be reported as a drain overrun that never happened.
 func TestClassifyServeErrorNamesADrainThatOutlivedTheGrace(t *testing.T) {
 	t.Parallel()
 
 	serveFailure := errors.New("accept tcp [::]:9190: use of closed network connection")
+	// The shape webhttp.Run returns for a grace expiry: the origin sentinel
+	// wrapping the deadline that produced it.
+	graceExpired := fmt.Errorf("%w: %w", webhttp.ErrShutdownGraceExpired, context.DeadlineExceeded)
 	tests := map[string]struct {
 		in        error
 		wantNamed bool
 	}{
-		"clean shutdown":               {in: nil, wantNamed: false},
-		"bare drain deadline":          {in: context.DeadlineExceeded, wantNamed: true},
-		"wrapped drain deadline":       {in: fmt.Errorf("shutting down: %w", context.DeadlineExceeded), wantNamed: true},
-		"serve failure":                {in: serveFailure, wantNamed: false},
-		"cancellation, not a deadline": {in: context.Canceled, wantNamed: false},
+		"clean shutdown":                {in: nil, wantNamed: false},
+		"grace expiry":                  {in: graceExpired, wantNamed: true},
+		"wrapped grace expiry":          {in: fmt.Errorf("shutting down: %w", graceExpired), wantNamed: true},
+		"deadline of another origin":    {in: context.DeadlineExceeded, wantNamed: false},
+		"serve failure":                 {in: serveFailure, wantNamed: false},
+		"cancellation, not a grace run": {in: context.Canceled, wantNamed: false},
 	}
 
 	for name, tt := range tests {
@@ -362,7 +393,7 @@ func TestClassifyServeErrorNamesADrainThatOutlivedTheGrace(t *testing.T) {
 			got := classifyServeError(tt.in)
 			if !tt.wantNamed {
 				if got != tt.in {
-					t.Errorf("classifyServeError(%v) = %v, want it returned unchanged: only the drain overrun may be renamed, or an accept failure is reported as a shutdown that never happened", tt.in, got)
+					t.Errorf("classifyServeError(%v) = %v, want it returned unchanged: only a webhttp-reported grace expiry may be renamed, or an accept failure or a caller's own deadline is reported as a shutdown that never happened", tt.in, got)
 				}
 				return
 			}
@@ -371,6 +402,9 @@ func TestClassifyServeErrorNamesADrainThatOutlivedTheGrace(t *testing.T) {
 			}
 			if !errors.Is(got, context.DeadlineExceeded) {
 				t.Errorf("classifyServeError(%v) = %v, want the deadline still unwrappable", tt.in, got)
+			}
+			if !errors.Is(got, webhttp.ErrShutdownGraceExpired) {
+				t.Errorf("classifyServeError(%v) = %v, want the grace-expiry origin still unwrappable", tt.in, got)
 			}
 			if !strings.Contains(got.Error(), "shutdown grace") {
 				t.Errorf("classifyServeError(%v) = %q, want the drain named", tt.in, got)

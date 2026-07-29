@@ -45,6 +45,11 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// validBeatToken is a token that satisfies every checkBeatToken rule, including
+// the minTokenLength floor. Tests that are not about the token itself use it so
+// the required credential is present and valid.
+const validBeatToken = "unit-test-beat-token"
+
 // setValidLoadEnv sets the minimal environment Load accepts. Tests that
 // exercise a variant override individual keys with t.Setenv afterwards.
 func setValidLoadEnv(t *testing.T) {
@@ -52,15 +57,18 @@ func setValidLoadEnv(t *testing.T) {
 	t.Setenv("BEATS", "api:20m")
 	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
 	t.Setenv("NODE_NAME", "node-1")
+	// BEAT_TOKEN is required: the bearer gate is /beat/{id}'s only gate, so Load
+	// refuses to start without it and every variant test needs one.
+	t.Setenv("BEAT_TOKEN", validBeatToken)
 }
 
 // unsetEnv removes key for the duration of the test. t.Setenv registers the
 // restore of the original value, so the following os.Unsetenv leaves the
 // variable absent inside the test and restored afterwards. A plain
 // t.Setenv(key, "") would leave it present-but-empty, which is not equivalent
-// for the keys this helper serves: `_FILE` keys reject a broken mount, and
-// BEAT_TOKEN rejects an accidental empty gate while absence deliberately serves
-// /beat/{id} open.
+// for the keys this helper serves: a `_FILE` key rejects a broken mount with its
+// own message, and BEAT_TOKEN distinguishes "you set it to nothing" from "you
+// set nothing at all" — both fail startup, with different remedies.
 func unsetEnv(t *testing.T, key string) {
 	t.Helper()
 	t.Setenv(key, "")
@@ -347,69 +355,98 @@ func TestLoadBeatToken(t *testing.T) {
 	}
 }
 
-// TestLoadDoesNotWarnAboutTokenLengthWhenNoTokenIsSet pins the non-empty
-// guard on the short-token warning. An absent BEAT_TOKEN is the documented
-// open-endpoint case, and the length warning must not speak for it: without
-// the token != "" guard, every ungated deployment logs "BEAT_TOKEN is shorter
-// than the recommended minimum" at startup, which reads as "a weak token is
-// armed" for a configuration that has no gate at all — so the one line an
-// operator would act on describes a token that does not exist while the real
-// state, an unauthenticated /beat/{id}, goes unnamed.
-// This test also pins the empty returned value, so the warning and the runtime
-// state cannot diverge.
-func TestLoadDoesNotWarnAboutTokenLengthWhenNoTokenIsSet(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
-	setValidLoadEnv(t)
-	unsetEnv(t, "BEAT_TOKEN")
-	unsetEnv(t, "BEAT_TOKEN_FILE")
-
-	rec := capture.Default(t)
-
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
+// TestLoadRefusesWithoutABeatToken pins the required credential. The bearer
+// gate is /beat/{id}'s ONLY gate: with no token, any client that can reach the
+// port keeps every beat reading fresh, so the switch is silently disarmed while
+// /healthz reports ready and nothing in the log says otherwise. A startup
+// refusal is the one signal that cannot be mistaken for a working observer, so
+// neither an absent variable nor a present-but-empty one may start.
+func TestLoadRefusesWithoutABeatToken(t *testing.T) {
+	tests := map[string]func(t *testing.T){
+		"absent": func(t *testing.T) {
+			unsetEnv(t, "BEAT_TOKEN")
+			unsetEnv(t, "BEAT_TOKEN_FILE")
+		},
+		"present but empty": func(t *testing.T) {
+			t.Setenv("BEAT_TOKEN", "")
+			unsetEnv(t, "BEAT_TOKEN_FILE")
+		},
 	}
-	if cfg.BeatToken != "" {
-		t.Fatalf("BeatToken = %q, want empty: an absent BEAT_TOKEN is the documented open-endpoint case", cfg.BeatToken)
-	}
-	if rec.Contains("BEAT_TOKEN is shorter") {
-		t.Errorf("an absent BEAT_TOKEN drew the short-token warning: %v; it reads as \"a weak token is armed\" for a configuration that has no gate at all", rec.Messages())
+	for name, setup := range tests {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			setup(t)
+
+			_, err := Load(maxNodeNameBytes)
+			if err == nil {
+				t.Fatalf("Load() with %s BEAT_TOKEN succeeded, want a startup refusal: an ungated /beat/{id} lets anything that reaches the port keep the switch armed", name)
+			}
+			// The message has to name the variable and what to do next: this is
+			// the refusal a first deployment meets, and the container
+			// crash-loops on it.
+			for _, want := range []string{"BEAT_TOKEN", "16"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Load() error = %q, want it to mention %q so the operator knows what to set", err, want)
+				}
+			}
+		})
 	}
 }
 
-func TestLoadShortBeatTokenWarnsWithoutLeakingIt(t *testing.T) {
-	// Serial (t.Setenv forbids t.Parallel anyway): swaps the process-global
-	// slog default to capture the short-token warning.
+// TestLoadRefusesAShortBeatTokenWithoutLeakingIt pins the length floor as a
+// REFUSAL. A guessable token is not a weaker gate, it is a bypassable one, and
+// the failed-auth throttle only slows a guessing run down; since the token is
+// the endpoint's only gate, a short one is refused at startup, where the
+// operator is watching, rather than warned about in a line nobody reads.
+//
+// The message may name the MINIMUM and nothing else about the value: the startup
+// log ships to a store whose audience is far wider than the encrypted file the
+// token lives in, so the token itself, its exact length and its character class
+// all stay out.
+func TestLoadRefusesAShortBeatTokenWithoutLeakingIt(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "shorty")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 
-	rec := capture.Default(t)
+	_, err := Load(maxNodeNameBytes)
+	if err == nil {
+		t.Fatal("Load() with a 6-byte BEAT_TOKEN succeeded, want a startup refusal: the token is the only gate, so a guessable one is a bypassable one")
+	}
+	if !strings.Contains(err.Error(), strconv.Itoa(minTokenLength)) {
+		t.Errorf("refusal = %q, want it to name the %d-byte minimum: it is the only actionable number", err, minTokenLength)
+	}
+	if strings.Contains(err.Error(), "shorty") {
+		t.Errorf("refusal leaks the token value: %q", err)
+	}
+	// Every number in the message must be the minimum: the token's own length is
+	// an attribute of a live credential, and this text ships to the log store.
+	for _, run := range digitRuns(err.Error()) {
+		if run != strconv.Itoa(minTokenLength) {
+			t.Errorf("refusal carries the number %q: %q; only the %d-byte minimum may appear, or the line bounds the guess space of an already-weak credential for every reader of the log store",
+				run, err, minTokenLength)
+		}
+	}
+}
 
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() with short BEAT_TOKEN = %v, want accepted (warn, not fail)", err)
+// digitRuns returns every maximal run of digits in s, so a test can assert which
+// numbers a message is allowed to carry.
+func digitRuns(s string) []string {
+	var runs []string
+	var cur strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			cur.WriteRune(r)
+			continue
+		}
+		if cur.Len() > 0 {
+			runs = append(runs, cur.String())
+			cur.Reset()
+		}
 	}
-	if cfg.BeatToken != "shorty" {
-		t.Errorf("BeatToken = %q, want the configured token (short tokens warn but still arm the gate)", cfg.BeatToken)
+	if cur.Len() > 0 {
+		runs = append(runs, cur.String())
 	}
-	if !rec.Contains("BEAT_TOKEN is shorter") {
-		t.Errorf("log output %v missing the short-token warning", rec.Messages())
-	}
-	// The actionable content is the recommended minimum, and it is the ONLY
-	// number the warning may carry: the token's own length is an attribute of a
-	// live credential, and this line is shipped to a log store whose audience is
-	// far wider than the encrypted file the token lives in.
-	if !rec.HasAttr("BEAT_TOKEN is shorter", "minimum", strconv.Itoa(minTokenLength)) {
-		t.Errorf("short-token warning does not report the recommended minimum %d: %v", minTokenLength, rec.Messages())
-	}
-	if _, found := rec.AttrValue("BEAT_TOKEN is shorter", "length"); found {
-		t.Errorf("short-token warning publishes the token's exact length: it bounds the guess space of an already-weak credential on an unrate-limited POST /beat/{id} for every reader of the log store")
-	}
-	if rec.Contains("shorty") || rec.AttrContains("", "", "shorty") {
-		t.Errorf("log output leaks the token value: %v", rec.Messages())
-	}
+	return runs
 }
 
 func TestLoadBeatTokenFromFile(t *testing.T) {
@@ -426,7 +463,7 @@ func TestLoadBeatTokenFromFile(t *testing.T) {
 		t.Fatalf("Load() error: %v", err)
 	}
 	if cfg.BeatToken != "file-borne-beat-token" {
-		t.Errorf("BeatToken = %q, want the file-borne token (BEAT_TOKEN_FILE alone must arm the gate, trimmed)", cfg.BeatToken)
+		t.Errorf("BeatToken = %q, want the file-borne token (BEAT_TOKEN_FILE alone must arm the gate, with the file's single trailing newline removed)", cfg.BeatToken)
 	}
 }
 
@@ -473,7 +510,7 @@ func TestLoadWebhookFromFile(t *testing.T) {
 		t.Fatalf("Load() error: %v", err)
 	}
 	if cfg.WebhookURL != "https://discord.example/file-borne-hook" {
-		t.Errorf("WebhookURL = %q, want the file-borne URL (DISCORD_WEBHOOK_URL_FILE is the documented secret-file convention, trimmed)", cfg.WebhookURL)
+		t.Errorf("WebhookURL = %q, want the file-borne URL (DISCORD_WEBHOOK_URL_FILE is the documented secret-file convention, with the file's single trailing newline removed)", cfg.WebhookURL)
 	}
 }
 
@@ -578,8 +615,10 @@ func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileReadFails(t *testing.T
 // while the plain BEAT_TOKEN is also set — the file wins, the advisory used to
 // fire, and startup then failed on the token, so the operator was told to
 // delete the only other token in the environment by a process that never ran.
-// (The whitespace path cannot reach here: envx unicode-trims the file's bytes,
-// so a blank file errors earlier.)
+// (An edge-padded file token is a second instance of this same shape, pinned by
+// TestLoadRejectsAPaddedFileBorneBeatToken: envx no longer trims the file's
+// bytes, so the padding refusal is reachable through the _FILE channel too. A
+// BLANK file still errors earlier, inside envx.)
 func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileTokenIsInvalid(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and t.Setenv forbids parallel tests anyway.
@@ -657,7 +696,8 @@ func TestLoadRejectsUnreadableBeatTokenFile(t *testing.T) {
 
 func TestLoadRejectsEmptyBeatTokenFile(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "beat-token")
-	// envx trims before its empty check, so a whitespace-only file is the
+	// envx judges blankness on the whitespace-trimmed content (even though it
+	// returns the value itself untrimmed), so a whitespace-only file is the
 	// same condition as a zero-byte one.
 	if err := os.WriteFile(tokenFile, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -668,10 +708,10 @@ func TestLoadRejectsEmptyBeatTokenFile(t *testing.T) {
 
 	_, err := Load(maxNodeNameBytes)
 	if err == nil {
-		t.Fatal("Load() with an empty BEAT_TOKEN_FILE = nil, want error (an empty secret file is a broken mount, not an open endpoint)")
+		t.Fatal("Load() with an empty BEAT_TOKEN_FILE = nil, want error (an empty secret file is a broken mount, and the token it should have carried is required)")
 	}
 	if !strings.Contains(err.Error(), "blank secret file") {
-		t.Errorf("error = %q, want the blank-secret-file diagnosis: the three secretFileError classes exist so the operator is told WHICH failure happened, and the generic fallback sends someone whose mount produced an empty file to check the path instead of the content", err)
+		t.Errorf("error = %q, want the blank-secret-file diagnosis: secretFileError names each envx failure class so the operator is told WHICH failure happened, and the generic fallback sends someone whose mount produced an empty file to check the path instead of the content", err)
 	}
 	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
 		t.Errorf("error = %q, want BEAT_TOKEN context", err)
@@ -789,8 +829,9 @@ func TestLoadTrimsPaddedPlainWebhook(t *testing.T) {
 		t.Fatalf("Load() error: %v", err)
 	}
 	// A trailing space survives url.Parse and is escaped as %20 on every
-	// POST, so an untrimmed webhook 404s forever. envx trims only its _FILE
-	// branch, so the plain variable is trimmed here. The webhook is trimmed
+	// POST, so an untrimmed webhook 404s forever. envx trims neither channel
+	// (the file channel only drops one trailing newline), so this trim is
+	// knell's own. The webhook is trimmed
 	// rather than refused because knell is its only sender: trimming makes it
 	// deliverable, and there is no second party that must reproduce the value.
 	// BEAT_TOKEN is the opposite case (see the test below) — senders must
@@ -833,6 +874,54 @@ func TestLoadRejectsAPaddedPlainBeatToken(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "BEAT_TOKEN") {
 				t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which variable to fix", err)
+			}
+			if strings.Contains(err.Error(), "unit-test-beat-token") {
+				t.Errorf("error = %q embeds the token value; the startup error is shipped to Loki, so it must describe the shape and never echo the credential", err)
+			}
+		})
+	}
+}
+
+// TestLoadRejectsAPaddedFileBorneBeatToken pins the _FILE half of the refusal
+// TestLoadRejectsAPaddedPlainBeatToken gives the plain variable: a secret file
+// whose CONTENT carries edge ASCII whitespace FAILS STARTUP.
+//
+// envx returns the file's content as written apart from at most ONE trailing
+// line ending, so the padded bytes reach checkBeatToken and both channels now
+// refuse the same value — which is what keeps "the token you configured" and
+// "the token that authenticates" the same string on the mounted-secret path too.
+// The earlier envx contract ran strings.TrimSpace over the file's bytes, so the
+// same file armed the gate with a REWRITTEN credential and nothing in this
+// package could observe it; without this test the next envx bump can restore
+// that silently. The trailing-newline cases are here to prove the one line
+// ending envx still removes does not rescue a padded value: `printf '%s\n'
+// token > file` stays unaffected, `printf '%s \n' token > file` does not.
+func TestLoadRejectsAPaddedFileBorneBeatToken(t *testing.T) {
+	tests := map[string]string{
+		"leading space":               " unit-test-beat-token",
+		"trailing space":              "unit-test-beat-token ",
+		"trailing space then newline": "unit-test-beat-token \n",
+		"leading tab then newline":    "\tunit-test-beat-token\n",
+	}
+	for name, content := range tests {
+		t.Run(name, func(t *testing.T) {
+			tokenFile := filepath.Join(t.TempDir(), "beat-token")
+			if err := os.WriteFile(tokenFile, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			setValidLoadEnv(t)
+			unsetEnv(t, "BEAT_TOKEN")
+			t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+
+			_, err := Load(maxNodeNameBytes)
+			if err == nil {
+				t.Fatalf("Load() with a BEAT_TOKEN_FILE holding %q = nil, want error: the padding is part of the configured credential, so arming the gate with a trimmed copy 401s every sender that presents the file's token and turns every configured beat falsely missing one deadline later", content)
+			}
+			if !strings.Contains(err.Error(), "leading or trailing ASCII whitespace") {
+				t.Errorf("error = %q, want the padding refusal: any other failure would mean the file channel was rejected for the wrong reason, or rewritten before checkBeatToken saw it", err)
+			}
+			if !strings.Contains(err.Error(), "BEAT_TOKEN") {
+				t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which secret to fix", err)
 			}
 			if strings.Contains(err.Error(), "unit-test-beat-token") {
 				t.Errorf("error = %q embeds the token value; the startup error is shipped to Loki, so it must describe the shape and never echo the credential", err)
@@ -885,13 +974,18 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 	// unicode.IsSpace and treats NBSP (U+00A0) as blank, but net/textproto
 	// strips only spaces and tabs: an NBSP-only token IS presented verbatim
 	// and DOES authenticate, so refusing it would fail startup on a working
-	// configuration, and trimming it to "" would silently serve /beat/{id}
-	// open. Accepted verbatim, gate armed, with the warning — it is still
-	// almost certainly an accident.
+	// configuration, and trimming it to "" would leave webapi's gate with no
+	// credential to verify. Accepted verbatim, gate armed, with the warning —
+	// it is still almost certainly an accident.
+	//
+	// Eight NBSPs, because the token has to clear the minTokenLength floor to
+	// reach the warning at all: NBSP encodes as two bytes, so this is exactly a
+	// 16-byte token. That is also why the floor does NOT make this warning
+	// unreachable — a value can be long enough and still read as blank.
 	//
 	// Serial (t.Setenv forbids t.Parallel): swaps the process-global slog
 	// default to assert the warning.
-	const token = "\u00a0"
+	const token = "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0"
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", token)
 	unsetEnv(t, "BEAT_TOKEN_FILE")
@@ -902,17 +996,19 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() with an NBSP-only BEAT_TOKEN = %v, want accepted: textproto keeps a non-ASCII space, so the token is presentable and the gate must stay armed", err)
 	}
-	if cfg.BeatToken != token {
-		t.Errorf("BeatToken = %q, want %q preserved verbatim: an empty BeatToken is webapi's open-endpoint sentinel, so trimming would disarm the gate the operator set", cfg.BeatToken, token)
+	if len(token) != minTokenLength {
+		t.Fatalf("fixture is %d bytes, want exactly %d: the case only reaches the warning past the length floor", len(token), minTokenLength)
 	}
-	// The shape, not just the length: the generic short-token warning fires
-	// for a 2-byte token too, so without this assertion the one warning that
-	// names the actual misconfiguration can be dropped and the log still
+	if cfg.BeatToken != token {
+		t.Errorf("BeatToken = %q, want %q preserved verbatim: trimming it would leave webapi's gate with a credential no sender presents", cfg.BeatToken, token)
+	}
+	// The shape, not just the length: without this assertion the one warning
+	// that names the actual misconfiguration can be dropped and the log still
 	// looks populated. The asserted text deliberately does not describe the
 	// token's character class — the startup log ships to Loki, so it must not
 	// narrow a guess at a live credential's alphabet.
 	if !rec.Contains("mistake for absent") {
-		t.Errorf("log output %v never says the gate is armed with a value that looks absent; the only other signal is the length hint, which reads as \"your token is short\" while senders must reproduce an invisible character", rec.Messages())
+		t.Errorf("log output %v never says the gate is armed with a value that looks absent; nothing else in the startup log distinguishes this token from one the operator can read, while senders must reproduce an invisible character", rec.Messages())
 	}
 	if rec.Contains("whitespace") {
 		t.Errorf("log output %v describes the token's character class; the startup log is shipped to Loki, so it must say the gate is armed without disclosing the credential's alphabet", rec.Messages())
@@ -1102,24 +1198,21 @@ func TestBeatTokenFitsHeaderAgreesWithTheTransportForEveryByte(t *testing.T) {
 	}
 }
 
-func TestLoadBeatTokenAtWarnBoundaryDoesNotWarn(t *testing.T) {
-	// Serial (t.Setenv forbids t.Parallel): swaps the process-global slog
-	// default to assert the absence of the short-token warning.
+// TestLoadAcceptsABeatTokenAtTheLengthFloor pins the inclusive edge of the
+// refusal: minTokenLength bytes is the SHORTEST accepted token, so an
+// off-by-one would fail startup on a value the README tells the operator to use.
+func TestLoadAcceptsABeatTokenAtTheLengthFloor(t *testing.T) {
+	token := strings.Repeat("x", minTokenLength)
 	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", strings.Repeat("x", 16))
+	t.Setenv("BEAT_TOKEN", token)
 	unsetEnv(t, "BEAT_TOKEN_FILE")
-
-	rec := capture.Default(t)
 
 	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
-		t.Fatalf("Load() error: %v", err)
+		t.Fatalf("Load() with a %d-byte BEAT_TOKEN = %v, want accepted: the floor is inclusive", minTokenLength, err)
 	}
-	if cfg.BeatToken != strings.Repeat("x", 16) {
-		t.Errorf("BeatToken = %q, want the configured 16-byte token", cfg.BeatToken)
-	}
-	if rec.Contains("BEAT_TOKEN is shorter") {
-		t.Errorf("16-byte token triggered the short-token warning (warn only below 16 bytes): %v", rec.Messages())
+	if cfg.BeatToken != token {
+		t.Errorf("BeatToken = %q, want the configured %d-byte token", cfg.BeatToken, minTokenLength)
 	}
 }
 
@@ -1129,11 +1222,10 @@ func TestLoadFallsBackToTheHostnameWhenNodeNameIsUnset(t *testing.T) {
 		t.Skipf("cannot determine the hostname: %v", err)
 	}
 	setValidLoadEnv(t)
-	// ABSENT, not present-but-empty: an unset NODE_NAME is what every
-	// deployment ships (the compose example sets BEATS and the webhook only),
-	// and this package already treats the two states differently elsewhere
-	// (loadBeatToken refuses a present-but-empty BEAT_TOKEN while an absent one
-	// serves /beat/{id} open).
+	// ABSENT, not present-but-empty: an unset NODE_NAME is what a deployment
+	// that accepts the hostname default ships, and this package treats the two
+	// states differently throughout (a present-but-blank NODE_NAME is warned
+	// about and ignored; an unset one is silent).
 	unsetEnv(t, "NODE_NAME")
 
 	cfg, err := Load(maxNodeNameBytes)
@@ -1292,7 +1384,7 @@ func TestLoadRejectsAPresentButEmptyBeatToken(t *testing.T) {
 
 	_, err := Load(maxNodeNameBytes)
 	if err == nil {
-		t.Fatal("Load() with a present-but-empty BEAT_TOKEN = nil, want error; envx.Require cannot tell it from unset, and it is exactly what compose interpolation of an undefined variable produces, so accepting it would serve /beat/{id} unauthenticated by accident")
+		t.Fatal("Load() with a present-but-empty BEAT_TOKEN = nil, want error; the token is required and an empty value is not one, and this is exactly what compose interpolation of an undefined variable produces")
 	}
 	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
 		t.Errorf("error = %q, want BEAT_TOKEN context: the operator has to know which variable to unset or fill in", err)
@@ -1349,7 +1441,7 @@ func TestLoadDoesNotWarnWhenOnlyTheSecretFilesAreSet(t *testing.T) {
 // neither exercises the ordinary plain-variable-only deployment, so dropping
 // the src check tells that operator, on every startup, to unset the variable
 // that is actually supplying the credential — advice that leaves /beat/{id}
-// ungated and the next start failing on a missing webhook.
+// ungated and the next start failing on a missing credential entirely.
 func TestLoadDoesNotWarnWhenOnlyThePlainVarsAreSet(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and t.Setenv forbids parallel tests anyway.
@@ -1372,13 +1464,15 @@ func TestLoadDoesNotWarnWhenOnlyThePlainVarsAreSet(t *testing.T) {
 	}
 }
 
-// TestConfigLogValueReportsBothSecretsByPresenceOnly pins the redaction seam:
-// LogValue is the reason a call site can log a whole Config without leaking,
-// so it must report DISCORD_WEBHOOK_URL and BEAT_TOKEN by presence and never
-// by value. The receiver under test is a VALUE, not a pointer: Load returns
+// TestConfigLogValueNeverRendersASecret pins the redaction seam:
+// LogValue is the reason a call site can log a whole Config without leaking, so
+// DISCORD_WEBHOOK_URL is reported by presence and BEAT_TOKEN is not reported at
+// all — it is required, so its presence is a constant and an attr for it would
+// report no state while giving a future edit somewhere to render the value. The
+// receiver under test is a VALUE, not a pointer: Load returns
 // Config by value and that is the form a future slog call would hand a
 // logger, so a seam that only covers *Config would not cover the leak.
-func TestConfigLogValueReportsBothSecretsByPresenceOnly(t *testing.T) {
+func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -1403,8 +1497,11 @@ func TestConfigLogValueReportsBothSecretsByPresenceOnly(t *testing.T) {
 			t.Errorf("LogValue attr %s = %q carries a secret verbatim: logging a Config would publish the Discord credential and the /beat/{id} gate into the log store", key, value)
 		}
 	}
-	if got["webhook"] != "configured" || got["beat_auth"] != "required" {
-		t.Errorf("webhook = %q, beat_auth = %q, want \"configured\" and \"required\": presence is the only thing these two attrs may report", got["webhook"], got["beat_auth"])
+	if got["webhook"] != "configured" {
+		t.Errorf("webhook = %q, want \"configured\": presence is the only thing this attr may report", got["webhook"])
+	}
+	if _, reported := got["beat_auth"]; reported {
+		t.Errorf("LogValue renders beat_auth = %q; the token is required, so the attr can only ever say \"required\" and reports no state", got["beat_auth"])
 	}
 
 	empty := Config{LogLevel: slog.LevelInfo}
@@ -1412,15 +1509,15 @@ func TestConfigLogValueReportsBothSecretsByPresenceOnly(t *testing.T) {
 	for _, attr := range empty.LogValue().Group() {
 		got[attr.Key] = attr.Value.String()
 	}
-	if got["webhook"] != "unset" || got["beat_auth"] != "open" {
-		t.Errorf("unconfigured: webhook = %q, beat_auth = %q, want \"unset\" and \"open\"; beat_auth must not read \"required\" for an ungated endpoint", got["webhook"], got["beat_auth"])
+	if got["webhook"] != "unset" {
+		t.Errorf("unconfigured: webhook = %q, want \"unset\"", got["webhook"])
 	}
 }
 
 // TestConfigLogValueReportsEveryNonSecretField pins the accuracy half of
-// LogValue's contract; TestConfigLogValueReportsBothSecretsByPresenceOnly
+// LogValue's contract; TestConfigLogValueNeverRendersASecret
 // pins the hygiene half. LogValue exists so a call site can hand a whole
-// Config to slog, and those seven attrs are then the entire rendering of a
+// Config to slog, and those six attrs are then the entire rendering of a
 // configuration that is env-only, with no reload and no readback endpoint.
 // Every value below differs from any plausible default and from every sibling
 // field, so an attr rewired to a literal or to the wrong field fails here
@@ -1459,7 +1556,6 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		"node":          "observer-borgcube",
 		"listen_addr":   "127.0.0.1:19190",
 		"webhook":       "configured",
-		"beat_auth":     "required",
 		"allowed_hosts": "allowlist(2)",
 		"log_level":     "DEBUG",
 	}
@@ -1784,9 +1880,10 @@ func TestLoadWarnsWhenLogLevelIsPresentButBlank(t *testing.T) {
 // TestLoadRejectsAFileBorneBeatTokenHTTPCannotCarry pins that the
 // control-byte refusal covers the _FILE channel too, the same way
 // TestLoadRejectsPlainHTTPWebhookFromFile pins the https gate for the webhook's
-// file channel. envx trims only the file's edges, so a two-line secret file (a
-// stray second line, a copy-pasted pair of lines) hands loadBeatToken a token
-// with an INTERIOR newline that no trim can rescue and no sender can present.
+// file channel. envx removes at most one trailing line ending, so a two-line
+// secret file (a stray second line, a copy-pasted pair of lines) hands
+// loadBeatToken a token with an INTERIOR newline that no trim can rescue and no
+// sender can present.
 // TestLoadRejectsABeatTokenHTTPCannotCarry covers the plain variable only, so
 // scoping the check to the plain channel — the shape the cycle-8 normalization
 // work moved code toward — leaves the mounted-secret path arming a gate that

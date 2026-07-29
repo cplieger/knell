@@ -38,9 +38,15 @@ func (f *fakeBeater) Beat(id string) (recorded, accepting bool) {
 	return true, true
 }
 
+// testBeatToken is the credential every test handler is built with. BEAT_TOKEN
+// is required in production (internal/config refuses to start without it), so
+// there is no ungated handler to test against: a test that is not about the gate
+// itself presents this token and gets the endpoint's real behaviour.
+const testBeatToken = "unit-test-beat-token"
+
 // newTestHandler assembles the routed handler around b with a healthy
 // liveness endpoint and a LIVE application context (nothing shutting down);
-// token gates the beat endpoint exactly as in production ("" = open).
+// token is the required beat credential, exactly as in production.
 func newTestHandler(b *fakeBeater, token string) http.Handler {
 	return newTestHandlerCtx(context.Background(), b, token)
 }
@@ -57,6 +63,16 @@ func newTestHandlerCtx(appCtx context.Context, b *fakeBeater, token string) http
 // whenever the liveness marker is absent (boot, or after the pre-drain flip).
 func newTestHandlerHealthz(appCtx context.Context, b *fakeBeater, token string, healthzStatus int) http.Handler {
 	return New(appCtx, b, Deps{Healthz: staticHealthz(healthzStatus), BeatToken: token})
+}
+
+// newBeatRequest builds a request presenting testBeatToken. The bearer gate is
+// the beat endpoint's only gate and it is required, so every test that is not
+// about the credential itself has to authenticate to reach the behaviour it is
+// pinning.
+func newBeatRequest(method, target string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, target, body)
+	req.Header.Set("Authorization", "Bearer "+testBeatToken)
+	return req
 }
 
 // staticHealthz stands in for health.Handler with a fixed verdict.
@@ -76,7 +92,7 @@ func TestBeatEndpoint(t *testing.T) {
 		wantSeen   int
 	}{
 		{name: "post known", method: http.MethodPost, path: "/beat/api", body: `{"alerts":[]}`, wantStatus: 200, wantSeen: 1},
-		{name: "get known", method: http.MethodGet, path: "/beat/api", wantStatus: 200, wantSeen: 1},
+		{name: "get rejected without recording", method: http.MethodGet, path: "/beat/api", wantStatus: 405},
 		{name: "post unknown", method: http.MethodPost, path: "/beat/ghost", wantStatus: 404},
 		{name: "missing id segment", method: http.MethodPost, path: "/beat/", wantStatus: 404},
 		// The bare /beat prefix has its own test with the stronger oracle:
@@ -99,8 +115,8 @@ func TestBeatEndpoint(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := &fakeBeater{known: map[string]bool{"api": true}}
-			h := newTestHandler(b, "")
-			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			h := newTestHandler(b, testBeatToken)
+			req := newBeatRequest(tt.method, tt.path, strings.NewReader(tt.body))
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 			if rec.Code != tt.wantStatus {
@@ -138,7 +154,7 @@ func TestBareBeatPathAnswersTheCodedNotFound(t *testing.T) {
 	for _, method := range []string{http.MethodPost, http.MethodGet} {
 		t.Run(method, func(t *testing.T) {
 			b := &fakeBeater{known: map[string]bool{"api": true}}
-			h := newTestHandler(b, "")
+			h := newTestHandler(b, testBeatToken)
 			beatSeriesBefore := beatSeriesLines(scrapeExposition(t, h))
 
 			rec := beatRequest(t, h, method, "/beat")
@@ -195,7 +211,18 @@ func beatSeriesLines(exposition string) []string {
 // redirects unless asked. Such a sender exits 0 having recorded nothing, and
 // the beat reads as missing one full deadline later with nothing saying the URL
 // was malformed. Each case must instead be the coded 404, carry no Location,
-// and record no beat.
+// and record no beat — and must stay countable: the refusal answers before the
+// mux, so the route metric can only call it "unmatched", and knell's own
+// pre-route refusal counter is what names the cause for an operator.
+// The two series a non-canonical refusal must move, spelled once so the route
+// label and the reason label cannot drift apart in the assertions below: the
+// pre-route class shares the request counter's "unmatched" path label with
+// scanner traffic, and knell's own reason counter is what separates them.
+const (
+	nonCanonicalRouteSeries  = `knell_http_requests_total{method="POST",path="` + unmatchedPathLabel + `",status="404"}`
+	nonCanonicalReasonSeries = `knell_pre_route_refusals_total{reason="non_canonical_beat_path"}`
+)
+
 func TestNonCanonicalBeatPathsAnswerTheCodedNotFound(t *testing.T) {
 	// "//beat/api" enters the /beat namespace only after cleaning;
 	// "/beat/api/../ghost" leaves one id for another; the rest are the
@@ -203,7 +230,15 @@ func TestNonCanonicalBeatPathsAnswerTheCodedNotFound(t *testing.T) {
 	for _, target := range []string{"/beat//", "//beat/api", "/beat/./api", "/beat/api/../ghost", "/beat/api//"} {
 		t.Run(target, func(t *testing.T) {
 			b := &fakeBeater{known: map[string]bool{"api": true}}
-			h := newTestHandler(b, "")
+			h := newTestHandler(b, testBeatToken)
+			// Deltas, not absolutes: the metrics registry is a package-level
+			// singleton shared by the whole test binary (and by a -count=2
+			// rerun). The reason series has to be present ALREADY, before any
+			// refusal in this subtest - that is the pre-minting contract, and
+			// mustSeriesValue is what fails if it is ever lost.
+			before := scrapeExposition(t, h)
+			unmatchedBefore, _ := seriesValue(t, before, nonCanonicalRouteSeries)
+			reasonBefore := mustSeriesValue(t, before, nonCanonicalReasonSeries)
 
 			rec := beatRequest(t, h, http.MethodPost, target)
 
@@ -220,13 +255,19 @@ func TestNonCanonicalBeatPathsAnswerTheCodedNotFound(t *testing.T) {
 			if len(b.seen) != 0 {
 				t.Errorf("POST %s recorded %v, want nothing: a non-canonical path names no beat", target, b.seen)
 			}
-			// The refusal is counted under its OWN class, not in the "unmatched"
-			// bucket it would otherwise share with port scans: knell's alert rules
-			// read /metrics, so a malformed sender URL has to be tellable apart
-			// from scanner traffic.
-			series := `knell_http_requests_total{method="POST",path="` + nonCanonicalBeatPattern + `",status="404"}`
-			if _, ok := seriesValue(t, scrapeExposition(t, h), series); !ok {
-				t.Errorf("%s missing from the exposition: a malformed sender URL is unalertable without it", series)
+			// The refusal answers before the mux routes, so the ROUTE metric
+			// can only bucket it as "unmatched" beside scanner traffic. What
+			// tells the two apart is knell's own pre-route refusal counter,
+			// keyed by cause: an operator investigating a beat that stopped
+			// arriving reads it to see that a sender is pinging a malformed URL.
+			after := scrapeExposition(t, h)
+			if got := mustSeriesValue(t, after, nonCanonicalRouteSeries); got != unmatchedBefore+1 {
+				t.Errorf("%s = %v, want %v: a pre-route refusal is still one served request",
+					nonCanonicalRouteSeries, got, unmatchedBefore+1)
+			}
+			if got := mustSeriesValue(t, after, nonCanonicalReasonSeries); got != reasonBefore+1 {
+				t.Errorf("%s = %v, want %v: without it a malformed sender URL is indistinguishable from a port scan",
+					nonCanonicalReasonSeries, got, reasonBefore+1)
 			}
 		})
 	}
@@ -234,7 +275,7 @@ func TestNonCanonicalBeatPathsAnswerTheCodedNotFound(t *testing.T) {
 	// The canonical spelling still records: the guard must refuse the rewritten
 	// shapes only, never a well-formed ping.
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandler(b, "")
+	h := newTestHandler(b, testBeatToken)
 	if rec := beatRequest(t, h, http.MethodPost, "/beat/api"); rec.Code != http.StatusOK {
 		t.Fatalf("POST /beat/api = %d, want 200: the canonical ping must still record (body %s)", rec.Code, rec.Body.String())
 	}
@@ -285,12 +326,13 @@ func FuzzBeatPathNeverRedirectsOrRecordsNonCanonically(f *testing.F) {
 		// million-exec run from writing an access line per input to stderr.
 		capture.Default(t)
 		b := &fakeBeater{known: map[string]bool{"api": true}}
-		h := newTestHandler(b, "")
+		h := newTestHandler(b, testBeatToken)
 
 		// Built by hand rather than via a target string: httptest.NewRequest
 		// panics on a target it cannot parse, and arbitrary bytes are exactly
-		// the input this target exists for.
-		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
+		// the input this target exists for. It presents the credential, so a
+		// refusal here is the path guard's verdict and never the gate's.
+		req := newBeatRequest(http.MethodPost, "/", strings.NewReader(""))
 		req.URL.Path = path
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -328,7 +370,7 @@ func TestMetricsExposition(t *testing.T) {
 	// InitBeat, so this test mints the gauge series itself.
 	metrics.SetBeatFresh("webapi-test", true)
 
-	h := newTestHandler(&fakeBeater{}, "")
+	h := newTestHandler(&fakeBeater{}, testBeatToken)
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -405,9 +447,9 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 			// slog default. It must be installed BEFORE New, because
 			// webhttp.Logging resolves slog.Default() when the chain is built.
 			rec := capture.Default(t)
-			h := newTestHandlerHealthz(context.Background(), &fakeBeater{known: map[string]bool{"api": true}}, "", tt.healthzStatus)
+			h := newTestHandlerHealthz(context.Background(), &fakeBeater{known: map[string]bool{"api": true}}, testBeatToken, tt.healthzStatus)
 
-			req := httptest.NewRequest(tt.method, tt.path, nil)
+			req := newBeatRequest(tt.method, tt.path, nil)
 			w := httptest.NewRecorder()
 			h.ServeHTTP(w, req)
 			if w.Code != tt.wantStatus {
@@ -441,8 +483,8 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 }
 
 func TestSecurityHeadersPresent(t *testing.T) {
-	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
-	req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
+	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
+	req := newBeatRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
@@ -451,11 +493,12 @@ func TestSecurityHeadersPresent(t *testing.T) {
 }
 
 // TestNoStoreOnEveryRoute pins that no response knell serves is cacheable: a
-// cached GET ping would never reach the observer (false MISSING notice) and a
-// cached /metrics exposition would report a stale beat_fresh=1 to the scraper,
-// which is the direction that masks the quorum alert.
+// cached ping response would let a sender believe a beat was recorded when the
+// request never reached the observer (false MISSING notice), and a cached
+// /metrics exposition would report a stale beat_fresh=1 to the scraper, which is
+// the direction that masks the quorum alert.
 func TestNoStoreOnEveryRoute(t *testing.T) {
-	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
+	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
 	for _, path := range []string{"/beat/api", "/healthz", "/metrics"} {
 		t.Run(path, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -484,10 +527,11 @@ func TestPanicUnderBeatHandlerAnswers500AndIsLogged(t *testing.T) {
 	// access log never reports a status for the endpoint that feeds the switch.
 	rec := capture.Default(t)
 	h := New(context.Background(), panicBeater{}, Deps{
-		Healthz: staticHealthz(http.StatusOK),
+		Healthz:   staticHealthz(http.StatusOK),
+		BeatToken: testBeatToken,
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
+	req := newBeatRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 
@@ -537,9 +581,9 @@ func TestBeatBodyDrainIsBounded(t *testing.T) {
 	// instead of read as a clean end-of-body. A bare io.LimitReader stops at
 	// 1 MiB exactly and cannot tell the two apart.
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandler(b, "")
+	h := newTestHandler(b, testBeatToken)
 	body := &unboundedReader{}
-	req := httptest.NewRequest(http.MethodPost, "/beat/api", body)
+	req := newBeatRequest(http.MethodPost, "/beat/api", body)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -572,12 +616,12 @@ func TestBeatOverLimitBodyWarnsAndStillRecords(t *testing.T) {
 	// default.
 	logs := capture.Default(t)
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandler(b, "")
+	h := newTestHandler(b, testBeatToken)
 	const warning = "beat body exceeded the cap"
 
 	// A normal-sized payload is drained without a word about it.
 	inCap := httptest.NewRecorder()
-	h.ServeHTTP(inCap, httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(strings.Repeat("x", 4096))))
+	h.ServeHTTP(inCap, newBeatRequest(http.MethodPost, "/beat/api", strings.NewReader(strings.Repeat("x", 4096))))
 	if inCap.Code != http.StatusOK {
 		t.Fatalf("in-cap ping = %d, want 200 (body %s)", inCap.Code, inCap.Body.String())
 	}
@@ -588,7 +632,7 @@ func TestBeatOverLimitBodyWarnsAndStillRecords(t *testing.T) {
 	// One byte past the cap is enough: the endless reader runs the drain into
 	// the limit.
 	over := httptest.NewRecorder()
-	h.ServeHTTP(over, httptest.NewRequest(http.MethodPost, "/beat/api", &unboundedReader{}))
+	h.ServeHTTP(over, newBeatRequest(http.MethodPost, "/beat/api", &unboundedReader{}))
 	if over.Code != http.StatusOK {
 		t.Fatalf("over-limit ping = %d, want 200: an oversized payload must not cost a legitimate sender its ping (body %s)",
 			over.Code, over.Body.String())
@@ -624,8 +668,8 @@ func (*interruptedReader) Read(p []byte) (int, error) {
 // ring a false missing notice.
 func TestBeatBodyReadFailureStillRecords(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandler(b, "")
-	req := httptest.NewRequest(http.MethodPost, "/beat/api", &interruptedReader{})
+	h := newTestHandler(b, testBeatToken)
+	req := newBeatRequest(http.MethodPost, "/beat/api", &interruptedReader{})
 	rec := httptest.NewRecorder()
 
 	h.ServeHTTP(rec, req)
@@ -760,67 +804,214 @@ func TestTokenGateScopedToBeatEndpoint(t *testing.T) {
 	}
 }
 
-func TestBeatTokenGateAppliesToGet(t *testing.T) {
-	// GET /beat/{id} records a ping exactly like POST, so the token must
-	// gate it identically: an ungated GET route would let any sender feed
-	// the switch without the credential.
+// TestEmptyBeatTokenFailsClosed pins the wiring guard. internal/config refuses
+// to start without a BEAT_TOKEN, so an empty one reaching webapi is a bug — and
+// the dangerous way to handle it is the one this rules out: building the
+// verifier over "Bearer "+"" would arm the gate for a credential every client
+// can present verbatim, an open endpoint with a published password. The zero
+// verifier refuses everything instead, including the bare scheme.
+func TestEmptyBeatTokenFailsClosed(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandler(b, "s3cret")
+	h := New(context.Background(), b, Deps{Healthz: staticHealthz(http.StatusOK)})
 
-	req := httptest.NewRequest(http.MethodGet, "/beat/api", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("GET without token = %d, want 401", rec.Code)
+	for _, auth := range []string{"", "Bearer ", "Bearer", "Bearer anything"} {
+		t.Run("auth "+auth, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
+			if auth != "" {
+				req.Header.Set("Authorization", auth)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("Authorization %q against an empty configured token = %d, want 401 (body %s)",
+					auth, rec.Code, rec.Body.String())
+			}
+		})
 	}
 	if len(b.seen) != 0 {
-		t.Errorf("unauthorized GET recorded a beat: %v", b.seen)
+		t.Errorf("recorded beats = %v, want none: an empty configured token must refuse every ping, never admit one", b.seen)
+	}
+}
+
+// TestFailedAuthIsThrottledInAggregate pins the failed-auth throttle. The token
+// is the endpoint's only gate, so an unthrottled 401 path is both a guessing
+// oracle at wire speed and a log-flood vector (one access line per attempt).
+// The three halves that make the throttle safe are pinned together, because each
+// one alone is a plausible mis-implementation: bad bearers are capped, a VALID
+// ping never draws a token (so a healthy fleet cannot throttle itself, even
+// behind a flood), and no other route or method draws one either. The 429 is
+// also the one refusal knell answers outside webhttp.Logging, so the reason
+// counter asserted below is its only vantage point.
+func TestFailedAuthIsThrottledInAggregate(t *testing.T) {
+	badBearer := func(h http.Handler) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
+		req.Header.Set("Authorization", "Bearer wrong")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/beat/api", nil)
-	req.Header.Set("Authorization", "Bearer s3cret")
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET with token = %d, want 200 (body %s)", rec.Code, rec.Body.String())
-	}
-	if len(b.seen) != 1 {
-		t.Errorf("authorized GET recorded %d beats, want 1", len(b.seen))
+	t.Run("bad bearers are capped at the burst", func(t *testing.T) {
+		b := &fakeBeater{known: map[string]bool{"api": true}}
+		h := newTestHandler(b, testBeatToken)
+		// The 429 is answered outside webhttp.Logging, so it reaches neither
+		// the access log nor the request counter: this reason series is the
+		// only vantage point on it. Deltas against the singleton registry.
+		const reasonSeries = `knell_pre_route_refusals_total{reason="auth_throttled"}`
+		reasonBefore := mustSeriesValue(t, scrapeExposition(t, h), reasonSeries)
+
+		// The bucket starts full, so exactly authFailBurst attempts reach the
+		// gate before it empties. A 429 inside that window would throttle an
+		// operator retrying a rotated token by hand.
+		for i := range authFailBurst {
+			if rec := badBearer(h); rec.Code != http.StatusUnauthorized {
+				t.Fatalf("attempt %d = %d, want 401: the burst must absorb %d attempts (body %s)",
+					i+1, rec.Code, authFailBurst, rec.Body.String())
+			}
+		}
+		// A 401 is the handler's refusal, not the throttle's: counting it here
+		// would make the series read as a throttle that fired when it did not.
+		if got := mustSeriesValue(t, scrapeExposition(t, h), reasonSeries); got != reasonBefore {
+			t.Errorf("%s = %v, want %v after %d unthrottled 401s: only a 429 is a throttled refusal",
+				reasonSeries, got, reasonBefore, authFailBurst)
+		}
+		rec := badBearer(h)
+		if rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("attempt %d = %d, want 429: an unbounded 401 path is a guessing oracle and a log flood (body %s)",
+				authFailBurst+1, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "too_many_auth_failures") {
+			t.Errorf("429 body = %s, want the too_many_auth_failures coded envelope", rec.Body.String())
+		}
+		if got := mustSeriesValue(t, scrapeExposition(t, h), reasonSeries); got != reasonBefore+1 {
+			t.Errorf("%s = %v, want %v: the 429 is logged and counted nowhere else, so an operator has no other way to see the throttle fired",
+				reasonSeries, got, reasonBefore+1)
+		}
+		// A sender that is merely early has to learn when to come back; the
+		// hint is what makes the refusal actionable rather than opaque.
+		if got := rec.Header().Get("Retry-After"); got == "" {
+			t.Errorf("429 carries no Retry-After: a throttled sender cannot tell when to retry")
+		}
+		if len(b.seen) != 0 {
+			t.Errorf("recorded beats = %v, want none: no failed-auth attempt may record", b.seen)
+		}
+	})
+
+	t.Run("a valid ping is never throttled", func(t *testing.T) {
+		b := &fakeBeater{known: map[string]bool{"api": true}}
+		h := newTestHandler(b, testBeatToken)
+
+		// Empty the bucket first: the point is that a valid ping does not draw
+		// from it at all, so it must succeed even while it is empty.
+		for range authFailBurst + 5 {
+			badBearer(h)
+		}
+		for i := range authFailBurst + 5 {
+			if rec := beatRequest(t, h, http.MethodPost, "/beat/api"); rec.Code != http.StatusOK {
+				t.Fatalf("valid ping %d during a failed-auth flood = %d, want 200: the fleet's own senders must never be throttled (body %s)",
+					i+1, rec.Code, rec.Body.String())
+			}
+		}
+		if len(b.seen) != authFailBurst+5 {
+			t.Errorf("recorded beats = %d, want %d: every valid ping must record", len(b.seen), authFailBurst+5)
+		}
+	})
+
+	t.Run("other requests draw no token", func(t *testing.T) {
+		b := &fakeBeater{known: map[string]bool{"api": true}}
+		h := newTestHandler(b, testBeatToken)
+
+		// None of these is a failed authentication: the probes are ungated, and
+		// the /beat spellings are refused as a method or as an unknown beat
+		// before any credential matters. Drawing on them would let unrelated
+		// traffic throttle the real senders' 401 budget.
+		for range authFailBurst + 5 {
+			for _, r := range []struct{ method, path string }{
+				{http.MethodGet, "/healthz"},
+				{http.MethodGet, "/metrics"},
+				{http.MethodGet, "/beat/api"},
+				{http.MethodPost, "/beat/api/extra"},
+				{http.MethodPost, "/beat"},
+			} {
+				req := httptest.NewRequest(r.method, r.path, nil)
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+				if rec.Code == http.StatusTooManyRequests {
+					t.Fatalf("%s %s = 429: only a failed authentication on the beat endpoint may draw a token", r.method, r.path)
+				}
+			}
+		}
+		// The budget is intact: the very next bad bearer is still a 401.
+		if rec := badBearer(h); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("bad bearer after unrelated traffic = %d, want 401: the bucket was drained by requests that are not auth failures", rec.Code)
+		}
+	})
+}
+
+// TestGetAndHeadNeverRecordABeat pins that the two fetch-shaped methods cannot
+// feed the switch, WITH a valid credential in hand. A recording GET is what an
+// <img>, a link preview, a crawler or an uptime prober can reach by accident, so
+// GET and HEAD are registered to refuse rather than left to fall through: only
+// POST records. The valid token is the point of the test — the refusal must be
+// the METHOD's, not the credential's, or a sender that holds the token could
+// still re-arm the switch from a URL somebody fetched for it.
+func TestGetAndHeadNeverRecordABeat(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			b := &fakeBeater{known: map[string]bool{"api": true}}
+			h := newTestHandler(b, testBeatToken)
+
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, newBeatRequest(method, "/beat/api", nil))
+
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("authorized %s /beat/api = %d, want 405: only POST records (body %s)",
+					method, rec.Code, rec.Body.String())
+			}
+			if len(b.seen) != 0 {
+				t.Errorf("authorized %s recorded %v, want nothing: a fetched URL must never re-arm the switch", method, b.seen)
+			}
+			// The refusal is coded and names POST, so a misconfigured sender
+			// learns what to send instead of reading a bare 404.
+			if !strings.Contains(rec.Body.String(), "method_not_allowed") {
+				t.Errorf("%s body = %s, want the method_not_allowed coded envelope", method, rec.Body.String())
+			}
+		})
 	}
 }
 
 // TestEveryRejectedMethodAnswersTheSameRefusal pins that the Allow header is
-// TRUE for every rejected method, not just for HEAD. Without the
-// method-agnostic /beat/{id} route, PUT/DELETE/PATCH/OPTIONS fall to
-// net/http's built-in 405, which assembles Allow from the registered patterns
-// and so answers "GET, HEAD, POST" — advertising as permitted the one method
-// this file registers a route for in order to REFUSE (a HEAD that recorded a
-// ping would keep the switch armed with no heartbeat behind it). A prober that
-// discovers methods from Allow would be steered straight at it.
+// TRUE for every rejected method. Without the method-agnostic /beat/{id} route,
+// PUT/DELETE/PATCH/OPTIONS fall to net/http's built-in 405, which assembles
+// Allow from the registered patterns and so answers "GET, HEAD, POST" —
+// advertising as permitted the two methods this file registers routes for in
+// order to REFUSE (a GET or HEAD that recorded a ping would keep the switch
+// armed with no heartbeat behind it). A prober that discovers methods from Allow
+// would be steered straight at them.
 func TestEveryRejectedMethodAnswersTheSameRefusal(t *testing.T) {
 	for _, method := range []string{
-		http.MethodHead, http.MethodPut, http.MethodDelete,
+		http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete,
 		http.MethodPatch, http.MethodOptions,
 		// CONNECT is the one method net/http routes by another code path:
 		// ServeMux skips path canonicalization for it and matches on
 		// r.URL.Host, so it reaches the method-agnostic route without the
 		// cleaning pass. It must still answer the same coded 405 with a
-		// truthful Allow — a CONNECT routed to the GET/POST pattern would
-		// RECORD a ping, and net/http's built-in 405 would advertise HEAD.
+		// truthful Allow — a CONNECT routed to the POST pattern would
+		// RECORD a ping, and net/http's built-in 405 would advertise GET.
 		http.MethodConnect, "WHATEVER",
 	} {
 		t.Run(method, func(t *testing.T) {
 			b := &fakeBeater{known: map[string]bool{"api": true}}
-			h := newTestHandler(b, "")
-			req := httptest.NewRequest(method, "/beat/api", nil)
+			h := newTestHandler(b, testBeatToken)
+			req := newBeatRequest(method, "/beat/api", nil)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 
 			if rec.Code != http.StatusMethodNotAllowed {
 				t.Errorf("%s /beat/api = %d, want 405", method, rec.Code)
 			}
-			if got := rec.Header().Get("Allow"); got != "GET, POST" {
-				t.Errorf("%s /beat/api Allow = %q, want \"GET, POST\": a rejected method must not be told that a method which does not record a beat is permitted", method, got)
+			if got := rec.Header().Get("Allow"); got != "POST" {
+				t.Errorf("%s /beat/api Allow = %q, want \"POST\": a rejected method must not be told that a method which does not record a beat is permitted", method, got)
 			}
 			// The coded JSON envelope, not net/http's plain "Method Not
 			// Allowed\n": every other refusal on this surface (401, 404, 405,
@@ -887,7 +1078,7 @@ func TestAccessLogPathIsBounded(t *testing.T) {
 			// slog default, and it must be installed BEFORE New because
 			// webhttp.Logging resolves slog.Default() when the chain is built.
 			rec := capture.Default(t)
-			h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
+			h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
 
 			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
 			h.ServeHTTP(httptest.NewRecorder(), req)
@@ -959,7 +1150,7 @@ func FuzzLoggedPathIsBounded(f *testing.F) {
 		// handler must be built after it because webhttp.Logging resolves
 		// slog.Default() when the chain is built.
 		logs := capture.Default(t)
-		h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
+		h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
 
 		// Built by hand rather than via a target string: httptest.NewRequest
 		// panics on a target it cannot parse, and arbitrary bytes are exactly
@@ -1080,10 +1271,10 @@ func mustSeriesValue(t *testing.T, exposition, series string) float64 {
 	return v
 }
 
-// beatRequest sends one ping through the routed handler.
+// beatRequest sends one authenticated ping through the routed handler.
 func beatRequest(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(method, path, strings.NewReader(""))
+	req := newBeatRequest(method, path, strings.NewReader(""))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -1105,7 +1296,7 @@ func newShutdownHarness(t *testing.T, id string) (http.Handler, context.CancelFu
 	watcher := watch.New([]watch.Beat{{ID: id, Deadline: time.Minute}}, &deliveringNotifier{}, clock.Now, start)
 	appCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	h := New(appCtx, watcher, Deps{Healthz: staticHealthz(http.StatusOK)})
+	h := New(appCtx, watcher, Deps{Healthz: staticHealthz(http.StatusOK), BeatToken: testBeatToken})
 	return h, cancel, clock, start
 }
 
@@ -1134,8 +1325,10 @@ func assertBeatRefused(t *testing.T, h http.Handler, method, path string) {
 // cancelled, which returns watch.Run (after it snapshots its undelivered work)
 // while webhttp keeps the HTTP surface live for up to the shutdown grace. A
 // ping accepted in that window is recorded behind a sender that no longer
-// exists, so from the instant the context is cancelled both accepted methods
-// must refuse and say so honestly. What accepting one would cost is pinned by
+// exists, so from the instant the context is cancelled the recording method must
+// refuse and say so honestly. GET and HEAD need no case here: they are refused
+// as methods in every lifecycle phase (TestGetAndHeadNeverRecordABeat).
+// What accepting one would cost is pinned by
 // the siblings below: TestCancelledBeatLeavesMetricsUnchanged (the exposition),
 // TestCancelledUnknownBeatMintsNoSeries (label cardinality),
 // TestCancelledBeatDoesNotReadBody (the drain), and
@@ -1146,11 +1339,7 @@ func TestBeatRefusedOnceTheApplicationContextIsCancelled(t *testing.T) {
 
 	cancel()
 
-	for _, method := range []string{http.MethodPost, http.MethodGet} {
-		t.Run("refused "+method, func(t *testing.T) {
-			assertBeatRefused(t, h, method, "/beat/"+id)
-		})
-	}
+	assertBeatRefused(t, h, http.MethodPost, "/beat/"+id)
 }
 
 // TestCancelledBeatLeavesMetricsUnchanged pins the exposition across the
@@ -1241,7 +1430,7 @@ func TestCancelledBeatDoesNotReadBody(t *testing.T) {
 	cancel()
 
 	body := &countingReader{}
-	req := httptest.NewRequest(http.MethodPost, "/beat/"+id, body)
+	req := newBeatRequest(http.MethodPost, "/beat/"+id, body)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
@@ -1279,10 +1468,10 @@ func TestBeatRefusedWhenCancellationHappensDuringBodyDrain(t *testing.T) {
 	appCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandlerCtx(appCtx, b, "")
+	h := newTestHandlerCtx(appCtx, b, testBeatToken)
 
 	bodyReader, bodyWriter := io.Pipe()
-	req := httptest.NewRequest(http.MethodPost, "/beat/api", bodyReader)
+	req := newBeatRequest(http.MethodPost, "/beat/api", bodyReader)
 	rec := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -1336,9 +1525,9 @@ func TestBeatRefusedWhenWatcherClosedAdmission(t *testing.T) {
 	t.Parallel()
 
 	b := &fakeBeater{known: map[string]bool{"api": true}, closed: true}
-	h := newTestHandler(b, "")
+	h := newTestHandler(b, testBeatToken)
 
-	req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader("ping"))
+	req := newBeatRequest(http.MethodPost, "/beat/api", strings.NewReader("ping"))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -1397,7 +1586,6 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 		ctx        context.Context
 		method     string
 		path       string
-		headers    map[string]string
 		wantStatus int
 		wantSeries string
 		wantSeen   int
@@ -1406,21 +1594,21 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 		// counting everything as a refusal, and it is the denominator an
 		// operator compares a refusal rate against.
 		"accepted ping": {
-			ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id,
+			token: testBeatToken, ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id,
 			wantStatus: http.StatusOK, wantSeen: 1,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="200"}`,
 		},
 		// A rotated or mistyped BEAT_TOKEN. The gate is outermost, so this is
 		// the refusal an unauthenticated caller reaches first.
 		"unauthorized ping": {
-			token: "s3cret", ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id,
+			token: "a-different-token-entirely", ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id,
 			wantStatus: http.StatusUnauthorized,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="401"}`,
 		},
 		// A typo in a sender's URL: the beat stays silent while the sender
 		// believes it is pinging.
 		"unknown beat id": {
-			ctx: context.Background(), method: http.MethodPost, path: "/beat/ghost",
+			token: testBeatToken, ctx: context.Background(), method: http.MethodPost, path: "/beat/ghost",
 			wantStatus: http.StatusNotFound,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="404"}`,
 		},
@@ -1428,21 +1616,21 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 		// /beat/{$}, so the refusal keeps the coded envelope and its own
 		// series instead of falling into net/http's unmatched-bucket 404.
 		"empty beat id": {
-			ctx: context.Background(), method: http.MethodPost, path: "/beat/",
+			token: testBeatToken, ctx: context.Background(), method: http.MethodPost, path: "/beat/",
 			wantStatus: http.StatusNotFound,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{$}",status="404"}`,
 		},
 		// A trailing-slash or extra-segment URL join: routes to
 		// /beat/{id}/{rest...}, same coded 404, its own series.
 		"nested beat path": {
-			ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id + "/",
+			token: testBeatToken, ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id + "/",
 			wantStatus: http.StatusNotFound,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}/{rest...}",status="404"}`,
 		},
 		// HEAD has its own registered route (so a HEAD probe cannot record a
 		// ping), and that route NAMES the method, so the label is truthful.
 		"head refused": {
-			ctx: context.Background(), method: http.MethodHead, path: "/beat/" + id,
+			token: testBeatToken, ctx: context.Background(), method: http.MethodHead, path: "/beat/" + id,
 			wantStatus: http.StatusMethodNotAllowed,
 			wantSeries: `knell_http_requests_total{method="HEAD",path="/beat/{id}",status="405"}`,
 		},
@@ -1454,24 +1642,22 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 		// which real method a sender is misconfigured to use. See
 		// TestRequestMetricLabelsBoundedByTheRouteTable for the bucket half.
 		"disallowed method refused": {
-			ctx: context.Background(), method: http.MethodPut, path: "/beat/" + id,
+			token: testBeatToken, ctx: context.Background(), method: http.MethodPut, path: "/beat/" + id,
 			wantStatus: http.StatusMethodNotAllowed,
 			wantSeries: `knell_http_requests_total{method="PUT",path="/beat/{id}",status="405"}`,
 		},
-		// A browser page tricked into the ping (the confused-deputy shape the
-		// Sec-Fetch guard refuses). Nothing else makes this class visible: it
-		// records no beat, so beatsReceived never moves, and an operator
-		// watching for forged pings has only this series to alert on.
-		"browser page ping": {
-			ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id,
-			headers:    map[string]string{"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors"},
-			wantStatus: http.StatusForbidden,
-			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="403"}`,
+		// GET has its own registered route refusing it, so a sender (or
+		// anything that fetched the URL for one) learns the method is not the
+		// recording one, and the label names the method truthfully.
+		"get refused": {
+			token: testBeatToken, ctx: context.Background(), method: http.MethodGet, path: "/beat/" + id,
+			wantStatus: http.StatusMethodNotAllowed,
+			wantSeries: `knell_http_requests_total{method="GET",path="/beat/{id}",status="405"}`,
 		},
 		// A ping arriving during the drain, after watch.Run already took its
 		// undelivered-work snapshot.
 		"ping during drain": {
-			ctx: cancelledCtx(), method: http.MethodPost, path: "/beat/" + id,
+			token: testBeatToken, ctx: cancelledCtx(), method: http.MethodPost, path: "/beat/" + id,
 			wantStatus: http.StatusServiceUnavailable,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="503"}`,
 		},
@@ -1486,10 +1672,7 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 			// shared by the whole test binary (and by a -count=2 rerun).
 			before, _ := seriesValue(t, scrapeExposition(t, h), tt.wantSeries)
 
-			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(""))
-			for name, value := range tt.headers {
-				req.Header.Set(name, value)
-			}
+			req := newBeatRequest(tt.method, tt.path, strings.NewReader(""))
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 			if rec.Code != tt.wantStatus {
@@ -1627,12 +1810,11 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 	allowedPaths := map[string]bool{
 		"/beat/{id}": true, "/beat": true, "/beat/{$}": true, "/beat/{id}/{rest...}": true,
 		"/healthz": true, "/metrics": true,
-		nonCanonicalBeatPattern: true,
-		unmatchedPathLabel:      true,
+		unmatchedPathLabel: true,
 	}
 
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandlerCtx(context.Background(), b, "")
+	h := newTestHandlerCtx(context.Background(), b, testBeatToken)
 	before := httpRequestSeries(scrapeExposition(t, h))
 
 	hostile := hostileRequestSet()
@@ -1646,7 +1828,7 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 	assertNoCallerTokens(t, exposition, hostile, allowedMethods, allowedPaths)
 	assertRequestSeriesVocabulary(t, after, allowedMethods, allowedPaths)
 
-	// The vocabulary can produce at most 10 methods x 7 paths x the handful of
+	// The vocabulary can produce at most 10 methods x 6 paths x the handful of
 	// statuses knell answers; the hostile requests above must land inside that,
 	// not grow it. The bound is deliberately loose — the membership checks above
 	// are the precise guard, this catches unbounded GROWTH regardless of
@@ -1701,7 +1883,7 @@ func TestUnroutedRequestsAreCountedUnderTheCollapsedSeries(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			b := &fakeBeater{known: map[string]bool{"api": true}}
-			h := newTestHandlerCtx(context.Background(), b, "")
+			h := newTestHandlerCtx(context.Background(), b, testBeatToken)
 			want := `knell_http_requests_total{method="` + tt.wantMethod +
 				`",path="` + unmatchedPathLabel + `",status="` + tt.wantStatus + `"}`
 			// Deltas, not absolutes: the registry is a package-level singleton
@@ -1738,7 +1920,7 @@ func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 	// default, and must be installed BEFORE New, because webhttp.Logging
 	// resolves slog.Default() when the chain is built.
 	logs := capture.Default(t)
-	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, "")
+	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
 
 	overlong := strings.Repeat("A", 300)
 	rec := beatRequest(t, h, overlong, "/beat/api")
@@ -1748,8 +1930,8 @@ func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("%d-byte bogus method = %d, want 405 (body %s)", len(overlong), rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get("Allow"); got != "GET, POST" {
-		t.Errorf("Allow = %q, want \"GET, POST\": bounding the logged method must not change the refusal", got)
+	if got := rec.Header().Get("Allow"); got != "POST" {
+		t.Errorf("Allow = %q, want \"POST\": bounding the logged method must not change the refusal", got)
 	}
 
 	// The logged method is the placeholder, never the caller's bytes.
@@ -1789,190 +1971,6 @@ const (
 	truncationMarker = "...(truncated)"
 )
 
-func TestBeatRefusesPageInitiatedBrowserRequests(t *testing.T) {
-	// Only browsers send Sec-Fetch-*, so the documented senders (curl, an
-	// Alertmanager webhook_config, a CI hook) send none of these headers and
-	// must stay accepted, as must the one browser shape the README invites: a
-	// navigation the user starts themselves, which carries Sec-Fetch-Site:
-	// none. Everything else a browser sends names an initiating page, which is
-	// the confused-deputy shape — including a cross-site NAVIGATION, because an
-	// iframe load is one. Without this test the guard can be deleted with the
-	// whole suite green: every other beat test sends no Sec-Fetch header at all,
-	// so nothing exercises the refusing side of the check.
-	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandler(b, "")
-
-	tests := []struct {
-		name       string
-		method     string
-		site       string
-		mode       string
-		origin     string
-		wantStatus int
-		wantSeen   int
-	}{
-		{name: "documented sender sends no Sec-Fetch", wantStatus: 200, wantSeen: 1},
-		{name: "address bar", site: "none", mode: "navigate", wantStatus: 200, wantSeen: 1},
-		{name: "bookmark without a mode", site: "none", wantStatus: 200, wantSeen: 1},
-		{name: "cross-site image load", site: "cross-site", mode: "no-cors", wantStatus: 403},
-		{name: "cross-site fetch", site: "cross-site", mode: "cors", wantStatus: 403},
-		// An iframe: a NAVIGATION with an initiating document, which the old
-		// Sec-Fetch-Mode carve-out admitted and this rule refuses.
-		{name: "cross-site iframe navigation", site: "cross-site", mode: "navigate", wantStatus: 403},
-		{name: "same-origin fetch", site: "same-origin", mode: "cors", wantStatus: 403},
-		{name: "same-origin subresource", site: "same-origin", mode: "no-cors", wantStatus: 403},
-		{name: "same-origin navigation from a page", site: "same-origin", mode: "navigate", wantStatus: 403},
-		// A compromised sibling origin on an allowed hostname.
-		{name: "same-site fetch", site: "same-site", mode: "cors", wantStatus: 403},
-		{name: "same-site navigation", site: "same-site", mode: "navigate", wantStatus: 403},
-		// knell's documented endpoint is plain HTTP, where a browser sends NO
-		// Fetch Metadata at all (it is appended only for a potentially
-		// trustworthy URL). Origin is the signal that survives, so these cases
-		// are the ones the Sec-Fetch-Site half cannot express — and a
-		// documented sender still sends neither header, so it stays accepted.
-		{name: "plain-http cross-origin fetch POST", method: http.MethodPost, origin: "http://evil.example", wantStatus: 403},
-		{name: "plain-http form POST with a nulled origin", method: http.MethodPost, origin: "null", wantStatus: 403},
-		// A cors-mode fetch GET: an Origin with no Sec-Fetch header at all. This
-		// is the leg browserPageRequest's doc names that the POST rows above
-		// cannot express, and the only row that fails a rewrite keying the
-		// Origin check on the method.
-		{name: "plain-http cors-mode fetch GET", origin: "http://evil.example", wantStatus: 403},
-		{name: "documented POST sender sends no Origin either", method: http.MethodPost, wantStatus: 200, wantSeen: 1},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			before := len(b.seen)
-			// Default GET: every Sec-Fetch row above is a browser GET. The
-			// Origin rows name their method because Origin is appended
-			// unconditionally for POST -- knell's canonical ping -- and only
-			// for a cors-mode GET, so both methods need a row.
-			method := tt.method
-			if method == "" {
-				method = http.MethodGet
-			}
-			req := httptest.NewRequest(method, "/beat/api", nil)
-			if tt.site != "" {
-				req.Header.Set("Sec-Fetch-Site", tt.site)
-			}
-			if tt.mode != "" {
-				req.Header.Set("Sec-Fetch-Mode", tt.mode)
-			}
-			if tt.origin != "" {
-				req.Header.Set("Origin", tt.origin)
-			}
-			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, req)
-			if rec.Code != tt.wantStatus {
-				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
-			}
-			if tt.wantStatus == http.StatusForbidden &&
-				!strings.Contains(rec.Body.String(), "browser_page_request") {
-				t.Errorf("body = %s, want the browser_page_request coded envelope", rec.Body.String())
-			}
-			if got := len(b.seen) - before; got != tt.wantSeen {
-				t.Errorf("recorded beats = %d, want %d", got, tt.wantSeen)
-			}
-		})
-	}
-
-	t.Run("refused body never read", func(t *testing.T) {
-		body := &countingReader{}
-		req := httptest.NewRequest(http.MethodPost, "/beat/api", body)
-		req.Header.Set("Sec-Fetch-Site", "cross-site")
-		req.Header.Set("Sec-Fetch-Mode", "no-cors")
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusForbidden {
-			t.Fatalf("status = %d, want 403", rec.Code)
-		}
-		if body.reads != 0 {
-			t.Errorf("body reads = %d, want 0 (refused requests must not be drained)", body.reads)
-		}
-		if code := rec.Body.String(); !strings.Contains(code, "browser_page_request") {
-			t.Errorf("body = %s, want the browser_page_request coded envelope", code)
-		}
-	})
-}
-
-// TestBrowserGuardAppliesWithTokenGateConfigured pins the SCOPE of the
-// browser-origin guard: it lives in record, so it refuses in the token
-// configuration too, and the credential gate stays outside it. Every other
-// browser-guard case builds an OPEN endpoint, so moving the check into
-// beatHandler's token == "" branch would leave a gated deployment with no
-// confused-deputy layer at all and the whole suite green.
-func TestBrowserGuardAppliesWithTokenGateConfigured(t *testing.T) {
-	const token = "s3cret"
-	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandler(b, token)
-
-	tests := []struct {
-		name       string
-		auth       string
-		site       string
-		mode       string
-		wantStatus int
-		wantCode   string
-		wantSeen   int
-	}{
-		// An authorized sender is still not allowed to be a browser tricked
-		// into the ping: the credential proves who, not what.
-		{
-			name: "authorized cross-site subresource refused",
-			auth: "Bearer " + token, site: "cross-site", mode: "no-cors",
-			wantStatus: http.StatusForbidden, wantCode: "browser_page_request",
-		},
-		// Same-site is refused under the token too: a compromised sibling
-		// origin on an allowed hostname is exactly the caller a credential
-		// cannot tell apart from the operator.
-		{
-			name: "authorized same-site request refused",
-			auth: "Bearer " + token, site: "same-site", mode: "cors",
-			wantStatus: http.StatusForbidden, wantCode: "browser_page_request",
-		},
-		// The credential gate is outermost, so an unauthenticated cross-site
-		// ping answers 401 and never learns the guard exists.
-		{
-			name: "unauthorized cross-site subresource answers the credential refusal",
-			site: "cross-site", mode: "no-cors",
-			wantStatus: http.StatusUnauthorized, wantCode: "unauthorized",
-		},
-		// The documented senders carry no Sec-Fetch headers and keep working
-		// with the token set: the guard costs them nothing.
-		{
-			name:       "authorized documented sender still records",
-			auth:       "Bearer " + token,
-			wantStatus: http.StatusOK, wantSeen: 1,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			before := len(b.seen)
-			req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
-			if tt.auth != "" {
-				req.Header.Set("Authorization", tt.auth)
-			}
-			if tt.site != "" {
-				req.Header.Set("Sec-Fetch-Site", tt.site)
-			}
-			if tt.mode != "" {
-				req.Header.Set("Sec-Fetch-Mode", tt.mode)
-			}
-			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, req)
-
-			if rec.Code != tt.wantStatus {
-				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
-			}
-			if tt.wantCode != "" && !strings.Contains(rec.Body.String(), tt.wantCode) {
-				t.Errorf("body = %s, want the %s coded envelope", rec.Body.String(), tt.wantCode)
-			}
-			if got := len(b.seen) - before; got != tt.wantSeen {
-				t.Errorf("recorded beats = %d, want %d", got, tt.wantSeen)
-			}
-		})
-	}
-}
-
 // hostPolicy builds the allowlist exactly as internal/config does, so this
 // file exercises the policy shape knell actually ships (loopback exempt, the
 // ALLOWED_HOSTS-naming 403).
@@ -1991,17 +1989,17 @@ func hostPolicy(t *testing.T, entries string) *webhttp.HostPolicy {
 // TestHostAllowlistBreaksDNSRebinding pins the one defense that stops a
 // rebinding page from reading knell's state under the attacker's hostname. The
 // attack request is indistinguishable from a legitimate one by every OTHER check
-// knell runs on /healthz and /metrics: browserPageRequest guards the BEAT
-// handler only, and on the documented default the endpoint is open. Only the
-// textual Host check refuses it, because the attacker controls what their
-// hostname resolves to but not what the browser puts in Host — and the /beat
-// case below proves the allowlist, not the handler's own guard, is what answers
-// first.
+// knell runs on /healthz and /metrics: the bearer gate covers the BEAT route
+// only, and those two endpoints must stay reachable for probes and scrapes.
+// Only the textual Host check refuses it, because the attacker controls what
+// their hostname resolves to but not what the browser puts in Host — and the
+// /beat case below proves the allowlist answers before the route's own refusals.
 func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	h := New(context.Background(), b, Deps{
-		Healthz: staticHealthz(http.StatusOK),
-		Hosts:   hostPolicy(t, "knell.example"),
+		Healthz:   staticHealthz(http.StatusOK),
+		Hosts:     hostPolicy(t, "knell.example"),
+		BeatToken: testBeatToken,
 	})
 
 	tests := map[string]struct {
@@ -2009,14 +2007,13 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		path       string
 		method     string // empty = POST
 		remoteAddr string
-		site       string
 		wantStatus int
 		wantSeen   int
 	}{
 		"allowed host records a beat":   {host: "knell.example", path: "/beat/api", wantStatus: http.StatusOK, wantSeen: 1},
 		"allowed host with port":        {host: "knell.example:9190", path: "/beat/api", wantStatus: http.StatusOK, wantSeen: 1},
 		"allowed host case-insensitive": {host: "KNELL.example", path: "/beat/api", wantStatus: http.StatusOK, wantSeen: 1},
-		"rebinding ping refused":        {host: "attacker.example", path: "/beat/api", site: "same-origin", wantStatus: http.StatusForbidden},
+		"rebinding ping refused":        {host: "attacker.example", path: "/beat/api", wantStatus: http.StatusForbidden},
 		"foreign host refused on beat":  {host: "attacker.example", path: "/beat/api", wantStatus: http.StatusForbidden},
 		// A non-canonical spelling under a foreign Host: the Host policy answers
 		// FIRST, so this is host_not_allowed, not canonicalBeatPath's 404. Pins
@@ -2045,13 +2042,10 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 			if method == "" {
 				method = http.MethodPost
 			}
-			req := httptest.NewRequest(method, tt.path, nil)
+			req := newBeatRequest(method, tt.path, nil)
 			req.Host = tt.host
 			if tt.remoteAddr != "" {
 				req.RemoteAddr = tt.remoteAddr
-			}
-			if tt.site != "" {
-				req.Header.Set("Sec-Fetch-Site", tt.site)
 			}
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
@@ -2076,10 +2070,10 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 // green.
 func TestNilHostPolicyAcceptsEveryHost(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandler(b, "") // Deps.Hosts is nil, exactly like an unset ALLOWED_HOSTS
+	h := newTestHandler(b, testBeatToken) // Deps.Hosts is nil, exactly like an unset ALLOWED_HOSTS
 
 	for _, host := range []string{"knell.example", "attacker.example", "192.0.2.9:9190", ""} {
-		req := httptest.NewRequest(http.MethodPost, "/beat/api", nil)
+		req := newBeatRequest(http.MethodPost, "/beat/api", nil)
 		req.Host = host
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -2119,16 +2113,23 @@ func scrapeAs(t *testing.T, h http.Handler, host string) string {
 func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	h := New(context.Background(), b, Deps{
-		Healthz: staticHealthz(http.StatusOK),
-		Hosts:   hostPolicy(t, "knell.example"),
+		Healthz:   staticHealthz(http.StatusOK),
+		Hosts:     hostPolicy(t, "knell.example"),
+		BeatToken: testBeatToken,
 	})
 
 	// The refusal happens before the mux routes, so the path label is the
-	// "unmatched" marker rather than a /beat template.
-	const series = `knell_http_requests_total{method="POST",path="unmatched",status="403"}`
-	before, _ := seriesValue(t, scrapeAs(t, h, "knell.example"), series)
+	// "unmatched" marker rather than a /beat template — which is why the cause
+	// is also counted by reason on knell's own pre-route refusal counter.
+	const (
+		series       = `knell_http_requests_total{method="POST",path="unmatched",status="403"}`
+		reasonSeries = `knell_pre_route_refusals_total{reason="host_not_allowed"}`
+	)
+	baseline := scrapeAs(t, h, "knell.example")
+	before, _ := seriesValue(t, baseline, series)
+	reasonBefore := mustSeriesValue(t, baseline, reasonSeries)
 
-	req := httptest.NewRequest(http.MethodPost, "/beat/api", nil)
+	req := newBeatRequest(http.MethodPost, "/beat/api", nil)
 	req.Host = "attacker.example"
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -2137,14 +2138,19 @@ func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 		t.Fatalf("status = %d, want 403 (body %s)", rec.Code, rec.Body.String())
 	}
 	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
-		t.Errorf("Cache-Control = %q, want no-store: the host refusal must stay INSIDE noStore", got)
+		t.Errorf("Cache-Control = %q, want no-store: the host refusal must stay INSIDE webhttp.NoStore", got)
 	}
 	if rec.Header().Get("X-Content-Type-Options") == "" {
 		t.Errorf("host refusal lost SecurityHeaders: %v", rec.Header())
 	}
-	if after, ok := seriesValue(t, scrapeAs(t, h, "knell.example"), series); !ok || after <= before {
+	after := scrapeAs(t, h, "knell.example")
+	if got, ok := seriesValue(t, after, series); !ok || got <= before {
 		t.Errorf("%s did not move (%v -> %v, present=%v): a refused Host must stay visible to a scrape",
-			series, before, after, ok)
+			series, before, got, ok)
+	}
+	if got := mustSeriesValue(t, after, reasonSeries); got != reasonBefore+1 {
+		t.Errorf("%s = %v, want %v: in the unmatched bucket a rebinding attempt is indistinguishable from a port scan unless its cause is counted",
+			reasonSeries, got, reasonBefore+1)
 	}
 	if len(b.seen) != 0 {
 		t.Errorf("recorded beats = %v, want none", b.seen)

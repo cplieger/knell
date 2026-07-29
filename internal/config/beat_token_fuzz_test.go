@@ -60,7 +60,10 @@ func FuzzCheckBeatToken(f *testing.F) {
 			return
 		}
 		if token == "" {
-			t.Fatal("accepted an empty token: webapi reads an empty BeatToken as \"serve /beat/{id} open\", so accepting it disarms the gate the operator asked for")
+			t.Fatal("accepted an empty token: BEAT_TOKEN is required and an empty value is no credential at all, so accepting it would leave webapi's gate with nothing to verify against")
+		}
+		if len(token) < minTokenLength {
+			t.Fatalf("accepted a %d-byte token: the gate is /beat/{id}'s only defense, so a value under the %d-byte floor is guessable and must fail startup", len(token), minTokenLength)
 		}
 		got, err := wireAuthorizationValue(t, token)
 		if err != nil {

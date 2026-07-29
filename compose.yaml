@@ -10,9 +10,12 @@ services:
       # the URL path IS the credential: DISCORD_WEBHOOK_URL_FILE reads it from a
       # mounted secret file instead of embedding it here (see README).
       DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/..."  # https only
+      # required, min 16 bytes (`openssl rand -hex 16`): senders present it as
+      # "Authorization: Bearer <token>". BEAT_TOKEN_FILE reads it from a file.
+      BEAT_TOKEN: "replace-with-a-random-token"
       NODE_NAME: "server-1"  # names this observer in notifications
 
     ports:
-      # published to every host interface: anyone reaching this port can ping a beat and keep the
-      # switch armed, and /metrics stays open even with BEAT_TOKEN set. Trusted network only, see README.
+      # published to every host interface: a ping needs BEAT_TOKEN, but /metrics
+      # stays open and enumerates every beat. Trusted network + TLS, see README.
       - "9190:9190"

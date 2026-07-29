@@ -33,10 +33,11 @@ const maxBeats = 64
 // than every 30 seconds still works with a longer deadline.
 const minDeadline = 30 * time.Second
 
-// minTokenLength is the shortest BEAT_TOKEN that does not draw a startup
-// warning: anything shorter is realistically guessable, so operators are
-// nudged toward a long random value (the check stays warn-only; the gate
-// still arms).
+// minTokenLength is the shortest BEAT_TOKEN knell will start with. The token is
+// the ONLY thing standing between a stranger who can reach the port and a
+// forged ping, so a value short enough to be guessed is refused rather than
+// warned about: a guessed token keeps the switch armed with no real heartbeat
+// behind it, which is the one failure this app exists to prevent.
 const minTokenLength = 16
 
 // asciiWhitespace is the cutset of characters that can never carry a bearer
@@ -90,11 +91,13 @@ type Config struct {
 
 // LogValue implements slog.LogValuer so a Config can never publish its own
 // secrets. DISCORD_WEBHOOK_URL's path IS the Discord credential and BeatToken
-// is the /beat/{id} gate, so both are reported by PRESENCE only: logging a
-// Config (or a *Config, whose method set includes this value receiver) stays
-// leak-free even from a call site that logs the whole struct rather than the
-// attributes this method itself chooses -- which is what main.go's logConfig
-// publishes today, by spreading this value's group.
+// is the required /beat/{id} gate, so NEITHER is rendered: the webhook is
+// reported by PRESENCE only and the token is not reported at all (it is
+// required, so its presence is not state). Logging a Config (or a *Config,
+// whose method set includes this value receiver) stays leak-free even from a
+// call site that logs the whole struct rather than the attributes this method
+// itself chooses -- which is what main.go's logConfig publishes today, by
+// spreading this value's group.
 //
 // The VALUE receiver is the load-bearing part: a *Config method set would leave
 // the bare Config that Load returns (and run() holds) outside slog.LogValuer, so
@@ -106,17 +109,11 @@ func (c Config) LogValue() slog.Value {
 	if c.WebhookURL != "" {
 		webhook = "configured"
 	}
-	beatAuth := "open"
-	if c.BeatToken != "" {
-		beatAuth = "required"
-	}
-	// The Host allowlist reports beside beat_auth because the two are knell's
-	// only optional gates, and an operator reading one expects the other on the
-	// same line. ABSENCE is the state that needs publishing: a present-but-blank
-	// ALLOWED_HOSTS warns at parse time, but a MISSPELLED variable name is
-	// indistinguishable from unset and draws nothing at all, so without this
-	// attribute an operator believes the DNS-rebinding guard is armed and no
-	// line contradicts them.
+	// The Host allowlist is knell's one OPTIONAL gate, and ABSENCE is the state
+	// that needs publishing: a present-but-blank ALLOWED_HOSTS warns at parse
+	// time, but a MISSPELLED variable name is indistinguishable from unset and
+	// draws nothing at all, so without this attribute an operator believes the
+	// DNS-rebinding guard is armed and no line contradicts them.
 	//
 	// The COUNT is state, not decoration: malformed entries are
 	// warned-and-dropped, so an active policy can hold zero usable hosts and
@@ -133,14 +130,14 @@ func (c Config) LogValue() slog.Value {
 		slog.String("node", c.Node),
 		slog.String("listen_addr", c.ListenAddr),
 		slog.String("webhook", webhook),
-		slog.String("beat_auth", beatAuth),
 		slog.String("allowed_hosts", allowedHosts),
 		slog.String("log_level", c.LogLevel.String()),
 	)
 }
 
 // Load reads the environment and returns the validated configuration.
-// BEATS and DISCORD_WEBHOOK_URL are required; everything else has a default.
+// BEATS, DISCORD_WEBHOOK_URL and BEAT_TOKEN are required; everything else has a
+// default.
 //
 // maxNodeNameBytes is the NODE_NAME cap this package ENFORCES; the bound itself
 // is owned by the package that renders the notices it is measured over
@@ -278,11 +275,11 @@ func listenAddr() string {
 // allowedHosts parses the ALLOWED_HOSTS exact-match Host allowlist. Unset (the
 // documented default) yields an inactive policy that accepts every Host, so the
 // guard ships permissive and removes no capability. An active allowlist is what
-// breaks DNS rebinding (CWE-346) on the endpoints webapi's browser-page refusal
-// does not cover: that refusal guards /beat/{id} only, so a rebinding page is
-// still free to read /metrics — which enumerates every beat and its freshness —
-// under the ATTACKER's hostname, and the allowlist is the only check that looks
-// at the Host that request carries. Matching is textual on the Host header,
+// breaks DNS rebinding (CWE-346) on the endpoints BEAT_TOKEN does not cover:
+// the bearer gate guards /beat/{id} only, so a rebinding page is still free to
+// read /metrics — which enumerates every beat and its freshness — under the
+// ATTACKER's hostname, and the allowlist is the only check that looks at the
+// Host that request carries. Matching is textual on the Host header,
 // the one value the attacker cannot forge away, and no name is resolved.
 //
 // Malformed entries WARN rather than fail startup, unlike the required values
@@ -349,12 +346,13 @@ func logLevel() slog.Level {
 // rejectBlankFileVar fails startup when a `_FILE` variable is PRESENT but
 // blank. envx gates its file channel on a non-empty value, so an empty
 // `_FILE` is indistinguishable from unset and silently falls back to the
-// plain variable — which for BEAT_TOKEN is fail-OPEN (an unauthenticated
-// /beat/{id}). Compose interpolation of an unset variable produces exactly
-// this shape. envx.IsBlankSecretFilePath reports the state (it owns the
-// `_FILE` suffix and the blank rule, and deliberately leaves the verdict to
-// the caller because only knell knows that a missing beat token means an open
-// endpoint); the refusal and its wording are knell's policy and stay here.
+// plain variable — which is not the credential the operator pointed knell at,
+// and for BEAT_TOKEN would arm the gate for a stale value while a rotated
+// secret file sat unread, 401ing every sender. Compose interpolation of an
+// unset variable produces exactly this shape. envx.IsBlankSecretFilePath
+// reports the state (it owns the `_FILE` suffix and the blank rule, and
+// deliberately leaves the verdict to the caller); the refusal and its wording
+// are knell's policy and stay here.
 func rejectBlankFileVar(key string) error {
 	if envx.IsBlankSecretFilePath(key) {
 		return fmt.Errorf("%s_FILE is set but empty: unset it to configure %s directly, or point it at a secret file", key, key)
@@ -372,24 +370,56 @@ func rejectBlankFileVar(key string) error {
 // BEAT_TOKEN_FILE is structurally identical for the bearer token. The original
 // error is deliberately NOT wrapped: %w would carry the path through
 // Error() anyway.
+//
+// envx classifies every secret-file failure with a sentinel
+// (ErrBlankSecretFile, ErrSecretFilePathRejected, ErrSecretFileTooLarge,
+// ErrSecretFileGrew, ErrSecretFileUnreadable), so each class states its own
+// remedy — fix the variable, shrink the file, stop rewriting it, fix the mount —
+// instead of one fold that had to describe all of them at once and sent an
+// operator whose file was oversized to check the path. Naming the class needs
+// no error-text matching and no access to the path, which is what makes the
+// per-class wording possible without leaking the value. The final branch stays
+// as the default for a class a future envx adds.
 func secretFileError(key string, err error) error {
-	if errors.Is(err, envx.ErrBlankSecretFile) {
+	switch {
+	case errors.Is(err, envx.ErrBlankSecretFile):
 		return fmt.Errorf("%s_FILE points to a blank secret file: point it at a file containing the secret, or unset it to configure %s directly", key, key)
-	}
-	var pathErr *os.PathError
-	if errors.As(err, &pathErr) {
+	case errors.Is(err, envx.ErrSecretFilePathRejected):
+		// envx refuses a path that is not already clean or that contains "..",
+		// and its own message embeds the value — which is exactly the leak this
+		// function exists to prevent, because a variable holding the credential
+		// instead of a path to it (a webhook URL's "https://" doubles a
+		// separator, so it never survives the clean check) lands here.
+		return fmt.Errorf("%s_FILE does not name a usable path: it must be an already-clean path with no \"..\" segment, no doubled separator and no trailing slash, e.g. /run/secrets/%s; if the variable holds the secret itself rather than a path to it, unset %s_FILE and configure %s directly", key, strings.ToLower(key), key, key)
+	case errors.Is(err, envx.ErrSecretFileTooLarge):
+		// 1 MiB is envx's documented secret-file ceiling, restated here because
+		// it is not exported. The shape this catches is a mount pointing at the
+		// wrong thing entirely — a bundle, an archive, a log — so the remedy is
+		// the mount, not the file's content.
+		return fmt.Errorf("%s_FILE points to a file larger than the 1 MiB secret-file limit, so it was refused instead of read: point it at a file holding only the secret (a few dozen bytes), not at a bundle, archive or log the mount picked up by mistake", key)
+	case errors.Is(err, envx.ErrSecretFileGrew):
+		// The file passed the size gate and then grew past it mid-read, so
+		// reading on would have handed knell a silently truncated secret. That
+		// is a writer problem, not a size problem: the remedy is an atomic
+		// write, which also fixes the shorter race of reading a half-written
+		// secret.
+		return fmt.Errorf("%s_FILE grew past the 1 MiB secret-file limit while it was being read, so the secret would have been silently truncated and every request using it would be rejected: have the writer create the file atomically (write a temporary file, then rename it into place) rather than appending to the mounted one, then restart knell", key)
+	case errors.Is(err, envx.ErrSecretFileUnreadable):
+		// The operating system refused the open, stat or read. envx keeps the
+		// *os.PathError reachable, so the syscall and its reason can be named:
 		// pathErr.Err is the bare reason ("no such file or directory",
-		// "permission denied"); pathErr.Path is the operator-supplied value and
-		// stays out of the message.
-		return fmt.Errorf("%s_FILE could not be read (%s failed): %v: check that the path the variable names exists inside the container and is readable by knell's non-root user", key, pathErr.Op, pathErr.Err)
+		// "permission denied"), while pathErr.Path is the operator-supplied
+		// value and stays out of the message.
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			return fmt.Errorf("%s_FILE could not be read (%s failed): %v: check that the path the variable names exists inside the container and is readable by knell's non-root user", key, pathErr.Op, pathErr.Err)
+		}
+		return fmt.Errorf("%s_FILE could not be read: check that the path the variable names exists inside the container and is readable by knell's non-root user", key)
 	}
-	// Only envx's path policy (unclean path, "..") embeds the path in its
-	// message; its size-limit and grew-during-read errors carry byte counts
-	// only. All three are untyped, so they cannot be told apart without matching
-	// error text, and the fold is what keeps the path-policy reason out of the
-	// log. The wording therefore names every requirement the fold covers, in the
-	// operator's own terms rather than the dependency's: 1 MiB is envx's
-	// documented secret-file ceiling, restated here because it is not exported.
+	// A failure class this envx version did not have when the branches above
+	// were written. The wording names every requirement the classes cover, in
+	// the operator's own terms rather than the dependency's, so an unclassified
+	// failure still tells the operator what a usable secret file looks like.
 	return fmt.Errorf("%s_FILE could not be read or validated: point it at a clean path (no \"..\") naming a readable secret file of at most 1 MiB; a secret file holds a few dozen bytes", key)
 }
 
@@ -447,11 +477,11 @@ func invisibleEdge(value string) bool {
 
 // errBeatTokenSetButEmpty is the refusal for a BEAT_TOKEN that is present and
 // carries no value. Two guards reach the same verdict — loadBeatToken's, because
-// envx cannot tell present-but-empty from unset, and checkBeatToken's, which stops
-// an empty token from reaching webapi where empty means "serve /beat/{id} open" —
-// so they share one message and cannot come to describe the misconfiguration
-// differently.
-var errBeatTokenSetButEmpty = errors.New("BEAT_TOKEN is set but empty: unset the variable entirely to serve /beat/{id} open on purpose, or set it to a long random token")
+// envx cannot tell present-but-empty from unset, and checkBeatToken's, which
+// stops an empty token from reaching webapi, where it would leave the gate with
+// no credential to verify against — so they share one message and cannot come to
+// describe the misconfiguration differently.
+var errBeatTokenSetButEmpty = fmt.Errorf("BEAT_TOKEN is set but empty: it is the only thing standing between a stranger who can reach this port and a forged ping, so there is no configuration in which knell serves /beat/{id} without it; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
 
 // checkBeatToken validates a configured BEAT_TOKEN as the exact credential
 // senders must present, or refuses it. It never rewrites the value.
@@ -476,18 +506,24 @@ var errBeatTokenSetButEmpty = errors.New("BEAT_TOKEN is set but empty: unset the
 // rather than report itself gated while rejecting every sender: a 401'd ping is
 // an undetectable ping, and one deadline later every configured beat goes
 // falsely missing.
+//
+// A token shorter than minTokenLength is refused for the opposite reason: it IS
+// presentable, and so is a guess at it. Since the token is the endpoint's only
+// gate, a guessable one lets a stranger keep the switch armed with no heartbeat
+// behind it.
 func checkBeatToken(token string) error {
 	if strings.Trim(token, asciiWhitespace) != token {
 		// The value is never echoed: the message names the variable and the
 		// shape of the problem only (the startup log ships to Loki), and it
 		// names the whole CUTSET rather than one member's mechanism, because
 		// both mechanisms above reach the same verdict.
-		return errors.New("BEAT_TOKEN has leading or trailing ASCII whitespace: a trailing space or tab is stripped from the header value on the wire, and CR, LF, VT and FF cannot be sent in one at all, so such a token never reaches the verifier as configured and POST /beat/{id} would reject every ping while the endpoint reports itself gated; a leading space or tab is refused too, because it authenticates as part of the credential while being invisible in the value you read; knell will not silently rewrite a credential, so remove the surrounding whitespace, or unset the variable entirely to serve /beat/{id} open on purpose")
+		return errors.New("BEAT_TOKEN has leading or trailing ASCII whitespace: a trailing space or tab is stripped from the header value on the wire, and CR, LF, VT and FF cannot be sent in one at all, so such a token never reaches the verifier as configured and POST /beat/{id} would reject every ping while the endpoint reports itself gated; a leading space or tab is refused too, because it authenticates as part of the credential while being invisible in the value you read; knell will not silently rewrite a credential, so remove the surrounding whitespace")
 	}
 	if token == "" {
 		// Nothing to present at all: fails startup like a present-but-empty
-		// BEAT_TOKEN and a blank BEAT_TOKEN_FILE. Keeping it armed reported a
-		// gated endpoint that rejected every ping.
+		// BEAT_TOKEN and a blank BEAT_TOKEN_FILE. Checked before the length
+		// floor below so an empty value gets the message written for it rather
+		// than being reported as merely too short.
 		return errBeatTokenSetButEmpty
 	}
 	if !beatTokenFitsHeader(token) {
@@ -503,46 +539,74 @@ func checkBeatToken(token string) error {
 		// value like "\u00a0\n\u00a0" passes the ASCII-edge refusal and reads
 		// blank to strings.TrimSpace, so warning first would log "the gate is
 		// armed" for a configuration this very check then refuses to start.
-		return errors.New("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it; use a token containing printable characters, or unset the variable entirely to serve /beat/{id} open on purpose")
+		return fmt.Errorf("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it; use a token of at least %d printable characters", minTokenLength)
+	}
+	if len(token) < minTokenLength {
+		// Presentable, and short enough to be guessed. The gate is the ONLY
+		// thing protecting /beat/{id} now, so a guessed token keeps every beat
+		// reading fresh while the thing it watches is dead — the one failure
+		// this app exists to prevent — and the throttle on failed attempts
+		// (see internal/webapi) slows a guessing run without ending it.
+		//
+		// The exact length is deliberately NOT logged, and neither is the
+		// value or its character class: the startup log ships to Loki, whose
+		// audience is far wider than the age-encrypted file the token lives in,
+		// and each of those facts narrows a guess. The operator set the token,
+		// so the minimum is the only number they need.
+		return fmt.Errorf("BEAT_TOKEN is shorter than the %d-byte minimum: it is the only gate on /beat/{id}, so a token short enough to guess lets a stranger who can reach this port keep every beat reading fresh while the thing it watches is dead; set a random token of at least %d bytes (e.g. `openssl rand -hex 16`)", minTokenLength, minTokenLength)
 	}
 	if strings.TrimSpace(token) == "" {
-		// All whitespace by Unicode rules, yet free of ASCII edge padding and
-		// legal in a header, so every rune survives the header (a non-ASCII
-		// space): the token IS presentable, so it is kept verbatim and the gate
-		// stays armed. Say so, because the only other signal is the length hint
-		// below, which reads as "your token is short" for a value the operator
-		// cannot see in `docker inspect` output. The wording deliberately does
-		// NOT name the value's character class: the startup log is shipped to
-		// Loki, where describing a live credential's alphabet narrows a guess.
-		slog.Warn("BEAT_TOKEN is armed with a value that is easy to mistake for absent; the /beat/{id} gate requires it and every sender must present it verbatim, so set a long random token, or unset the variable to serve the endpoint open")
+		// All whitespace by Unicode rules, yet long enough, free of ASCII edge
+		// padding and legal in a header, so every rune survives the header (a
+		// non-ASCII space): the token IS presentable, so it is kept verbatim and
+		// the gate stays armed. Reachable past the length floor because those
+		// runes are multi-byte — eight NBSPs are sixteen bytes — so the floor
+		// does not stand in for this warning. Say so, because nothing else in
+		// the startup log tells this token apart from one the operator can read,
+		// and it is invisible in `docker inspect` output too. The wording
+		// deliberately does NOT name the value's character class: the startup
+		// log is shipped to Loki, where describing a live credential's alphabet
+		// narrows a guess.
+		slog.Warn("BEAT_TOKEN is armed with a value that is easy to mistake for absent; the /beat/{id} gate requires it and every sender must present it verbatim, so set a random token of visible characters instead")
 	} else if invisibleEdge(token) {
-		// Presentable, non-blank, and carrying an edge rune the operator cannot
-		// see. ASCII edge padding was already REFUSED above, so what reaches
-		// here is a non-ASCII space, a zero-width space, a soft hyphen or a BOM
-		// (the shapes a token pasted out of a rendered page or a word processor
-		// carries) that textproto carries verbatim:
+		// Presentable, non-blank, long enough, and carrying an edge rune the
+		// operator cannot see. ASCII edge padding was already REFUSED above, so
+		// what reaches here is a non-ASCII space, a zero-width space, a soft
+		// hyphen or a BOM (the shapes a token pasted out of a rendered page or a
+		// word processor carries) that textproto carries verbatim:
 		// the gate arms for a value one character longer than the one the
 		// operator reads, every sender presenting the visible token gets 401,
 		// and one deadline later every configured beat posts a false MISSING
 		// notice. Warn rather than refuse, because the value IS presentable and
 		// a token containing a non-ASCII space is documented as accepted. As
 		// above, the wording never names the character class.
-		slog.Warn("BEAT_TOKEN is armed with a value whose first or last character is invisible but part of the credential; every sender must present it verbatim, so retype the token from visible characters, or unset the variable to serve /beat/{id} open")
+		slog.Warn("BEAT_TOKEN is armed with a value whose first or last character is invisible but part of the credential; every sender must present it verbatim, so retype the token from visible characters")
 	}
 	return nil
 }
 
-// loadBeatToken reads the optional BEAT_TOKEN bearer gate for
-// POST/GET /beat/{id}; an empty return disables the check. Optional means
-// ABSENT, not blank: a present-but-empty BEAT_TOKEN fails startup, and so does
-// any value no sender could present as configured — one carrying leading or
-// trailing ASCII whitespace, or one carrying an HTTP-forbidden control byte —
-// like an empty BEAT_TOKEN_FILE. The value is stored EXACTLY as configured, so
+// loadBeatToken reads the REQUIRED BEAT_TOKEN bearer gate for POST /beat/{id}.
+// It is required because it is the endpoint's only gate: nothing else
+// distinguishes a real sender from anything else that can reach the port, so
+// there is no configuration in which knell serves the endpoint without it. An
+// unset variable, a present-but-empty one, and any value no sender could present
+// as configured — one carrying leading or trailing ASCII whitespace, one
+// carrying an HTTP-forbidden control byte, or one under the minTokenLength floor
+// — all FAIL STARTUP, like an empty BEAT_TOKEN_FILE.
+//
+// The value is stored EXACTLY as configured, so
 // the token knell verifies is the one the operator wrote; nothing is rewritten.
-// A file-sourced token arrives already unicode-trimmed (envx.SecretWithSource
-// trims the file's bytes with strings.TrimSpace before returning them), so a
-// secret file's own edge whitespace is stripped by envx before this function
-// sees it and cannot trip the padding refusal. BEAT_TOKEN_FILE points at a
+// A file-sourced token arrives as written apart from ONE trailing line ending:
+// envx.SecretWithSource removes a single "\n" (or "\r\n") from the file's
+// content and returns every other byte verbatim, including edge spaces and
+// tabs. So the padding refusal covers the _FILE channel too — a BEAT_TOKEN_FILE
+// whose content carries leading or trailing ASCII whitespace FAILS STARTUP,
+// exactly as the plain variable does. That is the same principle this package
+// applies everywhere else — knell will not silently rewrite a credential — and
+// it is now consistent across both channels rather than trimmed on one of them.
+// The ordinary way of writing such a file is unaffected: `printf '%s\n' token >
+// file` and `echo token > file` differ from the token only by that one trailing
+// newline, which envx still removes. BEAT_TOKEN_FILE points at a
 // mounted secret file instead (the same convention DISCORD_WEBHOOK_URL uses),
 // keeping the credential out of `docker inspect` output.
 func loadBeatToken() (string, error) {
@@ -562,50 +626,32 @@ func loadBeatToken() (string, error) {
 			return "", tokenErr
 		}
 	case errors.As(err, new(*envx.MissingError)):
-		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE is set: the documented
-		// open-endpoint case, so the empty token stands and webapi's gate
-		// never arms. A PRESENT-but-empty BEAT_TOKEN lands here too (envx
-		// Require cannot tell it from unset) and that is exactly the shape
-		// compose interpolation of an undefined variable produces — so it is
-		// REFUSED rather than read as consent to an open endpoint, matching
-		// rejectBlankFileVar on the _FILE channel, whose own consequence is
-		// the same unauthenticated /beat/{id}. Only an ABSENT variable means
-		// "serve it open"; an operator who typed the name is asking for the
-		// gate, and a startup failure is the one signal an accident cannot
-		// be mistaken for intent (the INFO beat_auth=open line looks
-		// identical either way).
+		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE is set, or BEAT_TOKEN is
+		// present and empty (envx Require cannot tell the two apart, and
+		// compose interpolation of an undefined variable produces exactly the
+		// empty shape). Both fail startup, and they are reported separately
+		// because the operator's next move differs: one has to choose a token,
+		// the other already tried to and supplied nothing. Serving the endpoint
+		// without a credential is not one of the options: unauthenticated, any
+		// client that can reach the port keeps every beat reading fresh, which
+		// disarms the switch silently — and a startup failure is the one signal
+		// that cannot be mistaken for a working observer.
 		if v, ok := os.LookupEnv("BEAT_TOKEN"); ok && v == "" {
 			return "", errBeatTokenSetButEmpty
 		}
-		token = ""
+		return "", fmt.Errorf("BEAT_TOKEN is required: it is the only gate on /beat/{id}, so without it any client that can reach this port can keep every beat reading fresh while the thing it watches is dead; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one: %w", minTokenLength, err)
 	default:
 		// Any other error means the variable WAS provided and could not be
-		// used (unreadable or blank _FILE): fail closed rather than serving
-		// an open endpoint the operator meant to gate. The envx error is
-		// sanitized, never wrapped: it embeds the BEAT_TOKEN_FILE value, which
+		// used (unreadable or blank _FILE): fail closed rather than starting
+		// without the credential the operator meant to configure. The envx error
+		// is sanitized, never wrapped: it embeds the BEAT_TOKEN_FILE value, which
 		// is the bearer token itself whenever the operator pasted the
 		// credential into the file variable.
 		return "", secretFileError("BEAT_TOKEN", err)
 	}
-	if token == "" {
-		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE was set (the only arm that
-		// reaches here empty): the documented open-endpoint case, so there is
-		// nothing to measure. Stated once here so a check added below cannot
-		// forget it and warn about a token that does not exist.
-		return "", nil
-	}
 	// The token is now fully validated, so the winning-source advisory cannot
 	// be followed by a startup failure about the credential it just described.
 	warnPlainVarIgnored("BEAT_TOKEN", "token", tokenSrc)
-	if len(token) < minTokenLength {
-		// The exact length is deliberately NOT logged: it is an attribute of a
-		// live credential, and knell's startup log is shipped to Loki where its
-		// audience is far wider than the age-encrypted file the token itself
-		// lives in. The operator set the token, so the number tells them
-		// nothing they do not know, while it tells a log reader exactly how
-		// large the guess space for an unrate-limited POST /beat/{id} is.
-		slog.Warn("BEAT_TOKEN is shorter than the recommended minimum; a short token is guessable, prefer a long random value", "minimum", minTokenLength)
-	}
 	return token, nil
 }
 
@@ -631,10 +677,14 @@ func loadWebhook() (string, error) {
 		return "", secretFileError("DISCORD_WEBHOOK_URL", err)
 	}
 
-	// envx trims the _FILE branch only; a plain variable copied from a
-	// deployment file can carry padding. A trailing space survives
-	// url.Parse and is escaped as %20 on every POST, so Discord answers
-	// 404 forever and the switch can never ring.
+	// Neither channel trims: envx returns the plain variable verbatim and the
+	// file's content minus at most one trailing line ending, so a value copied
+	// from a deployment file can carry padding through either. A trailing space
+	// survives url.Parse and is escaped as %20 on every POST, so Discord answers
+	// 404 forever and the switch can never ring. The trim is therefore knell's
+	// own, and it applies to both channels. The webhook is trimmed where
+	// BEAT_TOKEN is refused because knell is this URL's only sender: there is no
+	// second party that must reproduce the value byte for byte.
 	webhook = strings.TrimSpace(webhook)
 	if webhook == "" {
 		// Whitespace-only: the variable WAS provided, so this is a broken

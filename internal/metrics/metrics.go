@@ -6,7 +6,8 @@
 // The registry and the collectors are unexported: the package's edge is
 // Handler plus the knell-semantic recording functions below (InitBeat,
 // RecordBeat, SetBeatFresh, RecordOutage, RecordOutageRecordDropped,
-// RecordHTTP and the three RecordNotification* functions). Callers therefore
+// RecordHTTP, RecordPreRouteRefusal and the three RecordNotification*
+// functions). Callers therefore
 // cannot register, rename or delete a series, nor write a raw label
 // position, which is what keeps the metric names, label sets and cold-start
 // zero samples the quorum and delivery alerts read in one place.
@@ -53,6 +54,12 @@
 // webhttp.WithRecordRouteMetric, so the library computes the pair and knell has
 // none of its own to get wrong.
 //
+// RecordPreRouteRefusal is reached from internal/webapi too, and its label is
+// bounded by CONSTRUCTION rather than by a contract on the caller: its only
+// argument type is Refusal, whose legal values are the constants declared in
+// this file, so no request-derived string can reach the label. That is
+// deliberate — every one of its call sites sits on an unauthenticated path.
+//
 // Runtime enforcement inside this package is deliberately NOT the answer: it
 // would add state plus an init-order dependency on config to defend against a
 // caller that does not exist. This comment is the guard instead — a reviewer's
@@ -69,11 +76,13 @@ import (
 )
 
 // beatLabel names the watched beat on per-beat metrics; kindLabel names the
-// notification kind (missing, recovered, history) on the delivery counters.
-// The remaining three label the served-request counter.
+// notification kind (missing, recovered, history) on the delivery counters;
+// reasonLabel names the cause on the pre-route refusal counter. The remaining
+// three label the served-request counter.
 const (
 	beatLabel   = "beat"
 	kindLabel   = "kind"
+	reasonLabel = "reason"
 	methodLabel = "method"
 	pathLabel   = "path"
 	statusLabel = "status"
@@ -100,12 +109,52 @@ const (
 // every new Kind constant here so those two exposition views stay aligned.
 var notificationKinds = []Kind{KindMissing, KindRecovered, KindHistory}
 
-var notificationKindsText = joinKinds(notificationKinds)
+var notificationKindsText = joinLabelValues(notificationKinds)
 
-func joinKinds(kinds []Kind) string {
-	parts := make([]string, len(kinds))
-	for i, k := range kinds {
-		parts[i] = string(k)
+// Refusal distinguishes pre-route refusal reason values from runtime strings,
+// the same way Kind does for the notification counters. The label it feeds is
+// bounded by CONSTRUCTION rather than by a caller contract: the only values
+// preRouteRefusals can carry are the constants below, so nothing off a request
+// can reach it. It is not a closed set to the compiler — untyped literals
+// remain assignable — so callers must use the constants and keep
+// refusalReasons in sync.
+type Refusal string
+
+// The refusal reasons are the legal values of reasonLabel on the pre-route
+// refusal counter. Each names the CAUSE rather than the status code knell
+// answers, because the status is what an operator already sees on
+// http_requests_total and the cause is what this counter exists to add.
+const (
+	// RefusalNonCanonicalBeatPath is a /beat spelling net/http would rewrite
+	// before routing (repeated slashes, a dot segment), refused 404 by
+	// internal/webapi's canonicalBeatPath. It means a sender is pinging a
+	// malformed URL.
+	RefusalNonCanonicalBeatPath Refusal = "non_canonical_beat_path"
+	// RefusalHostNotAllowed is a request whose Host is not in ALLOWED_HOSTS,
+	// refused 403 by the webhttp host policy. It means either a DNS-rebinding
+	// attempt or a hostname the deployment forgot to list.
+	RefusalHostNotAllowed Refusal = "host_not_allowed"
+	// RefusalAuthThrottled is a beat request refused 429 by the failed-auth
+	// throttle because the shared bucket was empty. It means failed
+	// authentication is arriving faster than the budget allows — a rotated
+	// token on a whole sender fleet, or a guessing run.
+	RefusalAuthThrottled Refusal = "auth_throttled"
+)
+
+// refusalReasons drives cold-start pre-minting and the HELP reason list. Add
+// every new Refusal constant here so those two exposition views stay aligned.
+var refusalReasons = []Refusal{RefusalNonCanonicalBeatPath, RefusalHostNotAllowed, RefusalAuthThrottled}
+
+var refusalReasonsText = joinLabelValues(refusalReasons)
+
+// joinLabelValues renders a closed label vocabulary for a HELP string: an
+// operator writing a selector reads it to learn which label values exist. It is
+// generic over the string-kinded label types (Kind, Refusal) so the two
+// vocabularies cannot drift apart on how they are advertised.
+func joinLabelValues[T ~string](values []T) string {
+	parts := make([]string, len(values))
+	for i, v := range values {
+		parts[i] = string(v)
 	}
 	return strings.Join(parts, ", ")
 }
@@ -124,6 +173,21 @@ func mintNotificationKinds() {
 		notificationsSent.Add(0, string(kind))
 		notificationsFailed.Add(0, string(kind))
 		notificationsDropped.Add(0, string(kind))
+	}
+}
+
+// mintRefusalReasons pre-mints the pre-route refusal counter at zero for every
+// reason, for exactly the reason mintNotificationKinds exists: a counter series
+// born at a nonzero value has no earlier sample for increase() to diff against,
+// so the very first refusal of a reason would be invisible to any windowed
+// query over it. That flaw is what retired this counter's predecessor — a
+// request-counter path label minted on its first use — so the pre-minting is
+// the whole point of the shape rather than a nicety. Called from init() below,
+// after the registrations, so the guarantee holds on every path that serves
+// /metrics.
+func mintRefusalReasons() {
+	for _, reason := range refusalReasons {
+		preRouteRefusals.Add(0, string(reason))
 	}
 }
 
@@ -269,6 +333,33 @@ var notificationsDropped = metricslib.NewLabeledCounter(
 	[]string{kindLabel},
 )
 
+// preRouteRefusals counts requests knell refuses BEFORE the mux routes, by
+// the reason knell refused them. Every such refusal is invisible to
+// httpRequests' path label — nothing has populated the matched pattern yet, so
+// they all share the "unmatched" bucket with scanner traffic — and each one
+// means something an operator investigating a missing beat wants named: a sender
+// pinging a malformed URL, a Host the deployment did not list (or a rebinding
+// attempt), and failed authentication arriving faster than the throttle's
+// budget.
+//
+// It is a DIAGNOSTIC, not an alert source, and deliberately has no rule of its
+// own: a sender whose pings are refused here is not feeding its beat, so that
+// beat crosses its deadline and the existing missing notice fires on its own.
+// This counter explains such a notice; alerting on it too would page twice for
+// one condition.
+//
+// The reason label is bounded by construction (see the Refusal type), which is
+// the whole difference from the marker this counter replaced: that one was a
+// server-assigned value on the request counter's path label, written by
+// assigning r.Pattern — a field webhttp documents as mux-populated — so the
+// class could have stopped being counted silently on a library change, and the
+// series was born on its first refusal where increase() can never see it.
+var preRouteRefusals = metricslib.NewLabeledCounter(
+	"pre_route_refusals_total",
+	"Requests refused before the mux routes, by reason ("+refusalReasonsText+"); a diagnostic for a missing beat, not an alert source.",
+	[]string{reasonLabel},
+)
+
 // httpRequests counts every served HTTP request by matched route template,
 // method and status. It is the ONLY view of a REFUSED ping: an unauthorized
 // (401), unknown-id (404), shutting-down (503) or disallowed-method (405)
@@ -278,7 +369,9 @@ var notificationsDropped = metricslib.NewLabeledCounter(
 // job is being alertable. Labels are bounded by the CALLER, which passes the
 // pair webhttp derives from the matched route and a closed method set rather
 // than anything off the request line (see the package doc's RecordHTTP
-// contract).
+// contract). A refusal answered BEFORE the mux routes has no matched pattern,
+// so it lands in the "unmatched" bucket here beside scanner traffic; its cause
+// is named on preRouteRefusals instead.
 var httpRequests = metricslib.NewLabeledCounter(
 	"http_requests_total",
 	"Served HTTP requests by matched route template, method and status.",
@@ -309,9 +402,11 @@ func init() {
 	registry.RegisterLabeledCounter(notificationsSent)
 	registry.RegisterLabeledCounter(notificationsFailed)
 	registry.RegisterLabeledCounter(notificationsDropped)
+	registry.RegisterLabeledCounter(preRouteRefusals)
 	registry.RegisterLabeledCounter(httpRequests)
 	registry.RegisterHistogram(httpDuration)
 	mintNotificationKinds()
+	mintRefusalReasons()
 }
 
 // Handler serves the Prometheus exposition: every registered metric plus
@@ -405,6 +500,18 @@ func RecordOutageRecordDropped(id string) {
 // on a status that is already being served.
 func RecordHTTP(method, path string, status int, d time.Duration) {
 	metricslib.RecordHTTP(httpRequests, httpDuration, d, method, path, strconv.Itoa(status))
+}
+
+// RecordPreRouteRefusal counts one request refused before the mux routed it,
+// under the reason knell refused it. The label is bounded by the Refusal type,
+// so no request-derived value can reach it (see the package doc). Its callers
+// are internal/webapi's pre-route guards: the non-canonical /beat path 404, the
+// ALLOWED_HOSTS 403 and the failed-auth throttle's 429, all of which collapse
+// onto http_requests_total's "unmatched" path label and are otherwise
+// indistinguishable from scanner traffic. Read it while investigating a missing
+// beat; it is deliberately not an alert source (see preRouteRefusals).
+func RecordPreRouteRefusal(reason Refusal) {
+	preRouteRefusals.Inc(string(reason))
 }
 
 // RecordNotificationSent counts one delivered notification message of kind.
