@@ -13,6 +13,7 @@ import (
 
 	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/webhttp"
 )
 
 // maxNodeNameBytes is the NODE_NAME bound the composition root passes to Load
@@ -1365,7 +1366,7 @@ func TestConfigLogValueReportsBothSecretsByPresenceOnly(t *testing.T) {
 // TestConfigLogValueReportsEveryNonSecretField pins the accuracy half of
 // LogValue's contract; TestConfigLogValueReportsBothSecretsByPresenceOnly
 // pins the hygiene half. LogValue exists so a call site can hand a whole
-// Config to slog, and those six attrs are then the entire rendering of a
+// Config to slog, and those seven attrs are then the entire rendering of a
 // configuration that is env-only, with no reload and no readback endpoint.
 // Every value below differs from any plausible default and from every sibling
 // field, so an attr rewired to a literal or to the wrong field fails here
@@ -1373,11 +1374,20 @@ func TestConfigLogValueReportsBothSecretsByPresenceOnly(t *testing.T) {
 func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 	t.Parallel()
 
+	// Two entries, so allowed_hosts pins the SIZE rather than merely "active":
+	// an allowlist state rendered from the wrong side of the policy (a hardcoded
+	// 1, or Active() read as the count) still reads plausible in a log line.
+	policy, invalid := webhttp.ParseHostList([]string{"knell.internal", "10.0.0.5"})
+	if len(invalid) > 0 {
+		t.Fatalf("ParseHostList rejected %v; the fixture must be a valid allowlist", invalid)
+	}
+
 	cfg := Config{
-		WebhookURL: "https://discord.example/hook",
-		Node:       "observer-borgcube",
-		ListenAddr: "127.0.0.1:19190",
-		BeatToken:  "unit-test-beat-token",
+		AllowedHosts: policy,
+		WebhookURL:   "https://discord.example/hook",
+		Node:         "observer-borgcube",
+		ListenAddr:   "127.0.0.1:19190",
+		BeatToken:    "unit-test-beat-token",
 		Beats: []Beat{
 			{ID: "watchdog-mimir", Deadline: 20 * time.Minute},
 			{ID: "watchdog-loki", Deadline: 26 * time.Hour},
@@ -1391,12 +1401,13 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"beats":       "2",
-		"node":        "observer-borgcube",
-		"listen_addr": "127.0.0.1:19190",
-		"webhook":     "configured",
-		"beat_auth":   "required",
-		"log_level":   "DEBUG",
+		"beats":         "2",
+		"node":          "observer-borgcube",
+		"listen_addr":   "127.0.0.1:19190",
+		"webhook":       "configured",
+		"beat_auth":     "required",
+		"allowed_hosts": "allowlist(2)",
+		"log_level":     "DEBUG",
 	}
 	if len(got) != len(want) {
 		t.Errorf("LogValue() rendered %d attrs %v, want exactly %d: an added attr has to be reviewed for secret content, and a dropped one silently removes a field from the only rendering of an env-only configuration", len(got), got, len(want))
@@ -1405,6 +1416,59 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		if got[key] != wantValue {
 			t.Errorf("LogValue attr %s = %q, want %q", key, got[key], wantValue)
 		}
+	}
+}
+
+// TestConfigLogValueReportsTheHostAllowlistState pins all three states the
+// allowed_hosts attr distinguishes, because the attr exists for the state the
+// rest of the process is SILENT about: a misspelled ALLOWED_HOSTS is
+// indistinguishable from unset, draws no parse warning, and leaves the
+// DNS-rebinding guard off while the operator believes it is armed.
+//
+// The zero-size case is why the attr carries a count instead of a boolean:
+// malformed entries are warned-and-dropped, so an ENGAGED allowlist can hold no
+// usable host and then rejects every non-loopback request — no sender can record
+// a beat — and a bare on/off value would render that identically to a working
+// allowlist. The nil case is the second reason: Config values built without
+// Load (every other test here, and a zero Config) must render rather than panic.
+func TestConfigLogValueReportsTheHostAllowlistState(t *testing.T) {
+	t.Parallel()
+
+	twoHosts, invalid := webhttp.ParseHostList([]string{"knell.internal", "10.0.0.5"})
+	if len(invalid) > 0 {
+		t.Fatalf("ParseHostList rejected %v; the fixture must be a valid allowlist", invalid)
+	}
+	// Non-blank but uncanonicalizable (a scheme and path, the shape the parse
+	// warning names): the gate ENGAGES fail-closed with nothing in it.
+	failClosed, invalid := webhttp.ParseHostList([]string{"https://knell.internal/"})
+	if len(invalid) != 1 {
+		t.Fatalf("ParseHostList reported %v invalid entries, want exactly 1: the fixture must engage the gate with no usable host", invalid)
+	}
+	blank, _ := webhttp.ParseHostList([]string{""})
+
+	for name, tc := range map[string]struct {
+		policy *webhttp.HostPolicy
+		want   string
+	}{
+		"unset leaves every Host accepted":      {policy: nil, want: "any"},
+		"blank value never engages the gate":    {policy: blank, want: "any"},
+		"an allowlist reports its size":         {policy: twoHosts, want: "allowlist(2)"},
+		"an unusable allowlist is still a gate": {policy: failClosed, want: "allowlist(0)"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := Config{AllowedHosts: tc.policy, LogLevel: slog.LevelInfo}
+			got := ""
+			for _, attr := range cfg.LogValue().Group() {
+				if attr.Key == "allowed_hosts" {
+					got = attr.Value.String()
+				}
+			}
+			if got != tc.want {
+				t.Errorf("allowed_hosts = %q, want %q: the startup summary is the only rendering of an env-only configuration, so a wrong value here is an operator believing the rebinding guard is in a state it is not", got, tc.want)
+			}
+		})
 	}
 }
 

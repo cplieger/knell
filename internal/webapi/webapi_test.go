@@ -79,6 +79,12 @@ func TestBeatEndpoint(t *testing.T) {
 		{name: "get known", method: http.MethodGet, path: "/beat/api", wantStatus: 200, wantSeen: 1},
 		{name: "post unknown", method: http.MethodPost, path: "/beat/ghost", wantStatus: 404},
 		{name: "missing id segment", method: http.MethodPost, path: "/beat/", wantStatus: 404},
+		// The bare prefix a truncated sender URL produces. It must be the coded
+		// 404, never net/http's synthesized 307 to /beat/: a 307 is a SUCCESS
+		// status, so `curl -fsS http://knell:9190/beat` would exit 0 having
+		// recorded nothing at all.
+		{name: "bare beat prefix rejected", method: http.MethodPost, path: "/beat", wantStatus: 404},
+		{name: "bare beat prefix rejected on GET", method: http.MethodGet, path: "/beat", wantStatus: 404},
 		{name: "head rejected without recording", method: http.MethodHead, path: "/beat/api", wantStatus: 405},
 		{name: "delete rejected", method: http.MethodDelete, path: "/beat/api", wantStatus: 405},
 		{name: "nested path rejected", method: http.MethodPost, path: "/beat/api/extra", wantStatus: 404},
@@ -121,6 +127,68 @@ func TestBeatEndpoint(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBareBeatPathAnswersTheCodedNotFound pins the bare /beat prefix, the one
+// misconfigured sender URL net/http used to answer for knell: with only
+// /beat/{$} and the {id} patterns registered, the mux synthesized a 307 to
+// /beat/ for it. 307 is a SUCCESS status, so the documented `curl -fsS` sender
+// (an unset or truncated variable in the URL) exited 0 having recorded nothing,
+// and the beat read as missing a full deadline later with nothing anywhere
+// saying the URL was wrong. So this pins the refusal on both accepted methods:
+// the coded 404 body, no redirect, nothing recorded, and no per-beat series
+// minted from a path that names no beat.
+func TestBareBeatPathAnswersTheCodedNotFound(t *testing.T) {
+	for _, method := range []string{http.MethodPost, http.MethodGet} {
+		t.Run(method, func(t *testing.T) {
+			b := &fakeBeater{known: map[string]bool{"api": true}}
+			h := newTestHandler(b, "")
+			beatSeriesBefore := beatSeriesLines(scrapeExposition(t, h))
+
+			rec := beatRequest(t, h, method, "/beat")
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("%s /beat = %d, want 404: a 3xx is a SUCCESS status to `curl -fsS`, so a truncated sender URL would exit 0 having recorded nothing (body %s)",
+					method, rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Location"); got != "" {
+				t.Errorf("%s /beat carries Location: %q, want no redirect", method, got)
+			}
+			if !strings.Contains(rec.Body.String(), "unknown_beat") {
+				t.Errorf("%s /beat body = %s, want the unknown_beat coded envelope a sender can parse", method, rec.Body.String())
+			}
+			if len(b.seen) != 0 {
+				t.Errorf("recorded beats = %v, want none: a path that names no beat must never record one", b.seen)
+			}
+			// The path names no beat, so it must mint no per-beat series: the
+			// beat id is a metric label, and a series is permanent for the
+			// process lifetime here and in every observer scraping knell.
+			exposition := scrapeExposition(t, h)
+			if got, before := beatSeriesLines(exposition), beatSeriesBefore; len(got) != len(before) {
+				t.Errorf("%s /beat changed the per-beat series set (%d -> %d): a bare prefix must mint nothing\n%s",
+					method, len(before), len(got), exposition)
+			}
+			// The refusal is still counted, under the registered pattern rather
+			// than the "unmatched" bucket, so a misconfigured sender is
+			// distinguishable from scanner traffic.
+			series := `knell_http_requests_total{method="` + method + `",path="/beat",status="404"}`
+			if _, ok := seriesValue(t, exposition, series); !ok {
+				t.Errorf("%s missing from the exposition: a truncated sender URL is unalertable without it\n%s", series, exposition)
+			}
+		})
+	}
+}
+
+// beatSeriesLines returns every per-beat series line in an exposition, so a test
+// can pin that a refusal minted no new one.
+func beatSeriesLines(exposition string) []string {
+	var lines []string
+	for line := range strings.SplitSeq(exposition, "\n") {
+		if strings.HasPrefix(line, "knell_beat") {
+			lines = append(lines, line)
+		}
+	}
+	return lines
 }
 
 func TestMetricsExposition(t *testing.T) {
@@ -1263,11 +1331,11 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 			wantStatus: http.StatusMethodNotAllowed,
 			wantSeries: `knell_http_requests_total{method="PUT",path="/beat/{id}",status="405"}`,
 		},
-		// A browser tricked into the ping (the confused-deputy shape the
+		// A browser page tricked into the ping (the confused-deputy shape the
 		// Sec-Fetch guard refuses). Nothing else makes this class visible: it
 		// records no beat, so beatsReceived never moves, and an operator
 		// watching for forged pings has only this series to alert on.
-		"cross-site browser ping": {
+		"browser page ping": {
 			ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id,
 			headers:    map[string]string{"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors"},
 			wantStatus: http.StatusForbidden,
@@ -1430,7 +1498,7 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 		otherMethodLabel: true,
 	}
 	allowedPaths := map[string]bool{
-		"/beat/{id}": true, "/beat/{$}": true, "/beat/{id}/{rest...}": true,
+		"/beat/{id}": true, "/beat": true, "/beat/{$}": true, "/beat/{id}/{rest...}": true,
 		"/healthz": true, "/metrics": true,
 		unmatchedPathLabel: true,
 	}
@@ -1450,7 +1518,7 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 	assertNoCallerTokens(t, exposition, hostile, allowedMethods, allowedPaths)
 	assertRequestSeriesVocabulary(t, after, allowedMethods, allowedPaths)
 
-	// The vocabulary can produce at most 10 methods x 6 paths x the handful of
+	// The vocabulary can produce at most 10 methods x 7 paths x the handful of
 	// statuses knell answers; the hostile requests above must land inside that,
 	// not grow it. The bound is deliberately loose — the membership checks above
 	// are the precise guard, this catches unbounded GROWTH regardless of
@@ -1591,13 +1659,16 @@ const (
 	overlongMethodMarker = "(overlong)"
 )
 
-func TestBeatRefusesCrossSiteBrowserSubresource(t *testing.T) {
+func TestBeatRefusesPageInitiatedBrowserRequests(t *testing.T) {
 	// Only browsers send Sec-Fetch-*, so the documented senders (curl, an
 	// Alertmanager webhook_config, a CI hook) send none of these headers and
-	// must stay accepted; the refusal is exactly the confused-deputy shape.
-	// Without this test the guard can be deleted with the whole suite green:
-	// every other beat test sends no Sec-Fetch header at all, so nothing
-	// exercises the refusing side of the check.
+	// must stay accepted, as must the one browser shape the README invites: a
+	// navigation the user starts themselves, which carries Sec-Fetch-Site:
+	// none. Everything else a browser sends names an initiating page, which is
+	// the confused-deputy shape — including a cross-site NAVIGATION, because an
+	// iframe load is one. Without this test the guard can be deleted with the
+	// whole suite green: every other beat test sends no Sec-Fetch header at all,
+	// so nothing exercises the refusing side of the check.
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	h := newTestHandler(b, "")
 
@@ -1609,11 +1680,19 @@ func TestBeatRefusesCrossSiteBrowserSubresource(t *testing.T) {
 		wantSeen   int
 	}{
 		{name: "documented sender sends no Sec-Fetch", wantStatus: 200, wantSeen: 1},
+		{name: "address bar", site: "none", mode: "navigate", wantStatus: 200, wantSeen: 1},
+		{name: "bookmark without a mode", site: "none", wantStatus: 200, wantSeen: 1},
 		{name: "cross-site image load", site: "cross-site", mode: "no-cors", wantStatus: 403},
 		{name: "cross-site fetch", site: "cross-site", mode: "cors", wantStatus: 403},
-		{name: "cross-site navigation is a human", site: "cross-site", mode: "navigate", wantStatus: 200, wantSeen: 1},
-		{name: "address bar", site: "none", mode: "navigate", wantStatus: 200, wantSeen: 1},
-		{name: "same-origin fetch", site: "same-origin", mode: "cors", wantStatus: 200, wantSeen: 1},
+		// An iframe: a NAVIGATION with an initiating document, which the old
+		// Sec-Fetch-Mode carve-out admitted and this rule refuses.
+		{name: "cross-site iframe navigation", site: "cross-site", mode: "navigate", wantStatus: 403},
+		{name: "same-origin fetch", site: "same-origin", mode: "cors", wantStatus: 403},
+		{name: "same-origin subresource", site: "same-origin", mode: "no-cors", wantStatus: 403},
+		{name: "same-origin navigation from a page", site: "same-origin", mode: "navigate", wantStatus: 403},
+		// A compromised sibling origin on an allowed hostname.
+		{name: "same-site fetch", site: "same-site", mode: "cors", wantStatus: 403},
+		{name: "same-site navigation", site: "same-site", mode: "navigate", wantStatus: 403},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1649,19 +1728,19 @@ func TestBeatRefusesCrossSiteBrowserSubresource(t *testing.T) {
 		if body.reads != 0 {
 			t.Errorf("body reads = %d, want 0 (refused requests must not be drained)", body.reads)
 		}
-		if code := rec.Body.String(); !strings.Contains(code, "cross_site_request") {
-			t.Errorf("body = %s, want the cross_site_request coded envelope", code)
+		if code := rec.Body.String(); !strings.Contains(code, "browser_page_request") {
+			t.Errorf("body = %s, want the browser_page_request coded envelope", code)
 		}
 	})
 }
 
-// TestCrossSiteGuardAppliesWithTokenGateConfigured pins the SCOPE of the
+// TestBrowserGuardAppliesWithTokenGateConfigured pins the SCOPE of the
 // browser-origin guard: it lives in record, so it refuses in the token
 // configuration too, and the credential gate stays outside it. Every other
-// cross-site case builds an OPEN endpoint, so moving the check into
+// browser-guard case builds an OPEN endpoint, so moving the check into
 // beatHandler's token == "" branch would leave a gated deployment with no
 // confused-deputy layer at all and the whole suite green.
-func TestCrossSiteGuardAppliesWithTokenGateConfigured(t *testing.T) {
+func TestBrowserGuardAppliesWithTokenGateConfigured(t *testing.T) {
 	const token = "s3cret"
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	h := newTestHandler(b, token)
@@ -1680,7 +1759,15 @@ func TestCrossSiteGuardAppliesWithTokenGateConfigured(t *testing.T) {
 		{
 			name: "authorized cross-site subresource refused",
 			auth: "Bearer " + token, site: "cross-site", mode: "no-cors",
-			wantStatus: http.StatusForbidden, wantCode: "cross_site_request",
+			wantStatus: http.StatusForbidden, wantCode: "browser_page_request",
+		},
+		// Same-site is refused under the token too: a compromised sibling
+		// origin on an allowed hostname is exactly the caller a credential
+		// cannot tell apart from the operator.
+		{
+			name: "authorized same-site request refused",
+			auth: "Bearer " + token, site: "same-site", mode: "cors",
+			wantStatus: http.StatusForbidden, wantCode: "browser_page_request",
 		},
 		// The credential gate is outermost, so an unauthenticated cross-site
 		// ping answers 401 and never learns the guard exists.
@@ -1742,13 +1829,14 @@ func hostPolicy(t *testing.T, entries string) *webhttp.HostPolicy {
 }
 
 // TestHostAllowlistBreaksDNSRebinding pins the one defense that stops a
-// rebinding page from re-arming the switch. The attack request is
-// indistinguishable from a legitimate one by every OTHER check knell runs: it
-// carries no Sec-Fetch mismatch (the page origin and the target authority are
-// identical, so the browser labels it same-origin and crossSiteSubresource
-// admits it), and on the documented default the endpoint is open. Only the
+// rebinding page from reading knell's state under the attacker's hostname. The
+// attack request is indistinguishable from a legitimate one by every OTHER check
+// knell runs on /healthz and /metrics: browserPageRequest guards the BEAT
+// handler only, and on the documented default the endpoint is open. Only the
 // textual Host check refuses it, because the attacker controls what their
-// hostname resolves to but not what the browser puts in Host.
+// hostname resolves to but not what the browser puts in Host — and the /beat
+// case below proves the allowlist, not the handler's own guard, is what answers
+// first.
 func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	h := New(context.Background(), b, "", Routes{

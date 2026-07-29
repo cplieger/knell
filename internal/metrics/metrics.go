@@ -5,8 +5,9 @@
 //
 // The registry and the collectors are unexported: the package's edge is
 // Handler plus the knell-semantic recording functions below (InitBeat,
-// RecordBeat, SetBeatFresh, RecordOutage, RecordHTTP and the three
-// RecordNotification* functions). Callers therefore cannot register, rename or
+// RecordBeat, SetBeatFresh, RecordOutage, RecordOutageRecordDropped,
+// RecordHTTP and the three RecordNotification* functions). Callers therefore
+// cannot register, rename or
 // delete a series, nor write a raw label position, which is what keeps the
 // metric names, label sets and cold-start zero samples the quorum and delivery
 // alerts read in one place.
@@ -15,7 +16,8 @@
 //
 // Label CARDINALITY is not structurally contained, and cannot be: Prometheus
 // creates the labelled child on first use, so InitBeat, RecordBeat,
-// SetBeatFresh and RecordOutage mint a per-beat series for whatever id they
+// SetBeatFresh, RecordOutage and RecordOutageRecordDropped mint a per-beat
+// series for whatever id they
 // are handed and this package has nothing to reject it with. A series, once
 // minted, is permanent for the process lifetime — in knell and in every
 // observer scraping it.
@@ -30,7 +32,7 @@
 //   - internal/webapi answers 404 for an unknown id, so an arbitrary request
 //     path never reaches watch.Beat at all.
 //
-// The only PRODUCTION caller of the four id-taking functions is
+// The only PRODUCTION caller of the five id-taking functions is
 // internal/watch; test code in this module may also call them, with fixed
 // literal ids only. If you are adding any other production call, you have
 // just inherited that contract: pass only an id internal/config validated and
@@ -115,8 +117,9 @@ func joinKinds(kinds []Kind) string {
 // a counter series born at a nonzero value has no earlier sample to diff
 // against. Dropped is minted for all three kinds like
 // its siblings, so the alert's selector covers the whole set from a cold start
-// (only missing and recovered have a drop path today; a failed history send
-// keeps its records and retries). Called from init() below, after the
+// (only recovered has a drop path today, recovered being the one fire-once
+// kind; a failed missing or history send keeps its records and retries). Called
+// from init() below, after the
 // registrations, so the guarantee cannot be lost by a path that serves
 // /metrics without building a Watcher.
 func mintNotificationKinds() {
@@ -178,12 +181,43 @@ var beatsReceived = metricslib.NewLabeledCounter(
 // every deadline crossing the state machine detects, at detection time and
 // independent of notification delivery. An outage whose notice was never
 // delivered, or was dropped by a full queue, or was collapsed with others
-// into one history message is counted here all the same. This is the only
-// series that counts OUTAGES: the notification counters count MESSAGES, and
-// one history message can cover several outages.
+// into one history message is counted here all the same. This is one of the two
+// series that count OUTAGES rather than messages (outageRecordsDropped is the
+// other): the notification counters count MESSAGES, and one history message can
+// cover several outages.
 var beatOutages = metricslib.NewLabeledCounter(
 	"beat_outages_total",
 	"Detected outages per beat: one increment per deadline crossing detected, independent of notification delivery.",
+	[]string{beatLabel},
+)
+
+// outageRecordsDropped counts outage RECORDS discarded for good per beat: one
+// increment per record whose outage had already ENDED when a full per-beat queue
+// refused it, so the record was that outage's last trace and no notice for it
+// will ever arrive.
+//
+// It exists because the notification counters cannot express this event without
+// lying in one direction or the other. Counting it on
+// notifications_dropped_total{kind="missing"} made ONE label mean two different
+// things — "which code path discarded a record" on dropped, "what type of
+// message" on sent and failed — and relabelling it kind="history" would be
+// worse, since a history message collapses several records, so N discarded
+// records are not N lost messages. The unit here is the RECORD, and the label is
+// the beat rather than any path or kind: this is the axis that matches the
+// operator's remedy, which is per-OUTAGE (reconstruct the missed window from
+// beatLastSeen), not per-message.
+//
+// The still-ONGOING overflow case deliberately does not reach here. That path
+// (internal/watch's recordOngoingOutage) also fails to queue a record, but the
+// outage stays detected and the next sweep with a free slot records and
+// delivers it, so nothing is discarded for good and paging on it would page for
+// back-pressure knell recovers from by itself. beatOutages already counts the
+// outage in both cases. The beat label is the same bounded label as its
+// siblings, so this adds no cardinality the package doc's contract does not
+// already cover.
+var outageRecordsDropped = metricslib.NewLabeledCounter(
+	"outage_records_dropped_total",
+	"Ended-outage records discarded per beat because the per-beat queue was full; no notice for them will ever arrive.",
 	[]string{beatLabel},
 )
 
@@ -206,30 +240,35 @@ var notificationsSent = metricslib.NewLabeledCounter(
 // to retry (watch.sendRecovered spells this out); failed{kind="recovered"}
 // therefore stays at its pre-minted zero. One increment per failed MESSAGE, so
 // a failed history message counts once whatever number of ended outages it
-// covered. A notification that was never attempted because its record was
-// discarded by a full queue is NOT counted here either: see
-// notificationsDropped.
+// covered. A notification that was never attempted because its outage record was
+// discarded by a full queue is NOT counted here either: that is a lost RECORD,
+// counted per record on outageRecordsDropped.
 var notificationsFailed = metricslib.NewLabeledCounter(
 	"notifications_failed_total",
 	"Webhook delivery attempts that failed after retries, by kind ("+notificationKindsText+"); one per failed message.",
 	[]string{kindLabel},
 )
 
-// notificationsDropped counts notifications that will never be delivered, by
-// kind. Two causes reach it: a record discarded when the per-beat queue was
-// full, and a recovered send that FAILED — recovered is dequeued before the
-// send and finishRecovery runs unconditionally, so nothing holds a record to
-// retry from. That is the line against notificationsFailed, which is drawn by
-// what SURVIVES rather than by whether a send was attempted: a notification
-// counted failed still has its record and retries, while a dropped one has
-// nothing left to retry from, so no notice for that transition will ever
-// arrive. Reconstruct the missed window from beatLastSeen; beatOutages
-// already counted the outage itself at detection. A queue-full event that
-// loses nothing — an ongoing outage that stays detected and is queued once a
-// slot frees — is not counted here either, because nothing was dropped.
+// notificationsDropped counts notification MESSAGES that will never be
+// delivered, by kind. Both causes are recovered-shaped, because recovered is
+// the only fire-once kind: a recovered transition discarded when the recovery
+// channel was full (so no send was ever attempted), and a recovered send that
+// FAILED — recovered is dequeued before the send and finishRecovery runs
+// unconditionally, so nothing holds a record to retry from. That is the line
+// against notificationsFailed, which is drawn by what SURVIVES rather than by
+// whether a send was attempted: a notification counted failed still has its
+// record and retries, while a dropped one has nothing left to retry from, so no
+// notice for that transition will ever arrive.
+//
+// A discarded outage RECORD is deliberately not here: it is counted per record
+// on outageRecordsDropped, because a record is not a message (a history message
+// collapses several). Reconstruct the missed window from beatLastSeen;
+// beatOutages already counted the outage itself at detection. A queue-full event
+// that loses nothing — an ongoing outage that stays detected and is queued once
+// a slot frees — is counted nowhere, because nothing was dropped.
 var notificationsDropped = metricslib.NewLabeledCounter(
 	"notifications_dropped_total",
-	"Notifications that will never be delivered, by kind ("+notificationKindsText+"); a record discarded when the per-beat queue was full, or a recovered send that failed with nothing left to retry from; distinct from a delivery that failed and will retry.",
+	"Notification messages that will never be delivered, by kind ("+notificationKindsText+"); a fire-once recovered notice discarded by a full queue or whose send failed with nothing left to retry from; distinct from a delivery that failed and will retry.",
 	[]string{kindLabel},
 )
 
@@ -269,6 +308,7 @@ func init() {
 	registry.RegisterLabeledGauge(beatDeadline)
 	registry.RegisterLabeledCounter(beatsReceived)
 	registry.RegisterLabeledCounter(beatOutages)
+	registry.RegisterLabeledCounter(outageRecordsDropped)
 	registry.RegisterLabeledCounter(notificationsSent)
 	registry.RegisterLabeledCounter(notificationsFailed)
 	registry.RegisterLabeledCounter(notificationsDropped)
@@ -303,6 +343,7 @@ func InitBeat(id string, deadline time.Duration, start time.Time) {
 	beatLastSeen.Set(float64(start.Unix()), id)
 	beatsReceived.Add(0, id)
 	beatOutages.Add(0, id)
+	outageRecordsDropped.Add(0, id)
 }
 
 // RecordBeat records an accepted ping for id observed at now: the ping is
@@ -330,11 +371,21 @@ func SetBeatFresh(id string, fresh bool) {
 }
 
 // RecordOutage counts one detected outage for id, at detection time and
-// independent of whether its notice is ever delivered. It is the only
-// counter that counts OUTAGES rather than messages. id is a label: see the
+// independent of whether its notice is ever delivered. It counts OUTAGES
+// rather than messages. id is a label: see the
 // package doc's label-cardinality contract.
 func RecordOutage(id string) {
 	beatOutages.Inc(id)
+}
+
+// RecordOutageRecordDropped counts one ended-outage RECORD for id discarded for
+// good because the per-beat queue was full: that record was the outage's last
+// trace, so no notice for it will ever arrive. It counts RECORDS, not messages,
+// which is why it is not a notification counter (see outageRecordsDropped). The
+// ongoing-outage overflow, which loses nothing, must not come here. id is a
+// label: see the package doc's label-cardinality contract.
+func RecordOutageRecordDropped(id string) {
+	outageRecordsDropped.Inc(id)
 }
 
 // RecordHTTP records one served HTTP request: its latency, and one increment
@@ -373,9 +424,10 @@ func RecordNotificationFailed(kind Kind) {
 }
 
 // RecordNotificationDropped counts one notification message of kind that will
-// never be delivered, for either cause: the record it would have been built
-// from was discarded by a full queue, or it was a recovered send that failed
-// and left no record behind. Nothing retries it.
+// never be delivered: a fire-once recovered notice discarded by a full recovery
+// queue, or one whose send failed and left no record behind. Nothing retries
+// it. A discarded outage RECORD is not a message and goes to
+// RecordOutageRecordDropped instead.
 func RecordNotificationDropped(kind Kind) {
 	notificationsDropped.Inc(string(kind))
 }

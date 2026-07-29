@@ -329,6 +329,11 @@ func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
 	if !rec.HasAttr("pending missing queue full", "silence", "47m0s") {
 		t.Errorf("drop warning does not report the dropped outage's silence: %v", rec.Records())
 	}
+	// The field that tells a log rule this is a loss and not a late notice:
+	// nothing was attempted for this record and nothing survives to attempt.
+	if !rec.HasAttr("pending missing queue full", "retryable", "false") {
+		t.Errorf("drop warning does not report retryable=false, so a log rule cannot tell it from a send that will retry: %v", rec.Records())
+	}
 }
 
 func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
@@ -390,10 +395,12 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 
 	// The ping that ends that outage is where it actually becomes lost: the
 	// queue is still full, so its closed record is discarded and no notice
-	// for it will ever arrive. That moves the dropped counter once, still
-	// never the failed one, and the outage itself was already counted.
+	// for it will ever arrive. That moves the per-RECORD dropped counter once,
+	// never the failed one and never the per-MESSAGE dropped counter, and the
+	// outage itself was already counted.
 	failedBefore = counterValue(t, "knell_notifications_failed_total", "missing")
 	droppedBefore = counterValue(t, "knell_notifications_dropped_total", "missing")
+	recordsDroppedBefore := beatCounterValue(t, "knell_outage_records_dropped_total", id)
 	outagesBefore = beatCounterValue(t, "knell_beat_outages_total", id)
 	closing := capture.Default(t)
 	clock.Advance(11 * time.Minute)
@@ -403,8 +410,11 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
 		t.Errorf("failed{missing} = %v after the ping whose record was dropped, want unchanged %v (nothing was ever sent for it)", got, failedBefore)
 	}
-	if got, want := counterValue(t, "knell_notifications_dropped_total", "missing"), droppedBefore+1; got != want {
-		t.Errorf("dropped{missing} = %v after the closing ping found no slot, want %v (that notice is lost for good)", got, want)
+	if got, want := beatCounterValue(t, "knell_outage_records_dropped_total", id), recordsDroppedBefore+1; got != want {
+		t.Errorf("outage_records_dropped_total = %v after the closing ping found no slot, want %v (that record is lost for good)", got, want)
+	}
+	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
+		t.Errorf("dropped{missing} = %v after the closing ping found no slot, want unchanged %v (a discarded record is not one lost message: a history notice collapses several)", got, droppedBefore)
 	}
 	if got := beatCounterValue(t, "knell_beat_outages_total", id); got != outagesBefore {
 		t.Errorf("beat_outages_total = %v after the ping closing an already-counted outage, want unchanged %v", got, outagesBefore)
@@ -416,6 +426,7 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	// A genuinely NEW outage is accounted on its own: the accounting mark is
 	// per outage, not a permanent mute.
 	droppedBefore = counterValue(t, "knell_notifications_dropped_total", "missing")
+	recordsDroppedBefore = beatCounterValue(t, "knell_outage_records_dropped_total", id)
 	outagesBefore = beatCounterValue(t, "knell_beat_outages_total", id)
 	fresh := capture.Default(t)
 	clock.Advance(11 * time.Minute)
@@ -425,6 +436,9 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	}
 	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
 		t.Errorf("dropped{missing} = %v after a new ONGOING outage overflowed, want unchanged %v (it is deferred, not lost)", got, droppedBefore)
+	}
+	if got := beatCounterValue(t, "knell_outage_records_dropped_total", id); got != recordsDroppedBefore {
+		t.Errorf("outage_records_dropped_total = %v after a new ONGOING outage overflowed, want unchanged %v (it is deferred, not lost)", got, recordsDroppedBefore)
 	}
 	if got := fresh.CountLevel(slog.LevelDebug, "pending missing queue full"); got != 1 {
 		t.Errorf("queue-full debug lines for the new outage = %d, want exactly 1 (a fresh overflow reports itself): %v", got, fresh.Messages())
@@ -436,7 +450,10 @@ func TestFailedAndDroppedNeverBothMoveForOneEvent(t *testing.T) {
 	// notification counters. failed and dropped answer two different
 	// operator questions -- "wait, it will retry" vs "reconstruct the missed
 	// window" -- so a single event must land on exactly one of them, or
-	// KnellNotifyFailing reports one incident as two.
+	// KnellNotifyFailing reports one incident as two. A lost outage RECORD
+	// lands on neither: it is counted per record on
+	// knell_outage_records_dropped_total, because one history message covers
+	// several records, so N lost records are not N lost messages.
 	const id = "failed-vs-dropped-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
@@ -454,7 +471,8 @@ func TestFailedAndDroppedNeverBothMoveForOneEvent(t *testing.T) {
 		t.Errorf("dropped{missing} = %v after a failed delivery, want unchanged %v (the record is still queued and retries)", got, droppedBefore)
 	}
 
-	// Event 2: a permanent queue-full drop of an ended outage. dropped only.
+	// Event 2: a permanent queue-full drop of an ended outage. The per-RECORD
+	// counter only.
 	// Fill the remaining slots with ended outages first (the failed send
 	// above left its record queued and open until this ping seals it).
 	for len(w.beats[id].pendingMissing) < missingQueueSize {
@@ -465,22 +483,27 @@ func TestFailedAndDroppedNeverBothMoveForOneEvent(t *testing.T) {
 	}
 	failedBefore = counterValue(t, "knell_notifications_failed_total", "missing")
 	droppedBefore = counterValue(t, "knell_notifications_dropped_total", "missing")
+	recordsDroppedBefore := beatCounterValue(t, "knell_outage_records_dropped_total", id)
 	clock.Advance(11 * time.Minute)
 	if recorded, _ := w.Beat(id); !recorded {
 		t.Fatalf("overflow Beat(%s) = false", id)
 	}
-	if got, want := counterValue(t, "knell_notifications_dropped_total", "missing"), droppedBefore+1; got != want {
-		t.Errorf("dropped{missing} = %v after a queue-full drop, want %v", got, want)
+	if got, want := beatCounterValue(t, "knell_outage_records_dropped_total", id), recordsDroppedBefore+1; got != want {
+		t.Errorf("outage_records_dropped_total = %v after a queue-full drop, want %v", got, want)
+	}
+	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
+		t.Errorf("dropped{missing} = %v after a queue-full drop, want unchanged %v (the message counter must not move for a lost RECORD)", got, droppedBefore)
 	}
 	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
 		t.Errorf("failed{missing} = %v after a queue-full drop, want unchanged %v (nothing was attempted, nothing will retry)", got, failedBefore)
 	}
 
-	// Event 3: the sweep-path queue-full event on an ongoing outage. Neither
+	// Event 3: the sweep-path queue-full event on an ongoing outage. No
 	// counter moves: the notice is deferred, not failed and not lost.
 	n.setFail(nil)
 	failedBefore = counterValue(t, "knell_notifications_failed_total", "missing")
 	droppedBefore = counterValue(t, "knell_notifications_dropped_total", "missing")
+	recordsDroppedBefore = beatCounterValue(t, "knell_outage_records_dropped_total", id)
 	outagesBefore := beatCounterValue(t, "knell_beat_outages_total", id)
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
@@ -492,6 +515,9 @@ func TestFailedAndDroppedNeverBothMoveForOneEvent(t *testing.T) {
 	}
 	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
 		t.Errorf("dropped{missing} = %v after a sweep-path queue-full event, want unchanged %v", got, droppedBefore)
+	}
+	if got := beatCounterValue(t, "knell_outage_records_dropped_total", id); got != recordsDroppedBefore {
+		t.Errorf("outage_records_dropped_total = %v after a sweep-path queue-full event, want unchanged %v", got, recordsDroppedBefore)
 	}
 }
 
@@ -538,6 +564,9 @@ func TestRecoveryQueueDropIsCountedAsDroppedNotFailed(t *testing.T) {
 	}
 	if got := rec.CountLevel(slog.LevelWarn, "recovery queue full"); got != 1 {
 		t.Errorf("recovery-drop warnings = %d, want exactly 1 (a lost notice is news): %v", got, rec.Messages())
+	}
+	if !rec.HasAttr("recovery queue full", "retryable", "false") {
+		t.Errorf("recovery-drop warning does not report retryable=false, so a log rule cannot tell it from a send that will retry: %v", rec.Records())
 	}
 }
 
@@ -594,6 +623,11 @@ func TestFailedRecoveredSendIsCountedAsDroppedNotFailed(t *testing.T) {
 	if !rec.HasAttr("recovered notification failed", "beat", id) {
 		t.Errorf("recovered-failure log does not name the beat: %v", rec.Records())
 	}
+	// Same level as the retryable missing/history failures (something WAS
+	// attempted), so the LEVEL cannot carry the distinction: this field does.
+	if !rec.HasAttr("recovered notification failed", "retryable", "false") {
+		t.Errorf("recovered-failure log does not report retryable=false, which is the only thing separating it from the Error a retried send logs: %v", rec.Records())
+	}
 
 	// The premise behind counting it as dropped: nothing is queued or resent
 	// once the notifier heals. If a retry existed, failed would be right.
@@ -605,8 +639,77 @@ func TestFailedRecoveredSendIsCountedAsDroppedNotFailed(t *testing.T) {
 	}
 }
 
+// TestUndeliveredNoticeLogsCarryTheirRetryability pins the retryable field on
+// the three loss/failure sites the capture-based tests around it do not reach:
+// the two send failures whose records stay queued, and the recovered notice
+// abandoned by a shutdown. The field exists because the LEVEL cannot carry this
+// distinction -- a retried send deliberately stays at Error rather than spamming
+// Warn every sweep, and the abandoned recovered notice is a permanent loss
+// logged at Info with no counter behind it at all -- so without it a log rule
+// cannot tell "the notice is late, wait for it" from "no notice will ever
+// arrive, reconstruct the window".
+func TestUndeliveredNoticeLogsCarryTheirRetryability(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, which every other test writes through.
+	const id = "retryability-log-probe"
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+
+	// A failed missing send: its record stays queued and the next sweep sends
+	// it again, so the failure is retryable.
+	clock.Advance(11 * time.Minute)
+	n.setFail(errors.New("discord down"))
+	missing := capture.Default(t)
+	w.sweep(context.Background())
+	if got := missing.CountLevel(slog.LevelError, "missing notification failed"); got != 1 {
+		t.Fatalf("missing-failure error lines = %d, want exactly 1: %v", got, missing.Messages())
+	}
+	if !missing.HasAttr("missing notification failed", "retryable", "true") {
+		t.Errorf("missing-failure log does not report retryable=true, so a log rule reads a late notice as a lost one: %v", missing.Records())
+	}
+
+	// A failed history send: same shape, its whole run stays queued.
+	clock.Advance(time.Minute)
+	if recorded, _ := w.Beat(id); !recorded {
+		t.Fatalf("closing Beat(%s) = false", id)
+	}
+	history := capture.Default(t)
+	w.sweep(context.Background())
+	if got := history.CountLevel(slog.LevelError, "outage history notification failed"); got != 1 {
+		t.Fatalf("history-failure error lines = %d, want exactly 1: %v", got, history.Messages())
+	}
+	if !history.HasAttr("outage history notification failed", "retryable", "true") {
+		t.Errorf("history-failure log does not report retryable=true: %v", history.Records())
+	}
+
+	// A recovered notice abandoned by a shutdown: recovered is fire-once and
+	// the event was already dequeued, so no notice for that recovery will ever
+	// arrive -- and this site moves no counter, which makes the log line its
+	// only trace and the field its only loss signal.
+	n.setFail(nil)
+	w.sweep(context.Background())
+	// One more outage, this time delivered, so the beat is alerted and the next
+	// ping queues a real recovered transition.
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	if recorded, _ := w.Beat(id); !recorded {
+		t.Fatalf("recovering Beat(%s) = false", id)
+	}
+	if got := len(w.recoveries); got != 1 {
+		t.Fatalf("queued recoveries = %d, want 1 (the test's own precondition)", got)
+	}
+	n.setFail(context.Canceled)
+	abandoned := capture.Default(t)
+	drainRecoveries(w)
+	if got := abandoned.CountLevel(slog.LevelInfo, "recovered notification abandoned"); got != 1 {
+		t.Fatalf("abandoned-recovery info lines = %d, want exactly 1: %v", got, abandoned.Messages())
+	}
+	if !abandoned.HasAttr("recovered notification abandoned", "retryable", "false") {
+		t.Errorf("abandoned-recovery log does not report retryable=false, and no counter moves for this loss at all: %v", abandoned.Records())
+	}
+}
+
 func TestHistoryNoticeCountsOncePerMessageWhileOutagesCountEach(t *testing.T) {
-	// Serial (no t.Parallel): asserts deltas on the package-global
 	// notification counters, which the parallel tests also move.
 	const id = "history-counter-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
@@ -727,6 +830,9 @@ func TestLogUndeliveredClassifiesOnlyEndedRecordsAsPermanentLoss(t *testing.T) {
 	if !rec.HasAttr("shutting down with undelivered ended-outage records", "still_ongoing", "1") {
 		t.Errorf("loss warning does not distinguish the re-detectable ongoing outage: %v", rec.Records())
 	}
+	if !rec.HasAttr("shutting down with undelivered ended-outage records", "retryable", "false") {
+		t.Errorf("loss warning does not report retryable=false for records that die with the process: %v", rec.Records())
+	}
 }
 
 func TestLogUndeliveredReportsAnOngoingOutageWithoutTheLossWarning(t *testing.T) {
@@ -813,6 +919,9 @@ func TestShutdownWarnsAboutQueuedRecoveredNotifications(t *testing.T) {
 	}
 	if !rec.AttrContains("shutting down with queued recovered notifications", "beats", id) {
 		t.Errorf("queued-recovery warning does not name the beat whose recovered notice is lost: %v", rec.Records())
+	}
+	if !rec.HasAttr("shutting down with queued recovered notifications", "retryable", "false") {
+		t.Errorf("queued-recovery warning does not report retryable=false for notices that die with the channel: %v", rec.Records())
 	}
 }
 

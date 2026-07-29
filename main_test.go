@@ -198,6 +198,14 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	if !rec.HasAttr("configuration loaded", "beats", "1") {
 		t.Errorf("startup summary omits the beat count: %v", rec.Messages())
 	}
+	// The Host allowlist's OFF state has to reach the shipped line, because it
+	// is the one knell is otherwise silent about: a misspelled ALLOWED_HOSTS
+	// reads as unset, draws no parse warning, and leaves the DNS-rebinding guard
+	// off while the operator believes it is armed. cfg carries no policy here,
+	// which is also the nil-safety check for the attr.
+	if !rec.HasAttr("configuration loaded", "allowed_hosts", "any") {
+		t.Errorf("allowed_hosts should report any when no allowlist is configured: %v", rec.Messages())
+	}
 	if !rec.Contains("watching beat") || !rec.AttrContains("watching beat", "beat", "api") {
 		t.Errorf("per-beat startup line missing: %v", rec.Messages())
 	}

@@ -159,17 +159,6 @@ func run() error {
 	srv := webhttp.NewServer(handler,
 		webhttp.WithReadTimeout(requestTimeout),
 		webhttp.WithWriteTimeout(requestTimeout),
-		// webhttp's 1 MiB MaxHeaderBytes default is sized for apps that carry
-		// large cookies or proxy header chains; knell serves three short routes
-		// (/healthz, /metrics, /beat/{id} with a 64-char id) and one optional
-		// bearer token. net/http grows a connection's header buffer up to this
-		// bound before any handler, middleware or token gate runs, so the
-		// default lets an unauthenticated peer allocate 1 MiB per concurrent
-		// connection on an endpoint whose whole job is to still be alive.
-		// 16 KiB is far above anything a sender or a fronting proxy emits and
-		// bounds that amplification at 64x less memory; over-long headers get
-		// net/http's own 431.
-		webhttp.WithMaxHeaderBytes(16<<10),
 		// Connection-level errors net/http reports itself -- above all
 		// "http: Accept error: ...; retrying", the trace of an exhausted fd
 		// budget that stops every beat from being received -- default to the

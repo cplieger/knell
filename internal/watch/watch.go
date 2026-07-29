@@ -15,6 +15,15 @@
 // of two reasons — a webhook outage held its alert back, or the outage ended
 // between two sweeps and no alert was ever due — and each record carries
 // which one (LateReason), because the operator's next step differs.
+//
+// Every log line reporting a notification that did not go out carries a
+// retryable attribute: true when the record survives and the next sweep sends
+// it again (the missing and history send failures), false when nothing is left
+// to attempt and no notice for that transition will ever arrive (a discarded
+// record, a dropped or failed recovered notice, the notices abandoned at
+// shutdown). The LEVEL is deliberately not that signal — a retried send stays
+// at Error rather than spamming Warn every sweep — so this attribute is what a
+// log rule keys on to tell "wait for it" from "reconstruct the window".
 package watch
 
 import (
@@ -412,8 +421,11 @@ func (st *beatState) queueDetectedOutage(rec *overdueBeat) bool {
 
 // recordEndedOutage queues the missing transition of an outage a ping has
 // already ended, the record that is now that outage's only trace: a full queue
-// loses it for good, so it counts a dropped notification and warns. The warning
-// is ungated: it is reachable at most once per outage (only a ping brings a
+// loses it for good, so it counts a dropped outage RECORD and warns. The record,
+// not a message: nothing was ever built or attempted for it, and a history
+// message can cover several records, so the per-record counter is the honest
+// unit (metrics.RecordOutageRecordDropped). The warning is ungated: it is
+// reachable at most once per outage (only a ping brings a
 // closed record, and the same ping re-arms the beat), so gating it would hide
 // the loss in exactly the sequence that produces it. Contrast
 // recordOngoingOutage. Callers hold w.mu.
@@ -421,18 +433,27 @@ func (st *beatState) recordEndedOutage(rec *overdueBeat) {
 	if st.queueDetectedOutage(rec) {
 		return
 	}
-	metrics.RecordNotificationDropped(metrics.KindMissing)
+	metrics.RecordOutageRecordDropped(rec.id)
+	// The two instants go in as time.Time values, not RFC3339 strings: slog
+	// stores a time.Time as a typed Time attr (slog.AnyValue special-cases it),
+	// so the UTC pin holds, sub-second precision survives, and a future JSON
+	// handler emits a real timestamp instead of a pre-rendered string. The kv
+	// form rather than slog.Time is the fleet's sloglint kv-only rule.
 	slog.Warn("pending missing queue full, ended outage dropped, its notification will never be delivered",
 		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.DownFor().String(),
-		"since", rec.silence.Started.UTC().Format(time.RFC3339),
-		"recovered", rec.recoveredAt.UTC().Format(time.RFC3339))
+		"since", rec.silence.Started.UTC(),
+		"recovered", rec.recoveredAt.UTC(),
+		// Nothing was attempted and nothing survives to attempt: this loss is
+		// permanent, unlike the retryable send failures that log at Error.
+		"retryable", false)
 }
 
 // recordOngoingOutage queues the missing transition of an outage that is still
 // in progress: a full queue costs nothing but a deferral, since the outage
 // stays detected (openMissing stays nil) and the next sweep with a free slot
-// records and delivers it. Nothing was dropped, so no notification counter
-// moves, and the back-pressure is logged at DEBUG once per affected outage via
+// records and delivers it. Nothing was dropped, so no delivery counter and no
+// dropped-record counter moves, and the back-pressure is logged at DEBUG once
+// per affected outage via
 // overflowAccounted rather than once per tick. Contrast recordEndedOutage.
 // Callers hold w.mu.
 func (st *beatState) recordOngoingOutage(rec *overdueBeat) {
@@ -445,9 +466,10 @@ func (st *beatState) recordOngoingOutage(rec *overdueBeat) {
 		return
 	}
 	st.overflowAccounted = true
+	// A time.Time value, for the reason recordEndedOutage's log gives.
 	slog.Debug("pending missing queue full, ongoing outage stays detected and is queued once a slot frees",
 		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.DownFor().String(),
-		"since", rec.silence.Started.UTC().Format(time.RFC3339))
+		"since", rec.silence.Started.UTC())
 }
 
 // lateReasonForUnqueuedOutage names why the notice for an outage that has NO
@@ -619,7 +641,7 @@ func (w *Watcher) Beat(id string) (recorded, accepting bool) {
 		// not a failed delivery attempt.
 		metrics.RecordNotificationDropped(metrics.KindRecovered)
 		slog.Warn("recovery queue full, dropping recovered notification, nothing retries it and no notice for this recovery will ever arrive",
-			"beat", id, "down_for", silence.DownFor().String())
+			"beat", id, "down_for", silence.DownFor().String(), "retryable", false)
 	}
 	return true, true
 }
@@ -707,10 +729,12 @@ func (w *Watcher) refreshFreshness() {
 // re-detects an ONGOING outage after the restart only if it outlasts one full
 // post-restart deadline, and never a closed one), and a queued recovered
 // transition is gone with the channel. This is the one
-// permanent-loss path no delivery counter can show: notifications_dropped_total
-// counts a notice that is lost for good once its delivery was ATTEMPTED and
-// failed (sendRecovered) or its record was discarded by a full queue
-// (recordEndedOutage, Beat), while a record still sitting in a queue here was
+// permanent-loss path no counter can show: notifications_dropped_total
+// counts a MESSAGE that is lost for good once its delivery was ATTEMPTED and
+// failed (sendRecovered) or its queued transition was discarded
+// (Beat's full recovery channel), and outage_records_dropped_total counts a
+// RECORD discarded by a full pending queue (recordEndedOutage), while a record
+// still sitting in a queue here was
 // never attempted and never discarded, so the log line is the operator's only
 // trace of it.
 //
@@ -735,7 +759,7 @@ func (w *Watcher) logUndelivered() {
 	}
 	if queuedRecoveries > 0 {
 		slog.Warn("shutting down with queued recovered notifications, they will never be delivered",
-			"queued", queuedRecoveries, "beats", lostRecoveries)
+			"queued", queuedRecoveries, "beats", lostRecoveries, "retryable", false)
 	}
 }
 
@@ -809,7 +833,7 @@ func logPendingLoss(p pendingLoss) {
 		return
 	}
 	slog.Warn("shutting down with undelivered ended-outage records, no notice for them will ever arrive",
-		"beat", p.id, "records", p.lost, "still_ongoing", p.ongoing)
+		"beat", p.id, "records", p.lost, "still_ongoing", p.ongoing, "retryable", false)
 }
 
 // overdue reports whether an observed silence has passed the beat's deadline.
@@ -1021,7 +1045,8 @@ func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 		}
 		metrics.RecordNotificationFailed(metrics.KindMissing)
 		slog.Error("missing notification failed, will retry next sweep",
-			"beat", beat.id, "silence", beat.silence.DownFor().String(), "error", err)
+			"beat", beat.id, "silence", beat.silence.DownFor().String(), "error", err,
+			"retryable", true)
 		return false
 	}
 	metrics.RecordNotificationSent(metrics.KindMissing)
@@ -1057,7 +1082,8 @@ func (w *Watcher) sendHistory(ctx context.Context, past beatOutages) bool {
 		metrics.RecordNotificationFailed(metrics.KindHistory)
 		w.markHistoryUndelivered(past.id, len(past.outages))
 		slog.Error("outage history notification failed, will retry next sweep",
-			"beat", past.id, "outages", len(past.outages), "error", err)
+			"beat", past.id, "outages", len(past.outages), "error", err,
+			"retryable", true)
 		return false
 	}
 	metrics.RecordNotificationSent(metrics.KindHistory)
@@ -1179,12 +1205,13 @@ func (w *Watcher) sendRecovered(ctx context.Context, ev recoveryEvent) {
 	if err := w.notifier.BeatRecovered(ctx, ev.id, ev.silence); err != nil {
 		if errors.Is(err, context.Canceled) {
 			slog.Info("recovered notification abandoned, shutting down, nothing retries it so no notice for this recovery will ever arrive",
-				"beat", ev.id, "down_for", ev.silence.DownFor().String())
+				"beat", ev.id, "down_for", ev.silence.DownFor().String(), "retryable", false)
 			return
 		}
 		metrics.RecordNotificationDropped(metrics.KindRecovered)
 		slog.Error("recovered notification failed, nothing retries it and no notice for this recovery will ever arrive",
-			"beat", ev.id, "down_for", ev.silence.DownFor().String(), "error", err)
+			"beat", ev.id, "down_for", ev.silence.DownFor().String(), "error", err,
+			"retryable", false)
 		return
 	}
 	metrics.RecordNotificationSent(metrics.KindRecovered)

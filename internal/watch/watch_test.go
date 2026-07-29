@@ -1264,19 +1264,25 @@ func TestPendingMissingQueueOverflowIsAccountedNotSilent(t *testing.T) {
 
 	// One more outage, of a distinctive length, overflows the queue. That
 	// outage already ended, so its record was its last trace: no notice for
-	// it will ever arrive. A permanent loss is what the DROPPED counter
-	// reports (failed means a delivery attempt that will retry, which this
-	// is not), and the outage must still count as detected.
+	// it will ever arrive. A permanent loss of a RECORD is what the per-record
+	// dropped counter reports (failed means a delivery attempt that will retry,
+	// which this is not; the per-MESSAGE dropped counter would claim one lost
+	// message for a record a history notice would have collapsed with others),
+	// and the outage must still count as detected.
 	const droppedSilence = 47 * time.Minute
 	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
 	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "missing")
+	recordsDroppedBefore := beatCounterValue(t, "knell_outage_records_dropped_total", id)
 	outagesBefore := beatCounterValue(t, "knell_beat_outages_total", id)
 	clock.Advance(droppedSilence)
 	if recorded, _ := w.Beat(id); !recorded {
 		t.Fatalf("overflow Beat(%s) = false", id)
 	}
-	if got, want := counterValue(t, "knell_notifications_dropped_total", "missing"), droppedBefore+1; got != want {
-		t.Errorf("dropped{missing} = %v after the queue-full drop, want %v (a lost outage must be accounted)", got, want)
+	if got, want := beatCounterValue(t, "knell_outage_records_dropped_total", id), recordsDroppedBefore+1; got != want {
+		t.Errorf("outage_records_dropped_total = %v after the queue-full drop, want %v (a lost outage record must be accounted)", got, want)
+	}
+	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
+		t.Errorf("dropped{missing} = %v after the queue-full drop, want unchanged %v (that counter counts MESSAGES, and no missing message was ever built for this record)", got, droppedBefore)
 	}
 	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
 		t.Errorf("failed{missing} = %v after the queue-full drop, want unchanged %v (nothing was attempted and nothing will retry)", got, failedBefore)
@@ -1400,6 +1406,7 @@ func TestSweepDetectedCrossingSurvivesAQueueFullOverflow(t *testing.T) {
 	// full is the worst failure it can have.
 	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
 	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "missing")
+	recordsDroppedBefore := beatCounterValue(t, "knell_outage_records_dropped_total", id)
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
 
@@ -1432,6 +1439,9 @@ func TestSweepDetectedCrossingSurvivesAQueueFullOverflow(t *testing.T) {
 	}
 	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
 		t.Errorf("dropped{missing} = %v after a sweep-path queue-full event, want unchanged %v (nothing was dropped: the record was queued once a slot freed)", got, droppedBefore)
+	}
+	if got := beatCounterValue(t, "knell_outage_records_dropped_total", id); got != recordsDroppedBefore {
+		t.Errorf("outage_records_dropped_total = %v after a sweep-path queue-full event, want unchanged %v (no record was discarded for good: the outage stayed detected and was queued once a slot freed)", got, recordsDroppedBefore)
 	}
 }
 

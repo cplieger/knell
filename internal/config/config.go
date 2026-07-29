@@ -84,8 +84,9 @@ type Config struct {
 // secrets. DISCORD_WEBHOOK_URL's path IS the Discord credential and BeatToken
 // is the /beat/{id} gate, so both are reported by PRESENCE only: logging a
 // Config (or a *Config, whose method set includes this value receiver) stays
-// leak-free even from a call site that logs the whole struct instead of the
-// hand-picked fields main.go's logConfig chooses today.
+// leak-free even from a call site that logs the whole struct rather than the
+// attributes this method itself chooses -- which is what main.go's logConfig
+// publishes today, by spreading this value's group.
 //
 // The VALUE receiver is the load-bearing part: a *Config method set would leave
 // the bare Config that Load returns (and run() holds) outside slog.LogValuer, so
@@ -101,12 +102,31 @@ func (c Config) LogValue() slog.Value {
 	if c.BeatToken != "" {
 		beatAuth = "required"
 	}
+	// The Host allowlist reports beside beat_auth because the two are knell's
+	// only optional gates, and an operator reading one expects the other on the
+	// same line. ABSENCE is the state that needs publishing: a present-but-blank
+	// ALLOWED_HOSTS warns at parse time, but a MISSPELLED variable name is
+	// indistinguishable from unset and draws nothing at all, so without this
+	// attribute an operator believes the DNS-rebinding guard is armed and no
+	// line contradicts them.
+	//
+	// The COUNT is state, not decoration: malformed entries are
+	// warned-and-dropped, so an active policy can hold zero usable hosts and
+	// then rejects every non-loopback request (fail closed) — a distinct and
+	// dangerous configuration a bare on/off value would render identically to a
+	// working allowlist. Active and Size are nil-safe, so a zero Config (and any
+	// Config built without going through Load) renders "any" rather than panicking.
+	allowedHosts := "any"
+	if c.AllowedHosts.Active() {
+		allowedHosts = fmt.Sprintf("allowlist(%d)", c.AllowedHosts.Size())
+	}
 	return slog.GroupValue(
 		slog.Int("beats", len(c.Beats)),
 		slog.String("node", c.Node),
 		slog.String("listen_addr", c.ListenAddr),
 		slog.String("webhook", webhook),
 		slog.String("beat_auth", beatAuth),
+		slog.String("allowed_hosts", allowedHosts),
 		slog.String("log_level", c.LogLevel.String()),
 	)
 }
@@ -229,11 +249,12 @@ func listenAddr() string {
 
 // allowedHosts parses the ALLOWED_HOSTS exact-match Host allowlist. Unset (the
 // documented default) yields an inactive policy that accepts every Host, so the
-// guard ships permissive and removes no capability. An active allowlist is the
-// only defense that breaks DNS rebinding (CWE-346): a rebinding request reaches
-// knell carrying the ATTACKER's hostname in Host while its Sec-Fetch-Site reads
-// same-origin, so webapi's cross-site refusal admits it and the ping re-arms the
-// switch with no heartbeat behind it. Matching is textual on the Host header,
+// guard ships permissive and removes no capability. An active allowlist is what
+// breaks DNS rebinding (CWE-346) on the endpoints webapi's browser-page refusal
+// does not cover: that refusal guards /beat/{id} only, so a rebinding page is
+// still free to read /metrics — which enumerates every beat and its freshness —
+// under the ATTACKER's hostname, and the allowlist is the only check that looks
+// at the Host that request carries. Matching is textual on the Host header,
 // the one value the attacker cannot forge away, and no name is resolved.
 //
 // Malformed entries WARN rather than fail startup, unlike the required values

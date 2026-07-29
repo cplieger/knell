@@ -72,10 +72,10 @@ func exposition(t *testing.T) string {
 }
 
 // TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat pins the per-beat
-// half of the cold-start guarantee: declaring a beat must publish all five
-// per-beat series, with the two counters born at zero, the last-seen gauge
+// half of the cold-start guarantee: declaring a beat must publish all six
+// per-beat series, with the three counters born at zero, the last-seen gauge
 // carrying the boot baseline and the deadline gauge carrying the configured
-// deadline. Four of the five come from InitBeat; knell_beat_fresh comes from
+// deadline. Five of the six come from InitBeat; knell_beat_fresh comes from
 // SetBeatFresh, the single door for the freshness verdict, because the
 // boundary belongs to the watch state machine (watch.New publishes the boot
 // verdict right after InitBeat, and internal/watch's own tests pin that it is
@@ -95,6 +95,7 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 		"knell_beat_deadline_seconds",
 		"knell_beats_received_total",
 		"knell_beat_outages_total",
+		"knell_outage_records_dropped_total",
 	}
 	// The registry outlives one test iteration, so leaving the probe series
 	// behind makes `go test -count=2` fail on the precondition below instead
@@ -106,6 +107,7 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 		beatDeadline.Delete(id)
 		beatsReceived.Delete(id)
 		beatOutages.Delete(id)
+		outageRecordsDropped.Delete(id)
 	})
 	for _, name := range series {
 		if got, ok := beatSeriesValue(t, name, id); ok {
@@ -124,6 +126,7 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 		"knell_beat_deadline_seconds":            "1200",
 		"knell_beats_received_total":             "0",
 		"knell_beat_outages_total":               "0",
+		"knell_outage_records_dropped_total":     "0",
 	}
 	for _, name := range series {
 		got, ok := beatSeriesValue(t, name, id)

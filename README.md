@@ -70,7 +70,7 @@ knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext. Put a
 
 `BEAT_TOKEN` gates `/beat/{id}` only: `/healthz` and `/metrics` stay open on the same port so probes and scrapes keep working. `/metrics` publishes every configured beat id plus each beat's last-seen timestamp and freshness, so anyone who can reach the port can enumerate the beats and see which one is about to fire, even with a token set. Publish the port to a trusted network only (the compose example maps it on every host interface), or put an authenticating proxy in front of `/metrics`.
 
-A trusted network is not enough on its own against a browser: a page an operator opens can make their browser send requests to knell under a hostname the attacker controls (DNS rebinding), and such a request looks same-origin to every header-based check. Set `ALLOWED_HOSTS` to the hostnames knell is actually reached by, and any other `Host` is refused before a beat can be recorded.
+A trusted network is not enough on its own against a browser: a page an operator opens can make their browser send requests to knell under a hostname the attacker controls (DNS rebinding), and while `/beat/{id}` refuses every request a browser page initiated (403 `browser_page_request`), `/healthz` and `/metrics` do not — and `/metrics` enumerates every beat. Set `ALLOWED_HOSTS` to the hostnames knell is actually reached by, and any other `Host` is refused on every endpoint before a beat can be recorded or the exposition read. Check that it took effect in the `configuration loaded` line knell logs at startup: `allowed_hosts=allowlist(2)` names how many hosts the gate holds, while `allowed_hosts=any` means no allowlist is active and every `Host` is accepted — which is what a misspelled variable name looks like, since knell cannot tell it from an unset one.
 
 A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling back, and so does a `NODE_NAME` over 256 bytes. For the webhook URL that means any scheme other than `https`, a URL that carries no path (host-only, root-only, or one whose credential sits in a query string — a Discord webhook always carries its credential in its path, `/api/webhooks/{id}/{token}`), and a URL containing a space or another invisible character such as a non-breaking or zero-width space (each is percent-encoded on every request, so the host and path that reach the other end are not the configured ones). A `BEAT_TOKEN` fails startup whenever senders could not present it as configured: when it is set but empty, when it carries surrounding spaces or tabs, or when it carries a control character HTTP forbids in a header value. Surrounding whitespace is refused rather than trimmed, because the value is verified verbatim: knell compares `Bearer <token>`, so a leading run of spaces sits inside the header value and reaches the verifier, while a trailing one is stripped on the wire — silently rewriting the token would arm the gate for a value that differs from the one you configured, and knell would then reject every ping while reporting itself gated, then declare every beat missing one deadline later. A non-ASCII space such as `U+00A0` does survive a header value, so a token containing one is accepted as configured. Unset the variable to serve `/beat/{id}` open on purpose. When a `_FILE` variable is set but its file cannot be read, because it is missing, unreadable, or empty, startup fails instead of falling back to the plain variable; only an unset `_FILE` variable falls back. A dead-man switch running with the wrong config is worse than one that refuses to start.
 
@@ -84,7 +84,7 @@ A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling b
 
 Request bodies on `/beat/{id}` are ignored, so webhook-shaped senders (an Alertmanager `webhook_configs` target, a CI notification hook) can point at it unchanged. Up to 1 MiB of the body is read and discarded so the connection stays reusable; a payload larger than that still records the ping and answers `{"ok":true}`, logs one `warn` line saying the body was not fully read, and closes that connection instead of draining the rest (so an oversized sender loses keep-alive, never its ping). A ping is never refused for its payload: the body is not what the switch is listening for.
 
-Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away from anything that fetches links automatically: a chat client's URL preview, a crawler, an uptime prober. An automated fetch feeds the switch and can mask a dead sender. `HEAD` requests are rejected with 405 and never record a ping, so a HEAD-only prober cannot feed the switch.
+Because `GET /beat/{id}` records a ping exactly like `POST`, keep beat URLs away from anything that fetches links automatically: a chat client's URL preview, a crawler, an uptime prober. Inside a browser that hazard is now blocked — any request a page initiated (an `<img>`, a `fetch`, a prefetch, an iframe) carries `Sec-Fetch-Site` and is refused with 403 `browser_page_request` — so what still records is a machine client sending no `Sec-Fetch-*` headers at all, which is what every documented sender is, and a human opening the URL from the address bar or a bookmark. `HEAD` requests are rejected with 405 and never record a ping, so a HEAD-only prober cannot feed the switch.
 
 `/healthz` and `/metrics` are logged as machine probes: a successful probe or scrape lands at `debug` (out of the log at the default level, visible under `LOG_LEVEL=debug` when the question is whether the prober arrives at all), while one answering 4xx or 5xx lands at `warn`/`error`. So a scrape that stopped landing shows up in the log without raising the level.
 
@@ -110,7 +110,7 @@ A live incident and one that is already over are reported differently: nothing a
 
   The whole run of ended outages goes out in a single sweep, so a genuinely live outage queued behind it waits one sweep rather than one sweep per stale record. Because the notice states the outages are over, no recovered notice follows for them.
 - **Queued outages**: each beat queues up to 8 records and reports them oldest first. When a beat's queue is full, the newest record is not queued, and the two cases that can arise differ in consequence:
-  - an outage a ping has already ended is **dropped for good**: its record was the last trace of it, so no notice for it will ever arrive. `knell_notifications_dropped_total{kind="missing"}` increments and a warning is logged, once for that outage. Reconstruct the missed window from `knell_beat_last_seen_timestamp_seconds`.
+  - an outage a ping has already ended is **dropped for good**: its record was the last trace of it, so no notice for it will ever arrive. `knell_outage_records_dropped_total{beat}` increments and a warning is logged, once for that outage. Reconstruct the missed window from `knell_beat_last_seen_timestamp_seconds`.
   - an outage still in progress **loses nothing**: it stays detected (`knell_beat_outages_total{beat}` already counted it), and it is queued and delivered once a slot opens. That is ordinary back-pressure while notifications are failing, so it is logged at debug level and moves no delivery counter.
 - The webhook URL is treated as a secret: it is never logged and never appears in error messages.
 
@@ -123,9 +123,10 @@ A live incident and one that is already over are reported differently: nothing a
 | `knell_beat_deadline_seconds{beat}` | gauge | the beat's configured silence deadline. Add it to the last-seen gauge to get when an overdue beat fires, and compare it across observers to catch a `BEATS` skew before one node alerts alone |
 | `knell_beats_received_total{beat}` | counter | accepted pings; unknown ids are rejected, not counted |
 | `knell_beat_outages_total{beat}` | counter | outages detected per beat, counted when the deadline is crossed and independent of any delivery. Count outages with this one, not with the notification counters |
+| `knell_outage_records_dropped_total{beat}` | counter | ended-outage records discarded per beat because the beat's queue was full. Counted per RECORD, not per message: the record was that outage's last trace, so no notice for it will ever arrive. Reconstruct the missed window from `knell_beat_last_seen_timestamp_seconds` |
 | `knell_notifications_sent_total{kind}` | counter | delivered webhook notifications (`missing`, `recovered`, `history`), one per delivered message: a `history` message covering several ended outages counts once |
 | `knell_notifications_failed_total{kind}` | counter | delivery attempts that failed after retries and will be retried, one per failed message. This counter means exactly that: something was sent, did not get through, and its record is still queued. In practice that is `missing` and `history`, which the next sweep tries again |
-| `knell_notifications_dropped_total{kind}` | counter | notifications that will never be delivered, either because a fire-once `recovered` send failed or because a record was discarded when the per-beat queue was full. Nothing retries a drop: reconstruct the missed window from `knell_beat_last_seen_timestamp_seconds` |
+| `knell_notifications_dropped_total{kind}` | counter | notification messages that will never be delivered, one per lost message. In practice that is `recovered`, the one fire-once kind: its transition was discarded by a full recovery queue, or its send failed with nothing left to retry from. Nothing retries a drop. A lost outage RECORD is counted on `knell_outage_records_dropped_total` instead, because a record is not a message |
 
 Plus standard `go_*` / `process_*` runtime metrics.
 
@@ -144,19 +145,23 @@ knell is itself the alert path for the things it watches, so alert rules about k
   annotations:
     summary: "beat {{ $labels.beat }} is overdue on {{ $labels.instance }}"
 
-# knell could not get a notification through, for one of two reasons the
+# knell could not get a notification through, for one of three reasons the
 # counters keep apart:
 #   failed  = a delivery attempt failed after retries (the webhook is
 #             unreachable) and its record is still queued, so it is retried
 #             every 15s sweep. The notice is late, not lost: wait for it.
-#   dropped = the notice will never arrive, either because a fire-once
-#             recovered send failed or because a record was discarded when
-#             its queue was full. Reconstruct the missed window from
-#             knell_beat_last_seen_timestamp_seconds.
+#   dropped = a MESSAGE that will never arrive, in practice a fire-once
+#             recovered notice whose send failed or whose transition was
+#             discarded by a full recovery queue.
+#   outage records dropped = an ended outage whose record was discarded by a
+#             full per-beat queue. Counted per record rather than per message,
+#             because one history message covers several records. Reconstruct
+#             the missed window from knell_beat_last_seen_timestamp_seconds.
 - alert: KnellNotifyFailing
   expr: >
     increase(knell_notifications_failed_total[15m]) > 0
     or increase(knell_notifications_dropped_total[15m]) > 0
+    or increase(knell_outage_records_dropped_total[15m]) > 0
   for: 0m
   labels:
     severity: warning

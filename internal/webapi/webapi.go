@@ -57,8 +57,10 @@ type Routes struct {
 	// Hosts is the exact-match Host allowlist (ALLOWED_HOSTS). A nil or
 	// inactive policy accepts every Host, which is the documented default;
 	// an active one is what breaks DNS rebinding, since a rebinding request
-	// carries the ATTACKER's hostname in Host while its Sec-Fetch-Site reads
-	// same-origin and so passes crossSiteSubresource.
+	// carries the ATTACKER's hostname in Host and nothing else on /healthz or
+	// /metrics looks at that: browserPageRequest guards the BEAT handler only,
+	// so without an allowlist a rebinding page still reads the exposition that
+	// enumerates every beat and its freshness.
 	Hosts *webhttp.HostPolicy
 }
 
@@ -123,17 +125,26 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 	// ones, so GET, POST and HEAD still route above.
 	mux.HandleFunc("/beat/{id}", writeMethodNotAllowed)
 	// A /beat path that names no configured beat answers this file's coded 404
-	// rather than net/http's plain-text one. /beat/{$} is the EMPTY id a sender
+	// rather than net/http's plain-text one. /beat is the bare prefix a sender
+	// built from a truncated URL sends; /beat/{$} is the EMPTY id a sender
 	// built from an unset variable sends; /beat/{id}/{rest...} is the
-	// trailing-slash or extra-segment URL join. Without a route both fall to
-	// net/http's own 404, which carries no code for a sender to parse and lands
+	// trailing-slash or extra-segment URL join. Without a route all three fall
+	// to net/http's own 404 (or, for the bare path, its 307), which carries no
+	// code for a sender to parse and lands
 	// in the request counter's "unmatched" bucket beside scanner traffic -- so
 	// the one refusal class that means "this beat is never being pinged" cannot
-	// be told apart from a port scan. Two patterns rather than one /beat/
-	// subtree so the path label still says WHICH shape arrived. Both are less
-	// specific than the four /beat/{id} patterns above, so a real ping still
-	// routes there, and net/http answers a bare /beat with its implicit 307 to
-	// /beat/, which lands on this same coded 404 and records nothing.
+	// be told apart from a port scan. Three patterns rather than one /beat/
+	// subtree so the path label still says WHICH shape arrived. All three are
+	// less specific than the four /beat/{id} patterns above, so a real ping
+	// still routes there.
+	//
+	// The bare /beat carries a reason of its own. Without an exact pattern for
+	// it, net/http synthesizes a 307 to /beat/ -- and 307 is a SUCCESS status,
+	// so the documented `curl -fsS` sender pointed at /beat (a truncated
+	// variable, a bad copy-paste) EXITS 0 having recorded nothing, leaving the
+	// beat to read as missing a full deadline later with nothing anywhere saying
+	// the URL was wrong. The coded 404 makes such a sender fail at the ping.
+	mux.HandleFunc("/beat", writeUnknownBeat)
 	mux.HandleFunc("/beat/{$}", writeUnknownBeat)
 	mux.HandleFunc("/beat/{id}/{rest...}", writeUnknownBeat)
 	mux.Handle("GET /healthz", routes.Healthz)
@@ -217,33 +228,51 @@ func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 
 // writeUnknownBeat refuses a ping that names no configured beat: 404 in this
 // file's standard coded envelope. It is the single home of that refusal for
-// every /beat path a sender can produce -- an id the config does not carry, an
-// EMPTY id (/beat/, what a URL built from an unset variable sends), and a
-// nested path under one (/beat/{id}/, a trailing-slash URL join) -- so a sender
+// every /beat path a sender can produce -- an id the config does not carry, the
+// BARE prefix (/beat, what a truncated URL sends), an EMPTY id (/beat/, what a
+// URL built from an unset variable sends), and a nested path under one
+// (/beat/{id}/, a trailing-slash URL join) -- so a sender
 // parsing knell's coded body never hits net/http's plain "404 page not found"
-// on exactly the spellings a misconfigured sender URL produces.
+// (or its 307 redirect) on exactly the spellings a misconfigured sender URL
+// produces.
 func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
 	webhttp.WriteError(w, r, http.StatusNotFound, "unknown_beat", "unknown beat id")
 }
 
-// crossSiteSubresource reports whether a BROWSER initiated this request as a
-// cross-site sub-resource load (an <img>, a script, a no-cors fetch) — the
-// confused-deputy shape, which would re-arm the switch with no real heartbeat
-// behind it. Only browsers send Sec-Fetch-*, so every documented sender is
-// unaffected, and a deliberate navigation (address bar, bookmark, click) is
-// still accepted. Advisory defense in depth, not the gate: BEAT_TOKEN is the
-// gate.
-func crossSiteSubresource(r *http.Request) bool {
-	return r.Header.Get("Sec-Fetch-Site") == "cross-site" &&
-		r.Header.Get("Sec-Fetch-Mode") != "navigate"
+// browserPageRequest reports whether a browser PAGE (or worker) initiated this
+// request, which is the confused-deputy shape: it would re-arm the switch with
+// no real heartbeat behind it. The rule is deliberately blunt — refuse any
+// request carrying a Sec-Fetch-Site header whose value is anything other than
+// "none"; admit it when the header is absent, or when it reads exactly "none".
+//
+// That single predicate is enough because of who the senders are. Every sender
+// knell documents is a machine client (curl -fsS, an Alertmanager
+// webhook_configs target, a CI hook) and sends no Fetch Metadata at all, while a
+// browser sends Sec-Fetch-Site on every request; and "none" is emitted only for
+// a user-initiated navigation with NO initiating document (address bar,
+// bookmark), which is the one browser shape the README invites ("GET works too,
+// for ad-hoc senders"). An iframe never sends "none": an iframe load is a
+// navigation, but it has an initiating document, so it reads cross-site or
+// same-origin/same-site. So this closes the cross-site sub-resource, the
+// cross-site navigation/iframe, AND the same-site sub-resource from a
+// compromised sibling origin, with no Sec-Fetch-Mode, Sec-Fetch-Dest or
+// user-activation inspection to get wrong.
+//
+// The header is trivially spoofable by a non-browser client, and that is
+// DELIBERATELY out of scope: this is confused-deputy protection, not
+// authentication. A caller that can reach the port directly does not need to
+// borrow anyone's browser, and BEAT_TOKEN is the control for that caller.
+func browserPageRequest(r *http.Request) bool {
+	site := r.Header.Get("Sec-Fetch-Site")
+	return site != "" && site != "none"
 }
 
-// writeCrossSiteRefused refuses a browser-forged ping: 403 in this file's
+// writeBrowserPageRefused refuses a browser-forged ping: 403 in this file's
 // standard coded envelope. It names no beat id, exactly like the 404 and 503
 // refusals, so it leaks nothing about which ids are configured.
-func writeCrossSiteRefused(w http.ResponseWriter, r *http.Request) {
-	webhttp.WriteError(w, r, http.StatusForbidden, "cross_site_request",
-		"a cross-site browser request cannot record a beat")
+func writeBrowserPageRefused(w http.ResponseWriter, r *http.Request) {
+	webhttp.WriteError(w, r, http.StatusForbidden, "browser_page_request",
+		"a beat cannot be recorded by a request a browser page initiated")
 }
 
 // writeShuttingDown refuses a beat because admission is closed: 503 in this
@@ -290,9 +319,11 @@ func beatHandler(appCtx context.Context, b Beater, token string) http.HandlerFun
 	record := func(w http.ResponseWriter, r *http.Request) {
 		// A ping the operator's browser was tricked into sending is not a
 		// heartbeat: refuse it before anything else, so it can neither record
-		// nor learn which phase the process is in.
-		if crossSiteSubresource(r) {
-			writeCrossSiteRefused(w, r)
+		// nor learn which phase the process is in. Only a navigation the user
+		// started themselves (no initiating page) is admitted; see
+		// browserPageRequest.
+		if browserPageRequest(r) {
+			writeBrowserPageRefused(w, r)
 			return
 		}
 		// Acceptance is closed for the rest of this process's life: refuse
