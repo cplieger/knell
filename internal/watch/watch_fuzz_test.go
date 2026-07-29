@@ -90,11 +90,10 @@ func checkHistoryPayloads(t *testing.T, n *fakeNotifier, ops string) {
 			t.Fatalf("ops %q: history notice %d reported no outages at all, but the contract says outages is never empty", ops, i)
 		}
 		for j, o := range outages {
-			// DownFor is Recovered.Sub(Started), so this preserves the old
-			// closed-and-ordered predicate through the span the notice renders.
-			// The separate positive-Silence predicate became inapplicable when
-			// that unread detection-time field was removed; its stronger
-			// internal counterpart remains in checkMissingQueueInvariants.
+			// DownFor is Recovered.Sub(Started), so a positive span IS the
+			// closed-and-ordered predicate, asserted through the figure the notice
+			// actually renders; its stronger internal counterpart lives in
+			// checkMissingQueueInvariants.
 			if o.DownFor() <= 0 {
 				t.Fatalf("ops %q: history notice %d outage %d reports a span of %s (started %s, recovered %s): a past-tense notice must only report ended outages, each with a positive span",
 					ops, i, j, o.DownFor(), o.Started, o.Recovered)
@@ -142,6 +141,28 @@ func FuzzMissingQueue(f *testing.F) {
 			deadline = 10 * time.Minute
 		)
 		w, clock, n := newTestWatcher(Beat{ID: id, Deadline: deadline})
+		// The accounting half of the counter split, on whatever interleaving the
+		// fuzzer found: a missing or history notice that cannot go out stays queued
+		// and is retried, so no MESSAGE of either kind is ever lost for good and
+		// knell_notifications_dropped_total must not move for them. A record a full
+		// queue discards is counted per RECORD instead
+		// (knell_outage_records_dropped_total, because one history message covers
+		// several), and the fire-once recovered send is the one kind that
+		// legitimately moves this counter, so both are excluded here. An op stream
+		// that moves either kind fires KnellNotifyFailing and sends an operator to
+		// reconstruct by hand a window this process in fact delivered. The counters
+		// are package-global and this target is serial, so their deltas over one op
+		// stream belong to this iteration.
+		droppedMissing := counterValue(t, "knell_notifications_dropped_total", "missing")
+		droppedHistory := counterValue(t, "knell_notifications_dropped_total", "history")
+		t.Cleanup(func() {
+			if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedMissing {
+				t.Errorf("ops %q: dropped{missing} = %v, want unchanged %v: an undelivered missing notice stays queued and is retried, so no missing MESSAGE is lost for good", ops, got, droppedMissing)
+			}
+			if got := counterValue(t, "knell_notifications_dropped_total", "history"); got != droppedHistory {
+				t.Errorf("ops %q: dropped{history} = %v, want unchanged %v: a failed history notice keeps its records and is retried, so no history MESSAGE is lost for good", ops, got, droppedHistory)
+			}
+		})
 		for _, op := range ops {
 			// The structural invariants below hold just as well if the queue
 			// dropped its OLDEST record and kept the incoming one, so they

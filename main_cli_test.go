@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
 	"slices"
@@ -131,8 +132,11 @@ func TestUnknownSubcommandExitsTwoWithoutBooting(t *testing.T) {
 	if code != 2 {
 		t.Errorf("knell serve = exit %d, want 2: %s", code, out)
 	}
-	if !strings.Contains(out, "unknown command") {
-		t.Errorf("output = %q, want it to name the unknown command", out)
+	if !strings.Contains(out, `level=ERROR msg="unknown command"`) {
+		t.Errorf("output = %q, want the usage failure as a level-carrying STRUCTURED line: a mistyped container command crash-loops while publishing no metrics at all, so this line is the only trace of the cause, and a bare stderr print still contains the words while carrying no level for the Loki rules that match every other knell failure", out)
+	}
+	if !strings.Contains(out, "command=serve") {
+		t.Errorf("output = %q, want the rejected command carried as an attribute; without it the line says a command was unknown but not which one, and there is no metric to identify it from", out)
 	}
 	if strings.Contains(out, "listening") {
 		t.Errorf("an unknown subcommand booted the server: %s", out)
@@ -200,6 +204,88 @@ func TestSignalledKnellLogsTheCleanStopAsItsLastLineAndExitsZero(t *testing.T) {
 	}
 }
 
+// TestConfiguredLogLevelReachesTheRunningProcess pins the one configuration
+// field nothing else in the suite can see APPLIED. run() installs the slog
+// handler before config parsing (so config warnings render through it) and
+// applies the parsed level to the handler afterwards; drop that one call and
+// the process keeps slogx's INFO default while the startup summary still
+// reports log_level=DEBUG -- an operator who raises the level to diagnose a
+// missing beat gets the summary's confirmation and none of the detail. The
+// config suite pins env-to-level PARSING only, and the in-process lifecycle
+// tests cannot inspect run()'s handler because run() replaces the default they
+// captured, so nothing outside a child process can catch it.
+//
+// The oracle is the /healthz access line, which webhttp logs at DEBUG for a
+// healthy probe: absent at the INFO default, present only once the parsed level
+// has actually reached the handler.
+func TestConfiguredLogLevelReachesTheRunningProcess(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	t.Cleanup(cancel)
+	cmd := exec.CommandContext(ctx, os.Args[0])
+	// Port 0: the child picks its own port, so this test never races another
+	// for a reserved one, and the bound address is read back off the listening
+	// line. LOG_LEVEL=debug is appended AFTER childEnv's pinned info and
+	// os/exec keeps the last duplicate, so it is the variable under test.
+	cmd.Env = childEnv(append(bootEnv("cli-log-level:1m", "127.0.0.1:0"), "LOG_LEVEL=debug"))
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start knell: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	var lines []string
+	var addr string
+	scanner := bufio.NewScanner(stderr)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+		if _, rest, found := strings.Cut(scanner.Text(), "msg=listening addr="); found {
+			if fields := strings.Fields(rest); len(fields) > 0 {
+				addr = fields[0]
+			}
+			break
+		}
+	}
+	if addr == "" {
+		t.Fatalf("knell never reported a bound listener; log:\n%s", strings.Join(lines, "\n"))
+	}
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("building the healthz request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("probe /healthz: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close /healthz body: %v", err)
+	}
+	// A healthy probe is what logs at DEBUG; a 4xx/5xx one logs at Warn/Error
+	// and would fail the level assertion for an unrelated reason.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/healthz on a serving switch = %d, want 200", resp.StatusCode)
+	}
+
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("signalling knell: %v", err)
+	}
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Errorf("knell after an interrupt = %v, want exit 0. log:\n%s", err, strings.Join(lines, "\n"))
+	}
+	if !slices.ContainsFunc(lines, func(line string) bool {
+		return strings.Contains(line, "level=DEBUG") && strings.Contains(line, "/healthz")
+	}) {
+		t.Errorf("no DEBUG line for the /healthz probe, so the parsed LOG_LEVEL never reached the handler: the level an operator turns up to diagnose an outage is reported as applied in the startup summary and silently discarded. log:\n%s",
+			strings.Join(lines, "\n"))
+	}
+}
+
 // TestRejectedConfigExitsOneWithoutLeakingTheWebhook pins the boot-failure
 // contract end to end: a rejected configuration exits 1 (so the container
 // restarts instead of idling as a dead switch), says so, and never echoes the
@@ -215,8 +301,8 @@ func TestRejectedConfigExitsOneWithoutLeakingTheWebhook(t *testing.T) {
 	if code != 1 {
 		t.Errorf("knell with a plain-http webhook = exit %d, want 1: %s", code, out)
 	}
-	if !strings.Contains(out, "knell exited with error") {
-		t.Errorf("output = %q, want the boot failure reported", out)
+	if !strings.Contains(out, `level=ERROR msg="knell exited with error"`) {
+		t.Errorf("output = %q, want the boot failure as a level-carrying STRUCTURED line: a rejected configuration crash-loops publishing no metrics, so this line is the operator's only trace, and a bare stderr print keeps the words while losing the level a Loki rule keys on", out)
 	}
 	if !strings.Contains(out, "scheme must be https") {
 		t.Errorf("output = %q, want the https-only webhook gate to be the rejection", out)

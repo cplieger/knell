@@ -69,6 +69,41 @@ func unsetEnv(t *testing.T, key string) {
 	}
 }
 
+// authEchoServer starts a throwaway server that echoes the Authorization header
+// it received back in X-Echo, so a test can compare what the wire carried
+// against what beatTokenFitsHeader claims about it.
+func authEchoServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Echo", r.Header.Get("Authorization"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// echoAuthHeader sends "Bearer "+token to srv and reports the Authorization
+// value the server actually read, or the error the client refused to send it
+// with. One definition of "what the transport carries" for both
+// beatTokenFitsHeader oracles, so the byte sweep and the hand-picked table
+// cannot come to measure different things.
+func echoAuthHeader(t *testing.T, srv *httptest.Server, token string) (string, error) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, doErr := srv.Client().Do(req)
+	if doErr != nil {
+		return "", doErr
+	}
+	echoed := resp.Header.Get("X-Echo")
+	if closeErr := resp.Body.Close(); closeErr != nil {
+		t.Errorf("closing body: %v", closeErr)
+	}
+	return echoed, nil
+}
+
 func TestParseBeats(t *testing.T) {
 	t.Parallel()
 
@@ -671,6 +706,15 @@ func TestAllowedHostsGate(t *testing.T) {
 		"present but blank is reported":     {set: true, raw: "", wantActive: false, wantWarn: "is set but blank"},
 		"malformed entries are dropped":     {set: true, raw: "knell.internal,http://x/y", wantActive: true, wantSize: 1, wantWarn: "dropping malformed ALLOWED_HOSTS entries"},
 		"all entries unusable fails closed": {set: true, raw: ":9190", wantActive: true, wantSize: 0, wantWarn: "rejecting every non-loopback request"},
+		// A PADDED blank is the same compose accident as the empty one above
+		// (ALLOWED_HOSTS="${HOSTS} " with HOSTS undefined), and which of the two
+		// outcomes it lands on is decided inside webhttp, not here: if
+		// ParseHostList ever stopped trimming an entry, "   " would become a
+		// non-blank unusable entry, the gate would ENGAGE with nothing in it, and
+		// every non-loopback ping would 403 until every beat posted a false
+		// MISSING notice. Pinned so a webhttp bump has to fail here rather than
+		// in production.
+		"padded blank never engages": {set: true, raw: "   ", wantActive: false, wantWarn: "is set but blank"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -996,10 +1040,7 @@ func TestBeatTokenFitsHeaderMatchesWhatHTTPActuallyCarries(t *testing.T) {
 	// and all loadBeatToken ever hands it) must survive a real request verbatim
 	// (a value the wire alters is just as unpresentable as one it rejects), and
 	// every rejected value must be one Go's HTTP client refuses to send.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Echo", r.Header.Get("Authorization"))
-	}))
-	t.Cleanup(srv.Close)
+	srv := authEchoServer(t)
 
 	tests := map[string]string{
 		"printable":       "plain-token-1234567",
@@ -1016,21 +1057,7 @@ func TestBeatTokenFitsHeaderMatchesWhatHTTPActuallyCarries(t *testing.T) {
 	}
 	for name, token := range tests {
 		t.Run(name, func(t *testing.T) {
-			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
-			if err != nil {
-				t.Fatalf("NewRequestWithContext: %v", err)
-			}
-			req.Header.Set("Authorization", "Bearer "+token)
-
-			resp, doErr := srv.Client().Do(req)
-			echoed := ""
-			if doErr == nil {
-				echoed = resp.Header.Get("X-Echo")
-				if err := resp.Body.Close(); err != nil {
-					t.Errorf("closing body: %v", err)
-				}
-			}
-
+			echoed, doErr := echoAuthHeader(t, srv, token)
 			if beatTokenFitsHeader(token) {
 				if doErr != nil {
 					t.Fatalf("beatTokenFitsHeader(%q) = true but the HTTP client refused to send it: %v — the predicate accepts a token startup would arm and no sender could present", token, doErr)
@@ -1058,10 +1085,7 @@ func TestBeatTokenFitsHeaderMatchesWhatHTTPActuallyCarries(t *testing.T) {
 // swept, because the predicate's precondition is that edge ASCII whitespace was
 // already trimmed.
 func TestBeatTokenFitsHeaderAgreesWithTheTransportForEveryByte(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Echo", r.Header.Get("Authorization"))
-	}))
-	t.Cleanup(srv.Close)
+	srv := authEchoServer(t)
 
 	for b := range 256 {
 		// INTERIOR placement only: a trailing SP or HTAB is legal in a field
@@ -1069,20 +1093,7 @@ func TestBeatTokenFitsHeaderAgreesWithTheTransportForEveryByte(t *testing.T) {
 		// byte-legality question for an already-trimmed value (see
 		// asciiWhitespace).
 		token := "alpha" + string([]byte{byte(b)}) + "beta"
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
-		if err != nil {
-			t.Fatalf("NewRequestWithContext: %v", err)
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
-
-		resp, doErr := srv.Client().Do(req)
-		echoed := ""
-		if doErr == nil {
-			echoed = resp.Header.Get("X-Echo")
-			if err := resp.Body.Close(); err != nil {
-				t.Errorf("closing body: %v", err)
-			}
-		}
+		echoed, doErr := echoAuthHeader(t, srv, token)
 
 		carried := doErr == nil && echoed == "Bearer "+token
 		if got := beatTokenFitsHeader(token); got != carried {

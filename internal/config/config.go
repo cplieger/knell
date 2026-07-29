@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/cplieger/envx"
 	"github.com/cplieger/slogx"
@@ -45,9 +46,12 @@ const minTokenLength = 16
 // VALUE — which for the token means its TRAILING run only, since the verifier's
 // value is "Bearer "+token and a leading run sits interior to it and survives —
 // while CR, LF, VT and FF are illegal bytes in a field value and are not
-// stripped at all, so no sender can put them on the wire. Either way the token
-// cannot reach the verifier as the operator wrote it, no matter what the sender
-// does.
+// stripped at all, so no sender can put them on the wire. A LEADING SP or HTAB
+// run is the one shape that WOULD survive verbatim: it sits interior to
+// "Bearer "+token, so nothing strips it and a sender presenting the configured
+// value does authenticate. It is refused anyway, as the ASCII twin of the
+// invisible edge invisibleEdge only warns about — it is part of the credential
+// while being absent from the value the operator reads.
 //
 // Non-ASCII spaces (NBSP U+00A0, NEL U+0085, U+2000…) are deliberately NOT in
 // the set: textproto keeps them, so a token made of them IS presented verbatim
@@ -196,6 +200,17 @@ func Load(maxNodeNameBytes int) (Config, error) {
 func nodeName(maxNodeNameBytes int) (string, error) {
 	raw, present := os.LookupEnv("NODE_NAME")
 	node := strings.TrimSpace(raw)
+	// TrimSpace's definition of blank is Unicode SPACES only, so a name built
+	// entirely from runes the operator cannot see (a zero-width space, a soft
+	// hyphen, a BOM) survives it and names nothing: every notice then reads
+	// "[knell ]" and no startup line says the value was useless. invisibleInURL
+	// is this package's own wider predicate for "the operator cannot see it"
+	// (it refuses such a rune in the webhook URL and warns about one at a
+	// token's edge), so both definitions of blank stay one definition and the
+	// existing warn-and-fall-back-to-hostname path covers this shape too.
+	if strings.TrimFunc(node, invisibleInURL) == "" {
+		node = ""
+	}
 	if node == "" {
 		if present {
 			// Same rule as listenAddr: an unset NODE_NAME is the documented
@@ -215,8 +230,14 @@ func nodeName(maxNodeNameBytes int) (string, error) {
 // missing or blank hostname is a warning rather than a startup failure — the
 // notices stay deliverable and attributable to something, which beats not
 // arming the switch at all.
+// osHostname is the seam over the one OS call this package cannot reach
+// through the environment: every other read is os.LookupEnv, which t.Setenv
+// already controls, so without this var the two fallback branches below are
+// unreachable from any test. Reassigned by tests in this package only.
+var osHostname = os.Hostname
+
 func hostnameNode() string {
-	host, err := os.Hostname()
+	host, err := osHostname()
 	if err != nil {
 		slog.Warn("failed to determine hostname, using fallback node name", "node", "unknown", "error", err)
 		return "unknown"
@@ -438,30 +459,30 @@ var errBeatTokenSetButEmpty = errors.New("BEAT_TOKEN is set but empty: unset the
 // Edge ASCII whitespace is REFUSED rather than trimmed, and the cutset holds
 // two distinct reasons for the one verdict. SP and HTAB are legal field-value
 // bytes the wire NORMALIZES: the verifier compares "Bearer "+token (see
-// internal/webapi), so a LEADING run is INTERIOR to the Authorization value and
-// the wire does NOT strip it — a sender using the configured value sends
-// "Bearer  secret" and gets 401 while startup reports the gate armed — while a
-// TRAILING run IS stripped on the wire, so the sender's value and the
-// verifier's differ the other way round. CR, LF, VT and FF are not normalized
-// at all: they are forbidden bytes in a field value, so a token carrying one at
-// an edge cannot be put on the wire by any sender (an interior one is refused
-// separately, by beatTokenFitsHeader).
+// internal/webapi), so a TRAILING run IS stripped from the Authorization value
+// on the wire and the sender's value and the verifier's then differ, while a
+// LEADING run is INTERIOR to that value and survives — it authenticates, and is
+// refused because it is an invisible part of the credential (the ASCII twin of
+// the invisibleEdge warning) and because TRIMMING it, the behaviour this
+// package carried before the verbatim rule landed, is what armed the gate for a
+// value no sender using the configured token could present. CR, LF, VT and FF
+// are not normalized at all: they are forbidden bytes in a field value, so a
+// token carrying one at an edge cannot be put on the wire by any sender (an
+// interior one is refused separately, by beatTokenFitsHeader).
 //
-// Either way the configured value and the authenticating value disagree, and a
-// dead-man switch should refuse to start rather than report itself gated while
-// rejecting every sender: a 401'd ping is an undetectable ping, and one
-// deadline later every configured beat goes falsely missing.
+// In each case the configured token is either unsendable as written (a trailing
+// SP or HTAB run, or a forbidden byte) or unreadable in the value the operator
+// holds (a leading SP or HTAB run), and a dead-man switch should refuse to start
+// rather than report itself gated while rejecting every sender: a 401'd ping is
+// an undetectable ping, and one deadline later every configured beat goes
+// falsely missing.
 func checkBeatToken(token string) error {
 	if strings.Trim(token, asciiWhitespace) != token {
 		// The value is never echoed: the message names the variable and the
-		// shape of the problem only (the startup log ships to Loki). It names
-		// the CUTSET rather than one member's mechanism, because the cutset is
-		// two failure modes with one verdict: SP and HTAB are legal field bytes
-		// the wire NORMALIZES (a trailing run is stripped, a leading one
-		// survives interior to "Bearer <token>"), while CR, LF, VT and FF are
-		// forbidden in a field value and are not stripped at all — no sender
-		// can put them on the wire.
-		return errors.New("BEAT_TOKEN has leading or trailing ASCII whitespace and cannot be presented verbatim in an HTTP Authorization header: knell will not silently rewrite a credential, so the value you configured and the value that authenticates would differ and POST /beat/{id} would reject every ping while the endpoint reports itself gated; remove the surrounding whitespace, or unset the variable entirely to serve /beat/{id} open on purpose")
+		// shape of the problem only (the startup log ships to Loki), and it
+		// names the whole CUTSET rather than one member's mechanism, because
+		// both mechanisms above reach the same verdict.
+		return errors.New("BEAT_TOKEN has leading or trailing ASCII whitespace: a trailing space or tab is stripped from the header value on the wire, and CR, LF, VT and FF cannot be sent in one at all, so such a token never reaches the verifier as configured and POST /beat/{id} would reject every ping while the endpoint reports itself gated; a leading space or tab is refused too, because it authenticates as part of the credential while being invisible in the value you read; knell will not silently rewrite a credential, so remove the surrounding whitespace, or unset the variable entirely to serve /beat/{id} open on purpose")
 	}
 	if token == "" {
 		// Nothing to present at all: fails startup like a present-but-empty
@@ -678,7 +699,15 @@ func parseBeatEntry(entry string, seen map[string]struct{}) (Beat, error) {
 	}
 	deadline, err := time.ParseDuration(strings.TrimSpace(rawDeadline))
 	if err != nil {
-		return Beat{}, fmt.Errorf("entry %q: invalid deadline: %w", entry, err)
+		// The stdlib message names the offending text but not the remedy, and
+		// this is the first refusal a new operator meets: BEATS is required, so
+		// a unit-less "api:30" and a day-unit "cron-backup:1d" are the two
+		// shapes a first BEATS carries. Every other refusal in this package
+		// names what to do next; without this one the container crash-loops on
+		// stdlib grammar text.
+		return Beat{}, fmt.Errorf("entry %q: invalid deadline: %w: use a Go duration "+
+			"with an explicit unit (s, m, h), e.g. 30s, 20m or 26h; there is no day "+
+			"unit, so a daily job is 26h", entry, err)
 	}
 	if deadline < minDeadline {
 		return Beat{}, fmt.Errorf("entry %q: deadline below minimum %s", entry, minDeadline)
@@ -749,7 +778,7 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		// would refuse it forever while startup reported success.
 		return nil, errors.New("missing path (the webhook URL's own path carries the credential, so a host-only URL cannot deliver a notification)")
 	}
-	if strings.IndexFunc(raw, invisibleInURL) >= 0 {
+	if !utf8.ValidString(raw) || strings.IndexFunc(raw, invisibleInURL) >= 0 {
 		// An interior space survives url.Parse and is percent-encoded on every
 		// POST, so the path that reaches Discord is not the path the operator
 		// pasted and the switch can never ring. Edge padding is already
@@ -764,6 +793,13 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		// host as well as the path. Visible runes are deliberately NOT refused
 		// even though they are escaped too: the operator can see them, and
 		// refusing them would reject a working non-Discord relay URL.
+		//
+		// utf8.ValidString carries the same rule down to the BYTE level, and the
+		// rune predicate cannot: an invalid UTF-8 byte decodes to U+FFFD, which
+		// unicode.IsPrint accepts, so a mis-encoded URL (a secret file written in
+		// latin-1, a value mangled by a mis-decoding pipeline) passed every gate
+		// and was percent-encoded byte by byte on every POST — in the HOST as
+		// well as the path, so the notice went to a name that does not resolve.
 		return nil, errors.New("contains a space or an invisible character (it is percent-encoded on every request, so the webhook host and path that reach the other end are not the configured ones; remove it, or percent-encode it yourself if it really belongs to the credential)")
 	}
 	return u, nil

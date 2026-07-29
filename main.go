@@ -19,7 +19,6 @@ import (
 
 	"github.com/cplieger/health"
 	"github.com/cplieger/knell/internal/config"
-	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/knell/internal/webapi"
@@ -151,10 +150,10 @@ func run() error {
 	// fact. Gating on the shared ctx rather than on the pre-drain hook keeps
 	// that deterministic: pre-drain and Run's exit race each other, ctx
 	// cancellation is one instant both see.
-	handler := webapi.New(ctx, watcher, cfg.BeatToken, webapi.Routes{
-		Healthz: health.Handler(marker),
-		Metrics: metrics.Handler(),
-		Hosts:   cfg.AllowedHosts,
+	handler := webapi.New(ctx, watcher, webapi.Deps{
+		Healthz:   health.Handler(marker),
+		BeatToken: cfg.BeatToken,
+		Hosts:     cfg.AllowedHosts,
 	})
 	srv := webhttp.NewServer(handler,
 		webhttp.WithReadTimeout(requestTimeout),

@@ -56,7 +56,7 @@ func newTestHandlerCtx(appCtx context.Context, b *fakeBeater, token string) http
 // test control, so a test can drive a FAILING probe: health.Handler answers 503
 // whenever the liveness marker is absent (boot, or after the pre-drain flip).
 func newTestHandlerHealthz(appCtx context.Context, b *fakeBeater, token string, healthzStatus int) http.Handler {
-	return New(appCtx, b, token, Routes{Healthz: staticHealthz(healthzStatus), Metrics: metrics.Handler()})
+	return New(appCtx, b, Deps{Healthz: staticHealthz(healthzStatus), BeatToken: token})
 }
 
 // staticHealthz stands in for health.Handler with a fixed verdict.
@@ -79,12 +79,8 @@ func TestBeatEndpoint(t *testing.T) {
 		{name: "get known", method: http.MethodGet, path: "/beat/api", wantStatus: 200, wantSeen: 1},
 		{name: "post unknown", method: http.MethodPost, path: "/beat/ghost", wantStatus: 404},
 		{name: "missing id segment", method: http.MethodPost, path: "/beat/", wantStatus: 404},
-		// The bare prefix a truncated sender URL produces. It must be the coded
-		// 404, never net/http's synthesized 307 to /beat/: a 307 is a SUCCESS
-		// status, so `curl -fsS http://knell:9190/beat` would exit 0 having
-		// recorded nothing at all.
-		{name: "bare beat prefix rejected", method: http.MethodPost, path: "/beat", wantStatus: 404},
-		{name: "bare beat prefix rejected on GET", method: http.MethodGet, path: "/beat", wantStatus: 404},
+		// The bare /beat prefix has its own test with the stronger oracle:
+		// TestBareBeatPathAnswersTheCodedNotFound.
 		{name: "head rejected without recording", method: http.MethodHead, path: "/beat/api", wantStatus: 405},
 		{name: "delete rejected", method: http.MethodDelete, path: "/beat/api", wantStatus: 405},
 		{name: "nested path rejected", method: http.MethodPost, path: "/beat/api/extra", wantStatus: 404},
@@ -224,6 +220,14 @@ func TestNonCanonicalBeatPathsAnswerTheCodedNotFound(t *testing.T) {
 			if len(b.seen) != 0 {
 				t.Errorf("POST %s recorded %v, want nothing: a non-canonical path names no beat", target, b.seen)
 			}
+			// The refusal is counted under its OWN class, not in the "unmatched"
+			// bucket it would otherwise share with port scans: knell's alert rules
+			// read /metrics, so a malformed sender URL has to be tellable apart
+			// from scanner traffic.
+			series := `knell_http_requests_total{method="POST",path="` + nonCanonicalBeatPattern + `",status="404"}`
+			if _, ok := seriesValue(t, scrapeExposition(t, h), series); !ok {
+				t.Errorf("%s missing from the exposition: a malformed sender URL is unalertable without it", series)
+			}
 		})
 	}
 
@@ -237,6 +241,76 @@ func TestNonCanonicalBeatPathsAnswerTheCodedNotFound(t *testing.T) {
 	if len(b.seen) != 1 {
 		t.Errorf("recorded beats = %v, want one: the canonical ping must still record", b.seen)
 	}
+}
+
+// FuzzBeatPathNeverRedirectsOrRecordsNonCanonically fuzzes the untrusted text
+// canonicalBeatPath judges. r.URL.Path is attacker-controlled, and the guard is
+// the only thing standing between a malformed sender URL and net/http's
+// redirect pass: ServeMux sanitizes repeated slashes and dot segments BEFORE
+// pattern selection, so without the guard every rewritten spelling answers 307
+// + Location — a SUCCESS status to the documented `curl -fsS` sender, which
+// then exits 0 having recorded nothing while the beat reads as missing one full
+// deadline later.
+//
+// TestNonCanonicalBeatPathsAnswerTheCodedNotFound pins five NAMED spellings.
+// This target pins the CLASS for arbitrary bytes, which is what a rewrite of
+// sanitizedPath, inBeatNamespace, or the chain's ordering can break in a
+// spelling no table names (an encoded dot segment, a repeated slash behind a
+// long id, a non-UTF-8 byte, a path that only ENTERS the namespace after
+// cleaning). Three invariants, all decided from the request alone:
+//
+//   - a request in (or cleaning into) the /beat namespace never answers a
+//     redirect, so no sender can be told "success" without recording;
+//   - its status stays inside the coded set knell answers there;
+//   - a beat is recorded ONLY for the exact canonical spelling, so no rewritten
+//     path can re-arm the switch under an id its sender did not name.
+func FuzzBeatPathNeverRedirectsOrRecordsNonCanonically(f *testing.F) {
+	for _, seed := range []string{
+		"/beat/api", "/beat", "/beat/", "/beat//", "//beat/api", "/beat/./api",
+		"/beat/api/../ghost", "/beat/api//", "/beat/api/", "/beat/%2e%2e/ghost",
+		"/beat/api/../../beat/api", "/beat/../beat/api", "/beat/.", "/beat/..",
+		"", "/", "/healthz", "/beat/" + strings.Repeat("a", 300),
+		"/beat/\x80", "/beat/a\nb", "/beat/api/./", "/beat///api",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, path string) {
+		// Serial by construction (the fuzz function runs one input at a time):
+		// capture.Default swaps the process-global slog default, and keeps a
+		// million-exec run from writing an access line per input to stderr.
+		capture.Default(t)
+		b := &fakeBeater{known: map[string]bool{"api": true}}
+		h := newTestHandler(b, "")
+
+		// Built by hand rather than via a target string: httptest.NewRequest
+		// panics on a target it cannot parse, and arbitrary bytes are exactly
+		// the input this target exists for.
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
+		req.URL.Path = path
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		// Outside the beat namespace net/http keeps its own behavior, redirects
+		// included (an empty path is cleaned to "/" with a 307): the guard
+		// deliberately does not reach there.
+		if !inBeatNamespace(path) && !inBeatNamespace(sanitizedPath(path)) {
+			return
+		}
+		switch rec.Code {
+		case http.StatusOK, http.StatusNotFound, http.StatusMethodNotAllowed:
+		default:
+			t.Fatalf("path %q = %d, want one of 200/404/405: every /beat spelling answers this file's coded envelope (body %s)",
+				path, rec.Code, rec.Body.String())
+		}
+		if loc := rec.Header().Get("Location"); loc != "" {
+			t.Fatalf("path %q answered %d with Location %q: a 3xx is a SUCCESS status to `curl -fsS`, so this sender would exit 0 having recorded nothing",
+				path, rec.Code, loc)
+		}
+		if recorded := len(b.seen) != 0; recorded != (path == "/beat/api") {
+			t.Fatalf("path %q recorded=%v (seen %v), want a beat recorded only for the canonical spelling: a rewritten path must never re-arm the switch",
+				path, recorded, b.seen)
+		}
+	})
 }
 
 func TestMetricsExposition(t *testing.T) {
@@ -404,9 +478,8 @@ func TestPanicUnderBeatHandlerAnswers500AndIsLogged(t *testing.T) {
 	// net/http: the sender sees a reset connection rather than a 500, and the
 	// access log never reports a status for the endpoint that feeds the switch.
 	rec := capture.Default(t)
-	h := New(context.Background(), panicBeater{}, "", Routes{
+	h := New(context.Background(), panicBeater{}, Deps{
 		Healthz: staticHealthz(http.StatusOK),
-		Metrics: metrics.Handler(),
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
@@ -722,7 +795,14 @@ func TestBeatTokenGateAppliesToGet(t *testing.T) {
 func TestEveryRejectedMethodAnswersTheSameRefusal(t *testing.T) {
 	for _, method := range []string{
 		http.MethodHead, http.MethodPut, http.MethodDelete,
-		http.MethodPatch, http.MethodOptions, "WHATEVER",
+		http.MethodPatch, http.MethodOptions,
+		// CONNECT is the one method net/http routes by another code path:
+		// ServeMux skips path canonicalization for it and matches on
+		// r.URL.Host, so it reaches the method-agnostic route without the
+		// cleaning pass. It must still answer the same coded 405 with a
+		// truthful Allow — a CONNECT routed to the GET/POST pattern would
+		// RECORD a ping, and net/http's built-in 405 would advertise HEAD.
+		http.MethodConnect, "WHATEVER",
 	} {
 		t.Run(method, func(t *testing.T) {
 			b := &fakeBeater{known: map[string]bool{"api": true}}
@@ -841,12 +921,6 @@ func TestAccessLogPathIsBounded(t *testing.T) {
 		})
 	}
 }
-
-// truncationMarker is what webhttp appends to a path its cap cut. It is the
-// library's text, restated here because the tests assert on the access line an
-// operator reads: if a version bump changed the marker, these assertions are
-// where knell finds out.
-const truncationMarker = "...(truncated)"
 
 // FuzzLoggedPathIsBounded fuzzes the untrusted text the access line records as
 // its path. r.URL.Path is attacker-controlled, net/http accepts a megabyte of
@@ -1026,7 +1100,7 @@ func newShutdownHarness(t *testing.T, id string) (http.Handler, context.CancelFu
 	watcher := watch.New([]watch.Beat{{ID: id, Deadline: time.Minute}}, &deliveringNotifier{}, clock.Now, start)
 	appCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	h := New(appCtx, watcher, "", Routes{Healthz: staticHealthz(http.StatusOK), Metrics: metrics.Handler()})
+	h := New(appCtx, watcher, Deps{Healthz: staticHealthz(http.StatusOK)})
 	return h, cancel, clock, start
 }
 
@@ -1548,7 +1622,8 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 	allowedPaths := map[string]bool{
 		"/beat/{id}": true, "/beat": true, "/beat/{$}": true, "/beat/{id}/{rest...}": true,
 		"/healthz": true, "/metrics": true,
-		unmatchedPathLabel: true,
+		nonCanonicalBeatPattern: true,
+		unmatchedPathLabel:      true,
 	}
 
 	b := &fakeBeater{known: map[string]bool{"api": true}}
@@ -1705,6 +1780,8 @@ const (
 	// Unforgeable: parentheses are not token characters, so net/http answers a
 	// request line spelling it 400 before a handler runs.
 	overlongMethodMarker = "(overlong)"
+	// truncationMarker is what webhttp appends to a path its cap cut.
+	truncationMarker = "...(truncated)"
 )
 
 func TestBeatRefusesPageInitiatedBrowserRequests(t *testing.T) {
@@ -1724,6 +1801,7 @@ func TestBeatRefusesPageInitiatedBrowserRequests(t *testing.T) {
 		name       string
 		site       string
 		mode       string
+		origin     string
 		wantStatus int
 		wantSeen   int
 	}{
@@ -1741,6 +1819,14 @@ func TestBeatRefusesPageInitiatedBrowserRequests(t *testing.T) {
 		// A compromised sibling origin on an allowed hostname.
 		{name: "same-site fetch", site: "same-site", mode: "cors", wantStatus: 403},
 		{name: "same-site navigation", site: "same-site", mode: "navigate", wantStatus: 403},
+		// knell's documented endpoint is plain HTTP, where a browser sends NO
+		// Fetch Metadata at all (it is appended only for a potentially
+		// trustworthy URL). Origin is the signal that survives, so these cases
+		// are the ones the Sec-Fetch-Site half cannot express — and a
+		// documented sender still sends neither header, so it stays accepted.
+		{name: "plain-http cross-origin fetch POST", origin: "http://evil.example", wantStatus: 403},
+		{name: "plain-http form POST with a nulled origin", origin: "null", wantStatus: 403},
+		{name: "documented sender sends no Origin either", wantStatus: 200, wantSeen: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1752,10 +1838,17 @@ func TestBeatRefusesPageInitiatedBrowserRequests(t *testing.T) {
 			if tt.mode != "" {
 				req.Header.Set("Sec-Fetch-Mode", tt.mode)
 			}
+			if tt.origin != "" {
+				req.Header.Set("Origin", tt.origin)
+			}
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if tt.wantStatus == http.StatusForbidden &&
+				!strings.Contains(rec.Body.String(), "browser_page_request") {
+				t.Errorf("body = %s, want the browser_page_request coded envelope", rec.Body.String())
 			}
 			if got := len(b.seen) - before; got != tt.wantSeen {
 				t.Errorf("recorded beats = %d, want %d", got, tt.wantSeen)
@@ -1887,9 +1980,8 @@ func hostPolicy(t *testing.T, entries string) *webhttp.HostPolicy {
 // first.
 func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := New(context.Background(), b, "", Routes{
+	h := New(context.Background(), b, Deps{
 		Healthz: staticHealthz(http.StatusOK),
-		Metrics: metrics.Handler(),
 		Hosts:   hostPolicy(t, "knell.example"),
 	})
 
@@ -1909,7 +2001,7 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		"foreign host refused on beat":  {host: "attacker.example", path: "/beat/api", wantStatus: http.StatusForbidden},
 		// A non-canonical spelling under a foreign Host: the Host policy answers
 		// FIRST, so this is host_not_allowed, not canonicalBeatPath's 404. Pins
-		// that canonicalBeatPath stays INSIDE routes.Hosts.Middleware() in Chain.
+		// that canonicalBeatPath stays INSIDE deps.Hosts.Middleware() in Chain.
 		"foreign host refused on a non-canonical beat path": {host: "attacker.example", path: "/beat/api//", wantStatus: http.StatusForbidden},
 		"foreign host refused on metrics":                   {host: "attacker.example", path: "/metrics", wantStatus: http.StatusForbidden},
 		"foreign host refused on healthz":                   {host: "attacker.example", path: "/healthz", wantStatus: http.StatusForbidden},
@@ -1965,7 +2057,7 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 // green.
 func TestNilHostPolicyAcceptsEveryHost(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandler(b, "") // Routes.Hosts is nil, exactly like an unset ALLOWED_HOSTS
+	h := newTestHandler(b, "") // Deps.Hosts is nil, exactly like an unset ALLOWED_HOSTS
 
 	for _, host := range []string{"knell.example", "attacker.example", "192.0.2.9:9190", ""} {
 		req := httptest.NewRequest(http.MethodPost, "/beat/api", nil)
@@ -2007,9 +2099,8 @@ func scrapeAs(t *testing.T, h http.Handler, host string) string {
 // exists to close for the other 403.
 func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := New(context.Background(), b, "", Routes{
+	h := New(context.Background(), b, Deps{
 		Healthz: staticHealthz(http.StatusOK),
-		Metrics: metrics.Handler(),
 		Hosts:   hostPolicy(t, "knell.example"),
 	})
 

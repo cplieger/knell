@@ -485,43 +485,16 @@ func TestRunAppliesConfiguredHostAllowlist(t *testing.T) {
 	r := startLifecycleRun(t)
 	waitForMarkerWithin(t, true, 10*time.Second)
 
-	blockedReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/healthz", nil)
-	if err != nil {
-		t.Fatalf("building blocked-host request: %v", err)
+	blockedStatus, blockedBody := getHealthzAsHost(t, addr, "attacker.example")
+	if blockedStatus != http.StatusForbidden {
+		t.Errorf("request with an unlisted Host = %d, want 403: an unwired ALLOWED_HOSTS policy leaves the DNS-rebinding guard disabled (body %s)", blockedStatus, blockedBody)
 	}
-	blockedReq.Host = "attacker.example"
-	blockedResp, err := http.DefaultClient.Do(blockedReq)
-	if err != nil {
-		t.Fatalf("request with blocked Host: %v", err)
-	}
-	blockedBody, err := io.ReadAll(io.LimitReader(blockedResp.Body, 1<<16))
-	if err != nil {
-		t.Fatalf("read blocked-host response: %v", err)
-	}
-	if err := blockedResp.Body.Close(); err != nil {
-		t.Fatalf("close blocked-host response: %v", err)
-	}
-	if blockedResp.StatusCode != http.StatusForbidden {
-		t.Errorf("request with an unlisted Host = %d, want 403: an unwired ALLOWED_HOSTS policy leaves the DNS-rebinding guard disabled (body %s)", blockedResp.StatusCode, blockedBody)
-	}
-	if !strings.Contains(string(blockedBody), "host_not_allowed") {
+	if !strings.Contains(blockedBody, "host_not_allowed") {
 		t.Errorf("blocked-host body = %s, want the host_not_allowed code", blockedBody)
 	}
 
-	allowedReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/healthz", nil)
-	if err != nil {
-		t.Fatalf("building allowed-host request: %v", err)
-	}
-	allowedReq.Host = "knell.internal"
-	allowedResp, err := http.DefaultClient.Do(allowedReq)
-	if err != nil {
-		t.Fatalf("request with allowed Host: %v", err)
-	}
-	if err := allowedResp.Body.Close(); err != nil {
-		t.Fatalf("close allowed-host response: %v", err)
-	}
-	if allowedResp.StatusCode != http.StatusOK {
-		t.Errorf("request with the configured Host = %d, want 200: the allowlist must admit the hostname the operator configured", allowedResp.StatusCode)
+	if allowedStatus, allowedBody := getHealthzAsHost(t, addr, "knell.internal"); allowedStatus != http.StatusOK {
+		t.Errorf("request with the configured Host = %d, want 200: the allowlist must admit the hostname the operator configured (body %s)", allowedStatus, allowedBody)
 	}
 
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
@@ -702,7 +675,7 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 }
 
 // TestRunServesTheMarkerVerdictOnHealthz pins the composition root's wiring of
-// health.Handler(marker) into webapi.Routes.Healthz -- the HTTP liveness
+// health.Handler(marker) into webapi.Deps.Healthz -- the HTTP liveness
 // endpoint the README documents and external monitoring probes. The webapi
 // tests inject staticHealthz, a fixed verdict, so they cannot catch a root that
 // wires the wrong handler here: with metrics.Handler in that slot /healthz
@@ -747,9 +720,21 @@ func TestRunServesTheMarkerVerdictOnHealthz(t *testing.T) {
 // status and the body a failure message should quote.
 func getHealthz(t *testing.T, addr string) (int, string) {
 	t.Helper()
+	return getHealthzAsHost(t, addr, "")
+}
+
+// getHealthzAsHost probes the liveness endpoint with an explicit Host header,
+// so the allowlist cases exercise the guard through the same bounded body read
+// and close check every other /healthz probe uses. An empty host leaves the
+// request's own Host untouched.
+func getHealthzAsHost(t *testing.T, addr, host string) (int, string) {
+	t.Helper()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/healthz", nil)
 	if err != nil {
 		t.Fatalf("building healthz request: %v", err)
+	}
+	if host != "" {
+		req.Host = host
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

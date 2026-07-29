@@ -1982,6 +1982,46 @@ func TestFastSendsDeliverEveryDueBeatInOneSweep(t *testing.T) {
 	}
 }
 
+// newStormWatcher builds the delivery-storm fixture both send-ordering tests
+// need: one short-deadline beat (recoverID) alerted on its own BEFORE the
+// storm, plus storm beats named from prefix that all cross their deadline
+// together. An alerted beat yields no notice, so the recovering beat takes no
+// part in the storm sweep and its recovery is the only thing competing with
+// it. On return, snapshot()[0] is that beat's pre-storm missing notice and
+// every later call belongs to the storm -- the offset
+// stormNoticesBeforeRecovery skips.
+func newStormWatcher(t *testing.T, prefix, recoverID string, storm int, stormWindow time.Duration) (*Watcher, *fakeClock, *fakeNotifier) {
+	t.Helper()
+	clock := newFakeClock()
+	n := &fakeNotifier{}
+	beats := append(
+		[]Beat{{ID: recoverID, Deadline: time.Minute}},
+		budgetProbeBeats(prefix, storm, stormWindow)...,
+	)
+	w := New(beats, n, clock.Now, clock.Now())
+	clock.Advance(2 * time.Minute)
+	w.sweep(t.Context())
+	if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" || got[0].id != recoverID {
+		t.Fatalf("calls = %v, want one missing notice for %s before the storm", got, recoverID)
+	}
+	clock.Advance(stormWindow)
+	return w, clock, n
+}
+
+// stormNoticesBeforeRecovery counts the storm notices delivered ahead of
+// recoverID's recovered notice, skipping the pre-storm missing notice
+// newStormWatcher leaves as calls[0]. found is false when the recovery never
+// arrived at all.
+func stormNoticesBeforeRecovery(n *fakeNotifier, recoverID string) (before int, found bool) {
+	for _, c := range n.snapshot()[1:] {
+		if c.kind == "recovered" && c.id == recoverID {
+			return before, true
+		}
+		before++
+	}
+	return before, false
+}
+
 func TestRunServicesRecoveriesAfterABudgetLimitedSweep(t *testing.T) {
 	t.Parallel()
 
@@ -1999,28 +2039,13 @@ func TestRunServicesRecoveriesAfterABudgetLimitedSweep(t *testing.T) {
 			recoverID   = "budget-recovery-probe"
 			tick        = 5 * time.Millisecond
 		)
-		clock := newFakeClock()
-		n := &fakeNotifier{}
-		beats := append(
-			[]Beat{{ID: recoverID, Deadline: time.Minute}},
-			budgetProbeBeats("budget-recovery-storm", storm, stormWindow)...,
-		)
-		w := New(beats, n, clock.Now, clock.Now())
+		// Phase 1, on this goroutine: the recovering beat is alerted alone and
+		// the whole storm fleet is left due.
+		w, clock, n := newStormWatcher(t, "budget-recovery-storm", recoverID, storm, stormWindow)
 
-		// Phase 1, on this goroutine: alert the recovering beat alone, on its
-		// own short deadline. An alerted beat yields no notice, so it takes no
-		// part in the storm sweep below and its recovery is the only thing
-		// competing with it.
-		clock.Advance(2 * time.Minute)
-		w.sweep(t.Context())
-		if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" || got[0].id != recoverID {
-			t.Fatalf("calls = %v, want one missing notice for %s before the storm", got, recoverID)
-		}
-
-		// Phase 2: the whole storm fleet crosses its deadline, and the first
-		// send of the storm sweep is when the recovering beat pings -- so the
-		// recovery is queued while the sender is deep in the storm.
-		clock.Advance(stormWindow)
+		// Phase 2: the first send of the storm sweep is when the recovering beat
+		// pings -- so the recovery is queued while the sender is deep in the
+		// storm.
 		sends := 0
 		n.onMissing = func() {
 			sends++
@@ -2040,17 +2065,9 @@ func TestRunServicesRecoveriesAfterABudgetLimitedSweep(t *testing.T) {
 		time.Sleep(tick)
 		synctest.Wait()
 
-		got := n.snapshot()
-		stormsBefore, found := 0, false
-		for _, c := range got[1:] {
-			if c.kind == "recovered" && c.id == recoverID {
-				found = true
-				break
-			}
-			stormsBefore++
-		}
+		stormsBefore, found := stormNoticesBeforeRecovery(n, recoverID)
 		if !found {
-			t.Fatalf("calls = %v, want the queued recovered notice delivered after the budget-limited sweep returned to the select", got)
+			t.Fatalf("calls = %v, want the queued recovered notice delivered after the budget-limited sweep returned to the select", n.snapshot())
 		}
 		if want := sendsBeforeBudgetCut(perSend); stormsBefore != want {
 			t.Errorf("storm notices ahead of the recovery = %d, want %d: the recovery must be serviced as soon as the sweep spends its budget, not after all %d storm beats",
@@ -2086,26 +2103,10 @@ func TestHandleTickPrioritizesQueuedRecovery(t *testing.T) {
 		stormWindow = 10 * time.Minute
 		recoverID   = "overrun-recovery-probe"
 	)
-	clock := newFakeClock()
-	n := &fakeNotifier{}
-	beats := append(
-		[]Beat{{ID: recoverID, Deadline: time.Minute}},
-		budgetProbeBeats("overrun-recovery-storm", storm, stormWindow)...,
-	)
-	w := New(beats, n, clock.Now, clock.Now())
-
-	// Alert the recovering beat alone, on its own short deadline. An alerted
-	// beat yields no notice, so it takes no part in the storm sweep below and
-	// its recovery is the only thing competing with it.
-	clock.Advance(2 * time.Minute)
-	w.sweep(t.Context())
-	if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" || got[0].id != recoverID {
-		t.Fatalf("calls = %v, want one missing notice for %s before the storm", got, recoverID)
-	}
+	w, clock, n := newStormWatcher(t, "overrun-recovery-storm", recoverID, storm, stormWindow)
 
 	// The state the ticker arm sees when a send overran the tick: the whole
 	// storm fleet is due AND a recovery is already sitting in the queue.
-	clock.Advance(stormWindow)
 	if recorded, _ := w.Beat(recoverID); !recorded {
 		t.Fatalf("Beat(%s) = false, want the ping recorded so its recovery is queued", recoverID)
 	}
@@ -2113,17 +2114,9 @@ func TestHandleTickPrioritizesQueuedRecovery(t *testing.T) {
 
 	w.handleTick(t.Context())
 
-	got := n.snapshot()
-	stormsBefore, found := 0, false
-	for _, c := range got[1:] {
-		if c.kind == "recovered" && c.id == recoverID {
-			found = true
-			break
-		}
-		stormsBefore++
-	}
+	stormsBefore, found := stormNoticesBeforeRecovery(n, recoverID)
 	if !found {
-		t.Fatalf("calls = %v, want the queued recovered notice delivered by the tick's own drain", got)
+		t.Fatalf("calls = %v, want the queued recovered notice delivered by the tick's own drain", n.snapshot())
 	}
 	if stormsBefore != 0 {
 		t.Errorf("storm notices ahead of the recovery = %d, want 0: the ticker arm must drain the queued recovery BEFORE the sweep it consumed that tick for",
@@ -2202,5 +2195,41 @@ func TestLiveNoticesCarryTheInstantsTheyClaim(t *testing.T) {
 	if got := n.recovered[0]; !got.Started.Equal(lastPing) || !got.Observed.Equal(endedAt) {
 		t.Errorf("recovered notice Transition = {Started %s, Observed %s}, want {%s, %s}: Started must be the last accepted ping before the outage and Observed the ping that ended it",
 			got.Started, got.Observed, lastPing, endedAt)
+	}
+}
+
+// TestOutageEndedRequiresARecoveryPointNoEarlierThanItsStart pins the predicate
+// notify's history path refuses an unfinished record with (BeatOutageHistory's
+// per-entry guard). watch owns the type and the invariant, so its boundary
+// belongs here: a record whose recovery point equals its start IS ended (the
+// contract is "no earlier than", not "after"), while an all-zero record is NOT
+// -- and the zero case is the only one the recovery-point clause alone rejects,
+// since a zero Recovered against a real Started already fails the ordering
+// clause. Inverting either clause makes the renderer refuse every history
+// notice (no past-tense notice ever delivers, and the sweep retries it every
+// tick forever) or publish "recovered at 0001-01-01" as a resolved outage.
+func TestOutageEndedRequiresARecoveryPointNoEarlierThanItsStart(t *testing.T) {
+	t.Parallel()
+
+	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	cases := map[string]struct {
+		outage Outage
+		want   bool
+	}{
+		"recovered after its start":  {outage: Outage{Started: started, Recovered: started.Add(11 * time.Minute)}, want: true},
+		"recovered at its start":     {outage: Outage{Started: started, Recovered: started}, want: true},
+		"no recovery point":          {outage: Outage{Started: started}, want: false},
+		"recovered before its start": {outage: Outage{Started: started, Recovered: started.Add(-time.Nanosecond)}, want: false},
+		"zero record":                {outage: Outage{}, want: false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tc.outage.Ended(); got != tc.want {
+				t.Errorf("Outage{Started: %s, Recovered: %s}.Ended() = %v, want %v",
+					tc.outage.Started, tc.outage.Recovered, got, tc.want)
+			}
+		})
 	}
 }

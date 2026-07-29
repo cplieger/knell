@@ -2089,3 +2089,70 @@ func TestHistoryTimestampRendersUTCWhateverZoneTheProducerUsed(t *testing.T) {
 		t.Errorf("content %q missing %q: historyMessage must convert the recovery point to UTC before formatting", content, want)
 	}
 }
+
+// TestNoticesReportWholeSecondDurations pins the .Truncate(time.Second) at
+// every site a notice renders a span. Every other fixture in this package
+// measures a whole-second silence, so all four truncations are no-ops under
+// test and dropping them leaves the suite green - while production spans are
+// never whole (Started, Observed and Recovered all come from time.Now), so
+// every notice an operator reads would start carrying nanoseconds.
+func TestNoticesReportWholeSecondDurations(t *testing.T) {
+	t.Parallel()
+
+	const ragged = 21*time.Minute + 30*time.Second + 123456789*time.Nanosecond
+	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	short := watch.Outage{Started: started, Recovered: started.Add(ragged), LateReason: watch.LateUndelivered}
+	// A ragged span that is also the batch's longest: the summary truncates
+	// watch.LongestOutage's result, a fourth call site no singular notice
+	// reaches.
+	long := watch.Outage{
+		Started:    started,
+		Recovered:  started.Add(47*time.Minute + 987654321*time.Nanosecond),
+		LateReason: watch.LateUndelivered,
+	}
+	cases := map[string]struct {
+		send func(*Discord) error
+		want string
+	}{
+		"missing": {
+			send: func(d *Discord) error { return d.BeatMissing(context.Background(), "api", liveSilence(ragged)) },
+			want: "silent for 21m30s.",
+		},
+		"recovered": {
+			send: func(d *Discord) error { return d.BeatRecovered(context.Background(), "api", liveSilence(ragged)) },
+			want: "after 21m30s of silence",
+		},
+		"history one": {
+			send: func(d *Discord) error {
+				return d.BeatOutageHistory(context.Background(), "api", []watch.Outage{short})
+			},
+			want: "was missing for 21m30s,",
+		},
+		"history several": {
+			send: func(d *Discord) error {
+				return d.BeatOutageHistory(context.Background(), "api", []watch.Outage{short, long})
+			},
+			want: "longest 47m0s,",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := newWebhookRecorder(http.StatusNoContent)
+			srv := httptest.NewServer(rec.handler(t))
+			defer srv.Close()
+
+			d := New(srv.URL, "node-1")
+			defer d.Close()
+
+			if err := tc.send(d); err != nil {
+				t.Fatalf("sending the %s notice: %v", name, err)
+			}
+			content := <-rec.contents
+			if !strings.Contains(content, tc.want) {
+				t.Errorf("the %s notice = %q, want it to report %q: an untruncated span renders nanoseconds, and every production span carries them", name, content, tc.want)
+			}
+		})
+	}
+}

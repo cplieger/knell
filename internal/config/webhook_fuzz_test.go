@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"unicode"
+	"unicode/utf8"
 )
 
 // FuzzParseWebhookURL pins the webhook validator's safety and secret-hygiene
@@ -63,6 +64,9 @@ func FuzzParseWebhookURL(f *testing.F) {
 			// table.
 			if u.Path == "" || u.Path == "/" {
 				t.Fatalf("accepted a URL whose path is %q: the webhook path IS the Discord credential, so this URL delivers nothing", u.Path)
+			}
+			if !utf8.ValidString(raw) {
+				t.Fatal("accepted a URL carrying an invalid UTF-8 byte: it is percent-encoded on every request, so the host or path that reaches the other end is not the configured one")
 			}
 			// Keep this oracle independent of invisibleInURL: using the
 			// production predicate here would let a narrowed predicate relax the

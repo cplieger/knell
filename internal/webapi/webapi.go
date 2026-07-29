@@ -19,8 +19,7 @@ import (
 // maxBeatBody caps how much of a ping request body is drained. Senders like
 // an Alertmanager webhook attach JSON payloads knell ignores; draining keeps
 // connections reusable, the cap keeps a hostile body from tying the handler.
-// An over-limit body is refused as a BODY, never as a ping: see the drain in
-// beatHandler.
+// An over-limit body is refused as a BODY, never as a ping: see drainBeatBody.
 const maxBeatBody = 1 << 20
 
 // loggedPathCap is the byte cap knell asks webhttp to apply to the access
@@ -30,13 +29,6 @@ const maxBeatBody = 1 << 20
 // attacker-controlled and net/http accepts a megabyte of it, so 128 keeps the
 // concrete beat id an operator needs intact while a flood cannot push knell's
 // own undelivered-notice warnings out of the retained log window.
-//
-// The cap and its truncation marker are the LIBRARY's now (see
-// webhttp.WithMaxLoggedPath): knell only chooses the number, because the
-// tighter budget is a fact about this route table and not about HTTP. The
-// logged METHOD is bounded by webhttp with no knob at all, since its ceiling
-// (24 bytes, over which the line records "(overlong)") follows from the IANA
-// method registry rather than from anything knell serves.
 const loggedPathCap = 128
 
 // Beater records pings. Implemented by watch.Watcher.
@@ -47,15 +39,16 @@ type Beater interface {
 	Beat(id string) (recorded, accepting bool)
 }
 
-// Routes carries the pre-built handlers webapi serves beside the beat
-// endpoint. They are named rather than positional because both are plain
-// http.Handler values: a transposed pair would compile and quietly serve
-// the metrics exposition at /healthz.
-type Routes struct {
+// Deps carries what the composition root supplies and webapi cannot reach on
+// its own: the liveness handler (built over main's health.Marker), the Host
+// allowlist, and the beat credential. They are named rather than positional
+// because the three are otherwise indistinguishable at a call site. The
+// Prometheus exposition is deliberately absent: webapi already imports
+// internal/metrics for the route-metric hook, so it serves metrics.Handler()
+// itself rather than having the same dependency injected a second way.
+type Deps struct {
 	// Healthz answers liveness.
 	Healthz http.Handler
-	// Metrics serves the Prometheus exposition.
-	Metrics http.Handler
 	// Hosts is the exact-match Host allowlist (ALLOWED_HOSTS). A nil or
 	// inactive policy accepts every Host, which is the documented default;
 	// an active one is what breaks DNS rebinding, since a rebinding request
@@ -64,10 +57,14 @@ type Routes struct {
 	// so without an allowlist a rebinding page still reads the exposition that
 	// enumerates every beat and its freshness.
 	Hosts *webhttp.HostPolicy
+	// BeatToken optionally gates /beat/{id} (empty = open). Last because a
+	// string's length word is not a pointer, which keeps the struct's
+	// pointer-scanned prefix at 32 bytes (govet fieldalignment).
+	BeatToken string
 }
 
 // New assembles the routed and middleware-wrapped root handler.
-// token optionally gates the beat endpoint (empty = open).
+// deps.BeatToken optionally gates the beat endpoint (empty = open).
 //
 // appCtx is the shared application context: the one main cancels on SIGTERM,
 // and the very same one watch.Run stops on. Cancelling it closes the beat
@@ -91,25 +88,14 @@ type Routes struct {
 // therefore counted in the shutdown tally logUndelivered reports (see
 // watch.Watcher.Beat) rather than landing behind a tally already taken.
 //
-// Those context checks are not the atomic boundary: no repetition of them can
-// be atomic with the recording, because a handler can pass one and be
-// descheduled while watch.Run reports and abandons its undelivered work. The
-// authoritative gate is the watcher's own admission state, decided under the
-// mutex that guards the beat mutation and returned as Beat's accepting result
-// (see watch.Watcher.Beat). The checks here remain necessary for two windows
-// the accepting result does not cover: the long drain read, so a
-// shutting-down endpoint cannot be held open by a trickled payload, and the
-// interval between cancellation and watch.Run reaching its ctx.Done arm,
-// during which the watcher is still accepting.
-//
 // Only the beat endpoint refuses. /healthz and /metrics keep serving through
 // the whole drain: the orchestrator has to see the liveness marker flip, and a
 // last scrape of the freshness exposition during the drain is useful.
-func New(appCtx context.Context, b Beater, token string, routes Routes) http.Handler {
+func New(appCtx context.Context, b Beater, deps Deps) http.Handler {
 	mux := http.NewServeMux()
 	// POST is the canonical ping; GET is accepted too so ad-hoc senders
 	// (curl without flags, simple healthcheck hooks) can participate.
-	beat := beatHandler(appCtx, b, token)
+	beat := beatHandler(appCtx, b, deps.BeatToken)
 	mux.HandleFunc("POST /beat/{id}", beat)
 	mux.HandleFunc("GET /beat/{id}", beat)
 	// HEAD is registered explicitly ONLY to override net/http's rule that a
@@ -149,8 +135,8 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 	mux.HandleFunc("/beat", writeUnknownBeat)
 	mux.HandleFunc("/beat/{$}", writeUnknownBeat)
 	mux.HandleFunc("/beat/{id}/{rest...}", writeUnknownBeat)
-	mux.Handle("GET /healthz", routes.Healthz)
-	mux.Handle("GET /metrics", routes.Metrics)
+	mux.Handle("GET /healthz", deps.Healthz)
+	mux.Handle("GET /metrics", metrics.Handler())
 
 	return webhttp.Chain(mux,
 		// /healthz and /metrics are machine probes, so they ride the
@@ -192,7 +178,7 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 		// security and no-store headers, but outside canonicalBeatPath, every
 		// route, and beatHandler's token gate. Inactive when ALLOWED_HOSTS is
 		// unset: HostPolicy.Middleware then returns next unwrapped.
-		routes.Hosts.Middleware(),
+		deps.Hosts.Middleware(),
 		// Inside the Host policy, and inside nothing else: this guard answers
 		// for knell's own routes only, so a refused Host must still be refused
 		// as a Host (403) rather than as an unknown beat. See canonicalBeatPath.
@@ -218,12 +204,13 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 // the guard covers every spelling ServeMux would rewrite. It is applied to the
 // DECODED r.URL.Path while ServeMux compares the ESCAPED one, so it is slightly
 // WIDER: an encoded dot segment (/beat/%2e%2e/ghost) draws no redirect from
-// net/http but is refused here. That costs those two spellings their route
-// label (a middleware refusal leaves r.Pattern empty, so the request counter
-// buckets them as "unmatched") and is accepted deliberately: the decoded path
-// is the one a sender believed it was pinging. /beat/ and /beat/{id}/ are
-// already canonical either way and keep routing to their own patterns (which
-// is what keeps their request-counter labels).
+// net/http but is refused here, and that is accepted deliberately: the decoded
+// path is the one a sender believed it was pinging. EVERY refusal here lands
+// before the mux routes, so none of them can inherit a route label — the guard
+// declares nonCanonicalBeatPattern itself instead of letting the whole class
+// fall into the "unmatched" bucket beside scanner traffic. /beat/ and
+// /beat/{id}/ are already canonical either way and keep routing to their own
+// patterns (which is what keeps their own request-counter labels).
 // The guard fires only when the request is in (or cleans into) the /beat
 // namespace, so every other path keeps net/http's own behavior. The verdict is
 // writeUnknownBeat: a path that is not a canonical /beat/{id} names no
@@ -234,12 +221,28 @@ func canonicalBeatPath(next http.Handler) http.Handler {
 		raw := r.URL.Path
 		if clean := sanitizedPath(raw); clean != raw &&
 			(inBeatNamespace(raw) || inBeatNamespace(clean)) {
+			// Declare the route label the mux never got to assign, so this
+			// refusal is countable as its own class rather than as unmatched
+			// scanner traffic. webhttp reads r.Pattern from the same request
+			// this handler received, so the assignment reaches the metric hook.
+			r.Pattern = nonCanonicalBeatPattern
 			writeUnknownBeat(w, r)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
+
+// nonCanonicalBeatPattern is the request-counter path label a canonicalBeatPath
+// refusal records under. The guard answers BEFORE the mux routes, so nothing has
+// populated r.Pattern and webhttp's derivation would bucket the whole class as
+// the "unmatched" marker — beside scanner traffic, which is exactly the
+// confusion the /beat, /beat/{$} and /beat/{id}/{rest...} routes exist to
+// prevent for the other misconfigured-sender spellings. Naming the class costs
+// one bounded series and keeps "a sender is pinging a malformed URL" alertable
+// from /metrics. Parentheses are not legal in a ServeMux pattern, so the marker
+// can never collide with a registered route.
+const nonCanonicalBeatPattern = "/beat/(non-canonical)"
 
 // sanitizedPath mirrors net/http's own cleanPath: path.Clean, with a trailing
 // slash preserved. The trailing slash is load-bearing here, because ServeMux
@@ -276,7 +279,7 @@ func inBeatNamespace(p string) bool {
 // answered from a cache, and a GET ping is a documented sender mode, so the
 // header goes on the whole surface rather than one route. It wraps the Host
 // policy as well as the mux so Host-refusal responses also carry no-store;
-// keep it before routes.Hosts.Middleware in Chain.
+// keep it before deps.Hosts.Middleware in Chain.
 func noStore(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -318,15 +321,21 @@ func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
 
 // browserPageRequest reports whether a browser PAGE (or worker) initiated this
 // request, which is the confused-deputy shape: it would re-arm the switch with
-// no real heartbeat behind it. The rule is deliberately blunt — refuse any
-// request carrying a Sec-Fetch-Site header whose value is anything other than
-// "none"; admit it when the header is absent, or when it reads exactly "none".
+// no real heartbeat behind it. The rule is deliberately blunt and reads two
+// browser-emitted signals — refuse any request carrying a Sec-Fetch-Site header
+// whose value is anything other than "none", OR carrying an Origin header at
+// all; admit it when neither is present, or when Sec-Fetch-Site reads exactly
+// "none" and no Origin came with it.
 //
-// That single predicate is enough because of who the senders are. Every sender
+// Those predicates are enough because of who the senders are. Every sender
 // knell documents is a machine client (curl -fsS, an Alertmanager
-// webhook_configs target, a CI hook) and sends no Fetch Metadata at all, while a
-// browser sends Sec-Fetch-Site on every request; and "none" is emitted only for
-// a user-initiated navigation with NO initiating document (address bar,
+// webhook_configs target, a CI hook) and sends no Fetch Metadata and no Origin
+// at all (Origin is a browser-managed forbidden header), while a browser sends
+// Sec-Fetch-Site on every request to a potentially trustworthy URL and Origin
+// on every page-initiated POST and cors-mode fetch regardless of transport —
+// which is what keeps the guard live on knell's documented plain-HTTP LAN
+// endpoint, where Fetch Metadata is omitted by specification. "none" is emitted
+// only for a user-initiated navigation with NO initiating document (address bar,
 // bookmark), which is the one browser shape the README invites ("GET works too,
 // for ad-hoc senders"). An iframe never sends "none": an iframe load is a
 // navigation, but it has an initiating document, so it reads cross-site or
@@ -335,13 +344,30 @@ func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
 // compromised sibling origin, with no Sec-Fetch-Mode, Sec-Fetch-Dest or
 // user-activation inspection to get wrong.
 //
-// The header is trivially spoofable by a non-browser client, and that is
+// Either header is trivially spoofable by a non-browser client, and that is
 // DELIBERATELY out of scope: this is confused-deputy protection, not
 // authentication. A caller that can reach the port directly does not need to
 // borrow anyone's browser, and BEAT_TOKEN is the control for that caller.
 func browserPageRequest(r *http.Request) bool {
-	site := r.Header.Get("Sec-Fetch-Site")
-	return site != "" && site != "none"
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "none" {
+		return true
+	}
+	// Origin is the signal that survives plain HTTP. Fetch Metadata is
+	// appended only for a potentially trustworthy URL, so on knell's
+	// documented http:// LAN endpoint Sec-Fetch-Site is absent from a
+	// browser request too; Origin has no such gate (Fetch, "append a
+	// request Origin header": appended when response tainting is "cors",
+	// or whenever the method is neither GET nor HEAD — a referrer policy
+	// only rewrites the VALUE to "null"). So a page-initiated fetch POST,
+	// a cors-mode fetch GET and a plain form POST all name themselves
+	// here, and POST is knell's canonical ping. No documented sender can
+	// lose its ping to this: Origin is a browser-managed forbidden header,
+	// so curl, an Alertmanager webhook_configs target and a CI hook never
+	// set it. A no-cors GET subresource (<img>, an iframe) still carries
+	// neither header on plain HTTP — that residual gap is the README's
+	// "put knell behind TLS, or set BEAT_TOKEN" condition, not this
+	// guard's.
+	return r.Header.Get("Origin") != ""
 }
 
 // writeBrowserPageRefused refuses a browser-forged ping: 403 in this file's
