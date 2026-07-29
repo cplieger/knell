@@ -80,6 +80,15 @@ type Deps struct {
 	// /metrics looks at that: BeatToken gates the BEAT route only, so without
 	// an allowlist a rebinding page still reads the exposition that
 	// enumerates every beat and its freshness.
+	//
+	// Because that is the exposure, the gate wraps the WHOLE mux rather than
+	// the beat route: an ACTIVE allowlist refuses a foreign Host on /healthz
+	// and /metrics too, not just /beat/{id}. That is deliberate — exempting the
+	// probe routes would leave the exposition readable by the request this
+	// exists to stop — but it means every hostname or IP a probe or a scraper
+	// reaches knell by has to be listed, or those routes 403 for the operator's
+	// own monitoring. The README's ALLOWED_HOSTS row says so for operators;
+	// this says so for the next reader of New.
 	Hosts *webhttp.HostPolicy
 	// BeatToken is the REQUIRED bearer credential for POST /beat/{id} and the
 	// endpoint's only gate (internal/config refuses to start without it). An
@@ -117,7 +126,10 @@ type Deps struct {
 //
 // Only the beat endpoint refuses. /healthz and /metrics keep serving through
 // the whole drain: the orchestrator has to see the liveness marker flip, and a
-// last scrape of the freshness exposition during the drain is useful.
+// last scrape of the freshness exposition during the drain is useful. That is a
+// statement about the DRAIN only — an active ALLOWED_HOSTS allowlist refuses a
+// foreign Host on all three routes at every point in the lifecycle, drain
+// included (see Deps.Hosts).
 func New(appCtx context.Context, b Beater, deps Deps) http.Handler {
 	mux := http.NewServeMux()
 	// POST is the ONLY method that records. GET and HEAD are registered
