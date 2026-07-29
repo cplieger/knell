@@ -172,6 +172,31 @@ func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 		"use GET or POST to record a beat")
 }
 
+// crossSiteSubresource reports whether a request was initiated by a BROWSER as
+// a cross-site sub-resource load (an <img>, a script, a no-cors fetch) rather
+// than by a sender or by a deliberate navigation. Only browsers send
+// Sec-Fetch-*, so every documented sender omits the headers and is unaffected:
+// curl, an Alertmanager webhook_config, a CI hook. A human opening the URL from
+// the address bar or a bookmark sends Sec-Fetch-Site: none, and a deliberate
+// click keeps Sec-Fetch-Mode: navigate. What is left is exactly the
+// confused-deputy shape — a page the operator did not write, forging a ping
+// from inside a browser that can reach this port — which re-arms the switch
+// with no real heartbeat behind it. The check is advisory by nature (a client
+// that sends no Sec-Fetch-Site is admitted), so it is a layer, not the gate:
+// BEAT_TOKEN remains the gate.
+func crossSiteSubresource(r *http.Request) bool {
+	return r.Header.Get("Sec-Fetch-Site") == "cross-site" &&
+		r.Header.Get("Sec-Fetch-Mode") != "navigate"
+}
+
+// writeCrossSiteRefused refuses a browser-forged ping: 403 in this file's
+// standard coded envelope. It names no beat id, exactly like the 404 and 503
+// refusals, so it leaks nothing about which ids are configured.
+func writeCrossSiteRefused(w http.ResponseWriter, r *http.Request) {
+	webhttp.WriteError(w, r, http.StatusForbidden, "cross_site_request",
+		"a cross-site browser request cannot record a beat")
+}
+
 // writeShuttingDown refuses a beat because acceptance is closed: 503 in this
 // file's standard coded envelope. It names no beat id — not even an unknown one
 // — so the refusal leaks as little as the 404 path does about which ids are
@@ -182,6 +207,44 @@ func writeShuttingDown(w http.ResponseWriter, r *http.Request) {
 		"knell is shutting down and is no longer accepting beats")
 }
 
+// drainBeatBody caps the beat body, then drains what fits so keep-alive
+// connections stay reusable; the payload itself is deliberately ignored. The
+// cap is webhttp.LimitBody (an http.MaxBytesReader over r.Body) rather than a
+// bare io.LimitReader, because a LimitReader ends the read SILENTLY at the cap:
+// an over-limit body would be indistinguishable from one that just ended, so
+// nothing would ever say a sender is shipping payloads knell refuses to read.
+// MaxBytesReader surfaces the overrun as an *http.MaxBytesError, which is what
+// the WARN below reports.
+//
+// The overrun is reported, never acted on: the ping still answers 200 and the
+// beat is recorded whether the body fit, overran, or the sender hung up
+// mid-send, because a heartbeat's payload is irrelevant and a dropped ping is
+// what this whole app exists to notice. Only the overrun warns; a mid-body
+// disconnect is ordinary.
+//
+// net/http does close the connection under that 200 (LimitBody reaches
+// net/http's own ResponseWriter through the StatusRecorder Unwrap chain
+// webhttp.Logging and Recoverer wrap the beat handler in). The close is
+// observable only on the SENDER's side of the wire, and an
+// httptest.ResponseRecorder cannot observe it at all, so the WARN stays both
+// the only channel through which a knell OPERATOR learns a sender is over the
+// cap and the thing the handler tests pin.
+func drainBeatBody(w http.ResponseWriter, r *http.Request) {
+	webhttp.LimitBody(w, r, maxBeatBody)
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			// No beat id and no sender-supplied text: the id at this point is
+			// still an unvalidated path segment (the 404 gate is downstream),
+			// and the request id ties this line to the access line that does
+			// carry the truncated path.
+			slog.WarnContext(r.Context(), "beat body exceeded the cap and was not fully read",
+				"limit_bytes", maxBeatBody,
+				"request_id", webhttp.RequestIDFromContext(r.Context()))
+		}
+	}
+}
+
 // beatHandler records a ping and answers {"ok":true}, or 404 for an id that
 // is not configured. Unknown ids are never recorded or counted: the id feeds
 // a metric label, so arbitrary paths must not mint series. A non-empty token
@@ -189,6 +252,13 @@ func writeShuttingDown(w http.ResponseWriter, r *http.Request) {
 // cancelled the endpoint accepts nothing more (see New).
 func beatHandler(appCtx context.Context, b Beater, token string) http.HandlerFunc {
 	record := func(w http.ResponseWriter, r *http.Request) {
+		// A ping the operator's browser was tricked into sending is not a
+		// heartbeat: refuse it before anything else, so it can neither record
+		// nor learn which phase the process is in.
+		if crossSiteSubresource(r) {
+			writeCrossSiteRefused(w, r)
+			return
+		}
 		// Acceptance is closed for the rest of this process's life: refuse
 		// before the body is touched, so a ping arriving during the drain
 		// cannot hold a handler goroutine (and with it the drain) open by
@@ -198,41 +268,10 @@ func beatHandler(appCtx context.Context, b Beater, token string) http.HandlerFun
 			writeShuttingDown(w, r)
 			return
 		}
-		// Cap the body, then drain what fits so keep-alive connections stay
-		// reusable; the payload itself is deliberately ignored. The cap is
-		// webhttp.LimitBody (an http.MaxBytesReader over r.Body) rather than a
-		// bare io.LimitReader, because a LimitReader ends the read SILENTLY at
-		// the cap: an over-limit body would be indistinguishable from one that
-		// just ended, so nothing would ever say a sender is shipping payloads
-		// knell refuses to read. MaxBytesReader surfaces the overrun as an
-		// *http.MaxBytesError, which is what the WARN below reports.
-		//
-		// The overrun is reported, never acted on: the ping still answers 200
-		// and the beat below is recorded whether the body fit, overran, or the
-		// sender hung up mid-send, because a heartbeat's payload is irrelevant
-		// and a dropped ping is what this whole app exists to notice. Only the
-		// overrun warns; a mid-body disconnect is ordinary.
-		//
-		// net/http does close the connection under that 200 (LimitBody reaches
-		// net/http's own ResponseWriter through the StatusRecorder Unwrap chain
-		// webhttp.Logging and Recoverer wrap this handler in). The close is
-		// observable only on the SENDER's side of the wire, and an
-		// httptest.ResponseRecorder cannot observe it at all, so the WARN stays
-		// both the only channel through which a knell OPERATOR learns a sender
-		// is over the cap and the thing the handler tests pin.
-		webhttp.LimitBody(w, r, maxBeatBody)
-		if _, err := io.Copy(io.Discard, r.Body); err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				// No beat id and no sender-supplied text: the id here is still
-				// an unvalidated path segment (the 404 gate is below), and the
-				// request id ties this line to the access line that does carry
-				// the truncated path.
-				slog.WarnContext(r.Context(), "beat body exceeded the cap and was not fully read",
-					"limit_bytes", maxBeatBody,
-					"request_id", webhttp.RequestIDFromContext(r.Context()))
-			}
-		}
+		// Cap and drain the body (the payload is deliberately ignored) so
+		// keep-alive connections stay reusable; an over-cap sender is reported,
+		// never refused. See drainBeatBody.
+		drainBeatBody(w, r)
 		id := r.PathValue("id")
 		// Re-check on the far side of the body read: this is the check that
 		// closes the window that matters, because the read above can block for

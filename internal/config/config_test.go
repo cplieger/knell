@@ -1394,6 +1394,35 @@ func TestLoadWarnsOnlyWhenLogLevelIsUnparseable(t *testing.T) {
 	}
 }
 
+// TestLoadWarnsWhenLogLevelIsPresentButBlank pins the OTHER half of the
+// LOG_LEVEL diagnostic, the one TestLoadWarnsOnlyWhenLogLevelIsUnparseable
+// deliberately does not cover: slogx.ParseLevel returns ok=true for a blank
+// value, so without this line a LOG_LEVEL that resolved empty (compose
+// interpolation of an undefined variable produces exactly that shape) falls
+// back to info in total silence — on the one knob an operator turns while
+// diagnosing a live outage. The message is distinct from the typo warning on
+// purpose, so the sibling test's "present but blank does not warn" case keeps
+// pinning the typo-vs-accident distinction.
+func TestLoadWarnsWhenLogLevelIsPresentButBlank(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	setValidLoadEnv(t)
+	t.Setenv("LOG_LEVEL", "   ")
+
+	rec := capture.Default(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.LogLevel != slog.LevelInfo {
+		t.Errorf("LogLevel = %v, want INFO: a blank LOG_LEVEL must land on the documented default", cfg.LogLevel)
+	}
+	if !rec.Contains("LOG_LEVEL is set but blank") {
+		t.Errorf("no warning that a blank LOG_LEVEL was ignored; the operator set the variable and this process threw the value away, so the level they turned up to diagnose an outage silently never applies: %v", rec.Messages())
+	}
+}
+
 // TestLoadRejectsAFileBorneBeatTokenHTTPCannotCarry pins that the
 // control-byte refusal covers the _FILE channel too, the same way
 // TestLoadRejectsPlainHTTPWebhookFromFile pins the https gate for the webhook's
@@ -1423,4 +1452,92 @@ func TestLoadRejectsAFileBorneBeatTokenHTTPCannotCarry(t *testing.T) {
 	if strings.Contains(err.Error(), "alpha") || strings.Contains(err.Error(), "beta") {
 		t.Errorf("error = %q embeds the token value; the startup error is shipped to Loki, so it must describe the shape and never echo the credential", err)
 	}
+}
+
+// TestLoadWarnsOnlyWhenAnOptionalVariableIsPresentButBlank pins the
+// present-versus-unset distinction on the two optional variables that fall
+// back silently: NODE_NAME and LISTEN_ADDR. Both warn ONLY when the operator
+// set the variable and this process threw the value away; an unset variable is
+// the documented default and must stay silent. Neither half is asserted
+// anywhere else - the existing tests pin the resulting VALUE (the hostname
+// fallback, the :9190 default) and capture no log - so dropping the `if
+// present` guard makes every default deployment log two warnings about
+// variables nobody set, and dropping the warning lets a value the operator set
+// be discarded with no signal at all, on the two settings that decide which
+// observer a Discord notice names and whether /metrics answers at the scraped
+// address.
+func TestLoadWarnsOnlyWhenAnOptionalVariableIsPresentButBlank(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	tests := map[string]struct {
+		key      string
+		value    string
+		unset    bool
+		warnSub  string
+		wantWarn bool
+	}{
+		"node name blank warns":       {key: "NODE_NAME", value: "  ", warnSub: "NODE_NAME is set but blank", wantWarn: true},
+		"node name unset stays quiet": {key: "NODE_NAME", unset: true, warnSub: "NODE_NAME is set but blank", wantWarn: false},
+		"node name set stays quiet":   {key: "NODE_NAME", value: "observer-1", warnSub: "NODE_NAME is set but blank", wantWarn: false},
+		"listen addr blank warns":     {key: "LISTEN_ADDR", value: "   ", warnSub: "LISTEN_ADDR is set but blank", wantWarn: true},
+		"listen addr unset is quiet":  {key: "LISTEN_ADDR", unset: true, warnSub: "LISTEN_ADDR is set but blank", wantWarn: false},
+		"listen addr set is quiet":    {key: "LISTEN_ADDR", value: "127.0.0.1:9999", warnSub: "LISTEN_ADDR is set but blank", wantWarn: false},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			if tt.unset {
+				unsetEnv(t, tt.key)
+			} else {
+				t.Setenv(tt.key, tt.value)
+			}
+
+			rec := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if got := rec.Contains(tt.warnSub); got != tt.wantWarn {
+				t.Errorf("%s=%q (unset=%v): warned = %v, want %v; the warning is the only signal that a value the operator set was discarded, and a warning for an unset variable trains the operator to ignore it: %v",
+					tt.key, tt.value, tt.unset, got, tt.wantWarn, rec.Messages())
+			}
+		})
+	}
+
+	// The blank-LISTEN_ADDR warning must name the address the listener falls
+	// back to: without it the operator reads "ignored" with no way to tell which
+	// port the scrape should target.
+	t.Run("blank listen addr warning names the default", func(t *testing.T) {
+		setValidLoadEnv(t)
+		t.Setenv("LISTEN_ADDR", " ")
+
+		rec := capture.Default(t)
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if cfg.ListenAddr != defaultListenAddr {
+			t.Fatalf("ListenAddr = %q, want %q", cfg.ListenAddr, defaultListenAddr)
+		}
+		if !rec.HasAttr("LISTEN_ADDR is set but blank", "listen_addr", defaultListenAddr) {
+			t.Errorf("blank-LISTEN_ADDR warning does not report the fallback address %q: %v", defaultListenAddr, rec.Records())
+		}
+	})
+
+	// The blank-NODE_NAME warning has to name the way out, because the operator
+	// who set the variable is the one reading it.
+	t.Run("blank node name warning tells the operator both options", func(t *testing.T) {
+		setValidLoadEnv(t)
+		t.Setenv("NODE_NAME", "\t")
+
+		rec := capture.Default(t)
+
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if !strings.Contains(strings.Join(rec.Messages(), "\n"), "unset the variable") {
+			t.Errorf("blank-NODE_NAME warning does not name the unset-for-hostname option: %v", rec.Messages())
+		}
+	})
 }

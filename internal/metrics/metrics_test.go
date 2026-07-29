@@ -72,9 +72,10 @@ func exposition(t *testing.T) string {
 }
 
 // TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat pins the per-beat
-// half of the cold-start guarantee: InitBeat must publish all four per-beat
-// series, with the two counters born at zero and the last-seen gauge carrying
-// the boot baseline. A counter whose first exposed sample is already nonzero
+// half of the cold-start guarantee: InitBeat must publish all five per-beat
+// series, with the two counters born at zero, the last-seen gauge carrying
+// the boot baseline and the deadline gauge carrying the configured deadline.
+// A counter whose first exposed sample is already nonzero
 // has no earlier sample for increase() to diff against, so a series dropped
 // from InitBeat is an alert that stays silent through the first event of the
 // beat's life; a missing last-seen baseline leaves the operator no window to
@@ -87,6 +88,7 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 	series := []string{
 		"knell_beat_fresh",
 		"knell_beat_last_seen_timestamp_seconds",
+		"knell_beat_deadline_seconds",
 		"knell_beats_received_total",
 		"knell_beat_outages_total",
 	}
@@ -96,11 +98,12 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 		}
 	}
 
-	InitBeat(id, time.Unix(1700000000, 0))
+	InitBeat(id, 20*time.Minute, time.Unix(1700000000, 0))
 
 	want := map[string]string{
 		"knell_beat_fresh":                       "1",
 		"knell_beat_last_seen_timestamp_seconds": "1700000000",
+		"knell_beat_deadline_seconds":            "1200",
 		"knell_beats_received_total":             "0",
 		"knell_beat_outages_total":               "0",
 	}

@@ -105,9 +105,7 @@ func (n *fakeNotifier) setFail(err error) {
 func (n *fakeNotifier) snapshot() []call {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	out := make([]call, len(n.calls))
-	copy(out, n.calls)
-	return out
+	return slices.Clone(n.calls)
 }
 
 // onlyHistory returns the single history payload the notifier received,
@@ -1091,6 +1089,58 @@ func TestFailedHistorySendMakesTheRetriedNoticeBlameDelivery(t *testing.T) {
 		t.Errorf(`late reason on the retried notice = %s, want %s: %s renders as "nothing was wrong with delivery", which is false in a notice this webhook already refused once - the operator is told to look nowhere while delivery is what failed`,
 			reasonName(got), reasonName(LateUndelivered), reasonName(got))
 	}
+}
+
+func TestFailedHistorySendBlamesDeliveryForEveryRecordItCovered(t *testing.T) {
+	t.Parallel()
+
+	// The multi-record half of the blame rule. A sustained webhook outage is
+	// exactly what queues several ended outages behind ONE history notice, and
+	// when that notice fails, every record it covered is now late because
+	// delivery failed - not just the head. A record left claiming
+	// LateEndedBeforeDetection renders as "nothing was wrong with delivery" in
+	// the very notice this webhook already refused, so the operator is told to
+	// look nowhere for the rest of the batch.
+	const (
+		id       = "history-blame-run-probe"
+		deadline = 10 * time.Minute
+		outages  = 3
+	)
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: deadline})
+	if !w.Beat(id) {
+		t.Fatalf("Beat(%s) = false", id)
+	}
+	// Three outages that each began AND ended between two sweeps, so every
+	// record starts out blaming nothing (LateEndedBeforeDetection).
+	for range outages {
+		clock.Advance(deadline + time.Minute)
+		if !w.Beat(id) {
+			t.Fatalf("late Beat(%s) = false", id)
+		}
+	}
+	queued := w.beats[id].pendingMissing
+	if len(queued) != outages {
+		t.Fatalf("queued records = %d, want %d closed records for the batch", len(queued), outages)
+	}
+	for i, rec := range queued {
+		if rec.late != LateEndedBeforeDetection {
+			t.Fatalf("queued record %d late reason = %s, want %s before any send was attempted",
+				i, reasonName(rec.late), reasonName(LateEndedBeforeDetection))
+		}
+	}
+
+	// One history notice covers all three records, and it fails.
+	n.setFail(errors.New("discord down"))
+	w.sweep(context.Background())
+	if calls := n.snapshot(); len(calls) != 0 {
+		t.Fatalf("failed history send recorded calls: %v", calls)
+	}
+
+	n.setFail(nil)
+	w.sweep(context.Background())
+	got := onlyHistory(t, n)
+	checkSpans(t, got, deadline+time.Minute, deadline+time.Minute, deadline+time.Minute)
+	checkLateReasons(t, got, LateUndelivered, LateUndelivered, LateUndelivered)
 }
 
 func TestCanceledHistorySendKeepsTheLateReasonItWasRecordedWith(t *testing.T) {

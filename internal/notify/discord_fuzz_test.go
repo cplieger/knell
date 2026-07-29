@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -283,6 +284,22 @@ func webhookNeedles(rawURL string) []string {
 			needles = append(needles, escaped)
 		}
 	}
+	return withQuotedForms(needles)
+}
+
+// withQuotedForms appends the strconv.Quote rendering of every needle (minus
+// the surrounding quotes), which is the form a leak takes when the leaking
+// text is rendered with %q -- the exact verb net/http uses for the Location
+// header (`failed to parse Location header "<header>"`). A credential
+// segment carrying a quote, a backslash or a control byte renders escaped
+// there, so the raw needle alone would not match it.
+func withQuotedForms(needles []string) []string {
+	for _, form := range needles[:len(needles):len(needles)] {
+		q := strconv.Quote(form)
+		if quoted := q[1 : len(q)-1]; quoted != form {
+			needles = append(needles, quoted)
+		}
+	}
 	return needles
 }
 
@@ -369,7 +386,7 @@ func locationNeedles(location string) []string {
 	if i := strings.LastIndex(location, "/"); i >= 0 {
 		needles = append(needles, location[i+1:])
 	}
-	return needles
+	return withQuotedForms(needles)
 }
 
 // attemptAgainstRedirectStub performs one postAttempt against a stub transport

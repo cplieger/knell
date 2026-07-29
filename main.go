@@ -36,6 +36,21 @@ import (
 // to finish and exit under its own power.
 const shutdownGrace = 8 * time.Second
 
+// requestTimeout bounds a whole request, read and write alike. No route
+// streams, so both bounds are safe: the read bound stops a slow-trickled
+// body from holding a handler goroutine forever (the 1 MiB drain cap bounds
+// bytes, not time), and the write bound stops a client that requests
+// /metrics and never reads the response from pinning the goroutine in Write.
+//
+// It is LARGER than shutdownGrace, and that pairing is load-bearing: webhttp
+// spends one grace budget across pre-drain, srv.Shutdown and the teardown,
+// and srv.Shutdown waits for in-flight requests -- so a single request still
+// inside this bound when the signal arrives can spend the whole grace, leave
+// awaitWatchLoop no budget, and turn an ordinary stop into the exit
+// classifyServeError names. Read the two constants together before changing
+// either.
+const requestTimeout = 30 * time.Second
+
 func main() {
 	// CLI liveness probe for the Docker healthcheck (scratch image: no
 	// shell, no curl). The marker is level-based boot state — set once the
@@ -51,7 +66,16 @@ func main() {
 			health.RunProbe(health.DefaultPath)
 			os.Exit(1)
 		default:
-			fmt.Fprintf(os.Stderr, "unknown command %q (the only subcommand is \"health\")\n", os.Args[1])
+			// Structured and level-carrying, on the same stderr stream every other
+			// knell line uses. A mistyped container command is a boot failure that
+			// crash-loops under `restart: unless-stopped` while publishing no
+			// metrics at all, so this line is the only trace of the cause -- and a
+			// bare fmt line carries no level, so the Loki rules that match every
+			// other knell failure cannot match it. Installing the handler here is
+			// safe because this branch exits: run() installs its own, and the two
+			// paths never both run.
+			slogx.Setup(slogx.Options{})
+			slog.Error("unknown command", "command", os.Args[1], "supported", "health")
 			os.Exit(2)
 		}
 	}
@@ -112,14 +136,7 @@ func run() error {
 	notifier := notify.New(cfg.WebhookURL, cfg.Node)
 	defer notifier.Close()
 
-	// Translate the config DTO into the watch package's own input type: the
-	// composition root owns the boundary, so the state machine never
-	// depends on how configuration was parsed.
-	beats := make([]watch.Beat, len(cfg.Beats))
-	for i, b := range cfg.Beats {
-		beats[i] = watch.Beat{ID: b.ID, Deadline: b.Deadline}
-	}
-	watcher := watch.New(beats, notifier, time.Now, processStart)
+	watcher := watch.New(watchBeats(cfg.Beats), notifier, time.Now, processStart)
 
 	// The app context goes into webapi so beat ACCEPTANCE closes at the same
 	// instant the watch loop stops: watcher.Run returns on ctx.Done() after
@@ -134,14 +151,20 @@ func run() error {
 		Healthz: health.Handler(marker),
 		Metrics: metrics.Handler(),
 	})
-	// No route streams, so whole-request read and write bounds are safe
-	// here: the read bound stops a slow-trickled body from holding a
-	// handler goroutine forever (the 1 MiB drain cap bounds bytes, not
-	// time), and the write bound stops a client that requests /metrics
-	// and never reads the response from pinning the goroutine in Write.
 	srv := webhttp.NewServer(handler,
-		webhttp.WithReadTimeout(30*time.Second),
-		webhttp.WithWriteTimeout(30*time.Second),
+		webhttp.WithReadTimeout(requestTimeout),
+		webhttp.WithWriteTimeout(requestTimeout),
+		// webhttp's 1 MiB MaxHeaderBytes default is sized for apps that carry
+		// large cookies or proxy header chains; knell serves three short routes
+		// (/healthz, /metrics, /beat/{id} with a 64-char id) and one optional
+		// bearer token. net/http grows a connection's header buffer up to this
+		// bound before any handler, middleware or token gate runs, so the
+		// default lets an unauthenticated peer allocate 1 MiB per concurrent
+		// connection on an endpoint whose whole job is to still be alive.
+		// 16 KiB is far above anything a sender or a fronting proxy emits and
+		// bounds that amplification at 64x less memory; over-long headers get
+		// net/http's own 431.
+		webhttp.WithMaxHeaderBytes(16<<10),
 		// Connection-level errors net/http reports itself -- above all
 		// "http: Accept error: ...; retrying", the trace of an exhausted fd
 		// budget that stops every beat from being received -- default to the
@@ -153,15 +176,7 @@ func run() error {
 	// Bind up front so a port-in-use error surfaces synchronously.
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ListenAddr)
 	if err != nil {
-		// A signal that arrives before the bind cancels the Listen itself, so
-		// this error IS the shutdown, not a port conflict. Report the stop and
-		// return nil (run's contract for a clean signal-driven shutdown)
-		// instead of an Error line naming the address.
-		if ctx.Err() != nil {
-			slog.Info("shutting down before the listener was bound")
-			return nil
-		}
-		return fmt.Errorf("binding %s: %w", cfg.ListenAddr, err)
+		return classifyBindError(ctx.Err(), cfg.ListenAddr, err)
 	}
 	slog.Info("listening", "addr", ln.Addr().String())
 	marker.Set(true)
@@ -200,27 +215,60 @@ func run() error {
 	onShutdown := func(teardownCtx context.Context) {
 		awaitWatchLoop(teardownCtx, watcherDone)
 	}
-	// Handle the non-graceful exit where Serve returns before a signal:
-	// webhttp skips the drain hooks on this path, so mark the process
-	// unhealthy, cancel the watcher, and wait for it under the one grace
-	// budget carried by exitCtx. Run invokes either this hook or the
-	// graceful shutdown hooks, never both.
-	//
-	// The stop() is this hook's own, not a duplicate of main's defer: ctx is
-	// still live here (no signal arrived), so without it awaitWatchLoop would
-	// wait out the whole grace for a watch loop nobody asked to stop.
+	// Handle the non-graceful exit where Serve returns before a signal.
+	// webhttp.Run invokes either this hook or the graceful shutdown hooks,
+	// never both; teardownAfterServeExit owns what that path must do.
 	serveExit := webhttp.WithServeExit(func(exitCtx context.Context) {
-		marker.Set(false)
-		// The graceful path's "shutting down" does not run here (webhttp skips
-		// pre-drain when Serve returns on its own), and the serve error itself is
-		// logged only after this teardown returns. Without this line the watch
-		// loop's abandoned-delivery lines are read before anything says why.
-		slog.Info("serve loop exited, tearing down")
-		stop()
-		onShutdown(exitCtx)
+		teardownAfterServeExit(exitCtx, marker, stop, watcherDone)
 	})
 	err = webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
 	return classifyServeError(err)
+}
+
+// teardownAfterServeExit runs the teardown for the non-graceful exit where
+// Serve returns before a signal: webhttp skips the drain hooks on that path,
+// so this is the only place that marks the process unhealthy, cancels the
+// watcher and waits for it, all under the one grace budget carried by exitCtx.
+//
+// The stop() is this path's own, not a duplicate of main's defer: the app
+// context is still live here (no signal arrived), so without it awaitWatchLoop
+// would wait out the whole grace for a watch loop nobody asked to stop.
+func teardownAfterServeExit(exitCtx context.Context, marker *health.Marker, stop context.CancelFunc, watcherDone <-chan struct{}) {
+	marker.Set(false)
+	// The graceful path's "shutting down" does not run here (webhttp skips
+	// pre-drain when Serve returns on its own), and the serve error itself is
+	// logged only after this teardown returns. Without this line the watch
+	// loop's abandoned-delivery lines are read before anything says why.
+	slog.Info("serve loop exited, tearing down")
+	stop()
+	awaitWatchLoop(exitCtx, watcherDone)
+}
+
+// classifyBindError turns a failed listener bind into run's own contract.
+//
+// A signal that arrives before the bind cancels the Listen itself, so that
+// error IS the shutdown, not a port conflict: report the stop and return nil
+// (run's contract for a clean signal-driven shutdown) instead of an ERROR line
+// naming an address that was never the problem. ctxErr is the app context's
+// error at the moment of the failure, so a nil ctxErr means the bind itself
+// failed and the caller must see it.
+func classifyBindError(ctxErr error, addr string, err error) error {
+	if ctxErr != nil {
+		slog.Info("shutting down before the listener was bound")
+		return nil
+	}
+	return fmt.Errorf("binding %s: %w", addr, err)
+}
+
+// watchBeats translates the config DTOs into the watch package's own input
+// type. The composition root owns this boundary, so the state machine never
+// depends on how configuration was parsed.
+func watchBeats(cfg []config.Beat) []watch.Beat {
+	beats := make([]watch.Beat, len(cfg))
+	for i, b := range cfg {
+		beats[i] = watch.Beat{ID: b.ID, Deadline: b.Deadline}
+	}
+	return beats
 }
 
 // classifyServeError turns webhttp.Run's outcome into run's own contract.
@@ -232,7 +280,7 @@ func run() error {
 // the other one returns srv.Serve's own failure, an accept error that carries
 // no deadline. Every other outcome, nil included, passes through untouched.
 func classifyServeError(err error) error {
-	if err != nil && errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("the shutdown sequence outlived the %s shutdown grace (in-flight requests still draining, or a stalled pre-drain hook): %w", shutdownGrace, err)
 	}
 	return err
@@ -243,6 +291,7 @@ func classifyServeError(err error) error {
 // abandoned deliveries are then the operator's only trace of the notices this
 // process will never send.
 func awaitWatchLoop(teardownCtx context.Context, watcherDone <-chan struct{}) {
+	start := time.Now()
 	select {
 	case <-watcherDone:
 	case <-teardownCtx.Done():
@@ -254,7 +303,16 @@ func awaitWatchLoop(teardownCtx context.Context, watcherDone <-chan struct{}) {
 		select {
 		case <-watcherDone:
 		default:
-			slog.Warn("watch loop still running at the end of the shutdown grace")
+			// Report how much of the SHARED budget this phase actually got:
+			// pre-drain -> srv.Shutdown -> here all spend one shutdownGrace, so a
+			// waited value near zero says the drain consumed the budget and the loop
+			// was never given a chance, while one near the grace says the loop
+			// itself is wedged. Without both figures the line reads as an
+			// accusation against the loop either way, and nothing names the
+			// constant to raise — the same reason classifyServeError names it.
+			slog.Warn("watch loop still running at the end of the shutdown grace",
+				"waited", time.Since(start).Truncate(time.Millisecond).String(),
+				"grace", shutdownGrace.String())
 		}
 	}
 }
@@ -265,14 +323,13 @@ func logConfig(cfg *config.Config) {
 	for _, b := range cfg.Beats {
 		slog.Info("watching beat", "beat", b.ID, "deadline", b.Deadline.String())
 	}
-	beatAuth := "open"
-	if cfg.BeatToken != "" {
-		beatAuth = "required"
-	}
-	slog.Info("configuration loaded",
-		"beats", len(cfg.Beats),
-		"node", cfg.Node,
-		"listen_addr", cfg.ListenAddr,
-		"webhook", "configured",
-		"beat_auth", beatAuth)
+	// The summary's attributes come from config.Config.LogValue, the package
+	// that owns which of them are secrets and how each renders. Hand-picking
+	// them here published a rendering that had already drifted from it: the
+	// effective LOG_LEVEL was absent, and the webhook attribute was a literal
+	// rather than the presence LogValue reports. Group() spreads the SAME flat
+	// attribute names the line emitted before, so nothing in the shipped stream
+	// is renamed. No context exists at this call site yet — the signal context
+	// is installed after configuration loads — hence Background.
+	slog.LogAttrs(context.Background(), slog.LevelInfo, "configuration loaded", cfg.LogValue().Group()...)
 }

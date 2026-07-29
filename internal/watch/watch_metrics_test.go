@@ -954,3 +954,53 @@ func TestBudgetCutIsLoggedOncePerSweepWithTheDeferredCount(t *testing.T) {
 		t.Errorf("budget-cut lines in a sweep that delivered everything = %d, want 0: %v", got, quiet.Messages())
 	}
 }
+
+func TestRunReportsUndeliveredWorkWhenTheContextIsCancelled(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default.
+	//
+	// The shutdown report is wiring, not just a function: every other test of
+	// it calls logUndelivered directly, so deleting Run's call to it leaves
+	// them all green while the operator loses the ONLY trace of a notice that
+	// died with the process (this path has no delivery counter behind it).
+	const id = "run-shutdown-report-probe"
+	clock := newFakeClock()
+	n := &fakeNotifier{}
+	w := New([]Beat{{ID: id, Deadline: 10 * time.Minute}}, n, clock.Now, clock.Now())
+
+	// One ended outage whose notice never got out: the webhook is down when
+	// the sweep detects the crossing, so the record stays queued, and a late
+	// ping seals it. That record is the outage's only trace.
+	n.setFail(errors.New("discord down"))
+	if !w.Beat(id) {
+		t.Fatalf("Beat(%s) = false", id)
+	}
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	if !w.Beat(id) {
+		t.Fatalf("late Beat(%s) = false", id)
+	}
+	if got := len(w.beats[id].pendingMissing); got != 1 {
+		t.Fatalf("queued records before shutdown = %d, want 1 undelivered ended-outage record", got)
+	}
+
+	rec := capture.Default(t)
+	// A tick far beyond this test's lifetime, so only the cancellation arm of
+	// Run's select runs.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.Run(ctx, time.Hour)
+	}()
+	cancel()
+	<-done
+
+	if got := rec.CountLevel(slog.LevelWarn, "shutting down with undelivered ended-outage records"); got != 1 {
+		t.Errorf("shutdown loss warnings = %d, want exactly 1: Run must report the notices dying with the process, which no counter records: %v",
+			got, rec.Messages())
+	}
+	if !rec.HasAttr("watch loop stopped", "permanent_loss", "1") {
+		t.Errorf("shutdown summary does not report the permanently lost record: %v", rec.Records())
+	}
+}

@@ -74,12 +74,7 @@ func prepareLifecycleRun(t *testing.T, beat string) string {
 		t.Fatalf("releasing the reserved port: %v", err)
 	}
 
-	t.Setenv("BEATS", beat+":1m")
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/api/webhooks/1234567890/verysecrettoken")
-	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
-	unsetEnv(t, "BEAT_TOKEN")
-	unsetEnv(t, "BEAT_TOKEN_FILE")
-	t.Setenv("LISTEN_ADDR", addr)
+	installRunEnv(t, beat+":1m", addr)
 	capture.Default(t)
 	if err := os.Remove(health.DefaultPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		t.Skipf("cannot clear health marker at %s: %v", health.DefaultPath, err)
@@ -267,7 +262,11 @@ func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	r := startLifecycleRun(t)
 	waitForMarkerWithin(t, true, 10*time.Second)
 
-	resp, err := http.Get("http://" + addr + "/metrics")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/metrics", nil)
+	if err != nil {
+		t.Fatalf("building the /metrics request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("scrape /metrics: %v", err)
 	}
@@ -584,6 +583,59 @@ func TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace(t *testing.T) {
 
 	if rec.CountLevel(slog.LevelWarn, stillRunningWarn) != 0 {
 		t.Errorf("messages = %v, want no still-running warning for a loop that stopped inside the grace", rec.Messages())
+	}
+}
+
+// TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits pins the
+// non-graceful teardown: webhttp skips the drain hooks when Serve returns
+// before a signal, so this path is the only thing that stops a dead process
+// from reporting itself healthy and the only thing that cancels the watch
+// loop. A dropped marker flip leaves `knell health` calling a container with
+// no listener healthy until it is killed; a missing stop() leaves the watcher
+// alerting behind a server that no longer answers, and makes the teardown burn
+// the whole grace on a loop nobody asked to stop.
+//
+// The stop func closes watcherDone: the wait can only finish if cancellation
+// happened FIRST, so a teardown that waits before cancelling fails here
+// instead of only being slow in production.
+func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default.
+	rec := capture.Default(t)
+
+	marker := health.NewMarker(t.TempDir() + "/healthy")
+	marker.Set(true)
+	if !marker.Healthy() {
+		t.Skip("cannot plant a health marker in the test temp dir")
+	}
+
+	exitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	watcherDone := make(chan struct{})
+	stopCalls := 0
+	stop := func() {
+		stopCalls++
+		close(watcherDone)
+	}
+
+	start := time.Now()
+	teardownAfterServeExit(exitCtx, marker, stop, watcherDone)
+	waited := time.Since(start)
+
+	if stopCalls != 1 {
+		t.Errorf("stop() called %d times, want exactly 1: an uncancelled watcher keeps alerting behind a server that stopped serving", stopCalls)
+	}
+	if marker.Healthy() {
+		t.Error("marker still healthy after the serve loop exited: the baked `knell health` probe would report a container with no listener as healthy")
+	}
+	if !rec.Contains("serve loop exited, tearing down") {
+		t.Errorf("messages = %v, want the non-graceful exit named; without it the watch loop's abandoned-delivery lines are read before anything says why", rec.Messages())
+	}
+	if n := rec.CountLevel(slog.LevelWarn, stillRunningWarn); n != 0 {
+		t.Errorf("%q logged %d times, want 0: the loop stopped inside the grace", stillRunningWarn, n)
+	}
+	if waited > time.Second {
+		t.Errorf("teardown took %s, want it to cancel the watch loop before waiting for it", waited)
 	}
 }
 

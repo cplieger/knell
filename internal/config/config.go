@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cplieger/envx"
+	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/slogx"
 )
 
@@ -50,22 +51,13 @@ const minTokenLength = 16
 // configuration.
 const asciiWhitespace = " \t\r\n\v\f"
 
-// maxNodeNameBytes caps NODE_NAME so every notification stays inside
-// Discord's 2000-character `content` limit. The node name is interpolated
-// into EVERY notice (missing, recovered, history), so an unbounded value
-// makes Discord reject all of them: knell would start, accept beats and
-// detect outages while no notice is ever delivered — a dead-man switch that
-// delivers nothing.
-//
-// The budget, worst case over notify's templates: the longest fixed text is
-// the single-outage history notice (54 chars) plus its longest late clause
-// (111) = 165, plus a beat id (<= 64 by beatIDPattern), a truncated duration
-// (<= 32) and a "2006-01-02 15:04 MST" recovery timestamp (20) = 281
-// characters. That leaves ~1719 for the node name, so 256 keeps a wide
-// margin while admitting every DNS-legal hostname (253 max). Counting BYTES
-// is conservative against Discord's character limit: UTF-8 bytes are always
-// >= the character count and >= the UTF-16 code-unit count.
-const maxNodeNameBytes = 256
+// maxNodeNameBytes caps NODE_NAME so every notification stays inside Discord's
+// 2000-character `content` limit. The bound itself lives in internal/notify
+// (notify.MaxNodeNameBytes), the package that owns every template it is
+// measured over, so a wording change and the budget it consumes are read in one
+// place; config's job is to ENFORCE it as an operator-facing cap. Counting
+// BYTES is conservative against Discord's character limit.
+const maxNodeNameBytes = notify.MaxNodeNameBytes
 
 // defaultListenAddr is the listener address used when LISTEN_ADDR is unset or
 // blank.
@@ -158,12 +150,7 @@ func Load() (Config, error) {
 	}
 	cfg.BeatToken = beatToken
 
-	rawLevel := envx.String("LOG_LEVEL", "")
-	level, ok := slogx.ParseLevel(rawLevel, slog.LevelInfo)
-	if !ok {
-		slog.Warn("invalid LOG_LEVEL, using info", "value", rawLevel)
-	}
-	cfg.LogLevel = level
+	cfg.LogLevel = logLevel()
 
 	return cfg, nil
 }
@@ -234,6 +221,29 @@ func listenAddr() string {
 		slog.Warn("LISTEN_ADDR is set but blank and was ignored; the listener binds every interface at the default address, so unset the variable to accept that on purpose, or set a host:port to narrow it", "listen_addr", defaultListenAddr)
 	}
 	return defaultListenAddr
+}
+
+// logLevel resolves the log level: LOG_LEVEL when it parses, else info. A
+// present-but-blank value is warned about and ignored, the same accident
+// listenAddr and nodeName already report (compose interpolation of an
+// undefined variable produces exactly it). It matters most on this variable:
+// slogx.ParseLevel returns ok=true for a blank value, so the one knob an
+// operator turns while diagnosing a live outage is also the one whose
+// silent fallback hides the diagnosis.
+func logLevel() slog.Level {
+	// LookupEnv, not envx.String, for the reason listenAddr gives: envx.String
+	// collapses present-but-blank with unset, and only the former is an
+	// accident worth a line.
+	raw, present := os.LookupEnv("LOG_LEVEL")
+	if present && strings.TrimSpace(raw) == "" {
+		slog.Warn("LOG_LEVEL is set but blank and was ignored; logging stays at the default level, so unset the variable to accept that on purpose, or set debug, info, warn or error", "log_level", slog.LevelInfo.String())
+		return slog.LevelInfo
+	}
+	level, ok := slogx.ParseLevel(raw, slog.LevelInfo)
+	if !ok {
+		slog.Warn("invalid LOG_LEVEL, using info", "value", raw)
+	}
+	return level
 }
 
 // rejectBlankFileVar fails startup when a `_FILE` variable is PRESENT but
@@ -329,6 +339,16 @@ func checkBeatToken(token string) error {
 		// where describing a live credential's alphabet narrows a guess.
 		slog.Warn("BEAT_TOKEN is armed with a value that is easy to mistake for absent; the /beat/{id} gate requires it and every sender must present it verbatim, so set a long random token, or unset the variable to serve the endpoint open")
 	}
+	if !beatTokenFitsHeader(token) {
+		// Free of edge padding, yet still unpresentable: a control byte (a
+		// pasted newline, a \n that came through a compose value verbatim, a
+		// stray second line in a secret file) is illegal in an HTTP field
+		// value, so no sender can deliver this token. Refuse at startup rather
+		// than arm a gate that 401s every ping and turns every configured beat
+		// falsely missing one deadline later. The value is never echoed: the
+		// message names the variable and the shape of the problem only.
+		return errors.New("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it; use a token containing printable characters, or unset the variable entirely to serve /beat/{id} open on purpose")
+	}
 	return nil
 }
 
@@ -387,20 +407,9 @@ func loadBeatToken() (string, error) {
 	if token == "" {
 		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE was set (the only arm that
 		// reaches here empty): the documented open-endpoint case, so there is
-		// no token to shape-check and nothing to measure. Stated once here so a
-		// check added below cannot forget it and warn about a token that does
-		// not exist.
+		// nothing to measure. Stated once here so a check added below cannot
+		// forget it and warn about a token that does not exist.
 		return "", nil
-	}
-	if !beatTokenFitsHeader(token) {
-		// Free of edge padding, yet still unpresentable: a control byte (a
-		// pasted newline, a \n that came through a compose value verbatim, a
-		// stray second line in a secret file) is illegal in an HTTP field
-		// value, so no sender can deliver this token. Refuse at startup rather
-		// than arm a gate that 401s every ping and turns every configured beat
-		// falsely missing one deadline later. The value is never echoed: the
-		// message names the variable and the shape of the problem only.
-		return "", errors.New("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it; use a token containing printable characters, or unset the variable entirely to serve /beat/{id} open on purpose")
 	}
 	// The token is now fully validated, so the winning-source advisory cannot
 	// be followed by a startup failure about the credential it just described.
@@ -436,8 +445,6 @@ func loadWebhook() (string, error) {
 		return "", fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
 	}
 
-	warnPlainVarIgnored("DISCORD_WEBHOOK_URL", "webhook URL", src)
-
 	// envx trims the _FILE branch only; a plain variable copied from a
 	// deployment file can carry padding. A trailing space survives
 	// url.Parse and is escaped as %20 on every POST, so Discord answers
@@ -453,6 +460,11 @@ func loadWebhook() (string, error) {
 	if _, err := parseWebhookURL(webhook); err != nil {
 		return "", fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
 	}
+	// The URL is now fully validated, so the winning-source advisory cannot be
+	// followed by a startup failure about the credential it just described --
+	// the position loadBeatToken already uses, and the one warnPlainVarIgnored's
+	// own contract requires.
+	warnPlainVarIgnored("DISCORD_WEBHOOK_URL", "webhook URL", src)
 	return webhook, nil
 }
 

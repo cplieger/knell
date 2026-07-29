@@ -1308,6 +1308,10 @@ func TestTransportPhraseClassifiesStructurally(t *testing.T) {
 			cause: &net.OpError{Op: "proxyconnect", Err: &net.DNSError{Err: remote, Name: remote}},
 			want:  "the egress proxy could not be reached",
 		},
+		"a timed-out egress proxy still names the proxy as the stage": {
+			cause: &net.OpError{Op: "proxyconnect", Err: &net.OpError{Op: "dial", Err: fmt.Errorf("%s: %w", remote, context.DeadlineExceeded)}},
+			want:  "a deadline expired during proxyconnect",
+		},
 		"reset": {
 			cause: &net.OpError{Op: "read", Err: fmt.Errorf("%s: %w", remote, syscall.ECONNRESET)},
 			want:  "the connection to the webhook was reset",
@@ -1881,6 +1885,18 @@ func TestExhaustedDeliveryIsLoggedBelowAlarmLevel(t *testing.T) {
 		t.Fatal("BeatMissing against a refused connection = nil, want error")
 	}
 	requireLogged(t, rec)
+	// Both lines must still say WHICH notice failed. httpx builds them as
+	// "<label> failed, retrying" and "<label> retries exhausted" from post's
+	// WithLabel; with the option dropped they read "operation ...", so the
+	// per-attempt record during a webhook outage names neither the
+	// notification kind nor the beat. requireLogged matches httpx's own words
+	// only, so nothing else in this package notices.
+	const label = "discord webhook missing api"
+	for _, line := range []string{label + " failed, retrying", label + " retries exhausted"} {
+		if rec.Count(line) == 0 {
+			t.Errorf("delivery logs have no %q line; records = %v", line, rec.Records())
+		}
+	}
 	// The level asserted as a level, not as TextHandler's `level=WARN`
 	// rendering: CountLevel reads the record's own Level, so the assertion
 	// survives a handler change and cannot be retired by a rendering one.

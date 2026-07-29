@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/cplieger/health"
 	"github.com/cplieger/knell/internal/config"
+	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -28,6 +30,23 @@ func unsetEnv(t *testing.T, key string) {
 	if err := os.Unsetenv(key); err != nil {
 		t.Fatalf("unsetting %s: %v", key, err)
 	}
+}
+
+// installRunEnv installs a complete environment config.Load accepts: the beats
+// spec, the listen address, the webhook (whose token half every leak assertion
+// greps for), and the _FILE and token variables explicitly CLEARED, since one
+// leaked from another test changes what run() reads. It is the single home of
+// "a configuration run() gets past", so a newly required variable cannot leave
+// one boot test failing at the config gate while its sibling still reaches the
+// gate it means to exercise.
+func installRunEnv(t *testing.T, beats, addr string) {
+	t.Helper()
+	t.Setenv("BEATS", beats)
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/api/webhooks/1234567890/verysecrettoken")
+	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
+	unsetEnv(t, "BEAT_TOKEN")
+	unsetEnv(t, "BEAT_TOKEN_FILE")
+	t.Setenv("LISTEN_ADDR", addr)
 }
 
 // plantHealthMarker creates the marker a previous knell run would have left
@@ -97,6 +116,31 @@ func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
 	}
 }
 
+// TestWatchBeatsCarriesEveryIDAndDeadlineIntoTheStateMachine pins the one
+// translation main owns between parsed configuration and the state machine.
+// The watch tests build their own []watch.Beat and the config tests stop at
+// []config.Beat, so a field dropped or crossed HERE is invisible to both: a
+// lost deadline arms every beat at zero and fires a false missing notice on
+// every restart, and a lost id makes the configured beat 404 forever.
+func TestWatchBeatsCarriesEveryIDAndDeadlineIntoTheStateMachine(t *testing.T) {
+	t.Parallel()
+
+	got := watchBeats([]config.Beat{
+		{ID: "api", Deadline: 20 * time.Minute},
+		{ID: "cron-backup", Deadline: 26 * time.Hour},
+	})
+	want := []watch.Beat{
+		{ID: "api", Deadline: 20 * time.Minute},
+		{ID: "cron-backup", Deadline: 26 * time.Hour},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("watchBeats = %v, want %v: a dropped deadline arms every beat at zero, so the first freshness refresh reports it overdue and the next sweep fires a false missing notice on every restart; a dropped id makes the beat unpingable and 404 forever", got, want)
+	}
+	if beats := watchBeats(nil); len(beats) != 0 {
+		t.Errorf("watchBeats(nil) = %v, want no beats", beats)
+	}
+}
+
 func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global
 	// slog default to inspect the startup summary.
@@ -157,12 +201,7 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = occupied.Close() })
 
-	t.Setenv("BEATS", "api:20m")
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/api/webhooks/1234567890/verysecrettoken")
-	unsetEnv(t, "BEAT_TOKEN")
-	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
-	unsetEnv(t, "BEAT_TOKEN_FILE")
-	t.Setenv("LISTEN_ADDR", occupied.Addr().String())
+	installRunEnv(t, "api:20m", occupied.Addr().String())
 	capture.Default(t)
 
 	err = run()
@@ -174,6 +213,42 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "verysecrettoken") {
 		t.Errorf("bind error leaks the webhook URL: %v", err)
+	}
+}
+
+// TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict pins the boot
+// path a container stopped during startup takes. A signal that arrives before
+// the bind cancels the Listen itself, so the resulting error IS the shutdown:
+// reported as a bind failure it would exit 1 (a restart loop) and name an
+// address that was never the problem. The inverse matters just as much: a real
+// port conflict must still surface, or knell idles as a dead switch behind a
+// listener nothing can reach.
+func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default.
+	rec := capture.Default(t)
+
+	bindFailure := errors.New("listen tcp :9190: bind: address already in use")
+
+	got := classifyBindError(nil, ":9190", bindFailure)
+	if got == nil {
+		t.Fatal("classifyBindError(nil ctxErr) = nil, want the bind failure surfaced so the boot fails instead of running as a switch nothing can reach")
+	}
+	if !errors.Is(got, bindFailure) {
+		t.Errorf("classifyBindError = %v, want the bind failure still unwrappable", got)
+	}
+	if !strings.Contains(got.Error(), ":9190") {
+		t.Errorf("classifyBindError = %q, want the address named so the operator knows which port to free", got)
+	}
+	if rec.Contains("shutting down before the listener was bound") {
+		t.Errorf("a port conflict reported itself as a clean stop: %v", rec.Messages())
+	}
+
+	if got := classifyBindError(context.Canceled, ":9190", bindFailure); got != nil {
+		t.Errorf("classifyBindError(canceled) = %v, want nil: a signal arriving before the bind is a clean stop, not a boot failure", got)
+	}
+	if !rec.Contains("shutting down before the listener was bound") {
+		t.Errorf("messages = %v, want the pre-bind stop reported; otherwise a container stopped mid-boot leaves no trace of why it never served", rec.Messages())
 	}
 }
 

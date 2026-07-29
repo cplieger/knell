@@ -149,6 +149,22 @@ var beatLastSeen = metricslib.NewLabeledGauge(
 	[]string{beatLabel},
 )
 
+// beatDeadline is each configured beat's silence deadline in seconds. It is
+// configuration, not state, so it never changes for the process lifetime:
+// it exists because the deadline is the value that decides when a beat is
+// declared missing, and without it the exposition cannot answer two
+// operator questions at all — how long until this overdue beat fires, and
+// do the observers aggregated by one quorum rule agree on the deadline
+// (a BEATS skew between nodes is otherwise invisible until one node
+// alerts and the others stay quiet). The label is the same bounded beat
+// label as its siblings, so this adds no cardinality the package doc's
+// contract does not already cover.
+var beatDeadline = metricslib.NewLabeledGauge(
+	"beat_deadline_seconds",
+	"Configured silence deadline per beat, in seconds.",
+	[]string{beatLabel},
+)
+
 // beatsReceived counts accepted pings per beat. Unknown beat ids are
 // rejected with 404 and deliberately not counted (the id is a label; counting
 // arbitrary request paths would let callers mint unbounded series).
@@ -250,6 +266,7 @@ var httpDuration = metricslib.NewHistogram(
 func init() {
 	registry.RegisterLabeledGauge(beatFresh)
 	registry.RegisterLabeledGauge(beatLastSeen)
+	registry.RegisterLabeledGauge(beatDeadline)
 	registry.RegisterLabeledCounter(beatsReceived)
 	registry.RegisterLabeledCounter(beatOutages)
 	registry.RegisterLabeledCounter(notificationsSent)
@@ -275,7 +292,8 @@ func Handler() http.Handler {
 // increase() needs an earlier sample to diff against. Only configured ids
 // reach here, which is what keeps the beat label bounded (see the package
 // doc's label-cardinality contract).
-func InitBeat(id string, start time.Time) {
+func InitBeat(id string, deadline time.Duration, start time.Time) {
+	beatDeadline.Set(deadline.Seconds(), id)
 	beatFresh.Set(1, id)
 	beatLastSeen.Set(float64(start.Unix()), id)
 	beatsReceived.Add(0, id)

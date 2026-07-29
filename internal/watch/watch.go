@@ -31,6 +31,14 @@ import (
 // expected to retry transient failures internally and return the final
 // outcome.
 //
+// Every method's returned error is logged VERBATIM by this package (sendMissing,
+// sendHistory and sendRecovered log it as the "error" attribute), so an
+// implementation must return only log-safe errors: the webhook endpoint knell
+// posts to carries its credential in its own URL path, and an error that wraps
+// that URL would publish the credential into the log stream. internal/notify
+// reduces every transport error through httpx.LogSafeError for exactly this
+// reason; a second implementation has to do the same.
+//
 // The first two methods report a LIVE incident as it happens; the third
 // reports outages that were already over by the time their notice could be
 // sent, so an implementation must render it in the past tense. Nothing
@@ -489,7 +497,7 @@ func New(beats []Beat, notifier Notifier, now func() time.Time, start time.Time)
 		// InitBeat publishes the beat's boot-armed baseline (fresh from
 		// start) and pre-mints its per-beat counters at zero, so increase()
 		// has an earlier sample from a cold start.
-		metrics.InitBeat(b.ID, start)
+		metrics.InitBeat(b.ID, b.Deadline, start)
 	}
 	return w
 }
@@ -564,7 +572,7 @@ func (w *Watcher) Beat(id string) bool {
 			st.recovering = false
 			w.mu.Unlock()
 			metrics.RecordNotificationDropped(metrics.KindRecovered)
-			slog.Warn("recovery queue full, dropping recovered notification",
+			slog.Warn("recovery queue full, dropping recovered notification, nothing retries it and no notice for this recovery will ever arrive",
 				"beat", id, "down_for", silence.DownFor().String())
 		}
 	}

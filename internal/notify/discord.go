@@ -35,6 +35,34 @@ import (
 // governs).
 const attemptTimeout = 10 * time.Second
 
+// maxContentRunes is Discord's hard limit on a webhook message's `content`
+// field. Every notice this package renders must stay inside it, or Discord
+// answers 400 and no notice is ever delivered.
+const maxContentRunes = 2000
+
+// MaxNodeNameBytes is the largest node name every notice this package renders
+// can carry and still stay inside Discord's 2000-character `content` limit.
+// The node name is interpolated into EVERY notice (missing, recovered,
+// history), so an unbounded value makes Discord reject all of them: knell would
+// start, accept beats and detect outages while no notice is ever delivered — a
+// dead-man switch that delivers nothing. It lives here, beside the templates it
+// is measured over, so a wording change and the budget it consumes are read in
+// one place; internal/config enforces it as the operator-facing NODE_NAME cap.
+//
+// The budget, worst case over the templates below: the MULTI-outage history
+// notice (historyMessage's len(outages) > 1 branch, 65 chars of fixed text)
+// carrying the mixed batchLateClause (101 chars, the longest of the four late
+// clauses), plus a beat id (<= 64 by config's beat-id grammar), a truncated
+// duration (<= 32), a "2006-01-02 15:04 MST" recovery timestamp (20) and three
+// outage counts (1 digit each: a batch is bounded by watch's missingQueueSize =
+// 8) = 285 characters. The single-outage notice is shorter (54 + its 111-char
+// LateEndedBeforeDetection clause + 64 + 32 + 20 = 281) and so is the missing
+// notice (168 + 64 + 32 = 264). That leaves ~1715 for the node name, so 256
+// keeps a wide margin while admitting every DNS-legal hostname (253 max).
+// Counting BYTES is conservative against Discord's character limit: UTF-8 bytes
+// are always >= the character count and >= the UTF-16 code-unit count.
+const MaxNodeNameBytes = 256
+
 // maxAttempts is the total delivery attempts per notification (httpx
 // semantics: total, including the first).
 const maxAttempts = 3
@@ -134,7 +162,12 @@ func (d *Discord) BeatRecovered(ctx context.Context, id string, live watch.Trans
 }
 
 // historyTimeFormat includes the date because queued history notices may arrive
-// days after recovery, and the zone because readers may be outside the observer's timezone.
+// days after recovery, and the zone because readers may be outside the
+// observer's timezone. The instant is always converted to UTC before
+// formatting, so the zone renders as "UTC" whatever TZ the process runs
+// under: the README's notice examples state UTC, and the recovery point is
+// what an operator correlates against knell's own log lines (slogx normalizes
+// those to UTC) and knell_beat_last_seen_timestamp_seconds.
 const historyTimeFormat = "2006-01-02 15:04 MST"
 
 // BeatOutageHistory announces outages that were already over by the time this
@@ -147,6 +180,19 @@ func (d *Discord) BeatOutageHistory(ctx context.Context, id string, outages []wa
 		// watch never sends an empty history notice; guard so a future
 		// caller cannot post a message that reports nothing.
 		return errors.New("delivering history notification: no ended outages to report")
+	}
+	// The contract's other half, guarded the same way: every entry carries its
+	// own recovery point. watch's closedRun stops at the first record whose
+	// recoveredAt is unset, so an open record never reaches here today - but
+	// one would render "recovered at 0001-01-01 00:00 UTC" and a negative
+	// silence, which is exactly the resolved-outage lie this package exists to
+	// prevent, so refuse it instead of publishing it.
+	for i := range outages {
+		if outages[i].Recovered.IsZero() || outages[i].Recovered.Before(outages[i].Started) {
+			return fmt.Errorf(
+				"delivering history notification: outage %d of %d has no recovery point at or after its start",
+				i+1, len(outages))
+		}
 	}
 	return d.post(ctx, "history "+id, d.historyMessage(id, outages))
 }
@@ -162,7 +208,7 @@ func (d *Discord) BeatOutageHistory(ctx context.Context, id string, outages []wa
 // could see it, where a webhook check finds nothing wrong.
 func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 	last := outages[len(outages)-1]
-	recovered := last.Recovered.Format(historyTimeFormat)
+	recovered := last.Recovered.UTC().Format(historyTimeFormat)
 	if len(outages) == 1 {
 		return fmt.Sprintf(
 			"🕓 [knell %s] beat **%s** was missing for %s, recovered at %s. %s",
@@ -342,6 +388,20 @@ func safeTransportError(err error) error {
 			break
 		}
 		cause = logSafe(cause)
+	}
+	var unreduced *url.Error
+	if errors.As(cause, &unreduced) {
+		// The cap was reached with a *url.Error still in the chain, so the
+		// full webhook URL is still reachable through it -- and post's own
+		// logSafe SEARCHES the chain with errors.As and RETURNS what it
+		// finds, so it would discard this wrapper and render that error's
+		// cause (net/http writes two of those from the Location header).
+		// Fail closed like every other reduction here: publish the phrase
+		// with no cause at all. The cost is the classification httpx and
+		// watch read off the chain, so the attempt is terminal and the 15s
+		// sweep retries the delivery -- affordable where a published
+		// credential is not.
+		return transportError{phrase: "webhook transport failed", cause: nil}
 	}
 	return transportError{phrase: transportPhrase(cause), cause: cause}
 }
@@ -647,6 +707,13 @@ func readFailure(err error) string {
 	switch {
 	case errors.Is(err, io.ErrUnexpectedEOF):
 		return "the connection closed before the body was complete"
+	case errors.Is(err, context.Canceled):
+		// Shutdown, not a fault on the path to Discord: the sweep's context
+		// was canceled while the rejected response's body was being read.
+		// It reaches here by the same mechanism as the deadline below (the
+		// attempt context governs the body read too), and transportPhrase
+		// names the same cause for the pre-response half of an attempt.
+		return "delivery was canceled before the body was complete"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "the attempt deadline expired mid-body"
 	case errors.Is(err, syscall.ECONNRESET):

@@ -117,7 +117,7 @@ func TestMetricsExposition(t *testing.T) {
 	// tests run in isolation (labeled metrics emit no output until a first
 	// series is recorded). The notification counters need no touch: the
 	// metrics package pre-mints every kind at init.
-	metrics.InitBeat("webapi-test", time.Unix(0, 0))
+	metrics.InitBeat("webapi-test", 20*time.Minute, time.Unix(0, 0))
 
 	h := newTestHandler(&fakeBeater{}, "")
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
@@ -314,9 +314,7 @@ type unboundedReader struct {
 }
 
 func (r *unboundedReader) Read(p []byte) (int, error) {
-	for i := range p {
-		p[i] = 0
-	}
+	clear(p)
 	r.n += int64(len(p))
 	return len(p), nil
 }
