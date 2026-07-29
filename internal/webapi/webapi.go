@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path"
+	"strings"
 
 	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/webhttp"
@@ -191,15 +193,84 @@ func New(appCtx context.Context, b Beater, token string, routes Routes) http.Han
 		// of beatHandler's token gate. Inactive when ALLOWED_HOSTS is unset:
 		// HostPolicy.Middleware then returns next unwrapped.
 		routes.Hosts.Middleware(),
+		// Inside the Host policy, and inside nothing else: this guard answers
+		// for knell's own routes only, so a refused Host must still be refused
+		// as a Host (403) rather than as an unknown beat. See canonicalBeatPath.
+		canonicalBeatPath,
 	)
+}
+
+// canonicalBeatPath refuses a /beat request whose path net/http would rewrite
+// before route matching, so no /beat spelling can answer a redirect.
+//
+// ServeMux sanitizes repeated slashes and literal dot segments in its own
+// pass, which runs BEFORE pattern selection: /beat//, /beat/./api,
+// /beat/api/../ghost and //beat/api all answer 307 with a Location, and no
+// registered pattern can catch them (the exact /beat, /beat/{$} and
+// /beat/{id}/{rest...} routes only close the spellings that reach matching).
+// A 307 is a SUCCESS status to the documented `curl -fsS` sender, so such a
+// sender exits 0 having recorded nothing and the beat reads as missing a full
+// deadline later, with nothing anywhere saying the URL was malformed — the
+// same failure the bare /beat route exists to prevent, one spelling class over.
+//
+// The comparison is against the sanitation net/http itself performs
+// (path.Clean, with a trailing slash preserved — see net/http's cleanPath), so
+// the guard fires on exactly the spellings ServeMux would rewrite and on
+// nothing else: /beat/ and /beat/{id}/ are already canonical and keep routing
+// to their own patterns (which is what keeps their request-counter labels).
+// The guard fires only when the request is in (or cleans into) the /beat
+// namespace, so every other path keeps net/http's own behavior. The verdict is
+// writeUnknownBeat: a path that is not a canonical /beat/{id} names no
+// configured beat, which is exactly what the other malformed-URL shapes
+// already answer.
+func canonicalBeatPath(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := r.URL.Path
+		if clean := sanitizedPath(raw); clean != raw &&
+			(inBeatNamespace(raw) || inBeatNamespace(clean)) {
+			writeUnknownBeat(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// sanitizedPath mirrors net/http's own cleanPath: path.Clean, with a trailing
+// slash preserved. The trailing slash is load-bearing here, because ServeMux
+// does NOT redirect a path that only ends in one when a pattern matches it —
+// /beat/ and /beat/{id}/ are served by this file's own routes — so folding it
+// away would make canonicalBeatPath swallow two refusals that already answer
+// correctly under their own patterns.
+func sanitizedPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	clean := path.Clean(p)
+	if p[len(p)-1] == '/' && clean != "/" {
+		clean += "/"
+	}
+	return clean
+}
+
+// inBeatNamespace reports whether p is the bare /beat prefix or a path under
+// it. Both the raw and the sanitized spelling matter to canonicalBeatPath: a
+// request can ENTER the namespace only after cleaning (//beat/api) or leave one
+// id for another (/beat/api/../ghost), and either way the sender believed it
+// was pinging a beat.
+func inBeatNamespace(p string) bool {
+	return p == "/beat" || strings.HasPrefix(p, "/beat/")
 }
 
 // noStore marks every response uncacheable. Every route knell serves is
 // dynamic state: a ping acknowledgement, a liveness verdict, and the
 // freshness exposition that IS the quorum ground truth. None of it may be
 // answered from a cache, and a GET ping is a documented sender mode, so the
-// header goes on the whole surface rather than one route. It is listed last
-// in Chain (innermost) so it lands before any handler writes a status.
+// header goes on the whole surface rather than one route. It wraps the Host
+// policy as well as the mux so Host-refusal responses also carry no-store;
+// keep it before routes.Hosts.Middleware in Chain.
 func noStore(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")

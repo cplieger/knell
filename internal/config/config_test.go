@@ -772,11 +772,10 @@ func TestLoadTrimsPaddedPlainWebhook(t *testing.T) {
 // string: a dead-man switch must not silently rewrite a credential.
 func TestLoadRejectsAPaddedPlainBeatToken(t *testing.T) {
 	tests := map[string]string{
-		"leading space":    " unit-test-beat-token",
-		"trailing space":   "unit-test-beat-token ",
-		"both edges":       "  unit-test-beat-token  ",
-		"leading tab":      "\tunit-test-beat-token",
-		"trailing newline": "unit-test-beat-token\n",
+		"leading space":  " unit-test-beat-token",
+		"trailing space": "unit-test-beat-token ",
+		"both edges":     "  unit-test-beat-token  ",
+		"leading tab":    "\tunit-test-beat-token",
 	}
 	for name, token := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -947,18 +946,28 @@ func TestLoadRejectsASCIIPaddingAroundANonASCIISpaceBeatToken(t *testing.T) {
 
 func TestLoadRejectsABeatTokenHTTPCannotCarry(t *testing.T) {
 	// Distinct from the whitespace-only refusal: these values are non-empty
-	// after the ASCII trim, so trimming cannot rescue them, yet HTTP forbids
+	// after an ASCII trim, so trimming cannot rescue them, yet HTTP forbids
 	// the byte they carry in a field value. Go's client refuses to write the
 	// header and Go's server rejects a handcrafted one before beatHandler, so
 	// the gate would be armed with a token no sender could ever present —
 	// knell starts, reports healthy, records no ping, and one deadline later
-	// declares every configured beat missing.
+	// declares every configured beat missing. The interior spellings are caught
+	// by beatTokenFitsHeader and the edge ones by the padding cutset; the
+	// classification is one class to the operator, which is why they share this
+	// table.
 	tests := map[string]string{
 		"interior newline":        "alpha\nbeta",
 		"interior carriage":       "alpha\rbeta",
 		"trailing newline inside": "alpha\nbeta\n",
 		"delete byte":             "alpha\x7fbeta",
 		"vertical tab interior":   "alpha\vbeta",
+		// A single trailing newline (the shape a pasted value or a here-doc
+		// carries) is the EDGE spelling of the same class: CR/LF/VT/FF are
+		// forbidden field-value bytes, so no sender can present it, and the edge
+		// cutset refuses it before the interior check runs. Classified here
+		// rather than beside the SP/HTAB padding cases, which HTTP normalizes
+		// rather than forbids.
+		"trailing newline": "unit-test-beat-token\n",
 	}
 	for name, token := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -1510,6 +1519,14 @@ func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
 		// the path, so startup succeeds and no notice can ever be delivered.
 		"non-breaking space in path": {raw: "https://discord.example/api/webhooks/1/ab\u00a0c", wantErr: "invisible character"},
 		"zero-width space in host":   {raw: "https://discord.\u200bexample/api/webhooks/1/abc", wantErr: "invisible character"},
+		// url.Parse checks a port's syntax, not its range: an out-of-range port
+		// starts the process healthy and then fails EVERY POST inside net/http
+		// ("invalid port"), so the switch arms and can never ring. Both edges of
+		// the unusable range are pinned because each is a distinct spelling of
+		// the same operator typo.
+		"port zero":        {raw: "https://discord.example:0/api/webhooks/1/abc", wantErr: "port must be between 1 and 65535"},
+		"port above range": {raw: "https://discord.example:65536/api/webhooks/1/abc", wantErr: "port must be between 1 and 65535"},
+		"port far above":   {raw: "https://discord.example:99999/api/webhooks/1/abc", wantErr: "port must be between 1 and 65535"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -1527,6 +1544,17 @@ func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
 				}
 			}
 		})
+	}
+
+	// The usable port edges stay accepted: the range check must refuse the
+	// unusable spellings only, never a working non-default relay port.
+	for _, raw := range []string{
+		"https://discord.example:1/api/webhooks/1/abc",
+		"https://discord.example:65535/api/webhooks/1/abc",
+	} {
+		if _, err := parseWebhookURL(raw); err != nil {
+			t.Errorf("parseWebhookURL(%q) = %v, want nil: a port inside 1..65535 is usable", raw, err)
+		}
 	}
 
 	if _, err := parseWebhookURL("https://discord.example/api/webhooks/1/abc"); err != nil {

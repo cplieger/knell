@@ -468,6 +468,68 @@ func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 	r.waitForReturn(t, 10*time.Second, "after a shutdown signal")
 }
 
+// TestRunAppliesConfiguredHostAllowlist pins the other half main owns: the
+// wiring of cfg.AllowedHosts into webapi.New. The config suite pins env-to-
+// policy parsing and the webapi suite receives the policy as an argument, so
+// neither can catch a composition root that drops the field — every endpoint
+// would stay reachable through an attacker-controlled Host while startup still
+// reports allowlist(1).
+func TestRunAppliesConfiguredHostAllowlist(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
+	// process-wide signal, and the shared health-marker path.
+	addr := prepareLifecycleRun(t, "host-gate")
+	// Every other lifecycle boot leaves ALLOWED_HOSTS unset (the policy is
+	// then inactive and admits any Host), so this is the variable under test.
+	t.Setenv("ALLOWED_HOSTS", "knell.internal")
+
+	r := startLifecycleRun(t)
+	waitForMarkerWithin(t, true, 10*time.Second)
+
+	blockedReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("building blocked-host request: %v", err)
+	}
+	blockedReq.Host = "attacker.example"
+	blockedResp, err := http.DefaultClient.Do(blockedReq)
+	if err != nil {
+		t.Fatalf("request with blocked Host: %v", err)
+	}
+	blockedBody, err := io.ReadAll(io.LimitReader(blockedResp.Body, 1<<16))
+	if err != nil {
+		t.Fatalf("read blocked-host response: %v", err)
+	}
+	if err := blockedResp.Body.Close(); err != nil {
+		t.Fatalf("close blocked-host response: %v", err)
+	}
+	if blockedResp.StatusCode != http.StatusForbidden {
+		t.Errorf("request with an unlisted Host = %d, want 403: an unwired ALLOWED_HOSTS policy leaves the DNS-rebinding guard disabled (body %s)", blockedResp.StatusCode, blockedBody)
+	}
+	if !strings.Contains(string(blockedBody), "host_not_allowed") {
+		t.Errorf("blocked-host body = %s, want the host_not_allowed code", blockedBody)
+	}
+
+	allowedReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("building allowed-host request: %v", err)
+	}
+	allowedReq.Host = "knell.internal"
+	allowedResp, err := http.DefaultClient.Do(allowedReq)
+	if err != nil {
+		t.Fatalf("request with allowed Host: %v", err)
+	}
+	if err := allowedResp.Body.Close(); err != nil {
+		t.Fatalf("close allowed-host response: %v", err)
+	}
+	if allowedResp.StatusCode != http.StatusOK {
+		t.Errorf("request with the configured Host = %d, want 200: the allowlist must admit the hostname the operator configured", allowedResp.StatusCode)
+	}
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("signalling self: %v", err)
+	}
+	r.waitForReturn(t, 10*time.Second, "after a shutdown signal")
+}
+
 // beatResponse is one /beat answer: the status and the body a failure message
 // should quote.
 type beatResponse struct {

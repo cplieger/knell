@@ -2,8 +2,9 @@
 // configured beat last pinged, declares a beat missing once its deadline of
 // silence passes, and notifies on the missing and recovered transitions.
 //
-// The deadline clock for every beat starts at construction (process boot),
-// so a beat that never pings at all still alerts one deadline after boot.
+// The deadline clock for every beat starts at the process-start baseline
+// supplied to New, so a beat that never pings still alerts one deadline after
+// process start even when startup work delays watcher construction.
 // That deliberately closes the classic dead-man blind spot where a receiver
 // restart silently disarms the switch until the first ping re-arms it.
 //
@@ -16,14 +17,15 @@
 // between two sweeps and no alert was ever due — and each record carries
 // which one (LateReason), because the operator's next step differs.
 //
-// Every log line reporting a notification that did not go out carries a
-// retryable attribute: true when the record survives and the next sweep sends
-// it again (the missing and history send failures), false when nothing is left
-// to attempt and no notice for that transition will ever arrive (a discarded
-// record, a dropped or failed recovered notice, the notices abandoned at
-// shutdown). The LEVEL is deliberately not that signal — a retried send stays
-// at Error rather than spamming Warn every sweep — so this attribute is what a
-// log rule keys on to tell "wait for it" from "reconstruct the window".
+// Every log line reporting a delivery failure or a notice abandoned for good
+// carries a retryable attribute: true when the record survives and the next
+// sweep sends it again (the missing and history send failures), false when
+// nothing is left to attempt and no notice for that transition will ever
+// arrive (a discarded record, a dropped or failed recovered notice, the
+// notices abandoned at shutdown). The LEVEL is deliberately not that signal — a
+// retried send stays at Error rather than spamming Warn every sweep — so this
+// attribute is what a log rule keys on to tell "wait for it" from
+// "reconstruct the window".
 package watch
 
 import (
@@ -247,14 +249,17 @@ type Beat struct {
 const missingQueueSize = 8
 
 // overdueBeat is one detected missing transition: a beat past its deadline,
-// captured as the silence interval observed when the crossing was detected
-// (silence.Started is the lastSeen it was measured from, silence.Observed the
-// sweep that saw it). It stays queued on the beat until its notification is
-// delivered, and sendMissing hands it to BeatMissing unchanged, so the live
-// notice reports the interval the state machine recorded instead of a span
-// re-derived at the send.
-// recoveredAt is set once a ping ends the outage (zero while it is still
-// ongoing), so the ended outage's span survives the wait and its notice can
+// captured as the silence interval it was measured over. silence.Started is
+// the fixed lastSeen anchor the outage began at; while the outage remains
+// open, collectBeatDue refreshes silence.Observed on each sweep so a retried
+// live notice reports current silence rather than the reading of the sweep
+// that first detected the crossing. It stays queued on the beat until its
+// notification is delivered, and sendMissing hands the record's own interval
+// to BeatMissing, so the live notice reports the interval the state machine
+// recorded instead of a span re-derived at the send.
+// recoveredAt freezes the first ping that ends the outage (zero while it is
+// still ongoing), after which history derives the full span from Started to
+// recoveredAt: the ended outage's span survives the wait and its notice can
 // report it in the past tense instead of as a live failure. late says WHY
 // that past-tense notice is late, which only the code that records the
 // crossing knows (see LateReason).
@@ -1040,7 +1045,8 @@ func collectBeatDue(id string, st *beatState, now time.Time) (*overdueBeat, []Ou
 func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 	if err := w.notifier.BeatMissing(ctx, beat.id, beat.silence); err != nil {
 		if errors.Is(err, context.Canceled) {
-			slog.Info("missing notification abandoned, shutting down", "beat", beat.id)
+			slog.Info("missing notification abandoned, shutting down",
+				"beat", beat.id, "retryable", false)
 			return true
 		}
 		metrics.RecordNotificationFailed(metrics.KindMissing)
@@ -1076,7 +1082,8 @@ func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 func (w *Watcher) sendHistory(ctx context.Context, past beatOutages) bool {
 	if err := w.notifier.BeatOutageHistory(ctx, past.id, past.outages); err != nil {
 		if errors.Is(err, context.Canceled) {
-			slog.Info("outage history notification abandoned, shutting down", "beat", past.id)
+			slog.Info("outage history notification abandoned, shutting down",
+				"beat", past.id, "retryable", false)
 			return true
 		}
 		metrics.RecordNotificationFailed(metrics.KindHistory)

@@ -317,13 +317,8 @@ func logConfig(cfg *config.Config) {
 	for _, b := range cfg.Beats {
 		slog.Info("watching beat", "beat", b.ID, "deadline", b.Deadline.String())
 	}
-	// The summary's attributes come from config.Config.LogValue, the package
-	// that owns which of them are secrets and how each renders. Hand-picking
-	// them here published a rendering that had already drifted from it: the
-	// effective LOG_LEVEL was absent, and the webhook attribute was a literal
-	// rather than the presence LogValue reports. Group() spreads the SAME flat
-	// attribute names the line emitted before, so nothing in the shipped stream
-	// is renamed. No context exists at this call site yet — the signal context
-	// is installed after configuration loads — hence Background.
+	// Config owns secret redaction and startup-field selection; Group spreads
+	// those fields into the flat configuration record. No signal context exists
+	// yet because configuration loads before signal registration.
 	slog.LogAttrs(context.Background(), slog.LevelInfo, "configuration loaded", cfg.LogValue().Group()...)
 }

@@ -191,6 +191,54 @@ func beatSeriesLines(exposition string) []string {
 	return lines
 }
 
+// TestNonCanonicalBeatPathsAnswerTheCodedNotFound pins the redirect class no
+// route pattern can close. ServeMux sanitizes repeated slashes and literal dot
+// segments in a pass that runs BEFORE pattern matching, so without
+// canonicalBeatPath every spelling below answers 307 + Location — and a 307 is
+// a SUCCESS status to the documented `curl -fsS` sender, which does not follow
+// redirects unless asked. Such a sender exits 0 having recorded nothing, and
+// the beat reads as missing one full deadline later with nothing saying the URL
+// was malformed. Each case must instead be the coded 404, carry no Location,
+// and record no beat.
+func TestNonCanonicalBeatPathsAnswerTheCodedNotFound(t *testing.T) {
+	// "//beat/api" enters the /beat namespace only after cleaning;
+	// "/beat/api/../ghost" leaves one id for another; the rest are the
+	// repeated-slash and dot-segment spellings a URL join produces.
+	for _, target := range []string{"/beat//", "//beat/api", "/beat/./api", "/beat/api/../ghost", "/beat/api//"} {
+		t.Run(target, func(t *testing.T) {
+			b := &fakeBeater{known: map[string]bool{"api": true}}
+			h := newTestHandler(b, "")
+
+			rec := beatRequest(t, h, http.MethodPost, target)
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("POST %s = %d, want 404: a 3xx is a SUCCESS status to `curl -fsS`, so a malformed sender URL would exit 0 having recorded nothing (body %s)",
+					target, rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Location"); got != "" {
+				t.Errorf("POST %s carries Location: %q, want no redirect", target, got)
+			}
+			if !strings.Contains(rec.Body.String(), "unknown_beat") {
+				t.Errorf("POST %s body = %s, want the unknown_beat coded envelope a sender can parse", target, rec.Body.String())
+			}
+			if len(b.seen) != 0 {
+				t.Errorf("POST %s recorded %v, want nothing: a non-canonical path names no beat", target, b.seen)
+			}
+		})
+	}
+
+	// The canonical spelling still records: the guard must refuse the rewritten
+	// shapes only, never a well-formed ping.
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	h := newTestHandler(b, "")
+	if rec := beatRequest(t, h, http.MethodPost, "/beat/api"); rec.Code != http.StatusOK {
+		t.Fatalf("POST /beat/api = %d, want 200: the canonical ping must still record (body %s)", rec.Code, rec.Body.String())
+	}
+	if len(b.seen) != 1 {
+		t.Errorf("recorded beats = %v, want one: the canonical ping must still record", b.seen)
+	}
+}
+
 func TestMetricsExposition(t *testing.T) {
 	// Declare a beat so the per-beat series exist even when this package's
 	// tests run in isolation (labeled metrics emit no output until a first

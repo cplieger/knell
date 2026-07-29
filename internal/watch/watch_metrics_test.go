@@ -336,6 +336,56 @@ func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
 	}
 }
 
+// TestQueueFullDropKeepsTimestampAttrsTyped pins the ATTRIBUTE KINDS of the
+// queue-full loss log, which the level/message assertions above cannot see: the
+// drop warning is the lost outage's only trace, so its two instants must stay
+// typed time.Time values in UTC (a pre-rendered RFC3339 string keeps the test
+// above green while discarding sub-second precision and the typed shape a JSON
+// handler emits).
+func TestQueueFullDropKeepsTimestampAttrsTyped(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, which every other test writes through.
+	const id = "missing-overflow-timestamp-probe"
+	zone := time.FixedZone("probe", -7*60*60)
+	clock := &fakeClock{now: time.Date(2026, 7, 23, 12, 0, 0, 123456789, zone)}
+	w := New([]Beat{{ID: id, Deadline: 10 * time.Minute}}, &fakeNotifier{}, clock.Now, clock.Now())
+	w.Beat(id)
+	fillMissingQueue(t, w, clock, id)
+
+	wantSince := clock.Now().UTC()
+	clock.Advance(47*time.Minute + 987*time.Nanosecond)
+	wantRecovered := clock.Now().UTC()
+	rec := capture.Default(t)
+	w.Beat(id)
+
+	got := make(map[string]slog.Value, 2)
+	for _, record := range rec.Records() {
+		if !strings.HasPrefix(record.Message, "pending missing queue full") {
+			continue
+		}
+		record.Attrs(func(attr slog.Attr) bool {
+			if attr.Key == "since" || attr.Key == "recovered" {
+				got[attr.Key] = attr.Value
+			}
+			return true
+		})
+	}
+	for key, want := range map[string]time.Time{"since": wantSince, "recovered": wantRecovered} {
+		value, ok := got[key]
+		if !ok {
+			t.Errorf("queue-full warning has no %s attribute: %v", key, rec.Records())
+			continue
+		}
+		if value.Kind() != slog.KindTime {
+			t.Errorf("queue-full warning %s kind = %s, want Time (structured log consumers must receive a timestamp, not a pre-rendered string)", key, value.Kind())
+			continue
+		}
+		if timestamp := value.Time(); !timestamp.Equal(want) || timestamp.Location() != time.UTC {
+			t.Errorf("queue-full warning %s = %v, want %v with UTC location and nanosecond precision", key, timestamp, want)
+		}
+	}
+}
+
 func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	// Serial (no t.Parallel): asserts deltas on the package-global
 	// notification counters and captures the process-global slog default. An
@@ -640,9 +690,9 @@ func TestFailedRecoveredSendIsCountedAsDroppedNotFailed(t *testing.T) {
 }
 
 // TestUndeliveredNoticeLogsCarryTheirRetryability pins the retryable field on
-// the three loss/failure sites the capture-based tests around it do not reach:
-// the two send failures whose records stay queued, and the recovered notice
-// abandoned by a shutdown. The field exists because the LEVEL cannot carry this
+// the loss/failure sites the capture-based tests around it do not reach: the
+// two send failures whose records stay queued, and the three notices abandoned
+// by a shutdown. The field exists because the LEVEL cannot carry this
 // distinction -- a retried send deliberately stays at Error rather than spamming
 // Warn every sweep, and the abandoned recovered notice is a permanent loss
 // logged at Info with no counter behind it at all -- so without it a log rule
@@ -707,9 +757,45 @@ func TestUndeliveredNoticeLogsCarryTheirRetryability(t *testing.T) {
 	if !abandoned.HasAttr("recovered notification abandoned", "retryable", "false") {
 		t.Errorf("abandoned-recovery log does not report retryable=false, and no counter moves for this loss at all: %v", abandoned.Records())
 	}
+
+	// The two sibling abandonments, each on its own beat so no earlier state in
+	// this test decides which branch the sweep takes. Both are shutdowns, so
+	// this process sends nothing further for them: retryable=false, even though
+	// the identically-shaped FAILURE above is retryable=true.
+	const canceledMissingID = "retryability-canceled-missing-probe"
+	cm, cmClock, cmNotifier := newTestWatcher(Beat{ID: canceledMissingID, Deadline: 10 * time.Minute})
+	cm.Beat(canceledMissingID)
+	cmClock.Advance(11 * time.Minute)
+	cmNotifier.setFail(context.Canceled)
+	canceledMissing := capture.Default(t)
+	cm.sweep(context.Background())
+	if got := canceledMissing.CountLevel(slog.LevelInfo, "missing notification abandoned"); got != 1 {
+		t.Fatalf("abandoned-missing info lines = %d, want exactly 1: %v", got, canceledMissing.Messages())
+	}
+	if !canceledMissing.HasAttr("missing notification abandoned", "retryable", "false") {
+		t.Errorf("abandoned-missing log does not report retryable=false, so a log rule reads a notice this process abandoned as one it will resend: %v", canceledMissing.Records())
+	}
+
+	const canceledHistoryID = "retryability-canceled-history-probe"
+	ch, chClock, chNotifier := newTestWatcher(Beat{ID: canceledHistoryID, Deadline: 10 * time.Minute})
+	ch.Beat(canceledHistoryID)
+	chClock.Advance(11 * time.Minute)
+	if recorded, _ := ch.Beat(canceledHistoryID); !recorded {
+		t.Fatalf("closing Beat(%s) = false", canceledHistoryID)
+	}
+	chNotifier.setFail(context.Canceled)
+	canceledHistory := capture.Default(t)
+	ch.sweep(context.Background())
+	if got := canceledHistory.CountLevel(slog.LevelInfo, "outage history notification abandoned"); got != 1 {
+		t.Fatalf("abandoned-history info lines = %d, want exactly 1: %v", got, canceledHistory.Messages())
+	}
+	if !canceledHistory.HasAttr("outage history notification abandoned", "retryable", "false") {
+		t.Errorf("abandoned-history log does not report retryable=false: %v", canceledHistory.Records())
+	}
 }
 
 func TestHistoryNoticeCountsOncePerMessageWhileOutagesCountEach(t *testing.T) {
+	// Serial (no t.Parallel): it asserts deltas on the package-global
 	// notification counters, which the parallel tests also move.
 	const id = "history-counter-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})

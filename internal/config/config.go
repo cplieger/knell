@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -38,12 +39,15 @@ const minDeadline = 30 * time.Second
 const minTokenLength = 16
 
 // asciiWhitespace is the cutset of characters that can never carry a bearer
-// token through an HTTP header, and therefore the definition of the edge
-// padding loadBeatToken REFUSES: net/textproto strips leading and trailing
-// SPACE and TAB from every header value, and CR, LF, VT and FF are illegal
-// bytes in a field value, so a token whose edges are built from these
-// characters cannot reach the verifier as the operator wrote it no matter what
-// the sender puts on the wire.
+// token through an HTTP header unchanged, and therefore the definition of the
+// edge padding loadBeatToken REFUSES. The cutset covers two different
+// mechanisms: net/textproto strips SPACE and TAB from the edges of a header
+// VALUE — which for the token means its TRAILING run only, since the verifier's
+// value is "Bearer "+token and a leading run sits interior to it and survives —
+// while CR, LF, VT and FF are illegal bytes in a field value and are not
+// stripped at all, so no sender can put them on the wire. Either way the token
+// cannot reach the verifier as the operator wrote it, no matter what the sender
+// does.
 //
 // Non-ASCII spaces (NBSP U+00A0, NEL U+0085, U+2000…) are deliberately NOT in
 // the set: textproto keeps them, so a token made of them IS presented verbatim
@@ -228,10 +232,13 @@ func hostnameNode() string {
 // value (a blank one is warned about and ignored), else defaultListenAddr. A
 // padded LISTEN_ADDR copied from a deployment file is not
 // a usable address (net.Listen resolves " :9190" as a hostname lookup and
-// fails), and the padding is invisible in the resulting crash-loop log line.
-// Trimmed for the same reason the plain webhook and token values are trimmed; a
-// value that is entirely whitespace falls back to the default rather than to
-// "", which would bind an ephemeral port and hide the listener from scrapes.
+// fails), and the padding is invisible in the resulting crash-loop log line, so
+// the padding is trimmed here rather than refused: unlike a credential, an
+// address has no verifier on the other side that a trim could disagree with
+// (BEAT_TOKEN's padding is REFUSED for exactly that reason; see
+// checkBeatToken). A value that is entirely whitespace falls back to the default
+// rather than to "", which would bind an ephemeral port and hide the listener
+// from scrapes.
 func listenAddr() string {
 	// LookupEnv, not envx.String: only the PRESENT-but-blank case is an
 	// accident worth a line (compose interpolation of an undefined variable
@@ -424,22 +431,33 @@ var errBeatTokenSetButEmpty = errors.New("BEAT_TOKEN is set but empty: unset the
 // checkBeatToken validates a configured BEAT_TOKEN as the exact credential
 // senders must present, or refuses it. It never rewrites the value.
 //
-// Edge ASCII whitespace is REFUSED rather than trimmed. Silently rewriting a
-// credential is what split "the value you configured" from "the value that
-// authenticates": the verifier compares "Bearer "+token (see internal/webapi),
-// so a LEADING whitespace run is INTERIOR to the Authorization value and the
-// wire does NOT strip it — a sender using the configured value sends
-// "Bearer  secret" and gets 401 while startup reports the gate armed. A
-// TRAILING run is stripped on the wire, so the sender's value and the
-// verifier's differ the other way round. Either way the two disagree, and a
+// Edge ASCII whitespace is REFUSED rather than trimmed, and the cutset holds
+// two distinct reasons for the one verdict. SP and HTAB are legal field-value
+// bytes the wire NORMALIZES: the verifier compares "Bearer "+token (see
+// internal/webapi), so a LEADING run is INTERIOR to the Authorization value and
+// the wire does NOT strip it — a sender using the configured value sends
+// "Bearer  secret" and gets 401 while startup reports the gate armed — while a
+// TRAILING run IS stripped on the wire, so the sender's value and the
+// verifier's differ the other way round. CR, LF, VT and FF are not normalized
+// at all: they are forbidden bytes in a field value, so a token carrying one at
+// an edge cannot be put on the wire by any sender (an interior one is refused
+// separately, by beatTokenFitsHeader).
+//
+// Either way the configured value and the authenticating value disagree, and a
 // dead-man switch should refuse to start rather than report itself gated while
 // rejecting every sender: a 401'd ping is an undetectable ping, and one
 // deadline later every configured beat goes falsely missing.
 func checkBeatToken(token string) error {
 	if strings.Trim(token, asciiWhitespace) != token {
 		// The value is never echoed: the message names the variable and the
-		// shape of the problem only (the startup log ships to Loki).
-		return errors.New("BEAT_TOKEN has leading or trailing whitespace: the token is used verbatim as the bearer credential and knell will not silently rewrite it, because a leading run of spaces or tabs sits INSIDE the \"Bearer <token>\" header value and reaches the verifier while a trailing one is stripped on the wire — so the value you configured and the value that authenticates would differ and POST /beat/{id} would reject every ping while the endpoint reports itself gated; remove the surrounding whitespace, or unset the variable entirely to serve /beat/{id} open on purpose")
+		// shape of the problem only (the startup log ships to Loki). It names
+		// the CUTSET rather than one member's mechanism, because the cutset is
+		// two failure modes with one verdict: SP and HTAB are legal field bytes
+		// the wire NORMALIZES (a trailing run is stripped, a leading one
+		// survives interior to "Bearer <token>"), while CR, LF, VT and FF are
+		// forbidden in a field value and are not stripped at all — no sender
+		// can put them on the wire.
+		return errors.New("BEAT_TOKEN has leading or trailing ASCII whitespace and cannot be presented verbatim in an HTTP Authorization header: knell will not silently rewrite a credential, so the value you configured and the value that authenticates would differ and POST /beat/{id} would reject every ping while the endpoint reports itself gated; remove the surrounding whitespace, or unset the variable entirely to serve /beat/{id} open on purpose")
 	}
 	if token == "" {
 		// Nothing to present at all: fails startup like a present-but-empty
@@ -704,6 +722,22 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		// webhook that has no destination at all — every notification would
 		// then fail as a transport error exactly when the switch must ring.
 		return nil, errors.New("missing host")
+	}
+	if port := u.Port(); port != "" {
+		// url.Parse validates a port's SYNTAX (digits only), never its RANGE, so
+		// "https://discord.example:99999/hook" parses, passes every gate here,
+		// and starts the process healthy — while net/http refuses the address on
+		// every POST ("invalid port"), httpx retries the transport failure and
+		// the sweep retries forever. A permanently undeliverable webhook is the
+		// one failure a dead-man switch cannot afford, and startup is the only
+		// moment the operator is watching. The number is the operator's own
+		// value, not part of the credential, but the message still omits it for
+		// the same reason every refusal here does: the startup error ships to
+		// Loki, and a fixed constant cannot leak a mis-parsed secret.
+		n, convErr := strconv.Atoi(port)
+		if convErr != nil || n < 1 || n > 65535 {
+			return nil, errors.New("port must be between 1 and 65535")
+		}
 	}
 	if u.Path == "" || u.Path == "/" {
 		// The webhook's PATH is the credential, so a URL that carries none is
