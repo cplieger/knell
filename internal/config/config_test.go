@@ -11,8 +11,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/slogx/capture"
 )
+
+// maxNodeNameBytes is the NODE_NAME bound the composition root passes to Load
+// in production. Load takes it as a parameter so the environment boundary does
+// not depend on the Discord notifier (notify owns the budget and the templates
+// it is measured over); the tests read the real value here, from the same
+// source main does, so the cap they pin is the cap that ships.
+const maxNodeNameBytes = notify.MaxNodeNameBytes
 
 // Both forms must satisfy slog.LogValuer: the redaction seam only covers a
 // call site that logs the whole struct if the VALUE implements it too (Load
@@ -183,7 +191,7 @@ func TestLoad(t *testing.T) {
 	t.Setenv("LISTEN_ADDR", ":9999")
 	t.Setenv("LOG_LEVEL", "debug")
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -210,7 +218,7 @@ func TestLoadDefaultsAndFailures(t *testing.T) {
 	t.Setenv("LISTEN_ADDR", "")
 	t.Setenv("LOG_LEVEL", "")
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -219,18 +227,18 @@ func TestLoadDefaultsAndFailures(t *testing.T) {
 	}
 
 	t.Setenv("BEATS", "")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "BEATS is required") {
+	if _, err := Load(maxNodeNameBytes); err == nil || !strings.Contains(err.Error(), "BEATS is required") {
 		t.Errorf("Load() with empty BEATS error = %v, want it to name BEATS as required", err)
 	}
 
 	t.Setenv("BEATS", "api:20m")
 	t.Setenv("DISCORD_WEBHOOK_URL", "")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL is required") {
+	if _, err := Load(maxNodeNameBytes); err == nil || !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL is required") {
 		t.Errorf("Load() with empty DISCORD_WEBHOOK_URL error = %v, want it to name DISCORD_WEBHOOK_URL as required", err)
 	}
 
 	t.Setenv("DISCORD_WEBHOOK_URL", "not-a-url")
-	_, err = Load()
+	_, err = Load(maxNodeNameBytes)
 	if err == nil || !strings.Contains(err.Error(), "scheme must be https") {
 		t.Errorf("Load() with a schemeless DISCORD_WEBHOOK_URL error = %v, want the https-scheme rejection", err)
 	}
@@ -239,24 +247,11 @@ func TestLoadDefaultsAndFailures(t *testing.T) {
 	}
 }
 
-func TestLoadInvalidLogLevelFallsBackToInfo(t *testing.T) {
-	setValidLoadEnv(t)
-	t.Setenv("LOG_LEVEL", "chatty")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.LogLevel.String() != "INFO" {
-		t.Errorf("LogLevel = %v, want INFO (fallback for unknown value)", cfg.LogLevel)
-	}
-}
-
 func TestLoadRejectsMalformedBeats(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEATS", "api:1s")
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatal("Load() with below-minimum deadline = nil, want error")
 	}
@@ -269,7 +264,7 @@ func TestLoadRejectsPlainHTTPWebhook(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("DISCORD_WEBHOOK_URL", "http://127.0.0.1:9/hook")
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatal("Load() with a plain-http webhook = nil, want error (the webhook URL is a secret and must not transit in cleartext)")
 	}
@@ -290,7 +285,7 @@ func TestLoadRejectsPlainHTTPWebhookFromFile(t *testing.T) {
 	t.Setenv("DISCORD_WEBHOOK_URL", "")
 	t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatal("Load() with a plain-http DISCORD_WEBHOOK_URL_FILE = nil, want error: the https gate must apply to the file channel too, or a mounted secret ships the credential in cleartext")
 	}
@@ -307,26 +302,12 @@ func TestLoadBeatToken(t *testing.T) {
 	t.Setenv("BEAT_TOKEN", "unit-test-beat-token")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
 	if cfg.BeatToken != "unit-test-beat-token" {
 		t.Errorf("BeatToken = %q, want the configured token (webapi's gate arms only when config carries it)", cfg.BeatToken)
-	}
-}
-
-func TestLoadBeatTokenDefaultsEmpty(t *testing.T) {
-	setValidLoadEnv(t)
-	unsetEnv(t, "BEAT_TOKEN")
-	unsetEnv(t, "BEAT_TOKEN_FILE")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.BeatToken != "" {
-		t.Errorf("BeatToken = %q, want empty (open endpoint) when BEAT_TOKEN is unset", cfg.BeatToken)
 	}
 }
 
@@ -338,8 +319,8 @@ func TestLoadBeatTokenDefaultsEmpty(t *testing.T) {
 // armed" for a configuration that has no gate at all — so the one line an
 // operator would act on describes a token that does not exist while the real
 // state, an unauthenticated /beat/{id}, goes unnamed.
-// TestLoadBeatTokenDefaultsEmpty pins the returned value for this case but
-// captures no log, so the warning is free to fire.
+// This test also pins the empty returned value, so the warning and the runtime
+// state cannot diverge.
 func TestLoadDoesNotWarnAboutTokenLengthWhenNoTokenIsSet(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and t.Setenv forbids parallel tests anyway.
@@ -349,7 +330,7 @@ func TestLoadDoesNotWarnAboutTokenLengthWhenNoTokenIsSet(t *testing.T) {
 
 	rec := capture.Default(t)
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -370,7 +351,7 @@ func TestLoadShortBeatTokenWarnsWithoutLeakingIt(t *testing.T) {
 
 	rec := capture.Default(t)
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() with short BEAT_TOKEN = %v, want accepted (warn, not fail)", err)
 	}
@@ -404,7 +385,7 @@ func TestLoadBeatTokenFromFile(t *testing.T) {
 	t.Setenv("BEAT_TOKEN", "")
 	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -426,7 +407,7 @@ func TestLoadBeatTokenFileWinsOverPlainVar(t *testing.T) {
 
 	rec := capture.Default(t)
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -451,7 +432,7 @@ func TestLoadWebhookFromFile(t *testing.T) {
 	t.Setenv("DISCORD_WEBHOOK_URL", "")
 	t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -473,7 +454,7 @@ func TestLoadWebhookFileWinsOverPlainVar(t *testing.T) {
 
 	rec := capture.Default(t)
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -495,7 +476,7 @@ func TestLoadRejectsUnreadableWebhookFile(t *testing.T) {
 	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/fallback")
 	t.Setenv("DISCORD_WEBHOOK_URL_FILE", missing)
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatal("Load() with unreadable DISCORD_WEBHOOK_URL_FILE = nil, want error (the secret file must not silently fall back to the environment value)")
 	}
@@ -529,7 +510,7 @@ func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileReadFails(t *testing.T
 
 		rec := capture.Default(t)
 
-		if _, err := Load(); err == nil {
+		if _, err := Load(maxNodeNameBytes); err == nil {
 			t.Fatal("Load() with an unreadable DISCORD_WEBHOOK_URL_FILE = nil, want error")
 		}
 		if rec.Contains("the plain variable is ignored") {
@@ -545,7 +526,7 @@ func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileReadFails(t *testing.T
 
 		rec := capture.Default(t)
 
-		if _, err := Load(); err == nil {
+		if _, err := Load(maxNodeNameBytes); err == nil {
 			t.Fatal("Load() with an unreadable BEAT_TOKEN_FILE = nil, want error")
 		}
 		if rec.Contains("the plain variable is ignored") {
@@ -576,7 +557,7 @@ func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileTokenIsInvalid(t *test
 
 	rec := capture.Default(t)
 
-	if _, err := Load(); err == nil {
+	if _, err := Load(maxNodeNameBytes); err == nil {
 		t.Fatal("Load() with a two-line BEAT_TOKEN_FILE = nil, want error: the interior newline is illegal in a header value")
 	}
 	if rec.Contains("the plain variable is ignored") {
@@ -606,7 +587,7 @@ func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileWebhookIsInvalid(t *te
 
 	rec := capture.Default(t)
 
-	if _, err := Load(); err == nil {
+	if _, err := Load(maxNodeNameBytes); err == nil {
 		t.Fatal("Load() with a plain-http DISCORD_WEBHOOK_URL_FILE = nil, want error")
 	}
 	if rec.Contains("the plain variable is ignored") {
@@ -620,7 +601,7 @@ func TestLoadRejectsUnreadableBeatTokenFile(t *testing.T) {
 	t.Setenv("BEAT_TOKEN", "env-fallback-token")
 	t.Setenv("BEAT_TOKEN_FILE", missing)
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatal("Load() with unreadable BEAT_TOKEN_FILE = nil, want error (the secret file must not silently fall back to the environment value, which would arm the gate with the wrong token)")
 	}
@@ -643,7 +624,7 @@ func TestLoadRejectsEmptyBeatTokenFile(t *testing.T) {
 	t.Setenv("BEAT_TOKEN", "env-fallback-token")
 	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatal("Load() with an empty BEAT_TOKEN_FILE = nil, want error (an empty secret file is a broken mount, not an open endpoint)")
 	}
@@ -660,7 +641,7 @@ func TestLoadRejectsBlankBeatTokenFileVar(t *testing.T) {
 	t.Setenv("BEAT_TOKEN", "env-fallback-token")
 	t.Setenv("BEAT_TOKEN_FILE", "")
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatal("Load() with a present-but-empty BEAT_TOKEN_FILE = nil, want error; envx cannot tell it from unset, so falling back would serve an unauthenticated /beat/{id} the operator meant to gate")
 	}
@@ -676,7 +657,7 @@ func TestLoadRejectsBlankWebhookFileVar(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("DISCORD_WEBHOOK_URL_FILE", "   ")
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatal("Load() with a present-but-empty DISCORD_WEBHOOK_URL_FILE = nil, want error rather than a silent fallback to the plain variable")
 	}
@@ -691,7 +672,7 @@ func TestLoadTrimsPaddedPlainWebhook(t *testing.T) {
 	t.Setenv("BEAT_TOKEN", "unit-test-beat-token")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -735,7 +716,7 @@ func TestLoadRejectsAPaddedPlainBeatToken(t *testing.T) {
 			t.Setenv("BEAT_TOKEN", token)
 			unsetEnv(t, "BEAT_TOKEN_FILE")
 
-			_, err := Load()
+			_, err := Load(maxNodeNameBytes)
 			if err == nil {
 				t.Fatalf("Load() with BEAT_TOKEN=%q = nil, want error: rewriting the credential would arm the gate for a value the sender that uses the configured one cannot present", token)
 			}
@@ -776,7 +757,7 @@ func TestLoadRejectsAnASCIIWhitespaceOnlyBeatToken(t *testing.T) {
 			t.Setenv("BEAT_TOKEN", token)
 			unsetEnv(t, "BEAT_TOKEN_FILE")
 
-			_, err := Load()
+			_, err := Load(maxNodeNameBytes)
 			if err == nil {
 				t.Fatalf("Load() with BEAT_TOKEN=%q = nil, want error: the token cannot survive into a header value, so every ping 401s against an endpoint that reports itself gated", token)
 			}
@@ -806,7 +787,7 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 
 	rec := capture.Default(t)
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() with an NBSP-only BEAT_TOKEN = %v, want accepted: textproto keeps a non-ASCII space, so the token is presentable and the gate must stay armed", err)
 	}
@@ -840,7 +821,7 @@ func TestLoadRejectsASCIIPaddingAroundANonASCIISpaceBeatToken(t *testing.T) {
 	t.Setenv("BEAT_TOKEN", " \u00a0 ")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatal("Load() with an ASCII-padded NBSP BEAT_TOKEN = nil, want error: silently trimming the padding arms the gate for a value the sender using the configured one cannot present")
 	}
@@ -870,7 +851,7 @@ func TestLoadRejectsABeatTokenHTTPCannotCarry(t *testing.T) {
 			t.Setenv("BEAT_TOKEN", token)
 			unsetEnv(t, "BEAT_TOKEN_FILE")
 
-			_, err := Load()
+			_, err := Load(maxNodeNameBytes)
 			if err == nil {
 				t.Fatalf("Load() with BEAT_TOKEN=%q = nil, want error: HTTP forbids that byte in a field value, so every ping 401s against an endpoint that reports itself gated", token)
 			}
@@ -995,7 +976,7 @@ func TestLoadBeatTokenAtWarnBoundaryDoesNotWarn(t *testing.T) {
 
 	rec := capture.Default(t)
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -1020,7 +1001,7 @@ func TestLoadFallsBackToTheHostnameWhenNodeNameIsUnset(t *testing.T) {
 	// serves /beat/{id} open).
 	unsetEnv(t, "NODE_NAME")
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -1033,7 +1014,7 @@ func TestLoadTrimsPaddedListenAddr(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("LISTEN_ADDR", "  0.0.0.0:9999  ")
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -1042,24 +1023,11 @@ func TestLoadTrimsPaddedListenAddr(t *testing.T) {
 	}
 }
 
-func TestLoadFallsBackToTheDefaultListenAddrWhenBlank(t *testing.T) {
-	setValidLoadEnv(t)
-	t.Setenv("LISTEN_ADDR", "   ")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.ListenAddr != ":9190" {
-		t.Errorf("ListenAddr = %q, want :9190: an empty address makes net.Listen bind an EPHEMERAL port, hiding /metrics from Alloy and /beat/{id} from every sender", cfg.ListenAddr)
-	}
-}
-
 func TestLoadTrimsPaddedNodeName(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("NODE_NAME", "  node-1  ")
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -1073,7 +1041,7 @@ func TestLoadAcceptsANodeNameAtTheLimit(t *testing.T) {
 	node := strings.Repeat("n", maxNodeNameBytes)
 	t.Setenv("NODE_NAME", node)
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() with a %d-byte NODE_NAME error = %v, want it accepted: the cap is the last accepted value, and it still leaves every notice far inside Discord's 2000-character limit", maxNodeNameBytes, err)
 	}
@@ -1086,7 +1054,7 @@ func TestLoadRejectsANodeNamePastTheLimit(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("NODE_NAME", strings.Repeat("n", maxNodeNameBytes+1))
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatalf("Load() with a %d-byte NODE_NAME = nil, want error: the name prefixes every notice, so an oversized one makes Discord reject missing, recovered and history alike - the switch arms and never rings", maxNodeNameBytes+1)
 	}
@@ -1113,7 +1081,7 @@ func TestLoadCountsNodeNameLengthInBytesNotRunes(t *testing.T) {
 		node := strings.Repeat("é", maxNodeNameBytes/2)
 		t.Setenv("NODE_NAME", node)
 
-		cfg, err := Load()
+		cfg, err := Load(maxNodeNameBytes)
 		if err != nil {
 			t.Fatalf("Load() with a %d-byte (%d-rune) NODE_NAME error = %v, want it accepted", len(node), maxNodeNameBytes/2, err)
 		}
@@ -1129,7 +1097,7 @@ func TestLoadCountsNodeNameLengthInBytesNotRunes(t *testing.T) {
 		node := strings.Repeat("é", maxNodeNameBytes-10)
 		t.Setenv("NODE_NAME", node)
 
-		if _, err := Load(); err == nil {
+		if _, err := Load(maxNodeNameBytes); err == nil {
 			t.Fatalf("Load() with a %d-byte (%d-rune) NODE_NAME = nil, want error: the bound is counted in bytes, which is the conservative direction against Discord's character limit", len(node), maxNodeNameBytes-10)
 		}
 	})
@@ -1139,7 +1107,7 @@ func TestLoadRejectsWhitespaceOnlyWebhook(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("DISCORD_WEBHOOK_URL", "   ")
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatal("Load() with a whitespace-only DISCORD_WEBHOOK_URL = nil, want error: a broken secret pipeline must fail startup rather than arm a switch that can never ring")
 	}
@@ -1153,7 +1121,7 @@ func TestLoadRejectsAPresentButEmptyBeatToken(t *testing.T) {
 	t.Setenv("BEAT_TOKEN", "")
 	unsetEnv(t, "BEAT_TOKEN_FILE")
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatal("Load() with a present-but-empty BEAT_TOKEN = nil, want error; envx.Require cannot tell it from unset, and it is exactly what compose interpolation of an undefined variable produces, so accepting it would serve /beat/{id} unauthenticated by accident")
 	}
@@ -1191,7 +1159,7 @@ func TestLoadDoesNotWarnWhenOnlyTheSecretFilesAreSet(t *testing.T) {
 
 	rec := capture.Default(t)
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -1223,7 +1191,7 @@ func TestLoadDoesNotWarnWhenOnlyThePlainVarsAreSet(t *testing.T) {
 
 	rec := capture.Default(t)
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -1342,6 +1310,12 @@ func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
 		"host only":              {raw: "https://discord.example", wantErr: "missing path"},
 		"root path only":         {raw: "https://discord.example/", wantErr: "missing path"},
 		"interior space in path": {raw: "https://discord.example/api/webhooks/1/ab c", wantErr: "contains a space"},
+		// An authority made of nothing but a port has a NON-EMPTY url.Host
+		// (":443"), so a Host-based gate admits it: startup succeeds, the
+		// health marker goes ready, and every notice then fails as a transport
+		// error for lack of any destination host. Hostname() is what tells the
+		// two apart.
+		"port-only authority": {raw: "https://:443/api/webhooks/1/abc", wantErr: "missing host"},
 		// Deliberate scope decision, not an oversight: knell posts to Discord
 		// only, and a Discord webhook always carries its credential in the
 		// path (/api/webhooks/{id}/{token}). A query-carried credential is out
@@ -1375,16 +1349,106 @@ func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsAWebhookWithoutAHostname is the startup half of the port-only
+// authority case: an operator whose secret pipeline dropped the host must be
+// told at boot, not one outage later. Without it the process starts, /healthz
+// reports ready, and every notice fails for lack of a destination — the exact
+// failure mode a dead-man switch cannot afford.
+func TestLoadRejectsAWebhookWithoutAHostname(t *testing.T) {
+	setValidLoadEnv(t)
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://:443/api/webhooks/1/canary-webhook-token")
+
+	_, err := Load(maxNodeNameBytes)
+	if err == nil {
+		t.Fatal("Load() with a port-only webhook authority = nil, want error: startup is the only moment the operator is watching")
+	}
+	if !strings.Contains(err.Error(), "missing host") {
+		t.Errorf("error = %q, want it to name the missing host", err)
+	}
+	if strings.Contains(err.Error(), "canary-webhook-token") {
+		t.Errorf("error = %q leaks the webhook credential; the startup error is shipped to Loki", err)
+	}
+}
+
+// TestLoadDoesNotLeakACredentialPastedIntoASecretFileVariable pins the
+// sanitizer on both _FILE channels. envx embeds the KEY_FILE VALUE in its
+// blank-file, path-policy and os.PathError messages — correct for a path, and a
+// credential leak for the most common misconfiguration of this convention: the
+// operator pastes the secret itself into DISCORD_WEBHOOK_URL_FILE (or
+// BEAT_TOKEN_FILE) instead of a path to it. Wrapping envx's error verbatim
+// copied that live credential into the startup ERROR line, from where Loki
+// keeps it long after the value is rotated.
+func TestLoadDoesNotLeakACredentialPastedIntoASecretFileVariable(t *testing.T) {
+	tests := map[string]struct {
+		key    string
+		canary string
+	}{
+		"webhook url pasted into the file variable": {
+			key:    "DISCORD_WEBHOOK_URL",
+			canary: "https://discord.example/api/webhooks/1/canary-webhook-token",
+		},
+		"bearer token pasted into the file variable": {
+			key:    "BEAT_TOKEN",
+			canary: "canary-bearer-token-value",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			t.Setenv(tt.key+"_FILE", tt.canary)
+
+			_, err := Load(maxNodeNameBytes)
+			if err == nil {
+				t.Fatalf("Load() with %s_FILE holding the credential itself = nil, want error: the file channel must fail closed", tt.key)
+			}
+			if !strings.Contains(err.Error(), tt.key+"_FILE") {
+				t.Errorf("error = %q, want it to name %s_FILE so the operator knows which variable is broken", err, tt.key)
+			}
+			if strings.Contains(err.Error(), tt.canary) {
+				t.Errorf("error = %q embeds the pasted credential; startup errors are shipped to Loki, where they outlive the secret", err)
+			}
+		})
+	}
+}
+
+// TestLoadRefusesAHeaderIllegalTokenWithoutCallingItArmed pins the ORDER of
+// checkBeatToken's two remaining checks. A plain BEAT_TOKEN of Unicode spaces
+// around a control byte passes the ASCII-edge refusal and reads blank to
+// strings.TrimSpace, so warning first logged "the gate is armed" for a value
+// the very next check refuses to start on — two contradictory startup signals
+// for one value, of which only the failure ever happened.
+// TestLoadKeepsANonASCIISpaceBeatTokenArmed pins the warning itself for a valid
+// NBSP-only token, so the two together fix the order.
+func TestLoadRefusesAHeaderIllegalTokenWithoutCallingItArmed(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", "\u00a0\n\u00a0")
+
+	rec := capture.Default(t)
+
+	_, err := Load(maxNodeNameBytes)
+	if err == nil {
+		t.Fatal("Load() with a BEAT_TOKEN carrying an interior newline = nil, want error: no sender can present a control byte in a header value")
+	}
+	if !strings.Contains(err.Error(), "control character") {
+		t.Errorf("error = %q, want the control-character refusal", err)
+	}
+	if rec.Contains("mistake for absent") {
+		t.Errorf("startup reported the gate armed for a token it then refused: %v", rec.Messages())
+	}
+}
+
 // TestLoadWarnsOnlyWhenLogLevelIsUnparseable pins the ONLY signal that a
 // mistyped LOG_LEVEL was ignored. slogx.ParseLevel returns ok=true for an unset
 // value and ok=false only for a non-empty unparseable one, so this WARN is what
 // separates "the operator asked for debug and got debug" from "the operator
 // typo'd and is silently running at info" — a distinction that matters exactly
 // when someone is turning up logging to diagnose a live outage.
-// TestLoadInvalidLogLevelFallsBackToInfo pins the resulting level but captures
-// no log, so inverting or dropping the !ok guard keeps every existing test
-// green while every default deployment either loses the warning or gains a
-// spurious one on a perfectly valid level.
+// The table pins both the resulting level and the warning's presence, so a
+// regression in either half — an inverted or dropped !ok guard that loses the
+// warning on a typo, or gains a spurious one on a perfectly valid level — fails
+// this one behavior-focused test.
 func TestLoadWarnsOnlyWhenLogLevelIsUnparseable(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and t.Setenv forbids parallel tests anyway.
@@ -1410,7 +1474,7 @@ func TestLoadWarnsOnlyWhenLogLevelIsUnparseable(t *testing.T) {
 
 			rec := capture.Default(t)
 
-			cfg, err := Load()
+			cfg, err := Load(maxNodeNameBytes)
 			if err != nil {
 				t.Fatalf("Load() error: %v", err)
 			}
@@ -1441,7 +1505,7 @@ func TestLoadWarnsWhenLogLevelIsPresentButBlank(t *testing.T) {
 
 	rec := capture.Default(t)
 
-	cfg, err := Load()
+	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -1472,7 +1536,7 @@ func TestLoadRejectsAFileBorneBeatTokenHTTPCannotCarry(t *testing.T) {
 	unsetEnv(t, "BEAT_TOKEN")
 	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
 
-	_, err := Load()
+	_, err := Load(maxNodeNameBytes)
 	if err == nil {
 		t.Fatal("Load() with a two-line BEAT_TOKEN_FILE = nil, want error: the interior newline is illegal in a header value, so the gate would be armed with a token no sender can present and every configured beat goes falsely missing one deadline later")
 	}
@@ -1524,7 +1588,7 @@ func TestLoadWarnsOnlyWhenAnOptionalVariableIsPresentButBlank(t *testing.T) {
 
 			rec := capture.Default(t)
 
-			if _, err := Load(); err != nil {
+			if _, err := Load(maxNodeNameBytes); err != nil {
 				t.Fatalf("Load() error: %v", err)
 			}
 			if got := rec.Contains(tt.warnSub); got != tt.wantWarn {
@@ -1543,7 +1607,7 @@ func TestLoadWarnsOnlyWhenAnOptionalVariableIsPresentButBlank(t *testing.T) {
 
 		rec := capture.Default(t)
 
-		cfg, err := Load()
+		cfg, err := Load(maxNodeNameBytes)
 		if err != nil {
 			t.Fatalf("Load() error: %v", err)
 		}
@@ -1563,7 +1627,7 @@ func TestLoadWarnsOnlyWhenAnOptionalVariableIsPresentButBlank(t *testing.T) {
 
 		rec := capture.Default(t)
 
-		if _, err := Load(); err != nil {
+		if _, err := Load(maxNodeNameBytes); err != nil {
 			t.Fatalf("Load() error: %v", err)
 		}
 		if !strings.Contains(strings.Join(rec.Messages(), "\n"), "unset the variable") {

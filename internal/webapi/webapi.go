@@ -39,8 +39,10 @@ const loggedPathCap = 128
 
 // Beater records pings. Implemented by watch.Watcher.
 type Beater interface {
-	// Beat records a ping for id, returning false for unknown ids.
-	Beat(id string) bool
+	// Beat records id when admission is open. recorded is false for an
+	// unknown id; accepting is false once the watcher has closed admission
+	// for shutdown, in which case nothing was recorded.
+	Beat(id string) (recorded, accepting bool)
 }
 
 // Routes carries the pre-built handlers webapi serves beside the beat
@@ -73,6 +75,15 @@ type Routes struct {
 // instant both goroutines observe, so gating on it closes acceptance at that
 // same instant whatever order they run in, instead of leaving the endpoint
 // fully live for the rest of the drain.
+//
+// Those context checks are the EARLY refusal, not the boundary: no repetition
+// of them can be atomic with the recording, because a handler can pass one and
+// be descheduled while watch.Run reports and abandons its undelivered work.
+// The authoritative gate is the watcher's own admission state, decided under
+// the mutex that guards the beat mutation and returned as Beat's accepting
+// result (see watch.Watcher.Beat); the checks here just refuse the long drain
+// window before a body is read, so a shutting-down endpoint cannot be held
+// open by a trickled payload.
 //
 // Only the beat endpoint refuses. /healthz and /metrics keep serving through
 // the whole drain: the orchestrator has to see the liveness marker flip, and a
@@ -172,18 +183,13 @@ func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 		"use GET or POST to record a beat")
 }
 
-// crossSiteSubresource reports whether a request was initiated by a BROWSER as
-// a cross-site sub-resource load (an <img>, a script, a no-cors fetch) rather
-// than by a sender or by a deliberate navigation. Only browsers send
-// Sec-Fetch-*, so every documented sender omits the headers and is unaffected:
-// curl, an Alertmanager webhook_config, a CI hook. A human opening the URL from
-// the address bar or a bookmark sends Sec-Fetch-Site: none, and a deliberate
-// click keeps Sec-Fetch-Mode: navigate. What is left is exactly the
-// confused-deputy shape — a page the operator did not write, forging a ping
-// from inside a browser that can reach this port — which re-arms the switch
-// with no real heartbeat behind it. The check is advisory by nature (a client
-// that sends no Sec-Fetch-Site is admitted), so it is a layer, not the gate:
-// BEAT_TOKEN remains the gate.
+// crossSiteSubresource reports whether a BROWSER initiated this request as a
+// cross-site sub-resource load (an <img>, a script, a no-cors fetch) — the
+// confused-deputy shape, which would re-arm the switch with no real heartbeat
+// behind it. Only browsers send Sec-Fetch-*, so every documented sender is
+// unaffected, and a deliberate navigation (address bar, bookmark, click) is
+// still accepted. Advisory defense in depth, not the gate: BEAT_TOKEN is the
+// gate.
 func crossSiteSubresource(r *http.Request) bool {
 	return r.Header.Get("Sec-Fetch-Site") == "cross-site" &&
 		r.Header.Get("Sec-Fetch-Mode") != "navigate"
@@ -197,47 +203,34 @@ func writeCrossSiteRefused(w http.ResponseWriter, r *http.Request) {
 		"a cross-site browser request cannot record a beat")
 }
 
-// writeShuttingDown refuses a beat because acceptance is closed: 503 in this
+// writeShuttingDown refuses a beat because admission is closed: 503 in this
 // file's standard coded envelope. It names no beat id — not even an unknown one
 // — so the refusal leaks as little as the 404 path does about which ids are
-// configured, and it is the single home of the refusal both checks in record
-// answer with.
+// configured, and it is the single home of the refusal all three admission
+// checks in record answer with (the two context checks and the watcher's
+// authoritative accepting result).
 func writeShuttingDown(w http.ResponseWriter, r *http.Request) {
 	webhttp.WriteError(w, r, http.StatusServiceUnavailable, "shutting_down",
 		"knell is shutting down and is no longer accepting beats")
 }
 
-// drainBeatBody caps the beat body, then drains what fits so keep-alive
-// connections stay reusable; the payload itself is deliberately ignored. The
-// cap is webhttp.LimitBody (an http.MaxBytesReader over r.Body) rather than a
-// bare io.LimitReader, because a LimitReader ends the read SILENTLY at the cap:
-// an over-limit body would be indistinguishable from one that just ended, so
-// nothing would ever say a sender is shipping payloads knell refuses to read.
-// MaxBytesReader surfaces the overrun as an *http.MaxBytesError, which is what
-// the WARN below reports.
-//
-// The overrun is reported, never acted on: the ping still answers 200 and the
-// beat is recorded whether the body fit, overran, or the sender hung up
-// mid-send, because a heartbeat's payload is irrelevant and a dropped ping is
-// what this whole app exists to notice. Only the overrun warns; a mid-body
-// disconnect is ordinary.
-//
-// net/http does close the connection under that 200 (LimitBody reaches
-// net/http's own ResponseWriter through the StatusRecorder Unwrap chain
-// webhttp.Logging and Recoverer wrap the beat handler in). The close is
-// observable only on the SENDER's side of the wire, and an
-// httptest.ResponseRecorder cannot observe it at all, so the WARN stays both
-// the only channel through which a knell OPERATOR learns a sender is over the
-// cap and the thing the handler tests pin.
+// drainBeatBody drains the deliberately ignored ping payload so keep-alive
+// connections stay reusable, capped at maxBeatBody. The cap is
+// webhttp.LimitBody (an http.MaxBytesReader) rather than a bare io.LimitReader
+// because a LimitReader ends the read SILENTLY at the cap: the overrun has to be
+// reportable, and the WARN below is the only channel through which an operator
+// learns a sender ships payloads knell refuses to read. Every read error stays
+// nonfatal — the ping answers 200 and the beat is recorded either way, because a
+// heartbeat's payload is irrelevant and a dropped ping is what this app exists
+// to notice.
 func drainBeatBody(w http.ResponseWriter, r *http.Request) {
 	webhttp.LimitBody(w, r, maxBeatBody)
 	if _, err := io.Copy(io.Discard, r.Body); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			// No beat id and no sender-supplied text: the id at this point is
-			// still an unvalidated path segment (the 404 gate is downstream),
-			// and the request id ties this line to the access line that does
-			// carry the truncated path.
+			// No beat id and no sender-supplied text: the id here is still an
+			// unvalidated path segment (the 404 gate is downstream), so
+			// correlate through the access line via the request id.
 			slog.WarnContext(r.Context(), "beat body exceeded the cap and was not fully read",
 				"limit_bytes", maxBeatBody,
 				"request_id", webhttp.RequestIDFromContext(r.Context()))
@@ -273,21 +266,30 @@ func beatHandler(appCtx context.Context, b Beater, token string) http.HandlerFun
 		// never refused. See drainBeatBody.
 		drainBeatBody(w, r)
 		id := r.PathValue("id")
-		// Re-check on the far side of the body read: this is the check that
-		// closes the window that matters, because the read above can block for
-		// the whole 30s read timeout, so a request ADMITTED while the app was
-		// still live routinely arrives here after cancellation — that is the
-		// window srv.Shutdown keeps open by design, since it waits for
-		// in-flight requests. Recording now would move lastSeen, count the
-		// ping, republish the freshness gauge, and for an alerted beat queue a
-		// recovered notification onto a channel whose only reader (watch.Run)
-		// has already returned: a notice lost with no counter and no warning,
-		// behind a tally watch.Run has already taken.
+		// Re-check on the far side of the body read: the read above can block
+		// for the whole 30s read timeout, so a request ADMITTED while the app
+		// was still live routinely arrives here after cancellation — that is
+		// the window srv.Shutdown keeps open by design, since it waits for
+		// in-flight requests. Refusing here answers 503 without paying for a
+		// Beat call, but it is not the boundary that has to hold: a context
+		// check cannot be atomic with the recording, because this goroutine
+		// can be descheduled between the two while watch.Run reports and
+		// abandons its undelivered work. Beat itself decides admission under
+		// the mutex that guards the state change (see watch.Watcher.Beat), so
+		// the accepting result below is the authoritative refusal and this
+		// check is only the early one.
 		if appCtx.Err() != nil {
 			writeShuttingDown(w, r)
 			return
 		}
-		if !b.Beat(id) {
+		recorded, accepting := b.Beat(id)
+		if !accepting {
+			// The watcher closed admission while this handler was in flight:
+			// nothing was recorded, so the sender must not be told 200.
+			writeShuttingDown(w, r)
+			return
+		}
+		if !recorded {
 			webhttp.WriteError(w, r, http.StatusNotFound, "unknown_beat", "unknown beat id")
 			return
 		}

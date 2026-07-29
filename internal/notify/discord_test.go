@@ -166,7 +166,7 @@ func TestBeatOutageHistoryReportsOneEndedOutageInThePastTense(t *testing.T) {
 	// late by construction — see historyTimeFormat).
 	for _, want := range []string{
 		"node-1", "api", "was missing for 12m0s", "recovered at 2026-07-23 14:07 UTC",
-		"went undelivered", "check the webhook",
+		"delivery was delayed", "check the webhook",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("content %q missing %q", content, want)
@@ -212,7 +212,7 @@ func TestBeatOutageHistorySummarizesSeveralEndedOutages(t *testing.T) {
 		"last recovered at 2026-07-23 14:07 UTC",
 		// Every entry above carries the zero LateReason (LateUndelivered),
 		// which is also what a producer that names no reason gets.
-		"went undelivered", "check the webhook",
+		"Delivery was delayed for every outage", "check the webhook",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("content %q missing %q", content, want)
@@ -245,9 +245,13 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 	}
 	const (
 		webhookClause = "check the webhook"
-		undelivered   = "undelivered"
+		delayedOne    = "This notice is late because delivery was delayed"
+		delayedAll    = "Delivery was delayed for every outage"
 		selfResolved  = "ended before a sweep detected it"
 		deliveryFine  = "nothing was wrong with delivery"
+		// The sweep's send budget can defer a record before any send is
+		// started, so no notice may claim a delivery ATTEMPT happened.
+		noAttemptClaim = "attempt"
 	)
 	cases := map[string]struct {
 		outages []watch.Outage
@@ -257,12 +261,16 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 		"one outage that ended before any sweep saw it": {
 			outages: []watch.Outage{outage(12*time.Minute, watch.LateEndedBeforeDetection)},
 			want:    []string{"was missing for 12m0s", selfResolved, deliveryFine},
-			forbid:  []string{webhookClause, undelivered, "notifications were failing"},
+			forbid:  []string{webhookClause, delayedOne, "notifications were failing"},
 		},
 		"one outage whose alert the webhook never took": {
 			outages: []watch.Outage{outage(12*time.Minute, watch.LateUndelivered)},
-			want:    []string{"was missing for 12m0s", undelivered, webhookClause},
-			forbid:  []string{selfResolved, deliveryFine},
+			want:    []string{"was missing for 12m0s", delayedOne, webhookClause},
+			// LateUndelivered is also reached without any send having been
+			// tried (the sweep's send budget defers a record before its turn),
+			// so the clause must point at delivery without claiming an
+			// attempt was made.
+			forbid: []string{selfResolved, deliveryFine, noAttemptClaim},
 		},
 		"a batch of outages that all ended before a sweep saw them": {
 			outages: []watch.Outage{
@@ -270,15 +278,15 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 				outage(47*time.Minute, watch.LateEndedBeforeDetection),
 			},
 			want:   []string{"had 2 outages", "longest 47m0s", selfResolved, deliveryFine},
-			forbid: []string{webhookClause, undelivered},
+			forbid: []string{webhookClause, delayedAll},
 		},
 		"a batch of outages whose alerts were all undelivered": {
 			outages: []watch.Outage{
 				outage(12*time.Minute, watch.LateUndelivered),
 				outage(47*time.Minute, watch.LateUndelivered),
 			},
-			want:   []string{"had 2 outages", "longest 47m0s", undelivered, webhookClause},
-			forbid: []string{selfResolved, deliveryFine},
+			want:   []string{"had 2 outages", "longest 47m0s", delayedAll, webhookClause},
+			forbid: []string{selfResolved, deliveryFine, noAttemptClaim},
 		},
 		// The batch a real webhook outage produces on a flapping beat: some
 		// alerts held back, some outages over before a sweep could see them.
@@ -292,11 +300,11 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 			},
 			want: []string{
 				"had 3 outages", "longest 47m0s",
-				"2 had an earlier report attempt go undelivered", "1 ended before a sweep detected it", webhookClause,
+				"Delivery was delayed for 2 (check the webhook)", "1 ended before a sweep detected it", webhookClause,
 			},
 			forbid: []string{
 				// Neither single-reason clause may stand in for a mixed batch.
-				"An earlier attempt to report them went undelivered", "Each " + selfResolved,
+				delayedAll, "Each " + selfResolved, noAttemptClaim,
 			},
 		},
 	}
@@ -1203,8 +1211,10 @@ func TestAuthRejectionsNameTheWebhookURLNotAnAPIKey(t *testing.T) {
 					t.Errorf("err = %v, want it to name %q", err, want)
 				}
 			}
-			// Neither the body's own words nor the credential itself.
-			for _, leak := range []string{"plainsegment", "<html>"} {
+			// Neither the body's own words nor the credential itself — and
+			// not httpx's keyed-API diagnosis either: rendering "invalid API
+			// key" beside "knell sends no API key" contradicts itself.
+			for _, leak := range []string{"plainsegment", "<html>", "invalid API key", "access denied"} {
 				if strings.Contains(err.Error(), leak) {
 					t.Errorf("err = %v, kept %q", err, leak)
 				}

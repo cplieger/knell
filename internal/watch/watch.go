@@ -476,6 +476,11 @@ type Watcher struct {
 	beats      map[string]*beatState
 	recoveries chan recoveryEvent
 	mu         sync.Mutex
+	// accepting is the authoritative beat-admission state, guarded by mu so
+	// it orders against the beat mutation itself: stopAccepting, Beat and the
+	// shutdown snapshot are one serialized sequence, which is what a context
+	// check in the HTTP handler cannot be (see Beat and stopAccepting).
+	accepting bool
 }
 
 // New builds a Watcher for the given beats. start is the process-start
@@ -491,6 +496,7 @@ func New(beats []Beat, notifier Notifier, now func() time.Time, start time.Time)
 		now:        now,
 		beats:      make(map[string]*beatState, len(beats)),
 		recoveries: make(chan recoveryEvent, len(beats)),
+		accepting:  true,
 	}
 	for _, b := range beats {
 		w.beats[b.ID] = &beatState{lastSeen: start, deadline: b.Deadline}
@@ -502,16 +508,30 @@ func New(beats []Beat, notifier Notifier, now func() time.Time, start time.Time)
 	return w
 }
 
-// Beat records a ping for id. It returns false when id is not a configured
-// beat (the caller answers 404 and nothing is recorded). A ping on an
-// alerted beat queues the recovered notification for the Run loop, so this
-// never blocks on the webhook.
-func (w *Watcher) Beat(id string) bool {
+// Beat records a ping for id. recorded is false when id is not a configured
+// beat (the caller answers 404 and nothing is recorded); accepting is false
+// once shutdown has closed admission (the caller answers 503 and nothing is
+// recorded). A ping on an alerted beat queues the recovered notification for
+// the Run loop, so this never blocks on the webhook.
+//
+// Admission is decided HERE, under the same mutex as the state mutation and
+// the recovered enqueue, because that is the only way the decision can be
+// atomic with respect to shutdown: a caller-side context check can pass and
+// then be descheduled while Run takes its undelivered-work snapshot and
+// returns, so the ping would land behind a tally that has already been
+// reported. Since stopAccepting takes this mutex too, every ping either
+// completes before admission closes — and is therefore visible to
+// logUndelivered — or observes accepting=false and records nothing at all.
+func (w *Watcher) Beat(id string) (recorded, accepting bool) {
 	w.mu.Lock()
+	if !w.accepting {
+		w.mu.Unlock()
+		return false, false
+	}
 	st, ok := w.beats[id]
 	if !ok {
 		w.mu.Unlock()
-		return false
+		return false, true
 	}
 	now := w.now()
 	previousSeen := st.lastSeen
@@ -556,8 +576,13 @@ func (w *Watcher) Beat(id string) bool {
 	// Publish the gauges under the lock so concurrent pings cannot write
 	// them out of state order (an older timestamp overwriting a newer one).
 	metrics.RecordBeat(id, now)
-	w.mu.Unlock()
-
+	// Queue the recovered transition INSIDE the critical section that mutated
+	// the beat: admission closed under this same mutex, so a ping that got
+	// here is wholly visible to the shutdown tally. Enqueueing after the
+	// unlock would reopen the race one step further along — the channel's only
+	// reader could have drained and returned in between. The channel send is
+	// non-blocking, so holding the lock across it cannot stall a ping.
+	recoveryDropped := false
 	if wasAlerted {
 		select {
 		case w.recoveries <- recoveryEvent{id: id, silence: silence}:
@@ -565,18 +590,33 @@ func (w *Watcher) Beat(id string) bool {
 			// Cannot happen while the queue bound matches the beat count
 			// (one pending recovery per beat), but never block a ping.
 			// The dropped recovery is no longer pending, so un-mark it or
-			// the beat could never alert again. Nothing retries a dropped
-			// recovery notice, so this is a permanent loss like a dropped
-			// missing record, not a failed delivery attempt.
-			w.mu.Lock()
+			// the beat could never alert again.
 			st.recovering = false
-			w.mu.Unlock()
-			metrics.RecordNotificationDropped(metrics.KindRecovered)
-			slog.Warn("recovery queue full, dropping recovered notification, nothing retries it and no notice for this recovery will ever arrive",
-				"beat", id, "down_for", silence.DownFor().String())
+			recoveryDropped = true
 		}
 	}
-	return true
+	w.mu.Unlock()
+
+	if recoveryDropped {
+		// Reported outside the lock: neither the counter nor the log line is
+		// part of the state transition. Nothing retries a dropped recovery
+		// notice, so this is a permanent loss like a dropped missing record,
+		// not a failed delivery attempt.
+		metrics.RecordNotificationDropped(metrics.KindRecovered)
+		slog.Warn("recovery queue full, dropping recovered notification, nothing retries it and no notice for this recovery will ever arrive",
+			"beat", id, "down_for", silence.DownFor().String())
+	}
+	return true, true
+}
+
+// stopAccepting closes beat admission for the rest of the process's life.
+// It takes the mutex Beat mutates under, so once it returns no ping can still
+// be between its admission check and its state change: that ordering is what
+// makes logUndelivered's tally complete rather than merely narrow.
+func (w *Watcher) stopAccepting() {
+	w.mu.Lock()
+	w.accepting = false
+	w.mu.Unlock()
 }
 
 // Run drives the watch loop until ctx is cancelled: a sweep every tick plus
@@ -604,12 +644,25 @@ func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Close admission before tallying: stopAccepting and the snapshot
+			// serialize on the same mutex, so nothing can be recorded between
+			// them (see Beat).
+			w.stopAccepting()
 			w.logUndelivered()
 			return
 		case ev := <-w.recoveries:
 			w.sendRecovered(ctx, ev)
 		case <-ticker.C:
-			w.sweep(ctx)
+			// A send may overrun the next tick while a recovery queues. Preserve
+			// the consumed tick, but let the queued recovery go first.
+			select {
+			case ev := <-w.recoveries:
+				w.sendRecovered(ctx, ev)
+			default:
+			}
+			if ctx.Err() == nil {
+				w.sweep(ctx)
+			}
 		}
 	}
 }
@@ -639,25 +692,49 @@ func (w *Watcher) refreshFreshness() {
 // never attempted and never discarded, so the log line is the operator's only
 // trace of it.
 //
-// The tally below is complete by construction: acceptance closes at the same
-// cancellation that brings Run here. webapi.New gates /beat/{id} on the shared
-// application context, so a ping arriving from that instant on is refused with
-// 503 and records nothing (see webapi.New), whichever order the HTTP drain and
-// this loop's exit happen to run in. Only a ping already past that gate when
-// cancellation fired can still record — a window of a few instructions, where
-// it used to be the whole shutdown grace of fully live serving.
+// The tally below is complete by construction, and mechanically so: Run closes
+// admission (stopAccepting) before taking the snapshot, and both take the same
+// mutex Beat mutates under, so a ping either finished before admission closed
+// — and is counted here — or observes accepting=false, records nothing, and is
+// refused with 503. webapi.New additionally gates /beat/{id} on the shared
+// application context, which refuses the long drain window early (before the
+// body is even read) rather than deep in the watcher; the atomic boundary is
+// Beat's, whichever order the HTTP drain and this loop's exit happen to run in.
 func (w *Watcher) logUndelivered() {
-	type pending struct {
-		id      string
-		lost    int
-		ongoing int
+	beats, total, lostTotal := w.snapshotUndelivered()
+	lostRecoveries := drainRecoveryIDs(w.recoveries)
+	queuedRecoveries := len(lostRecoveries)
+	slog.Info("watch loop stopped",
+		"undelivered_records", total, "permanent_loss", lostTotal,
+		"ongoing_records", total-lostTotal,
+		"queued_recoveries", queuedRecoveries)
+	for _, p := range beats {
+		logPendingLoss(p)
 	}
-	var beats []pending
-	total, lostTotal := 0, 0
+	if queuedRecoveries > 0 {
+		slog.Warn("shutting down with queued recovered notifications, they will never be delivered",
+			"queued", queuedRecoveries, "beats", lostRecoveries)
+	}
+}
+
+// pendingLoss is one beat's undelivered-record tally at shutdown: lost counts
+// the CLOSED records whose notice will never arrive, ongoing the records whose
+// outage is still in progress.
+type pendingLoss struct {
+	id      string
+	lost    int
+	ongoing int
+}
+
+// snapshotUndelivered tallies every beat's undelivered records under the mutex
+// and returns them with the process-wide totals, so the logging below runs
+// entirely outside the lock.
+func (w *Watcher) snapshotUndelivered() (beats []pendingLoss, total, lostTotal int) {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	for id, st := range w.beats {
 		// Only a CLOSED record is a permanent loss; the open tail (openMissing)
-		// is an outage still in progress, which the godoc above explains.
+		// is an outage still in progress, which logUndelivered's godoc explains.
 		// overflowAccounted counts as one more ongoing record: a detected outage
 		// the sweep could not queue lives in that flag alone, and a drain can
 		// empty the slice while that outage is still in progress, so shutdown
@@ -673,46 +750,44 @@ func (w *Watcher) logUndelivered() {
 		if lost+ongoing == 0 {
 			continue
 		}
-		beats = append(beats, pending{id: id, lost: lost, ongoing: ongoing})
+		beats = append(beats, pendingLoss{id: id, lost: lost, ongoing: ongoing})
 		total += lost + ongoing
 		lostTotal += lost
 	}
-	w.mu.Unlock()
-	// Drain the queue so the warning can NAME the beats whose recovered
-	// notice dies with the process: nothing consumes the channel after Run
-	// returns, and a bare count leaves the operator unable to tell which
-	// beat is still showing as down in Discord.
-	var lostRecoveries []string
-drain:
+	return beats, total, lostTotal
+}
+
+// drainRecoveryIDs empties the recovery queue and names the beats it held, so
+// the shutdown warning can NAME the beats whose recovered notice dies with the
+// process: nothing consumes the channel after Run returns, and a bare count
+// leaves the operator unable to tell which beat is still showing as down in
+// Discord.
+func drainRecoveryIDs(ch <-chan recoveryEvent) []string {
+	var ids []string
 	for {
 		select {
-		case ev := <-w.recoveries:
-			lostRecoveries = append(lostRecoveries, ev.id)
+		case ev := <-ch:
+			ids = append(ids, ev.id)
 		default:
-			break drain
+			return ids
 		}
 	}
-	queuedRecoveries := len(lostRecoveries)
-	slog.Info("watch loop stopped",
-		"undelivered_records", total, "permanent_loss", lostTotal,
-		"ongoing_records", total-lostTotal,
-		"queued_recoveries", queuedRecoveries)
-	for _, p := range beats {
-		if p.lost == 0 {
-			// Named rather than silent: a beat that returns inside the
-			// post-restart grace window ends the outage with no notice ever
-			// sent (README "Alerting", KnellRestartChurn).
-			slog.Info("shutting down with an ongoing outage, its notice arrives only if the outage outlives the post-restart deadline",
-				"beat", p.id, "still_ongoing", p.ongoing)
-			continue
-		}
-		slog.Warn("shutting down with undelivered ended-outage records, no notice for them will ever arrive",
-			"beat", p.id, "records", p.lost, "still_ongoing", p.ongoing)
+}
+
+// logPendingLoss emits one beat's shutdown line, at the level its loss class
+// deserves: an ongoing-only outage is informational, an ended-outage record is
+// a permanent loss.
+func logPendingLoss(p pendingLoss) {
+	if p.lost == 0 {
+		// Named rather than silent: a beat that returns inside the
+		// post-restart grace window ends the outage with no notice ever
+		// sent (README "Alerting", KnellRestartChurn).
+		slog.Info("shutting down with an ongoing outage, its notice arrives only if the outage outlives the post-restart deadline",
+			"beat", p.id, "still_ongoing", p.ongoing)
+		return
 	}
-	if queuedRecoveries > 0 {
-		slog.Warn("shutting down with queued recovered notifications, they will never be delivered",
-			"queued", queuedRecoveries, "beats", lostRecoveries)
-	}
+	slog.Warn("shutting down with undelivered ended-outage records, no notice for them will ever arrive",
+		"beat", p.id, "records", p.lost, "still_ongoing", p.ongoing)
 }
 
 // overdue reports whether an observed silence has passed the beat's deadline.
@@ -828,62 +903,81 @@ func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
 	defer w.mu.Unlock()
 	now := w.now()
 	for id, st := range w.beats {
-		// This sweep's reading of the beat's silence, as the two instants that
-		// bound it: the last accepted ping and this sweep. The freshness gauge,
-		// a queued record and the live notice all read their span from it.
-		silence := Transition{Started: st.lastSeen, Observed: now}
-		fresh := publishFreshness(id, silence.DownFor(), st.deadline)
-		// An overdue beat whose current outage is not on the queue yet is
-		// a fresh crossing to record. Recording it here rather than
-		// skipping the beat is what keeps a second outage alive while an
-		// earlier notice is still undelivered.
-		//
-		// A record this path queues is OPEN, so it can only ever become
-		// history if a ping ends the outage before its live notice was
-		// delivered: the send failed, st.recovering held the beat behind an
-		// earlier recovery, or sweepSendBudget deferred it to a later sweep.
-		// All three are one fact — the alert that was due had not been
-		// delivered — so the reason is LateUndelivered for every one of them,
-		// stated here rather than left to the zero value.
-		if !fresh && !st.alerted && st.openMissing() == nil {
-			st.recordOngoingOutage(&overdueBeat{
-				id: id, silence: silence, late: LateUndelivered,
-			})
-		}
-		head := st.headMissing()
-		if head == nil {
-			continue
-		}
-		// Only the still-open current outage refreshes its silence, so a
-		// retry reports how long the beat has been quiet: its observation
-		// instant moves forward while its start — the record's own anchor —
-		// never does. Once a ping seals the record, that reading freezes at
-		// the observation taken when the outage was detected; a history notice
-		// reports the outage's full span (Outage.DownFor) instead, so the
-		// frozen reading is only supplementary detail.
-		// The lastSeen match is a defensive second guard, the twin of
-		// markDelivered's: an open head is always the tail (openMissing), and
-		// a ping seals the open tail in the same critical section that moves
-		// lastSeen, so today it cannot disagree with recoveredAt. Keep it, so
-		// a record whose start no longer matches lastSeen can never have a
-		// later beat's observation written over its own reading.
-		if head.recoveredAt.IsZero() && head.silence.Started.Equal(st.lastSeen) {
-			head.silence.Observed = now
-		}
-		// Held while an earlier recovery is queued or in flight, so
-		// transitions reach Discord in chronological order.
-		if st.recovering {
-			continue
-		}
-		// An ended head is history: collapse its whole run into one notice.
-		// An open head is a live incident and keeps the present-tense path.
-		if run := st.closedRun(); len(run) > 0 {
+		due, run := collectBeatDue(id, st, now)
+		if len(run) > 0 {
 			history = append(history, beatOutages{id: id, outages: run})
 			continue
 		}
-		live = append(live, *head)
+		if due != nil {
+			live = append(live, *due)
+		}
 	}
 	return live, history
+}
+
+// collectBeatDue is collectDue's per-beat state transition: it publishes the
+// beat's freshness gauge, records a newly detected crossing, refreshes an
+// open record's reading, and reports what this sweep owes the beat — a live
+// missing notice, a run of ended outages to collapse into one history notice,
+// or neither. The caller holds w.mu; the returned record is a COPY, so no
+// pointer into pendingMissing escapes the critical section.
+func collectBeatDue(id string, st *beatState, now time.Time) (*overdueBeat, []Outage) {
+	// This sweep's reading of the beat's silence, as the two instants that
+	// bound it: the last accepted ping and this sweep. The freshness gauge,
+	// a queued record and the live notice all read their span from it.
+	silence := Transition{Started: st.lastSeen, Observed: now}
+	fresh := publishFreshness(id, silence.DownFor(), st.deadline)
+	// An overdue beat whose current outage is not on the queue yet is
+	// a fresh crossing to record. Recording it here rather than
+	// skipping the beat is what keeps a second outage alive while an
+	// earlier notice is still undelivered.
+	//
+	// A record this path queues is OPEN, so it can only ever become
+	// history if a ping ends the outage before its live notice was
+	// delivered: the send failed, st.recovering held the beat behind an
+	// earlier recovery, or sweepSendBudget deferred it to a later sweep.
+	// All three are one fact — the alert that was due had not been
+	// delivered — so the reason is LateUndelivered for every one of them,
+	// stated here rather than left to the zero value.
+	if !fresh && !st.alerted && st.openMissing() == nil {
+		st.recordOngoingOutage(&overdueBeat{
+			id: id, silence: silence, late: LateUndelivered,
+		})
+	}
+	head := st.headMissing()
+	if head == nil {
+		return nil, nil
+	}
+	// Only the still-open current outage refreshes its silence, so a
+	// retry reports how long the beat has been quiet: its observation
+	// instant moves forward while its start — the record's own anchor —
+	// never does. Once a ping seals the record, that reading freezes at
+	// the observation taken when the outage was detected; a history notice
+	// reports the outage's full span (Outage.DownFor) instead, so the
+	// frozen reading is only supplementary detail.
+	// The lastSeen match is a defensive second guard, the twin of
+	// markDelivered's: an open head is always the tail (openMissing), and
+	// a ping seals the open tail in the same critical section that moves
+	// lastSeen, so today it cannot disagree with recoveredAt. Keep it, so
+	// a record whose start no longer matches lastSeen can never have a
+	// later beat's observation written over its own reading.
+	if head.recoveredAt.IsZero() && head.silence.Started.Equal(st.lastSeen) {
+		head.silence.Observed = now
+	}
+	// Held while an earlier recovery is queued or in flight, so
+	// transitions reach Discord in chronological order.
+	if st.recovering {
+		return nil, nil
+	}
+	// An ended head is history: collapse its whole run into one notice.
+	// An open head is a live incident and keeps the present-tense path.
+	if run := st.closedRun(); len(run) > 0 {
+		return nil, run
+	}
+	// Copy the record before it leaves the critical section, so the sweep
+	// never holds a pointer into pendingMissing.
+	due := *head
+	return &due, nil
 }
 
 // sendMissing delivers one due missing transition and reports whether

@@ -35,32 +35,18 @@ import (
 // governs).
 const attemptTimeout = 10 * time.Second
 
-// maxContentRunes is Discord's hard limit on a webhook message's `content`
-// field. Every notice this package renders must stay inside it, or Discord
-// answers 400 and no notice is ever delivered.
-const maxContentRunes = 2000
-
-// MaxNodeNameBytes is the largest node name every notice this package renders
-// can carry and still stay inside Discord's 2000-character `content` limit.
+// MaxNodeNameBytes is the maximum UTF-8 byte length of NODE_NAME.
+// internal/config enforces this cap so every rendered notification remains
+// within Discord's content limit.
+//
 // The node name is interpolated into EVERY notice (missing, recovered,
 // history), so an unbounded value makes Discord reject all of them: knell would
 // start, accept beats and detect outages while no notice is ever delivered — a
-// dead-man switch that delivers nothing. It lives here, beside the templates it
-// is measured over, so a wording change and the budget it consumes are read in
-// one place; internal/config enforces it as the operator-facing NODE_NAME cap.
-//
-// The budget, worst case over the templates below: the MULTI-outage history
-// notice (historyMessage's len(outages) > 1 branch, 65 chars of fixed text)
-// carrying the mixed batchLateClause (101 chars, the longest of the four late
-// clauses), plus a beat id (<= 64 by config's beat-id grammar), a truncated
-// duration (<= 32), a "2006-01-02 15:04 MST" recovery timestamp (20) and three
-// outage counts (1 digit each: a batch is bounded by watch's missingQueueSize =
-// 8) = 285 characters. The single-outage notice is shorter (54 + its 111-char
-// LateEndedBeforeDetection clause + 64 + 32 + 20 = 281) and so is the missing
-// notice (168 + 64 + 32 = 264). That leaves ~1715 for the node name, so 256
-// keeps a wide margin while admitting every DNS-legal hostname (253 max).
-// Counting BYTES is conservative against Discord's character limit: UTF-8 bytes
-// are always >= the character count and >= the UTF-16 code-unit count.
+// dead-man switch that delivers nothing. Counting BYTES is conservative against
+// Discord's character limit: UTF-8 bytes are always >= the character count and
+// >= the UTF-16 code-unit count. TestEveryNoticeStaysInsideDiscordsContentLimit
+// owns the derivation: it renders every notice shape at its worst case and
+// fails when a wording change eats the budget.
 const MaxNodeNameBytes = 256
 
 // maxAttempts is the total delivery attempts per notification (httpx
@@ -228,17 +214,18 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 // nobody spends an evening on a webhook that posted this very message on its
 // first try.
 //
-// The undelivered wording deliberately does NOT claim the live alert was still
-// pending when the beat returned, because watch reaches this reason two ways: a
-// live missing alert that never got through, and an outage that ended before
-// any sweep saw it whose HISTORY notice then failed to post (blameDelivery
-// upgrades that record to LateUndelivered). Naming a failed attempt instead of
-// a pending live alert is true for both, and still points at the webhook.
+// The undelivered wording deliberately does NOT claim an attempt was already
+// made, because watch reaches this reason three ways: a live missing alert that
+// never got through, an outage that ended before any sweep saw it whose HISTORY
+// notice then failed to post (blameDelivery upgrades that record to
+// LateUndelivered), and a record the sweep's send budget deferred before any
+// attempt was started. Naming a DELAY in delivery instead of a failed attempt
+// is true for all three, and still points at the webhook.
 func lateClause(reason watch.LateReason) string {
 	if reason == watch.LateEndedBeforeDetection {
 		return "This notice is late only because the outage ended before a sweep detected it - nothing was wrong with delivery."
 	}
-	return "This notice is late because an earlier attempt to report it went undelivered - check the webhook."
+	return "This notice is late because delivery was delayed - check the webhook."
 }
 
 // batchLateClause explains why a whole run of ended outages is reported after
@@ -246,12 +233,12 @@ func lateClause(reason watch.LateReason) string {
 // back while short outages keep ending between sweeps, which is exactly how a
 // flapping beat behaves during a Discord outage — so a mixed batch reports
 // BOTH counts instead of picking the majority reason and stating something
-// false about the rest. It keeps the webhook pointer: one failed report attempt
-// is reason enough to look at delivery, while naming the outages that ended
+// false about the rest. It keeps the webhook pointer: one delayed report is
+// reason enough to look at delivery, while naming the outages that ended
 // before a sweep saw them stops the count from reading as that many webhook
-// failures. Like lateClause, the undelivered half names a failed ATTEMPT to
-// report rather than a pending live alert, because a record upgraded to
-// LateUndelivered by a failed history post never had a live alert due.
+// failures. Like lateClause, the undelivered half names a DELAY in delivery
+// rather than a failed attempt, because a record the sweep's send budget
+// deferred was never attempted at all.
 func batchLateClause(outages []watch.Outage) string {
 	ended := 0
 	for _, o := range outages {
@@ -265,11 +252,11 @@ func batchLateClause(outages []watch.Outage) string {
 	// Blaming delivery is the direction a reason-less batch must fall through
 	// to, like watch.LateUndelivered being the zero value.
 	case 0:
-		return "An earlier attempt to report them went undelivered - check the webhook."
+		return "Delivery was delayed for every outage - check the webhook."
 	case len(outages):
 		return "Each ended before a sweep detected it - nothing was wrong with delivery."
 	default:
-		return fmt.Sprintf("%d had an earlier report attempt go undelivered (check the webhook), %d ended before a sweep detected it.",
+		return fmt.Sprintf("Delivery was delayed for %d (check the webhook); %d ended before a sweep detected it.",
 			len(outages)-ended, ended)
 	}
 }
@@ -594,15 +581,39 @@ func deliveryError(resp *http.Response) error {
 		// the operator only when the body arrives whole and under
 		// maxErrorBodyBytes, so name the credential knell actually has and
 		// the verdict stands on its own when the body contributes nothing.
-		return fmt.Errorf(
-			"%w%s (knell sends no API key - DISCORD_WEBHOOK_URL's own path and token are the credential: recreate the webhook and update the config)",
-			statusErr, detail)
+		//
+		// %w cannot be used here: it would carry CheckHTTPStatus's own
+		// "invalid API key (401)" / "access denied (403)" text into the
+		// message this correction exists to replace, so the operator would
+		// read both diagnoses at once. webhookCredentialError writes the
+		// whole message itself and keeps the typed cause reachable through
+		// Unwrap, so errors.As still classifies it.
+		return &webhookCredentialError{cause: statusErr, detail: detail, status: resp.StatusCode}
 	}
 	if detail != "" {
 		return fmt.Errorf("%w%s", statusErr, detail)
 	}
 	return statusErr
 }
+
+// webhookCredentialError reports a 401/403 in knell's own words while keeping
+// httpx's typed status error reachable for errors.As. Its Error text is
+// entirely knell-owned on purpose: the httpx wording it replaces describes a
+// keyed API, and knell sends no API key — DISCORD_WEBHOOK_URL's own path and
+// token are the credential.
+type webhookCredentialError struct {
+	cause  error
+	detail string
+	status int
+}
+
+func (e *webhookCredentialError) Error() string {
+	return fmt.Sprintf(
+		"HTTP %d: DISCORD_WEBHOOK_URL's path/token credential was rejected%s (knell sends no API key: recreate the webhook and update the config)",
+		e.status, e.detail)
+}
+
+func (e *webhookCredentialError) Unwrap() error { return e.cause }
 
 // statusDetail renders what a rejected response adds to its status code,
 // using only numbers this package measured and words this package wrote.

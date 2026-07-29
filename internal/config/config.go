@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/cplieger/envx"
-	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/slogx"
 )
 
@@ -50,14 +49,6 @@ const minTokenLength = 16
 // as blank, so using it as the refusal test would fail startup on a working
 // configuration.
 const asciiWhitespace = " \t\r\n\v\f"
-
-// maxNodeNameBytes caps NODE_NAME so every notification stays inside Discord's
-// 2000-character `content` limit. The bound itself lives in internal/notify
-// (notify.MaxNodeNameBytes), the package that owns every template it is
-// measured over, so a wording change and the budget it consumes are read in one
-// place; config's job is to ENFORCE it as an operator-facing cap. Counting
-// BYTES is conservative against Discord's character limit.
-const maxNodeNameBytes = notify.MaxNodeNameBytes
 
 // defaultListenAddr is the listener address used when LISTEN_ADDR is unset or
 // blank.
@@ -117,7 +108,14 @@ func (c Config) LogValue() slog.Value {
 
 // Load reads the environment and returns the validated configuration.
 // BEATS and DISCORD_WEBHOOK_URL are required; everything else has a default.
-func Load() (Config, error) {
+//
+// maxNodeNameBytes is the NODE_NAME cap this package ENFORCES; the bound itself
+// is owned by the package that renders the notices it is measured over
+// (internal/notify's MaxNodeNameBytes), and the composition root passes it in —
+// the same mediation main already performs when it translates a config.Beat
+// into a watch.Beat. Taking it as a parameter keeps the environment boundary
+// free of any dependency on the Discord transport.
+func Load(maxNodeNameBytes int) (Config, error) {
 	var cfg Config
 
 	rawBeats, err := envx.Require("BEATS")
@@ -136,7 +134,7 @@ func Load() (Config, error) {
 	}
 	cfg.WebhookURL = webhook
 
-	node, err := nodeName()
+	node, err := nodeName(maxNodeNameBytes)
 	if err != nil {
 		return cfg, err
 	}
@@ -158,14 +156,15 @@ func Load() (Config, error) {
 // nodeName resolves the observer name: NODE_NAME when set to a non-blank value
 // (a blank one is warned about and ignored), else the
 // hostname, else "unknown". A NODE_NAME past maxNodeNameBytes fails startup
-// like any other malformed required value: the cap (see maxNodeNameBytes for
-// the budget) is what guarantees no name can push a notification past
+// like any other malformed required value: the cap (owned by internal/notify,
+// which renders every template the budget is measured over, and passed down
+// from Load) is what guarantees no name can push a notification past
 // Discord's content limit, where the switch would arm and never ring. The
 // hostname fallback is not length-checked because the kernel
 // already bounds it far below the cap (HOST_NAME_MAX is 64 on Linux, 255 by
 // POSIX), and refusing to start over the machine's own hostname would trade a
 // deliverable notice for no notice at all.
-func nodeName() (string, error) {
+func nodeName(maxNodeNameBytes int) (string, error) {
 	raw, present := os.LookupEnv("NODE_NAME")
 	node := strings.TrimSpace(raw)
 	if node == "" {
@@ -262,6 +261,33 @@ func rejectBlankFileVar(key string) error {
 	return nil
 }
 
+// secretFileError rewrites an envx secret-file failure into a message that
+// names the variable and the failure CLASS but never the operator-supplied
+// path. envx embeds the KEY_FILE path in its blank-file, path-policy and
+// os.PathError messages — correct when the value is a path, and a leak when it
+// is not: the common misconfiguration `DISCORD_WEBHOOK_URL_FILE=https://…/<token>`
+// (the credential pasted into the file variable) would otherwise copy that live
+// webhook URL into the startup ERROR line and from there into Loki, and
+// BEAT_TOKEN_FILE is structurally identical for the bearer token. The original
+// error is deliberately NOT wrapped: %w would carry the path through
+// Error() anyway.
+func secretFileError(key string, err error) error {
+	if errors.Is(err, envx.ErrBlankSecretFile) {
+		return fmt.Errorf("%s_FILE points to a blank secret file: point it at a file containing the secret, or unset it to configure %s directly", key, key)
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		// pathErr.Err is the bare reason ("no such file or directory",
+		// "permission denied"); pathErr.Path is the operator-supplied value and
+		// stays out of the message.
+		return fmt.Errorf("%s_FILE could not be %s: %v", key, pathErr.Op, pathErr.Err)
+	}
+	// envx's path policy (unclean path, ".."), the size limit and the
+	// grew-during-read guard all embed the path in an untyped error, so none of
+	// their reasons can be surfaced verbatim.
+	return fmt.Errorf("%s_FILE could not be read or validated: check that it names a clean path to a readable secret file no larger than envx's limit", key)
+}
+
 // warnPlainVarIgnored reports that KEY_FILE supplied the secret while the
 // plain KEY was also set, so the plain variable was ignored. envx documents
 // this composition as the caller's policy (SecretWithSource reports the
@@ -328,17 +354,6 @@ func checkBeatToken(token string) error {
 		// gated endpoint that rejected every ping.
 		return errors.New("BEAT_TOKEN is set but empty: set it to a long random token, or unset the variable entirely to serve /beat/{id} open on purpose")
 	}
-	if strings.TrimSpace(token) == "" {
-		// All whitespace by Unicode rules, yet free of ASCII edge padding, so
-		// every rune survives the header (a non-ASCII space): the token IS
-		// presentable, so it is kept verbatim and the gate stays armed. Say
-		// so, because the only other signal is the length hint below, which
-		// reads as "your token is short" for a value the operator cannot see
-		// in `docker inspect` output. The wording deliberately does NOT name
-		// the value's character class: the startup log is shipped to Loki,
-		// where describing a live credential's alphabet narrows a guess.
-		slog.Warn("BEAT_TOKEN is armed with a value that is easy to mistake for absent; the /beat/{id} gate requires it and every sender must present it verbatim, so set a long random token, or unset the variable to serve the endpoint open")
-	}
 	if !beatTokenFitsHeader(token) {
 		// Free of edge padding, yet still unpresentable: a control byte (a
 		// pasted newline, a \n that came through a compose value verbatim, a
@@ -347,7 +362,23 @@ func checkBeatToken(token string) error {
 		// than arm a gate that 401s every ping and turns every configured beat
 		// falsely missing one deadline later. The value is never echoed: the
 		// message names the variable and the shape of the problem only.
+		//
+		// Checked BEFORE the armed-with-an-invisible-value warning below: a
+		// value like "\u00a0\n\u00a0" passes the ASCII-edge refusal and reads
+		// blank to strings.TrimSpace, so warning first would log "the gate is
+		// armed" for a configuration this very check then refuses to start.
 		return errors.New("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it; use a token containing printable characters, or unset the variable entirely to serve /beat/{id} open on purpose")
+	}
+	if strings.TrimSpace(token) == "" {
+		// All whitespace by Unicode rules, yet free of ASCII edge padding and
+		// legal in a header, so every rune survives the header (a non-ASCII
+		// space): the token IS presentable, so it is kept verbatim and the gate
+		// stays armed. Say so, because the only other signal is the length hint
+		// below, which reads as "your token is short" for a value the operator
+		// cannot see in `docker inspect` output. The wording deliberately does
+		// NOT name the value's character class: the startup log is shipped to
+		// Loki, where describing a live credential's alphabet narrows a guess.
+		slog.Warn("BEAT_TOKEN is armed with a value that is easy to mistake for absent; the /beat/{id} gate requires it and every sender must present it verbatim, so set a long random token, or unset the variable to serve the endpoint open")
 	}
 	return nil
 }
@@ -401,8 +432,11 @@ func loadBeatToken() (string, error) {
 	default:
 		// Any other error means the variable WAS provided and could not be
 		// used (unreadable or blank _FILE): fail closed rather than serving
-		// an open endpoint the operator meant to gate.
-		return "", fmt.Errorf("BEAT_TOKEN: %w", err)
+		// an open endpoint the operator meant to gate. The envx error is
+		// sanitized, never wrapped: it embeds the BEAT_TOKEN_FILE value, which
+		// is the bearer token itself whenever the operator pasted the
+		// credential into the file variable.
+		return "", secretFileError("BEAT_TOKEN", err)
 	}
 	if token == "" {
 		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE was set (the only arm that
@@ -441,8 +475,11 @@ func loadWebhook() (string, error) {
 		}
 		// Provided via _FILE but unreadable/empty: not a missing-variable
 		// case, and never a fallback to the plain variable — a webhook the
-		// operator meant to configure must fail startup, not go unset.
-		return "", fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
+		// operator meant to configure must fail startup, not go unset. The
+		// envx error is sanitized, never wrapped: it embeds the
+		// DISCORD_WEBHOOK_URL_FILE value, which is the webhook credential
+		// itself whenever the operator pasted the URL into the file variable.
+		return "", secretFileError("DISCORD_WEBHOOK_URL", err)
 	}
 
 	// envx trims the _FILE branch only; a plain variable copied from a
@@ -540,7 +577,12 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		// required scheme keeps the message actionable and leak-free.
 		return nil, errors.New("scheme must be https (the webhook URL's own path is the credential, so plain http would send it in cleartext)")
 	}
-	if u.Host == "" {
+	if u.Hostname() == "" {
+		// Hostname(), not Host: an authority that carries only a port
+		// ("https://:443/api/webhooks/x/y") has a non-empty Host and would
+		// pass, so startup would succeed and the health marker go ready for a
+		// webhook that has no destination at all — every notification would
+		// then fail as a transport error exactly when the switch must ring.
 		return nil, errors.New("missing host")
 	}
 	if u.Path == "" || u.Path == "/" {

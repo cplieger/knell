@@ -18,18 +18,23 @@ import (
 	"github.com/cplieger/slogx/capture"
 )
 
-// fakeBeater accepts a fixed id set and records what was recorded.
+// fakeBeater accepts a fixed id set and records what was recorded. closed
+// stands in for a watcher that has shut admission (watch.Watcher.stopAccepting).
 type fakeBeater struct {
-	known map[string]bool
-	seen  []string
+	known  map[string]bool
+	seen   []string
+	closed bool
 }
 
-func (f *fakeBeater) Beat(id string) bool {
+func (f *fakeBeater) Beat(id string) (recorded, accepting bool) {
+	if f.closed {
+		return false, false
+	}
 	if !f.known[id] {
-		return false
+		return false, true
 	}
 	f.seen = append(f.seen, id)
-	return true
+	return true, true
 }
 
 // newTestHandler assembles the routed handler around b with a healthy
@@ -263,7 +268,7 @@ func TestNoStoreOnEveryRoute(t *testing.T) {
 // beat handler.
 type panicBeater struct{}
 
-func (panicBeater) Beat(string) bool { panic("beat exploded") }
+func (panicBeater) Beat(string) (bool, bool) { panic("beat exploded") }
 
 func TestPanicUnderBeatHandlerAnswers500AndIsLogged(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
@@ -400,6 +405,38 @@ func TestBeatOverLimitBodyWarnsAndStillRecords(t *testing.T) {
 	}
 	if len(b.seen) != 2 {
 		t.Errorf("recorded beats = %v, want both pings recorded", b.seen)
+	}
+}
+
+// interruptedReader ends mid-body with a non-MaxBytesError, the shape a sender
+// that disconnects part-way through its payload produces.
+type interruptedReader struct{}
+
+func (*interruptedReader) Read(p []byte) (int, error) {
+	return copy(p, "partial"), io.ErrUnexpectedEOF
+}
+
+// TestBeatBodyReadFailureStillRecords pins that a body read failure other than
+// the cap overrun does not cost the sender its ping: drainBeatBody deliberately
+// ignores it, because a heartbeat's payload is irrelevant and treating a partial
+// sender disconnect as fatal would discard a valid beat and, one deadline later,
+// ring a false missing notice.
+func TestBeatBodyReadFailureStillRecords(t *testing.T) {
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	h := newTestHandler(b, "")
+	req := httptest.NewRequest(http.MethodPost, "/beat/api", &interruptedReader{})
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ping with an interrupted body = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	if len(b.seen) != 1 || b.seen[0] != "api" {
+		t.Errorf("recorded beats = %v, want [api]: a body read failure must not discard the heartbeat", b.seen)
+	}
+	if !strings.Contains(rec.Body.String(), `"ok":true`) {
+		t.Errorf("ok body = %s", rec.Body.String())
 	}
 }
 
@@ -843,33 +880,80 @@ func beatRequest(t *testing.T, h http.Handler, method, path string) *httptest.Re
 	return rec
 }
 
-// TestBeatRefusedOnceTheApplicationContextIsCancelled pins the acceptance
-// window against the real state machine and the real exposition. On SIGTERM the
-// shared context is cancelled, which returns watch.Run (after it snapshots its
-// undelivered work) while webhttp keeps the HTTP surface live for up to the
-// shutdown grace. A ping accepted in that window is recorded behind a sender
-// that no longer exists: lastSeen moves, knell_beats_received_total moves,
-// knell_beat_fresh is republished as 1 — a false "all good" sample for the
-// quorum rules — and for an alerted beat a recovered notification is queued on
-// a channel nobody reads again. So from the instant the context is cancelled
-// the endpoint must record NOTHING and say so honestly, while /healthz and
-// /metrics keep serving through the drain.
-func TestBeatRefusedOnceTheApplicationContextIsCancelled(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and it must be installed before New (webhttp.Logging resolves
-	// slog.Default() when the chain is built).
+// newShutdownHarness builds the routed handler over the real state machine for
+// one beat, on a fake clock, behind a cancellable application context —
+// cancel() is SIGTERM's effect on the app, and the only trigger the acceptance
+// guard may key on. Each caller passes its OWN beat id: the metrics registry is
+// a package-level singleton shared by the whole test binary. capture.Default is
+// installed before New because webhttp.Logging resolves slog.Default() when the
+// chain is built; it swaps the process-global default, so every caller stays
+// serial (no t.Parallel).
+func newShutdownHarness(t *testing.T, id string) (http.Handler, context.CancelFunc, *fakeClock, time.Time) {
+	t.Helper()
 	capture.Default(t)
-	// Ids unique to this test: the metrics registry is a package-level
-	// singleton shared by the whole test binary.
-	const id = "webapi-shutdown-guard"
-	const ghost = "webapi-shutdown-guard-ghost"
 	start := time.Unix(1_700_000_000, 0).UTC()
 	clock := &fakeClock{now: start}
 	watcher := watch.New([]watch.Beat{{ID: id, Deadline: time.Minute}}, &deliveringNotifier{}, clock.Now, start)
-
 	appCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	h := New(appCtx, watcher, "", Routes{Healthz: staticHealthz(http.StatusOK), Metrics: metrics.Handler()})
+	return h, cancel, clock, start
+}
+
+// assertBeatRefused drives one ping into a handler whose application context is
+// already cancelled and pins the whole refusal envelope: 503, the shutting_down
+// code so a sender can tell a refusal from a 404, and no echo of the beat id —
+// configured or not — so the refusal leaks as little as the 404 path does about
+// which ids exist.
+func assertBeatRefused(t *testing.T, h http.Handler, method, path string) {
+	t.Helper()
+	rec := beatRequest(t, h, method, path)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("%s %s after cancellation = %d, want 503 (body %s)", method, path, rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "shutting_down") {
+		t.Errorf("503 body = %s, want the shutting_down code so a sender can tell a refusal from a 404", body)
+	}
+	if id, ok := strings.CutPrefix(path, "/beat/"); ok && strings.Contains(body, id) {
+		t.Errorf("503 body = %s, must not echo the beat id", body)
+	}
+}
+
+// TestBeatRefusedOnceTheApplicationContextIsCancelled pins the acceptance
+// window against the real state machine. On SIGTERM the shared context is
+// cancelled, which returns watch.Run (after it snapshots its undelivered work)
+// while webhttp keeps the HTTP surface live for up to the shutdown grace. A
+// ping accepted in that window is recorded behind a sender that no longer
+// exists, so from the instant the context is cancelled both accepted methods
+// must refuse and say so honestly. What accepting one would cost is pinned by
+// the siblings below: TestCancelledBeatLeavesMetricsUnchanged (the exposition),
+// TestCancelledUnknownBeatMintsNoSeries (label cardinality),
+// TestCancelledBeatDoesNotReadBody (the drain), and
+// TestProbeRoutesServeWhileBeatAcceptanceIsClosed (the probes keep serving).
+func TestBeatRefusedOnceTheApplicationContextIsCancelled(t *testing.T) {
+	const id = "webapi-shutdown-guard"
+	h, cancel, _, _ := newShutdownHarness(t, id)
+
+	cancel()
+
+	for _, method := range []string{http.MethodPost, http.MethodGet} {
+		t.Run("refused "+method, func(t *testing.T) {
+			assertBeatRefused(t, h, method, "/beat/"+id)
+		})
+	}
+}
+
+// TestCancelledBeatLeavesMetricsUnchanged pins the exposition across the
+// refusal. A ping accepted during the drain moves lastSeen, moves
+// knell_beats_received_total, and republishes knell_beat_fresh as 1 — a false
+// "all good" sample for the quorum rules, behind a sender that no longer exists
+// (and for an alerted beat, a recovered notification queued on a channel nobody
+// reads again). The tally the endpoint carries into the drain must stay the one
+// watch.Run already reported.
+func TestCancelledBeatLeavesMetricsUnchanged(t *testing.T) {
+	const id = "webapi-shutdown-metrics"
+	h, cancel, clock, start := newShutdownHarness(t, id)
 
 	receivedSeries := `knell_beats_received_total{beat="` + id + `"}`
 	lastSeenSeries := `knell_beat_last_seen_timestamp_seconds{beat="` + id + `"}`
@@ -902,22 +986,7 @@ func TestBeatRefusedOnceTheApplicationContextIsCancelled(t *testing.T) {
 	// SIGTERM's effect on the app, and the only trigger the guard may key on.
 	cancel()
 
-	for _, method := range []string{http.MethodPost, http.MethodGet} {
-		t.Run("refused "+method, func(t *testing.T) {
-			rec := beatRequest(t, h, method, "/beat/"+id)
-			if rec.Code != http.StatusServiceUnavailable {
-				t.Fatalf("%s /beat/%s after cancellation = %d, want 503 (body %s)",
-					method, id, rec.Code, rec.Body.String())
-			}
-			body := rec.Body.String()
-			if !strings.Contains(body, "shutting_down") {
-				t.Errorf("503 body = %s, want the shutting_down code so a sender can tell a refusal from a 404", body)
-			}
-			if strings.Contains(body, id) {
-				t.Errorf("503 body = %s, must not echo the beat id", body)
-			}
-		})
-	}
+	assertBeatRefused(t, h, http.MethodPost, "/beat/"+id)
 
 	// Nothing may have moved: this is the tally watch.Run already reported.
 	exposition = scrapeExposition(t, h)
@@ -933,48 +1002,64 @@ func TestBeatRefusedOnceTheApplicationContextIsCancelled(t *testing.T) {
 		t.Errorf("%s after a refused ping = %v, want it still 0: a refused ping must not republish a silent beat as fresh, which is exactly the sample the quorum rules read",
 			freshSeries, got)
 	}
+}
 
-	t.Run("unknown id refused without minting a series", func(t *testing.T) {
-		rec := beatRequest(t, h, http.MethodPost, "/beat/"+ghost)
-		if rec.Code != http.StatusServiceUnavailable {
-			t.Fatalf("POST /beat/%s after cancellation = %d, want 503 (body %s)", ghost, rec.Code, rec.Body.String())
-		}
-		if body := rec.Body.String(); strings.Contains(body, ghost) {
-			t.Errorf("503 body = %s, must not echo the unknown beat id", body)
-		}
-		if exposition := scrapeExposition(t, h); strings.Contains(exposition, ghost) {
-			t.Errorf("exposition mentions %s: a refused ping must mint no series, like the 404 path", ghost)
-		}
-	})
+// TestCancelledUnknownBeatMintsNoSeries pins label cardinality on the refusal
+// path: an unknown id is a metric label an unauthenticated caller controls, so a
+// refused ping must mint no series at all, exactly like the 404 path it replaces
+// during the drain.
+func TestCancelledUnknownBeatMintsNoSeries(t *testing.T) {
+	const id = "webapi-shutdown-ghost-guard"
+	const ghost = "webapi-shutdown-ghost-unknown"
+	h, cancel, _, _ := newShutdownHarness(t, id)
 
-	t.Run("refused without reading the body", func(t *testing.T) {
-		// The refusal lands before the body drain, like the 401 one: a ping
-		// arriving during the drain must not be able to hold a handler
-		// goroutine — and with it srv.Shutdown — open by trickling a payload.
-		body := &countingReader{}
-		req := httptest.NewRequest(http.MethodPost, "/beat/"+id, body)
+	cancel()
+
+	assertBeatRefused(t, h, http.MethodPost, "/beat/"+ghost)
+	if exposition := scrapeExposition(t, h); strings.Contains(exposition, ghost) {
+		t.Errorf("exposition mentions %s: a refused ping must mint no series, like the 404 path", ghost)
+	}
+}
+
+// TestCancelledBeatDoesNotReadBody pins that the refusal lands BEFORE the body
+// drain, like the 401 one: a ping arriving during the drain must not be able to
+// hold a handler goroutine — and with it srv.Shutdown — open by trickling a
+// payload.
+func TestCancelledBeatDoesNotReadBody(t *testing.T) {
+	const id = "webapi-shutdown-body"
+	h, cancel, _, _ := newShutdownHarness(t, id)
+
+	cancel()
+
+	body := &countingReader{}
+	req := httptest.NewRequest(http.MethodPost, "/beat/"+id, body)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if body.reads != 0 {
+		t.Errorf("body reads = %d, want 0 (a refused ping must not be drained)", body.reads)
+	}
+}
+
+// TestProbeRoutesServeWhileBeatAcceptanceIsClosed pins the other half of the
+// drain: only the beat endpoint refuses. The orchestrator has to observe the
+// health flip, and a last scrape during the drain is useful.
+func TestProbeRoutesServeWhileBeatAcceptanceIsClosed(t *testing.T) {
+	const id = "webapi-shutdown-probes"
+	h, cancel, _, _ := newShutdownHarness(t, id)
+
+	cancel()
+
+	for _, path := range []string{"/healthz", "/metrics"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusServiceUnavailable {
-			t.Fatalf("status = %d, want 503", rec.Code)
+		if rec.Code != http.StatusOK {
+			t.Errorf("GET %s with the app context cancelled = %d, want 200", path, rec.Code)
 		}
-		if body.reads != 0 {
-			t.Errorf("body reads = %d, want 0 (a refused ping must not be drained)", body.reads)
-		}
-	})
-
-	t.Run("healthz and metrics keep serving", func(t *testing.T) {
-		// The orchestrator has to observe the health flip, and a last scrape
-		// during the drain is useful. Only the beat endpoint refuses.
-		for _, path := range []string{"/healthz", "/metrics"} {
-			req := httptest.NewRequest(http.MethodGet, path, nil)
-			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, req)
-			if rec.Code != http.StatusOK {
-				t.Errorf("GET %s with the app context cancelled = %d, want 200", path, rec.Code)
-			}
-		}
-	})
+	}
 }
 
 // TestBeatRefusedWhenCancellationHappensDuringBodyDrain pins the lifecycle
@@ -1029,6 +1114,33 @@ func TestBeatRefusedWhenCancellationHappensDuringBodyDrain(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "shutting_down") {
 		t.Errorf("503 body = %s, want the shutting_down code", rec.Body.String())
+	}
+}
+
+// TestBeatRefusedWhenWatcherClosedAdmission pins the LAST refusal, the only
+// one that is atomic with the recording: the app context is still live, so
+// both handler-side checks pass, and the 503 can only come from the watcher
+// reporting accepting=false (watch.Watcher closes admission under the mutex
+// that guards the beat mutation). A 200 here would tell a sender its heartbeat
+// landed while the watcher recorded nothing.
+func TestBeatRefusedWhenWatcherClosedAdmission(t *testing.T) {
+	t.Parallel()
+
+	b := &fakeBeater{known: map[string]bool{"api": true}, closed: true}
+	h := newTestHandler(b, "")
+
+	req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader("ping"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST with admission closed = %d, want 503 (body %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "shutting_down") {
+		t.Errorf("503 body = %s, want the shutting_down code", rec.Body.String())
+	}
+	if len(b.seen) != 0 {
+		t.Fatalf("beats recorded with admission closed = %v, want none", b.seen)
 	}
 }
 
@@ -1160,6 +1272,89 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 	}
 }
 
+// hostileRequest is one caller-controlled method/path pair driven at the routed
+// handler to see whether either value can reach a metric label.
+type hostileRequest struct{ method, path string }
+
+// hostileRequestSet is the caller-controlled traffic the cardinality guard
+// drives. Every token below is distinct, so a naive implementation mints a new
+// series per request and the assertions fail loudly rather than subtly.
+func hostileRequestSet() []hostileRequest {
+	var hostile []hostileRequest
+	add := func(method, path string) {
+		hostile = append(hostile, hostileRequest{method, path})
+	}
+	for i := range 12 {
+		suffix := strconv.Itoa(i)
+		// Distinct beat ids: all must collapse onto the /beat/{id} TEMPLATE,
+		// known and unknown alike (an unknown id answers 404 and must mint
+		// nothing, the same rule that protects the per-beat series).
+		add(http.MethodPost, "/beat/ghost"+suffix)
+		// Distinct method tokens on the method-agnostic route.
+		add("XYZZY"+suffix, "/beat/api")
+		// Distinct unmatched paths: scanner traffic.
+		add(http.MethodGet, "/wp-admin/"+suffix+"/setup.php")
+		// A distinct method AND a distinct unmatched path at once.
+		add("BLARG"+suffix, "/nope/"+suffix)
+	}
+	// Percent-encoded and traversal-shaped spellings of a real route: r.URL.Path
+	// varies without bound while the pattern does not.
+	add(http.MethodPost, "/beat/%61pi")
+	add(http.MethodGet, "/beat/a%2Fb")
+	add(http.MethodGet, "//healthz")
+	add(http.MethodGet, "/./metrics")
+	// A 300-byte method token: LENGTH must not widen the label set either, and
+	// no local middleware caps it any more — the closed method set is what
+	// buckets it, exactly as it buckets a short bogus token.
+	add(strings.Repeat("A", 300), "/beat/api")
+	// A lowercase spelling of a standard method is NOT that method (methods are
+	// case-sensitive, RFC 9110 §9.1), so it must bucket rather than hand a
+	// caller a second spelling of the GET series.
+	add("get", "/beat/api")
+	return hostile
+}
+
+// assertNoCallerTokens pins that nothing a caller sent appears ANYWHERE in the
+// exposition. This catches a label leak even if the per-series membership checks
+// were relaxed.
+func assertNoCallerTokens(t *testing.T, exposition string, requests []hostileRequest, allowedMethods, allowedPaths map[string]bool) {
+	t.Helper()
+	for _, req := range requests {
+		for _, token := range []string{req.method, req.path} {
+			if !allowedMethods[token] && !allowedPaths[token] && strings.Contains(exposition, token) {
+				t.Errorf("exposition contains the caller-supplied token %q: a request value reached a metric label\n%s", token, exposition)
+			}
+		}
+	}
+}
+
+// assertRequestSeriesVocabulary pins that every series, pre-existing or new, is
+// spelled from the closed method set crossed with the route table.
+func assertRequestSeriesVocabulary(t *testing.T, series, allowedMethods, allowedPaths map[string]bool) {
+	t.Helper()
+	for s := range series {
+		labels := strings.TrimSuffix(strings.TrimPrefix(s, "knell_http_requests_total{"), "}")
+		for pair := range strings.SplitSeq(labels, ",") {
+			name, value, ok := strings.Cut(pair, "=")
+			if !ok {
+				t.Errorf("unparseable label pair %q in %q", pair, s)
+				continue
+			}
+			value = strings.Trim(value, `"`)
+			switch name {
+			case "method":
+				if !allowedMethods[value] {
+					t.Errorf("series %s carries method=%q, which is not one the route table can produce: an unauthenticated caller can mint series without bound", s, value)
+				}
+			case "path":
+				if !allowedPaths[value] {
+					t.Errorf("series %s carries path=%q, which is not a registered route template", s, value)
+				}
+			}
+		}
+	}
+}
+
 // TestRequestMetricLabelsBoundedByTheRouteTable is the cardinality guard on the
 // request counter, and the reason knell hands webhttp.WithRecordRouteMetric the
 // job of deriving both labels instead of deriving them itself.
@@ -1198,40 +1393,7 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 	h := newTestHandlerCtx(context.Background(), b, "")
 	before := httpRequestSeries(scrapeExposition(t, h))
 
-	// Every hostile token below is distinct, so a naive implementation mints a
-	// new series per request and the assertions fail loudly rather than subtly.
-	var hostile []struct{ method, path string }
-	add := func(method, path string) {
-		hostile = append(hostile, struct{ method, path string }{method, path})
-	}
-	for i := range 12 {
-		suffix := strconv.Itoa(i)
-		// Distinct beat ids: all must collapse onto the /beat/{id} TEMPLATE,
-		// known and unknown alike (an unknown id answers 404 and must mint
-		// nothing, the same rule that protects the per-beat series).
-		add(http.MethodPost, "/beat/ghost"+suffix)
-		// Distinct method tokens on the method-agnostic route.
-		add("XYZZY"+suffix, "/beat/api")
-		// Distinct unmatched paths: scanner traffic.
-		add(http.MethodGet, "/wp-admin/"+suffix+"/setup.php")
-		// A distinct method AND a distinct unmatched path at once.
-		add("BLARG"+suffix, "/nope/"+suffix)
-	}
-	// Percent-encoded and traversal-shaped spellings of a real route: r.URL.Path
-	// varies without bound while the pattern does not.
-	add(http.MethodPost, "/beat/%61pi")
-	add(http.MethodGet, "/beat/a%2Fb")
-	add(http.MethodGet, "//healthz")
-	add(http.MethodGet, "/./metrics")
-	// A 300-byte method token: LENGTH must not widen the label set either, and
-	// no local middleware caps it any more — the closed method set is what
-	// buckets it, exactly as it buckets a short bogus token.
-	add(strings.Repeat("A", 300), "/beat/api")
-	// A lowercase spelling of a standard method is NOT that method (methods are
-	// case-sensitive, RFC 9110 §9.1), so it must bucket rather than hand a
-	// caller a second spelling of the GET series.
-	add("get", "/beat/api")
-
+	hostile := hostileRequestSet()
 	for _, req := range hostile {
 		beatRequest(t, h, req.method, req.path)
 	}
@@ -1239,38 +1401,8 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 	exposition := scrapeExposition(t, h)
 	after := httpRequestSeries(exposition)
 
-	// Nothing a caller sent may appear anywhere in the exposition. This catches
-	// a label leak even if the membership checks below were relaxed.
-	for _, req := range hostile {
-		for _, token := range []string{req.method, req.path} {
-			if !allowedMethods[token] && !allowedPaths[token] && strings.Contains(exposition, token) {
-				t.Errorf("exposition contains the caller-supplied token %q: a request value reached a metric label\n%s", token, exposition)
-			}
-		}
-	}
-
-	// Every series, pre-existing or new, must be spelled from the route table.
-	for series := range after {
-		labels := strings.TrimSuffix(strings.TrimPrefix(series, "knell_http_requests_total{"), "}")
-		for pair := range strings.SplitSeq(labels, ",") {
-			name, value, ok := strings.Cut(pair, "=")
-			if !ok {
-				t.Errorf("unparseable label pair %q in %q", pair, series)
-				continue
-			}
-			value = strings.Trim(value, `"`)
-			switch name {
-			case "method":
-				if !allowedMethods[value] {
-					t.Errorf("series %s carries method=%q, which is not one the route table can produce: an unauthenticated caller can mint series without bound", series, value)
-				}
-			case "path":
-				if !allowedPaths[value] {
-					t.Errorf("series %s carries path=%q, which is not a registered route template", series, value)
-				}
-			}
-		}
-	}
+	assertNoCallerTokens(t, exposition, hostile, allowedMethods, allowedPaths)
+	assertRequestSeriesVocabulary(t, after, allowedMethods, allowedPaths)
 
 	// The vocabulary can produce at most 10 methods x 4 paths x the handful of
 	// statuses knell answers; the hostile requests above must land inside that,

@@ -225,7 +225,7 @@ func FuzzBeatIDMintsNoSeriesForUnconfiguredID(f *testing.F) {
 	f.Fuzz(func(t *testing.T, id string) {
 		w, _, _ := newTestWatcher(Beat{ID: probe, Deadline: 10 * time.Minute})
 		before := beatFreshSeriesCount()
-		if got, want := w.Beat(id), id == probe; got != want {
+		if got, want := recordedBeat(w, id), id == probe; got != want {
 			t.Fatalf("Beat(%q) = %v, want %v (only a configured id may be accepted)", id, got, want)
 		}
 		if after := beatFreshSeriesCount(); after != before {

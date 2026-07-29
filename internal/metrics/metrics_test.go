@@ -92,6 +92,17 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 		"knell_beats_received_total",
 		"knell_beat_outages_total",
 	}
+	// The registry outlives one test iteration, so leaving the probe series
+	// behind makes `go test -count=2` fail on the precondition below instead
+	// of pinning production behavior. Registered BEFORE the preconditions so
+	// even a failing iteration cleans up for the next one.
+	t.Cleanup(func() {
+		beatFresh.Delete(id)
+		beatLastSeen.Delete(id)
+		beatDeadline.Delete(id)
+		beatsReceived.Delete(id)
+		beatOutages.Delete(id)
+	})
 	for _, name := range series {
 		if got, ok := beatSeriesValue(t, name, id); ok {
 			t.Fatalf("%s{beat=%q} = %s before InitBeat: the probe id is not unique to this test, so it cannot pin cold-start values", name, id, got)
@@ -178,6 +189,12 @@ func TestRecordHTTPRecordsBothTheCounterAndTheDuration(t *testing.T) {
 		status = 418
 	)
 	counter := `knell_http_requests_total{method="` + method + `",path="` + path + `",status="418"} `
+	// Same singleton-registry hygiene as the cold-start test: without this the
+	// probe series survives into the next iteration and `go test -count=2`
+	// fails on the uniqueness precondition below.
+	t.Cleanup(func() {
+		httpRequests.Delete(method, path, strconv.Itoa(status))
+	})
 
 	countBefore, _ := rawSeriesValue(t, "knell_http_request_duration_seconds_count")
 	sumBefore, _ := rawSeriesValue(t, "knell_http_request_duration_seconds_sum")

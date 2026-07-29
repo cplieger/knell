@@ -61,7 +61,7 @@ func TestBeatFreshGaugeTracksOverdueAndRecovery(t *testing.T) {
 		t.Fatalf("beat_fresh when overdue = %s, want 0", got)
 	}
 
-	if !w.Beat(id) {
+	if recorded, _ := w.Beat(id); !recorded {
 		t.Fatal("Beat returned false for configured id")
 	}
 	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
@@ -178,7 +178,7 @@ func TestRefreshFreshnessUpdatesGaugeWithoutNotifying(t *testing.T) {
 	}
 
 	// A ping restores the gauge; refreshFreshness must keep it at 1.
-	if !w.Beat(id) {
+	if recorded, _ := w.Beat(id); !recorded {
 		t.Fatal("Beat returned false for configured id")
 	}
 	w.refreshFreshness()
@@ -198,7 +198,7 @@ func TestUnknownBeatMintsNoMetricSeries(t *testing.T) {
 	// symptom at all until the series count explodes.
 	const unknown = "unknown-cardinality-probe"
 	w, _, _ := newTestWatcher(Beat{ID: "known-cardinality-probe", Deadline: 10 * time.Minute})
-	if w.Beat(unknown) {
+	if recorded, _ := w.Beat(unknown); recorded {
 		t.Fatalf("Beat(%s) = true, want false for an unconfigured id", unknown)
 	}
 	for _, name := range []string{
@@ -304,14 +304,14 @@ func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
 	w.Beat(id)
 	for range missingQueueSize {
 		clock.Advance(11 * time.Minute)
-		if !w.Beat(id) {
+		if recorded, _ := w.Beat(id); !recorded {
 			t.Fatalf("Beat(%s) = false", id)
 		}
 	}
 
 	rec := capture.Default(t)
 	clock.Advance(47 * time.Minute)
-	if !w.Beat(id) {
+	if recorded, _ := w.Beat(id); !recorded {
 		t.Fatalf("overflow Beat(%s) = false", id)
 	}
 
@@ -347,7 +347,7 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	w.Beat(id)
 	for range missingQueueSize {
 		clock.Advance(11 * time.Minute)
-		if !w.Beat(id) {
+		if recorded, _ := w.Beat(id); !recorded {
 			t.Fatalf("Beat(%s) = false", id)
 		}
 	}
@@ -407,7 +407,7 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	outagesBefore = beatCounterValue(t, "knell_beat_outages_total", id)
 	closing := capture.Default(t)
 	clock.Advance(11 * time.Minute)
-	if !w.Beat(id) {
+	if recorded, _ := w.Beat(id); !recorded {
 		t.Fatalf("closing Beat(%s) = false", id)
 	}
 	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
@@ -469,14 +469,14 @@ func TestFailedAndDroppedNeverBothMoveForOneEvent(t *testing.T) {
 	// above left its record queued and open until this ping seals it).
 	for len(w.beats[id].pendingMissing) < missingQueueSize {
 		clock.Advance(11 * time.Minute)
-		if !w.Beat(id) {
+		if recorded, _ := w.Beat(id); !recorded {
 			t.Fatalf("Beat(%s) = false", id)
 		}
 	}
 	failedBefore = counterValue(t, "knell_notifications_failed_total", "missing")
 	droppedBefore = counterValue(t, "knell_notifications_dropped_total", "missing")
 	clock.Advance(11 * time.Minute)
-	if !w.Beat(id) {
+	if recorded, _ := w.Beat(id); !recorded {
 		t.Fatalf("overflow Beat(%s) = false", id)
 	}
 	if got, want := counterValue(t, "knell_notifications_dropped_total", "missing"), droppedBefore+1; got != want {
@@ -536,7 +536,7 @@ func TestRecoveryQueueDropIsCountedAsDroppedNotFailed(t *testing.T) {
 	// Ping both without draining: the first recovery queues, the second
 	// finds the queue full and its notice is dropped for good.
 	for _, b := range beats {
-		if !w.Beat(b.ID) {
+		if recorded, _ := w.Beat(b.ID); !recorded {
 			t.Fatalf("Beat(%s) = false", b.ID)
 		}
 	}
@@ -575,7 +575,7 @@ func TestFailedRecoveredSendIsCountedAsDroppedNotFailed(t *testing.T) {
 	}
 
 	n.setFail(errors.New("discord down"))
-	if !w.Beat(id) {
+	if recorded, _ := w.Beat(id); !recorded {
 		t.Fatalf("Beat(%s) = false", id)
 	}
 	failedBefore := counterValue(t, "knell_notifications_failed_total", "recovered")
@@ -633,7 +633,7 @@ func TestHistoryNoticeCountsOncePerMessageWhileOutagesCountEach(t *testing.T) {
 	const outages = 3
 	for range outages {
 		clock.Advance(11 * time.Minute)
-		if !w.Beat(id) {
+		if recorded, _ := w.Beat(id); !recorded {
 			t.Fatalf("Beat(%s) = false", id)
 		}
 	}
@@ -675,7 +675,7 @@ func TestCanceledHistoryNotificationIsNotFailedAndKeepsRecords(t *testing.T) {
 	w.Beat(id)
 	for range 2 {
 		clock.Advance(11 * time.Minute)
-		if !w.Beat(id) {
+		if recorded, _ := w.Beat(id); !recorded {
 			t.Fatalf("Beat(%s) = false", id)
 		}
 	}
@@ -713,7 +713,7 @@ func TestLogUndeliveredClassifiesOnlyEndedRecordsAsPermanentLoss(t *testing.T) {
 	// The first late ping creates an already-ended record. A second silence
 	// then creates an ongoing outage behind it without delivering either.
 	clock.Advance(11 * time.Minute)
-	if !w.Beat(id) {
+	if recorded, _ := w.Beat(id); !recorded {
 		t.Fatalf("Beat(%s) = false", id)
 	}
 	clock.Advance(11 * time.Minute)
@@ -803,7 +803,7 @@ func TestShutdownWarnsAboutQueuedRecoveredNotifications(t *testing.T) {
 	// never drained, exactly as it sits when cancellation arrives.
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
-	if !w.Beat(id) {
+	if recorded, _ := w.Beat(id); !recorded {
 		t.Fatalf("Beat(%s) = false", id)
 	}
 	if got := len(w.recoveries); got != 1 {
@@ -841,7 +841,7 @@ func TestLogUndeliveredCountsAnUnqueuedOngoingOutage(t *testing.T) {
 	n.setFail(context.Canceled)
 	for range missingQueueSize {
 		clock.Advance(11 * time.Minute)
-		if !w.Beat(id) {
+		if recorded, _ := w.Beat(id); !recorded {
 			t.Fatalf("Beat(%s) = false", id)
 		}
 	}
@@ -937,7 +937,13 @@ func TestBudgetCutIsLoggedOncePerSweepWithTheDeferredCount(t *testing.T) {
 			t.Errorf("budget-cut lines at %s = %d, want 0 (back-pressure during a delivery outage is not a fault): %v", level, got, rec.Messages())
 		}
 	}
-	wantDeferred := total - sendsBeforeBudgetCut(perSend)
+	// Hard-coded, NOT derived from sweepSendBudget: with the documented
+	// five-second budget, three two-second sends start before the elapsed
+	// clock is strictly past it, so nine of the twelve due beats are deferred.
+	// Deriving this from the production constant would make the constant its
+	// own oracle, and an accidental retune (five seconds to ten) would change
+	// both sides and stay green while Run services queued recoveries later.
+	const wantDeferred = 9
 	if !rec.HasAttr(msg, "deferred_beats", strconv.Itoa(wantDeferred)) {
 		t.Errorf("budget-cut line does not report the %d beats deferred to the next sweep: %v", wantDeferred, rec.Records())
 	}
@@ -972,12 +978,12 @@ func TestRunReportsUndeliveredWorkWhenTheContextIsCancelled(t *testing.T) {
 	// the sweep detects the crossing, so the record stays queued, and a late
 	// ping seals it. That record is the outage's only trace.
 	n.setFail(errors.New("discord down"))
-	if !w.Beat(id) {
+	if recorded, _ := w.Beat(id); !recorded {
 		t.Fatalf("Beat(%s) = false", id)
 	}
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
-	if !w.Beat(id) {
+	if recorded, _ := w.Beat(id); !recorded {
 		t.Fatalf("late Beat(%s) = false", id)
 	}
 	if got := len(w.beats[id].pendingMissing); got != 1 {

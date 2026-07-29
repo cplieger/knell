@@ -123,7 +123,11 @@ func run() error {
 	marker.Cleanup()
 	defer marker.Cleanup()
 
-	cfg, err := config.Load()
+	// The NODE_NAME cap is notify's to own (it renders every template the
+	// budget is measured over) and config's to enforce, so the composition root
+	// mediates the value between them — the same translation it performs for
+	// config.Beat -> watch.Beat.
+	cfg, err := config.Load(notify.MaxNodeNameBytes)
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
 	}

@@ -21,6 +21,11 @@ import (
 // over-limit notice is answered 400, so knell would arm, detect outages and
 // never ring).
 func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
+	// Discord's hard limit on a webhook message's `content` field. Owned by
+	// this test, the only place that measures against it: an over-limit
+	// content is answered 400 and the notice is never delivered.
+	const discordContentLimit = 2000
+
 	rec := newWebhookRecorder(http.StatusNoContent)
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
@@ -61,9 +66,9 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 				t.Fatalf("sending the %s notice: %v", name, err)
 			}
 			content := <-rec.contents
-			if runes := len([]rune(content)); runes >= maxContentRunes {
+			if runes := len([]rune(content)); runes >= discordContentLimit {
 				t.Errorf("the %s notice renders %d characters at the worst case, want under Discord's %d-character content limit: either shorten the template or lower MaxNodeNameBytes, because Discord answers 400 for an over-limit content and the notice is never delivered",
-					name, runes, maxContentRunes)
+					name, runes, discordContentLimit)
 			}
 		})
 	}
