@@ -10,8 +10,8 @@ import (
 	"github.com/cplieger/knell/internal/watch"
 )
 
-// TestEveryNoticeStaysInsideDiscordsContentLimit makes the content budget
-// MaxNodeNameBytes is derived from structural instead of a prose comment: it
+// TestEveryNoticeStaysInsideDiscordsContentLimit makes the derivation behind
+// MaxNodeNameBytes structural instead of a prose comment: it
 // renders every shape this package produces at its worst case — the largest
 // accepted node name, the longest beat id config's grammar admits, a silence
 // long enough to render a maximal duration, and the LONGEST late clause of each
@@ -26,8 +26,9 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 	defer srv.Close()
 
 	// Every interpolated field at its maximum: the node name at the cap, a
-	// 64-byte beat id (config's beatIDPattern ceiling) and a silence measured in
-	// years so the truncated duration renders as wide as it ever will.
+	// 64-byte beat id (config's beatIDPattern ceiling) and a 200-year silence,
+	// which renders 12 characters against the 32 the budget reserves for a
+	// truncated duration (the widest a time.Duration can render is 15).
 	d := New(srv.URL, strings.Repeat("n", MaxNodeNameBytes))
 	defer d.Close()
 	id := strings.Repeat("b", 64)

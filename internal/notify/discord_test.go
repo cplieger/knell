@@ -1906,3 +1906,30 @@ func TestExhaustedDeliveryIsLoggedBelowAlarmLevel(t *testing.T) {
 		}
 	}
 }
+
+func TestHistoryTimestampRendersUTCWhateverZoneTheProducerUsed(t *testing.T) {
+	t.Parallel()
+
+	rec := newWebhookRecorder(http.StatusNoContent)
+	srv := httptest.NewServer(rec.handler(t))
+	defer srv.Close()
+
+	d := New(srv.URL, "node-1")
+	defer d.Close()
+
+	// The producer's instant carries a NON-UTC zone: main.go passes time.Now,
+	// so every Outage.Recovered is a time.Local value, and a UTC-built fixture
+	// cannot tell a rendered .UTC() apart from a UTC-zoned input.
+	offset := time.FixedZone("+0430", 4*3600+30*60)
+	recovered := time.Date(2026, 7, 23, 18, 37, 0, 0, offset)
+	outages := []watch.Outage{{Started: recovered.Add(-12 * time.Minute), Recovered: recovered}}
+	if err := d.BeatOutageHistory(context.Background(), "api", outages); err != nil {
+		t.Fatalf("BeatOutageHistory: %v", err)
+	}
+	content := <-rec.contents
+	// 18:37 +04:30 is 14:07 UTC; without the .UTC() conversion the notice
+	// renders "2026-07-23 18:37 +0430" and this fails.
+	if want := "recovered at 2026-07-23 14:07 UTC"; !strings.Contains(content, want) {
+		t.Errorf("content %q missing %q: historyMessage must convert the recovery point to UTC before formatting", content, want)
+	}
+}

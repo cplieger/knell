@@ -132,7 +132,12 @@ func TestSignalledKnellLogsTheCleanStopAsItsLastLineAndExitsZero(t *testing.T) {
 		"DISCORD_WEBHOOK_URL=https://discord.example/api/webhooks/1234567890/verysecrettoken",
 		// Port 0: the child picks its own port, so this test never races
 		// another test for a reserved one.
-		"LISTEN_ADDR=127.0.0.1:0")
+		"LISTEN_ADDR=127.0.0.1:0",
+		// The oracle is three INFO lines, and run() applies the parsed LOG_LEVEL
+		// before the listener is bound: an inherited LOG_LEVEL=warn would silence
+		// "listening", "shutting down" and "stopped" alike and report an ambient
+		// environment as a missing clean-stop contract.
+		"LOG_LEVEL=info")
 	// config.Load rejects a PRESENT-but-empty _FILE variable, so a value
 	// inherited from the parent environment must be removed, not blanked.
 	cmd.Env = slices.DeleteFunc(cmd.Env, func(entry string) bool {

@@ -1412,3 +1412,67 @@ const (
 	// request line spelling it 400 before a handler runs.
 	overlongMethodMarker = "(overlong)"
 )
+
+func TestBeatRefusesCrossSiteBrowserSubresource(t *testing.T) {
+	// Only browsers send Sec-Fetch-*, so the documented senders (curl, an
+	// Alertmanager webhook_config, a CI hook) send none of these headers and
+	// must stay accepted; the refusal is exactly the confused-deputy shape.
+	// Without this test the guard can be deleted with the whole suite green:
+	// every other beat test sends no Sec-Fetch header at all, so nothing
+	// exercises the refusing side of the check.
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	h := newTestHandler(b, "")
+
+	tests := []struct {
+		name       string
+		site       string
+		mode       string
+		wantStatus int
+		wantSeen   int
+	}{
+		{name: "documented sender sends no Sec-Fetch", wantStatus: 200, wantSeen: 1},
+		{name: "cross-site image load", site: "cross-site", mode: "no-cors", wantStatus: 403},
+		{name: "cross-site fetch", site: "cross-site", mode: "cors", wantStatus: 403},
+		{name: "cross-site navigation is a human", site: "cross-site", mode: "navigate", wantStatus: 200, wantSeen: 1},
+		{name: "address bar", site: "none", mode: "navigate", wantStatus: 200, wantSeen: 1},
+		{name: "same-origin fetch", site: "same-origin", mode: "cors", wantStatus: 200, wantSeen: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := len(b.seen)
+			req := httptest.NewRequest(http.MethodGet, "/beat/api", nil)
+			if tt.site != "" {
+				req.Header.Set("Sec-Fetch-Site", tt.site)
+			}
+			if tt.mode != "" {
+				req.Header.Set("Sec-Fetch-Mode", tt.mode)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if got := len(b.seen) - before; got != tt.wantSeen {
+				t.Errorf("recorded beats = %d, want %d", got, tt.wantSeen)
+			}
+		})
+	}
+
+	t.Run("refused body never read", func(t *testing.T) {
+		body := &countingReader{}
+		req := httptest.NewRequest(http.MethodPost, "/beat/api", body)
+		req.Header.Set("Sec-Fetch-Site", "cross-site")
+		req.Header.Set("Sec-Fetch-Mode", "no-cors")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", rec.Code)
+		}
+		if body.reads != 0 {
+			t.Errorf("body reads = %d, want 0 (refused requests must not be drained)", body.reads)
+		}
+		if code := rec.Body.String(); !strings.Contains(code, "cross_site_request") {
+			t.Errorf("body = %s, want the cross_site_request coded envelope", code)
+		}
+	})
+}

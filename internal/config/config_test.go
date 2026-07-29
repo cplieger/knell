@@ -584,6 +584,36 @@ func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileTokenIsInvalid(t *test
 	}
 }
 
+// TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileWebhookIsInvalid pins
+// the post-VALIDATION position of loadWebhook's advisory, the webhook half of
+// the pin TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileTokenIsInvalid
+// gives loadBeatToken: a readable DISCORD_WEBHOOK_URL_FILE whose content fails
+// the shape check must abort startup WITHOUT advising the operator to unset
+// the plain variable — the one webhook credential still in the environment.
+// Moving warnPlainVarIgnored back above the validation reintroduces exactly
+// that with every other test green: TestLoadRejectsPlainHTTPWebhookFromFile
+// sets the plain variable blank, so the advisory stays silent there either way.
+func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileWebhookIsInvalid(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	hookFile := filepath.Join(t.TempDir(), "webhook-url")
+	if err := os.WriteFile(hookFile, []byte("http://discord.example/file-borne-hook\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setValidLoadEnv(t)
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/fallback")
+	t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
+
+	rec := capture.Default(t)
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with a plain-http DISCORD_WEBHOOK_URL_FILE = nil, want error")
+	}
+	if rec.Contains("the plain variable is ignored") {
+		t.Errorf("a fatal webhook validation warned that the plain variable is ignored: %v; the advice tells the operator to delete the only webhook credential left in the environment, for a configuration that never ran", rec.Messages())
+	}
+}
+
 func TestLoadRejectsUnreadableBeatTokenFile(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing-beat-token")
 	setValidLoadEnv(t)
