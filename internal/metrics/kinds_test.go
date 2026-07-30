@@ -33,7 +33,7 @@ import (
 func TestEveryKindConstantIsPreMinted(t *testing.T) {
 	t.Parallel()
 
-	declared := declaredKindConstants(t, parseProductionFiles(t))
+	declared := declaredLabelConstants(t, parseProductionFiles(t), "Kind")
 
 	if len(declared) == 0 {
 		t.Fatal("found no Kind constants in the package source: the scan is broken, so it would pass for any missing kind")
@@ -45,6 +45,34 @@ func TestEveryKindConstantIsPreMinted(t *testing.T) {
 	}
 	if len(notificationKinds) != len(declared) {
 		t.Errorf("notificationKinds has %d entries for %d declared Kind constants %v: the pre-minting loop and the advertised HELP kind list must cover exactly the declared set", len(notificationKinds), len(declared), declared)
+	}
+}
+
+// TestEveryRefusalConstantIsPreMinted is the refusal half of the same sync rule
+// refusalReasons' own doc states ("Add every new Refusal constant here so those
+// two exposition views stay aligned"), and nothing else enforces it: the
+// cold-start test iterates refusalReasons, so a Refusal constant missing from
+// that slice is invisible to it, and its guard only fires when the SLICE grows.
+// A reason whose series is never pre-minted has no earlier sample for
+// increase() to diff against, so the first refusal of that reason is invisible
+// to a windowed query over it - which is the exact flaw that retired this
+// counter's predecessor, so losing it silently gives the reason label back the
+// shape it was introduced to fix.
+func TestEveryRefusalConstantIsPreMinted(t *testing.T) {
+	t.Parallel()
+
+	declared := declaredLabelConstants(t, parseProductionFiles(t), "Refusal")
+
+	if len(declared) == 0 {
+		t.Fatal("found no Refusal constants in the package source: the scan is broken, so it would pass for any missing reason")
+	}
+	for name, value := range declared {
+		if !slices.Contains(refusalReasons, Refusal(value)) {
+			t.Errorf("Refusal constant %s (%q) is not in refusalReasons: its series is never pre-minted at zero, so an increase() query misses the first refusal of that reason", name, value)
+		}
+	}
+	if len(refusalReasons) != len(declared) {
+		t.Errorf("refusalReasons has %d entries for %d declared Refusal constants %v: the pre-minting loop and the advertised HELP reason list must cover exactly the declared set", len(refusalReasons), len(declared), declared)
 	}
 }
 
@@ -72,11 +100,11 @@ const (
 		t.Fatalf("parsing the synthetic source: %v", err)
 	}
 
-	declared := declaredKindConstants(t, []*ast.File{file})
+	declared := declaredLabelConstants(t, []*ast.File{file}, "Kind")
 
 	want := map[string]string{"KindProbe": "probe", "KindTyped": "typed"}
 	if !maps.Equal(declared, want) {
-		t.Errorf("declaredKindConstants() = %v, want %v: a kind this scan cannot see keeps its sent/failed/dropped series un-minted while the pre-minting contract reports itself satisfied", declared, want)
+		t.Errorf("declaredLabelConstants(..., %q) = %v, want %v: a kind this scan cannot see keeps its sent/failed/dropped series un-minted while the pre-minting contract reports itself satisfied", "Kind", declared, want)
 	}
 }
 
@@ -105,107 +133,111 @@ func parseProductionFiles(t *testing.T) []*ast.File {
 	return files
 }
 
-// declaredKindConstants maps every declared Kind constant's name to its value.
-func declaredKindConstants(t *testing.T, files []*ast.File) map[string]string {
+// declaredLabelConstants maps every declared constant of the named label type
+// (Kind, Refusal) to its value. The type name is a parameter so the two
+// string-kinded label vocabularies share one scan: a second copy of it would be
+// the weaker of the two, and the shape it missed would be missed silently.
+func declaredLabelConstants(t *testing.T, files []*ast.File, typeName string) map[string]string {
 	t.Helper()
 	declared := map[string]string{}
 	for _, file := range files {
-		collectKindDecls(t, declared, file.Decls)
+		collectLabelDecls(t, declared, file.Decls, typeName)
 	}
 	return declared
 }
 
-// collectKindDecls narrows a file's declarations to its const blocks.
-func collectKindDecls(t *testing.T, declared map[string]string, decls []ast.Decl) {
+// collectLabelDecls narrows a file's declarations to its const blocks.
+func collectLabelDecls(t *testing.T, declared map[string]string, decls []ast.Decl, typeName string) {
 	t.Helper()
 	for _, decl := range decls {
 		gen, ok := decl.(*ast.GenDecl)
 		if ok && gen.Tok == token.CONST {
-			collectKindSpecs(t, declared, gen.Specs)
+			collectLabelSpecs(t, declared, gen.Specs, typeName)
 		}
 	}
 }
 
-// collectKindSpecs narrows a const block's specs to those declaring a Kind, in
-// either shape Go allows: an explicitly typed `Name Kind = "x"`, or an untyped
-// `Name = Kind("x")` conversion. Both mint a Kind constant this contract
-// covers, so recognizing only the typed shape would let a kind declared the
-// other way pass unnoticed with its three counters never pre-minted.
-func collectKindSpecs(t *testing.T, declared map[string]string, specs []ast.Spec) {
+// collectLabelSpecs narrows a const block's specs to those declaring the named
+// label type, in either shape Go allows: an explicitly typed `Name Kind = "x"`,
+// or an untyped `Name = Kind("x")` conversion. Both mint a constant this
+// contract covers, so recognizing only the typed shape would let one declared
+// the other way pass unnoticed with its series never pre-minted.
+func collectLabelSpecs(t *testing.T, declared map[string]string, specs []ast.Spec, typeName string) {
 	t.Helper()
 	for _, spec := range specs {
 		value, ok := spec.(*ast.ValueSpec)
 		if !ok {
 			continue
 		}
-		if ident, typed := value.Type.(*ast.Ident); typed && ident.Name == "Kind" {
-			collectKindValues(t, declared, value)
+		if ident, typed := value.Type.(*ast.Ident); typed && ident.Name == typeName {
+			collectLabelValues(t, declared, value, typeName)
 			continue
 		}
-		collectKindConversions(t, declared, value)
+		collectLabelConversions(t, declared, value, typeName)
 	}
 }
 
-// collectKindValues decodes one Kind spec's string literals, failing the test
-// for any declaration shape this contract cannot verify.
-func collectKindValues(t *testing.T, declared map[string]string, value *ast.ValueSpec) {
+// collectLabelValues decodes one spec's string literals, failing the test for
+// any declaration shape this contract cannot verify.
+func collectLabelValues(t *testing.T, declared map[string]string, value *ast.ValueSpec, typeName string) {
 	t.Helper()
 	for i, name := range value.Names {
 		if i >= len(value.Values) {
-			t.Errorf("Kind constant %s has no explicit value, so this test cannot verify it is pre-minted", name.Name)
+			t.Errorf("%s constant %s has no explicit value, so this test cannot verify it is pre-minted", typeName, name.Name)
 			continue
 		}
-		if unquoted, ok := kindLiteralValue(t, name.Name, value.Values[i]); ok {
+		if unquoted, ok := labelLiteralValue(t, typeName, name.Name, value.Values[i]); ok {
 			declared[name.Name] = unquoted
 		}
 	}
 }
 
-// kindLiteralValue decodes a kind's string-literal value, failing the test for
-// any value shape this contract cannot verify.
-func kindLiteralValue(t *testing.T, name string, expr ast.Expr) (string, bool) {
+// labelLiteralValue decodes a constant's string-literal value, failing the test
+// for any value shape this contract cannot verify.
+func labelLiteralValue(t *testing.T, typeName, name string, expr ast.Expr) (string, bool) {
 	t.Helper()
 	lit, ok := expr.(*ast.BasicLit)
 	if !ok || lit.Kind != token.STRING {
-		t.Errorf("Kind constant %s is not a string literal, so this test cannot verify it is pre-minted", name)
+		t.Errorf("%s constant %s is not a string literal, so this test cannot verify it is pre-minted", typeName, name)
 		return "", false
 	}
 	unquoted, err := strconv.Unquote(lit.Value)
 	if err != nil {
-		t.Errorf("Kind constant %s value %s: %v", name, lit.Value, err)
+		t.Errorf("%s constant %s value %s: %v", typeName, name, lit.Value, err)
 		return "", false
 	}
 	return unquoted, true
 }
 
-// collectKindConversions decodes the other legal shape of a kind declaration:
-// an untyped const whose value is a Kind("...") conversion. Without it such a
-// kind is invisible to this contract, so its sent/failed/dropped series are
+// collectLabelConversions decodes the other legal shape of a declaration: an
+// untyped const whose value is a Kind("...") / Refusal("...") conversion.
+// Without it such a constant is invisible to this contract, so its series are
 // never pre-minted and the test written to catch exactly that passes anyway.
-func collectKindConversions(t *testing.T, declared map[string]string, value *ast.ValueSpec) {
+func collectLabelConversions(t *testing.T, declared map[string]string, value *ast.ValueSpec, typeName string) {
 	t.Helper()
 	for i, name := range value.Names {
 		if i >= len(value.Values) {
 			continue
 		}
-		inner, ok := kindConversionArg(value.Values[i])
+		inner, ok := labelConversionArg(value.Values[i], typeName)
 		if !ok {
 			continue
 		}
-		if unquoted, ok := kindLiteralValue(t, name.Name, inner); ok {
+		if unquoted, ok := labelLiteralValue(t, typeName, name.Name, inner); ok {
 			declared[name.Name] = unquoted
 		}
 	}
 }
 
-// kindConversionArg returns the argument of a Kind("...") conversion.
-func kindConversionArg(expr ast.Expr) (ast.Expr, bool) {
+// labelConversionArg returns the argument of a Kind("...") / Refusal("...")
+// conversion.
+func labelConversionArg(expr ast.Expr, typeName string) (ast.Expr, bool) {
 	call, ok := expr.(*ast.CallExpr)
 	if !ok || len(call.Args) != 1 {
 		return nil, false
 	}
 	fn, ok := call.Fun.(*ast.Ident)
-	if !ok || fn.Name != "Kind" {
+	if !ok || fn.Name != typeName {
 		return nil, false
 	}
 	return call.Args[0], true

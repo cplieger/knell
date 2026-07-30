@@ -84,7 +84,11 @@ const userAgent = "knell (https://github.com/cplieger/knell)"
 type Discord struct {
 	client *http.Client
 	url    string
-	node   string
+	// node is the observer name ALREADY escaped for Discord markdown: New escapes
+	// it once because it is constant for the process, unlike the per-notice beat
+	// id. Every notice interpolates this field directly; escaping it a second
+	// time at a render site publishes the backslashes instead of the name.
+	node string
 	// attemptTimeout bounds one delivery attempt. It is a field rather than
 	// a direct use of the constant only so a test can shorten it on its own
 	// notifier; New always sets it to attemptTimeout.
@@ -119,12 +123,14 @@ func New(webhookURL, node string) *Discord {
 	// by surfacing its 3xx response, which postAttempt then reports as
 	// non-delivery; TestMethodChangingRedirectIsNotDelivery pins that, and
 	// is also the only test pinning that a policy is installed at all.
-	// CheckRedirect runs after net/http sets the header and before the request
-	// goes out, so deleting it here removes it from the wire; the policy then
-	// decides the hop. That header is the PREVIOUS request's full URL, and for a
-	// webhook the URL's path IS the credential, so an ordinary same-host hop (a
-	// relay that 307s /hooks/<token> to /api/v2/hooks) would hand the credential
-	// to the target path's access log and to anything that ships it.
+	//
+	// The Referer deletion is a second, separate reason: net/http writes the
+	// PREVIOUS request's full URL into that header, and for a webhook the URL's
+	// path IS the credential, so even an ordinary same-host hop (a relay that
+	// 307s /hooks/<token> to /api/v2/hooks) would hand the credential to the
+	// target path's access log and to anything that ships it. CheckRedirect runs
+	// after net/http sets the header and before the request goes out, so deleting
+	// it here removes it from the wire; the policy then decides the hop.
 	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		req.Header.Del("Referer")
@@ -262,6 +268,18 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 // as "abc" — the operator could not read the configured observer identity off
 // the alert.
 var markdownEscaper = strings.NewReplacer(
+	// Line breaks first, and collapsed rather than escaped: Discord's
+	// heading, blockquote and list markup is LINE-ANCHORED, so a backslash
+	// cannot suppress it (and would be published, per the note above) - only
+	// removing the break can. NODE_NAME is the one value that can carry one:
+	// config trims surrounding whitespace and caps bytes, so an interior
+	// "\r\n" survives and would render the single-line notice as several.
+	// A space keeps the byte count identical, so MaxNodeNameBytes's
+	// derivation is unchanged. CRLF precedes its halves because
+	// strings.Replacer matches patterns in argument order.
+	"\r\n", " ",
+	"\r", " ",
+	"\n", " ",
 	`\`, `\\`,
 	"*", `\*`,
 	"_", `\_`,
@@ -326,10 +344,8 @@ func batchLateClause(outages []watch.Outage) string {
 		}
 	}
 	switch ended {
-	// Order matters: for an empty batch (which BeatOutageHistory rejects and
-	// historyMessage never reaches) both cases equal 0, and the first one wins.
-	// Blaming delivery is the direction a reason-less batch must fall through
-	// to, like watch.LateUndelivered being the zero value.
+	// A batch whose records name no reason blames delivery rather than vouching
+	// for it, like watch.LateUndelivered being the zero value.
 	case 0:
 		return "Delivery was delayed for every outage - check the webhook."
 	case len(outages):
@@ -350,7 +366,16 @@ func batchLateClause(outages []watch.Outage) string {
 // rejected response through statusDetail (Discord's numeric error code and
 // knell's own wording for it, never the body's text).
 func (d *Discord) post(ctx context.Context, label, content string) error {
-	body, err := json.Marshal(map[string]string{"content": content})
+	// allowed_mentions with an EMPTY parse list is the only structural way to
+	// keep a notice from pinging anyone: the two values a notice interpolates
+	// (NODE_NAME and the beat id) are not filtered for mention tokens, and
+	// escapeMarkdown cannot be - a backslash before "@" is not one of Discord's
+	// escapes and would be published verbatim. So the payload states it instead
+	// of the text defending it, exactly like the rest of this package.
+	body, err := json.Marshal(map[string]any{
+		"content":          content,
+		"allowed_mentions": map[string][]string{"parse": {}},
+	})
 	if err != nil {
 		return fmt.Errorf("encoding webhook payload: %w", err)
 	}
@@ -467,6 +492,16 @@ func safeTransportError(err error) error {
 		// watch read off the chain, so the attempt is terminal and the 15s
 		// sweep retries the delivery -- affordable where a published
 		// credential is not.
+		//
+		// Say so. The phrase published below is the SAME one transportPhrase
+		// returns for an unrecognized cause with no net.OpError stage, so
+		// without this line the fail-closed path is indistinguishable from
+		// routine unclassified noise -- and the dropped cause is what httpx's
+		// transient check and watch's context.Canceled exemption read. No
+		// remote text and no URL are logged, only knell's own words and the cap.
+		slog.Warn("webhook transport error still carried a URL after the reduction cap, "+
+			"diagnosis dropped to protect the credential and this attempt is terminal",
+			"reductions", maxURLErrorDepth)
 		return transportError{phrase: "webhook transport failed", cause: nil}
 	}
 	return transportError{phrase: transportPhrase(cause), cause: cause}

@@ -85,8 +85,8 @@ func assertDeliveryErrorHidesWebhookURL(t *testing.T, rawURL string, status int,
 
 	const controlURL = "https://control.example/hooks/controlsegment"
 	needles := webhookNeedles(rawURL)
-	gotErr, requested := attemptAgainstStub(t, rawURL, status, body)
-	controlErr, _ := attemptAgainstStub(t, controlURL, status, controlBody(body, needles))
+	requested, gotErr := attemptAgainstStub(t, rawURL, status, body)
+	_, controlErr := attemptAgainstStub(t, controlURL, status, controlBody(body, needles))
 	if gotErr == nil {
 		// A nil error is only correct when nothing was delivered-checked (an
 		// unusable fuzzed URL never reached the transport) or the status was
@@ -231,7 +231,7 @@ func assertTypedStatusError(t *testing.T, gotErr error, requested bool, status i
 // answers with status and body, reporting the resulting error and whether the
 // transport was reached at all (a fuzzed URL that no request can be built from
 // fails earlier, and then no status branch ran).
-func attemptAgainstStub(t *testing.T, rawURL string, status int, body string) (err error, requested bool) {
+func attemptAgainstStub(t *testing.T, rawURL string, status int, body string) (requested bool, err error) {
 	t.Helper()
 
 	d := New(rawURL, "node-1")
@@ -250,7 +250,7 @@ func attemptAgainstStub(t *testing.T, rawURL string, status int, body string) (e
 		}, nil
 	})
 	_, err = d.postAttempt(context.Background(), []byte(`{"content":"fuzz"}`))
-	return err, requested
+	return requested, err
 }
 
 // webhookNeedles lists every text whose presence in a delivery error would be

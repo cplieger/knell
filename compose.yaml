@@ -10,12 +10,19 @@ services:
       # the URL path IS the credential: DISCORD_WEBHOOK_URL_FILE reads it from a
       # mounted secret file instead of embedding it here (see README).
       DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/..."  # https only
-      # required, min 16 bytes (`openssl rand -hex 16`): senders present it as
-      # "Authorization: Bearer <token>". BEAT_TOKEN_FILE reads it from a file.
-      BEAT_TOKEN: "replace-with-a-random-token"
+      # required, and the only gate on /beat/{id}: senders present it as
+      # "Authorization: Bearer <token>". This placeholder is deliberately too
+      # short to start with, so an un-replaced paste fails at boot instead of
+      # gating the endpoint with a token published in this file: replace it with
+      # `openssl rand -hex 16`. BEAT_TOKEN_FILE reads it from a file instead.
+      BEAT_TOKEN: "CHANGEME"
       NODE_NAME: "server-1"  # names this observer in notifications
 
     ports:
-      # published to every host interface: a ping needs BEAT_TOKEN, but /metrics
-      # stays open and enumerates every beat. Trusted network + TLS, see README.
+      # published to every host interface: a ping needs BEAT_TOKEN, but /healthz
+      # and /metrics stay open, and /metrics enumerates every beat. A trusted
+      # network is not enough on its own: a browser inside it can reach knell
+      # under a hostname an attacker controls (DNS rebinding). Set ALLOWED_HOSTS
+      # to the hostnames your senders, probes and scraper use, and front it with
+      # TLS -- see README "Configuration reference".
       - "9190:9190"

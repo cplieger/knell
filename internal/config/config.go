@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -40,19 +41,17 @@ const minDeadline = 30 * time.Second
 // behind it, which is the one failure this app exists to prevent.
 const minTokenLength = 16
 
-// asciiWhitespace is the cutset of characters that can never carry a bearer
-// token through an HTTP header unchanged, and therefore the definition of the
-// edge padding loadBeatToken REFUSES. The cutset covers two different
-// mechanisms: net/textproto strips SPACE and TAB from the edges of a header
-// VALUE — which for the token means its TRAILING run only, since the verifier's
-// value is "Bearer "+token and a leading run sits interior to it and survives —
-// while CR, LF, VT and FF are illegal bytes in a field value and are not
-// stripped at all, so no sender can put them on the wire. A LEADING SP or HTAB
-// run is the one shape that WOULD survive verbatim: it sits interior to
-// "Bearer "+token, so nothing strips it and a sender presenting the configured
-// value does authenticate. It is refused anyway, as the ASCII twin of the
-// invisible edge invisibleEdge only warns about — it is part of the credential
-// while being absent from the value the operator reads.
+// asciiWhitespace is the cutset of edge characters checkBeatToken REFUSES in a
+// BEAT_TOKEN. Two different mechanisms reach that one verdict:
+//   - SP and HTAB are legal field-value bytes the wire NORMALIZES. The verifier
+//     compares "Bearer "+token (see internal/webapi), so a TRAILING run IS
+//     stripped from the header value and the sender's value and the verifier's
+//     then differ, while a LEADING run is INTERIOR to that value and survives.
+//     The leading run is refused anyway, as the ASCII twin of the invisible edge
+//     invisibleEdge only warns about: it is part of the credential while being
+//     absent from the value the operator reads.
+//   - CR, LF, VT and FF are illegal bytes in a field value and are not stripped
+//     at all, so no sender can put them on the wire.
 //
 // Non-ASCII spaces (NBSP U+00A0, NEL U+0085, U+2000…) are deliberately NOT in
 // the set: textproto keeps them, so a token made of them IS presented verbatim
@@ -65,9 +64,16 @@ const asciiWhitespace = " \t\r\n\v\f"
 // blank.
 const defaultListenAddr = ":9190"
 
+// MaxBeatIDLen is the longest beat id beatIDPattern admits: the pattern is
+// built from it (1 leading character + MaxBeatIDLen-1), so the bound lives in
+// one place. Exported because a notifier has to render an id of this length
+// inside a bounded message.
+const MaxBeatIDLen = 64
+
 // beatIDPattern is the accepted beat-id grammar: URL-path and metric-label
-// safe, human-readable, bounded.
-var beatIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+// safe, human-readable, bounded by MaxBeatIDLen.
+var beatIDPattern = regexp.MustCompile(
+	fmt.Sprintf(`^[A-Za-z0-9][A-Za-z0-9_-]{0,%d}$`, MaxBeatIDLen-1))
 
 // Beat is one watched heartbeat: an id senders ping and the silence deadline
 // after which the beat is declared missing.
@@ -193,7 +199,11 @@ func Load(maxNodeNameBytes int) (Config, error) {
 // never ring. The hostname fallback is not length-checked because the kernel
 // already bounds it far below the cap (HOST_NAME_MAX is 64 on Linux, 255 by
 // POSIX), and refusing to start over the machine's own hostname would trade a
-// deliverable notice for no notice at all.
+// deliverable notice for no notice at all. That reasoning holds only while
+// maxNodeNameBytes stays at or above the OS bound: notify's budget test measures
+// the templates at the CAP, so a cap lowered below 255 would leave the DEFAULT
+// node name outside anything that was measured (TestNodeNameCapCoversTheHostnameFallback
+// pins it).
 func nodeName(maxNodeNameBytes int) (string, error) {
 	raw, present := os.LookupEnv("NODE_NAME")
 	node := strings.TrimSpace(raw)
@@ -264,12 +274,50 @@ func listenAddr() string {
 	// which is the documented default case and must stay silent.
 	raw, present := os.LookupEnv("LISTEN_ADDR")
 	if addr := strings.TrimSpace(raw); addr != "" {
+		warnEphemeralListenPort(addr)
 		return addr
 	}
 	if present {
 		slog.Warn("LISTEN_ADDR is set but blank and was ignored; the listener binds every interface at the default address, so unset the variable to accept that on purpose, or set a host:port to narrow it", "listen_addr", defaultListenAddr)
 	}
 	return defaultListenAddr
+}
+
+// warnEphemeralListenPort reports a LISTEN_ADDR that asks the kernel for an
+// ephemeral port. Port 0 binds successfully and startup reports itself healthy,
+// so net.Listen never refuses it and the address main logs is a different
+// number on every boot: no sender's POST /beat/{id} URL and no scrape target
+// can name it, so every configured beat goes missing one deadline after start
+// while the observer looks up. This is the outcome listenAddr already avoids on
+// the whitespace-only path ("which would bind an ephemeral port and hide the
+// listener from scrapes"); an explicitly configured 0 reaches it unremarked.
+// Warned rather than refused: the value is a working bind, so only the
+// diagnostic is missing.
+func warnEphemeralListenPort(addr string) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Not a host:port at all (a bare "9190", a stray path). net.Listen
+		// refuses it at bind time and main's classifyBindError names it, so
+		// there is nothing to add here.
+		return
+	}
+	// A service NAME ("http") is resolved by net.Listen, never zero.
+	if n, convErr := strconv.Atoi(port); convErr != nil || n != 0 {
+		return
+	}
+	slog.Warn("LISTEN_ADDR asks for port 0, so the kernel picks a fresh random port on every start; no sender can reach POST /beat/{id} and no scrape can reach /metrics at a port that changes each boot, so every configured beat goes missing one deadline after start",
+		"hint", "set an explicit port, e.g. "+defaultListenAddr)
+}
+
+// ParseAllowedHosts builds the ALLOWED_HOSTS policy SHAPE knell ships:
+// loopback-exempt, with the ALLOWED_HOSTS-naming 403 envelope. Exported so
+// internal/webapi's tests exercise the shipped shape rather than a hand-copied
+// twin that cannot fail when this one changes.
+func ParseAllowedHosts(entries []string) (policy *webhttp.HostPolicy, invalid []string) {
+	return webhttp.ParseHostList(entries,
+		webhttp.WithLoopbackExempt(),
+		webhttp.WithHostAllowlistError("host_not_allowed",
+			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"))
 }
 
 // allowedHosts parses the ALLOWED_HOSTS exact-match Host allowlist. Unset (the
@@ -300,10 +348,7 @@ func allowedHosts() *webhttp.HostPolicy {
 	// rebinding guard OFF while the operator believes the allowlist is armed.
 	// Unset is the documented default and must stay silent.
 	raw, present := os.LookupEnv(key)
-	policy, invalid := webhttp.ParseHostList(strings.Split(raw, ","),
-		webhttp.WithLoopbackExempt(),
-		webhttp.WithHostAllowlistError("host_not_allowed",
-			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"))
+	policy, invalid := ParseAllowedHosts(strings.Split(raw, ","))
 	if len(invalid) > 0 {
 		slog.Warn("dropping malformed "+key+" entries; they cannot match any Host a sender or browser sends",
 			"invalid", invalid,
@@ -374,9 +419,8 @@ func rejectBlankFileVar(key string) error {
 // envx classifies every secret-file failure with a sentinel
 // (ErrBlankSecretFile, ErrSecretFilePathRejected, ErrSecretFileTooLarge,
 // ErrSecretFileGrew, ErrSecretFileUnreadable), so each class states its own
-// remedy — fix the variable, shrink the file, stop rewriting it, fix the mount —
-// instead of one fold that had to describe all of them at once and sent an
-// operator whose file was oversized to check the path. Naming the class needs
+// remedy — fix the variable, shrink the file, stop rewriting it, fix the mount.
+// Naming the class needs
 // no error-text matching and no access to the path, which is what makes the
 // per-class wording possible without leaking the value. The final branch stays
 // as the default for a class a future envx adds.
@@ -486,26 +530,15 @@ var errBeatTokenSetButEmpty = fmt.Errorf("BEAT_TOKEN is set but empty: it is the
 // checkBeatToken validates a configured BEAT_TOKEN as the exact credential
 // senders must present, or refuses it. It never rewrites the value.
 //
-// Edge ASCII whitespace is REFUSED rather than trimmed, and the cutset holds
-// two distinct reasons for the one verdict. SP and HTAB are legal field-value
-// bytes the wire NORMALIZES: the verifier compares "Bearer "+token (see
-// internal/webapi), so a TRAILING run IS stripped from the Authorization value
-// on the wire and the sender's value and the verifier's then differ, while a
-// LEADING run is INTERIOR to that value and survives — it authenticates, and is
-// refused because it is an invisible part of the credential (the ASCII twin of
-// the invisibleEdge warning) and because TRIMMING it, the behaviour this
-// package carried before the verbatim rule landed, is what armed the gate for a
-// value no sender using the configured token could present. CR, LF, VT and FF
-// are not normalized at all: they are forbidden bytes in a field value, so a
-// token carrying one at an edge cannot be put on the wire by any sender (an
-// interior one is refused separately, by beatTokenFitsHeader).
-//
-// In each case the configured token is either unsendable as written (a trailing
-// SP or HTAB run, or a forbidden byte) or unreadable in the value the operator
-// holds (a leading SP or HTAB run), and a dead-man switch should refuse to start
-// rather than report itself gated while rejecting every sender: a 401'd ping is
-// an undetectable ping, and one deadline later every configured beat goes
-// falsely missing.
+// Edge ASCII whitespace is REFUSED rather than trimmed; asciiWhitespace holds
+// the two wire mechanisms behind that one verdict, and an interior forbidden
+// byte is refused separately by beatTokenFitsHeader. In every case the
+// configured token is either unsendable as written (a trailing SP or HTAB run,
+// or a forbidden byte) or unreadable in the value the operator holds (a leading
+// SP or HTAB run), and a dead-man switch should refuse to start rather than
+// report itself gated while rejecting every sender: a 401'd ping is an
+// undetectable ping, and one deadline later every configured beat goes falsely
+// missing.
 //
 // A token shorter than minTokenLength is refused for the opposite reason: it IS
 // presentable, and so is a guess at it. Since the token is the endpoint's only
@@ -555,7 +588,7 @@ func checkBeatToken(token string) error {
 		// so the minimum is the only number they need.
 		return fmt.Errorf("BEAT_TOKEN is shorter than the %d-byte minimum: it is the only gate on /beat/{id}, so a token short enough to guess lets a stranger who can reach this port keep every beat reading fresh while the thing it watches is dead; set a random token of at least %d bytes (e.g. `openssl rand -hex 16`)", minTokenLength, minTokenLength)
 	}
-	if strings.TrimSpace(token) == "" {
+	if strings.TrimFunc(token, invisibleInURL) == "" {
 		// All whitespace by Unicode rules, yet long enough, free of ASCII edge
 		// padding and legal in a header, so every rune survives the header (a
 		// non-ASCII space): the token IS presentable, so it is kept verbatim and
@@ -602,8 +635,7 @@ func checkBeatToken(token string) error {
 // tabs. So the padding refusal covers the _FILE channel too — a BEAT_TOKEN_FILE
 // whose content carries leading or trailing ASCII whitespace FAILS STARTUP,
 // exactly as the plain variable does. That is the same principle this package
-// applies everywhere else — knell will not silently rewrite a credential — and
-// it is now consistent across both channels rather than trimmed on one of them.
+// applies everywhere else: knell will not silently rewrite a credential.
 // The ordinary way of writing such a file is unaffected: `printf '%s\n' token >
 // file` and `echo token > file` differ from the token only by that one trailing
 // newline, which envx still removes. BEAT_TOKEN_FILE points at a
@@ -709,10 +741,30 @@ func loadWebhook() (string, error) {
 // [A-Za-z0-9][A-Za-z0-9_-]{0,63} and be unique; deadlines are Go durations
 // of at least minDeadline.
 func parseBeats(raw string) ([]Beat, error) {
-	entries := strings.Split(raw, ",")
-	beats := make([]Beat, 0, len(entries))
-	seen := make(map[string]struct{}, len(entries))
-	for _, entry := range entries {
+	// Count first, allocate second, and never materialize the split. BEATS is
+	// operator-supplied and unbounded, so sizing the containers from its ENTRY
+	// count let the value's LENGTH decide the footprint rather than the 64 beats
+	// this parser can keep: 1 MiB of separators allocated ~93 MiB, which a
+	// memory-limited container OOM-kills before either refusal below can name the
+	// cause -- and an OOM leaves the operator a crash loop with no message, the one
+	// startup failure this package has no way to explain afterwards. SplitSeq walks
+	// the same entries without the intermediate slice, so the count pass is free and
+	// both caps are decided before a single allocation.
+	configured := 0
+	for entry := range strings.SplitSeq(raw, ",") {
+		if strings.TrimSpace(entry) != "" {
+			configured++
+		}
+	}
+	if configured == 0 {
+		return nil, errors.New("no beats configured")
+	}
+	if configured > maxBeats {
+		return nil, fmt.Errorf("%d beats configured, maximum is %d", configured, maxBeats)
+	}
+	beats := make([]Beat, 0, configured)
+	seen := make(map[string]struct{}, configured)
+	for entry := range strings.SplitSeq(raw, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
@@ -722,12 +774,6 @@ func parseBeats(raw string) ([]Beat, error) {
 			return nil, err
 		}
 		beats = append(beats, b)
-	}
-	if len(beats) == 0 {
-		return nil, errors.New("no beats configured")
-	}
-	if len(beats) > maxBeats {
-		return nil, fmt.Errorf("%d beats configured, maximum is %d", len(beats), maxBeats)
 	}
 	return beats, nil
 }
@@ -838,9 +884,10 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		// utf8.ValidString carries the same rule down to the BYTE level, and the
 		// rune predicate cannot: an invalid UTF-8 byte decodes to U+FFFD, which
 		// unicode.IsPrint accepts, so a mis-encoded URL (a secret file written in
-		// latin-1, a value mangled by a mis-decoding pipeline) passed every gate
-		// and was percent-encoded byte by byte on every POST — in the HOST as
-		// well as the path, so the notice went to a name that does not resolve.
+		// latin-1, a value mangled by a mis-decoding pipeline) would pass every
+		// other gate and be percent-encoded byte by byte on every POST — in the
+		// HOST as well as the path, so the notice would go to a name that does
+		// not resolve.
 		return nil, errors.New("contains a space or an invisible character (it is percent-encoded on every request, so the webhook host and path that reach the other end are not the configured ones; remove it, or percent-encode it yourself if it really belongs to the credential)")
 	}
 	return u, nil

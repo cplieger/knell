@@ -639,6 +639,17 @@ func TestAwaitWatchLoopWarnsOnceWhenTheLoopOutlivesTheGrace(t *testing.T) {
 	if n := rec.CountLevel(slog.LevelWarn, stillRunningWarn); n != 1 {
 		t.Errorf("%q at WARN = %d, want exactly 1; messages = %v", stillRunningWarn, n, rec.Messages())
 	}
+	// Both figures carry the diagnosis the line exists for: without "grace"
+	// nothing names the constant to raise, and without "waited" the line cannot
+	// distinguish a drain that ate the whole budget (waited near zero, the loop
+	// never got a chance) from a wedged loop (waited near the grace), so it
+	// reads as an accusation against the loop either way.
+	if !rec.HasAttr(stillRunningWarn, "grace", shutdownGrace.String()) {
+		t.Errorf("still-running warning omits grace=%s: nothing then names the constant an operator would raise; records = %v", shutdownGrace, rec.Records())
+	}
+	if _, reported := rec.AttrValue(stillRunningWarn, "waited"); !reported {
+		t.Errorf("still-running warning omits the waited attr: the line cannot then tell a drain that consumed the whole budget from a wedged watch loop; records = %v", rec.Records())
+	}
 }
 
 // TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace pins that the hook
@@ -723,6 +734,44 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	}
 	if waited > time.Second {
 		t.Errorf("teardown took %s, want it to cancel the watch loop before waiting for it", waited)
+	}
+}
+
+// TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog pins the
+// two server wirings nothing else in the suite can see. Both are silent when
+// dropped: without WithReadTimeout/WithWriteTimeout a trickled body or a client
+// that never reads /metrics holds a handler goroutine for as long as it likes
+// (webhttp leaves both unset by default, bounding only the headers), and
+// without WithSlogErrorLog net/http's own connection-level lines -- above all
+// "http: Accept error: ...; retrying", the trace of an exhausted fd budget that
+// stops every beat from being received -- fall back to the standard logger as
+// unstructured, level-less text no level-based rule can match.
+//
+// The timeout halves assert the configured bound rather than a real trickle:
+// requestTimeout is 30s, so the behavioral version of this test would have to
+// wait that long. The error-log half is behavioral -- the bridge is driven and
+// the resulting record's LEVEL is the assertion.
+func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *testing.T) {
+	// Serial (no t.Parallel): webhttp.WithSlogErrorLog resolves slog.Default()
+	// as NewServer applies it, so the capture must be the default first.
+	rec := capture.Default(t)
+
+	srv := newServer(http.NotFoundHandler())
+
+	if srv.ReadTimeout != requestTimeout {
+		t.Errorf("ReadTimeout = %s, want %s: webhttp leaves it unset by default, and an unbounded read lets a trickled beat body hold a handler goroutine indefinitely", srv.ReadTimeout, requestTimeout)
+	}
+	if srv.WriteTimeout != requestTimeout {
+		t.Errorf("WriteTimeout = %s, want %s: an unbounded write lets a client that requests /metrics and never reads the response pin the goroutine in Write", srv.WriteTimeout, requestTimeout)
+	}
+	if srv.ErrorLog == nil {
+		t.Fatal("ErrorLog is nil, so net/http's connection-level errors go to the standard logger: an accept failure -- a whole-service outage here -- arrives as an unstructured, level-less line no log rule matches")
+	}
+
+	srv.ErrorLog.Print("http: Accept error: accept tcp [::]:9190: too many open files; retrying in 5ms")
+
+	if n := rec.CountLevel(slog.LevelError, "Accept error"); n != 1 {
+		t.Errorf("accept-error lines at ERROR = %d, want 1: knell's only job is answering pings, so an accept failure is an outage rather than a degradation; records = %v", n, rec.Records())
 	}
 }
 

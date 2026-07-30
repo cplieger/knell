@@ -99,6 +99,58 @@ func runMain(t *testing.T, env []string, args ...string) (int, string) {
 	}
 }
 
+// servingKnell is one knell child that has reported a bound listener: the
+// process, the address it bound, the lines read so far, and the scanner the
+// caller drains after signalling it.
+type servingKnell struct {
+	cmd     *exec.Cmd
+	scanner *bufio.Scanner
+	lines   []string
+	addr    string
+}
+
+// startServingKnell re-executes this test binary as knell with env and blocks
+// until it logs a bound listener, whose address it records. Both CLI boot tests
+// need the identical boot, and a second copy of it drifts from bootEnv's
+// contract and from the "msg=listening addr=" line the oracles parse -- a
+// reworded listening line would then be fixed in one copy and hang the other
+// until the 60s context kills it. Port 0 in the caller's addr keeps the child
+// off any port another test reserved; childEnv pins LOG_LEVEL=info, which the
+// oracles need, since an inherited LOG_LEVEL=warn silences "listening",
+// "shutting down" and "stopped" alike and reports an ambient environment as a
+// missing contract.
+func startServingKnell(t *testing.T, env []string) *servingKnell {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	t.Cleanup(cancel)
+	cmd := exec.CommandContext(ctx, os.Args[0])
+	cmd.Env = childEnv(env)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start knell: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	child := &servingKnell{cmd: cmd, scanner: bufio.NewScanner(stderr)}
+	for child.scanner.Scan() {
+		line := child.scanner.Text()
+		child.lines = append(child.lines, line)
+		if _, rest, found := strings.Cut(line, "msg=listening addr="); found {
+			if fields := strings.Fields(rest); len(fields) > 0 {
+				child.addr = fields[0]
+			}
+			break
+		}
+	}
+	if child.addr == "" {
+		t.Fatalf("knell never reported a bound listener; log:\n%s", strings.Join(child.lines, "\n"))
+	}
+	return child
+}
+
 // TestHealthSubcommandReportsTheMarkerVerdictWithoutBooting pins the Docker
 // healthcheck contract: `knell health` stats the marker and exits with the
 // probe's verdict, and never falls through into the server.
@@ -159,36 +211,8 @@ func TestUnknownSubcommandExitsTwoWithoutBooting(t *testing.T) {
 // before the teardown finished would prove nothing about the drain, and
 // "watch loop stopped" already contains the word.
 func TestSignalledKnellLogsTheCleanStopAsItsLastLineAndExitsZero(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	t.Cleanup(cancel)
-	cmd := exec.CommandContext(ctx, os.Args[0])
-	// Port 0: the child picks its own port, so this test never races another
-	// test for a reserved one. childEnv pins LOG_LEVEL=info, which this test's
-	// oracle needs: run() applies the parsed level before the listener is bound,
-	// so an inherited LOG_LEVEL=warn would silence "listening", "shutting down"
-	// and "stopped" alike and report an ambient environment as a missing
-	// clean-stop contract.
-	cmd.Env = childEnv(bootEnv("cli-clean-stop:1m", "127.0.0.1:0"))
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		t.Fatalf("stderr pipe: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start knell: %v", err)
-	}
-	t.Cleanup(func() { _ = cmd.Process.Kill() })
-
-	var lines []string
-	scanner := bufio.NewScanner(stderr)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-		if strings.Contains(scanner.Text(), "msg=listening") {
-			break
-		}
-	}
-	if len(lines) == 0 || !strings.Contains(lines[len(lines)-1], "msg=listening") {
-		t.Fatalf("knell never reported a bound listener; log:\n%s", strings.Join(lines, "\n"))
-	}
+	child := startServingKnell(t, bootEnv("cli-clean-stop:1m", "127.0.0.1:0"))
+	cmd, lines, scanner := child.cmd, child.lines, child.scanner
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
 		t.Fatalf("signalling knell: %v", err)
 	}
@@ -223,38 +247,10 @@ func TestSignalledKnellLogsTheCleanStopAsItsLastLineAndExitsZero(t *testing.T) {
 // healthy probe: absent at the INFO default, present only once the parsed level
 // has actually reached the handler.
 func TestConfiguredLogLevelReachesTheRunningProcess(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	t.Cleanup(cancel)
-	cmd := exec.CommandContext(ctx, os.Args[0])
-	// Port 0: the child picks its own port, so this test never races another
-	// for a reserved one, and the bound address is read back off the listening
-	// line. LOG_LEVEL=debug is appended AFTER childEnv's pinned info and
-	// os/exec keeps the last duplicate, so it is the variable under test.
-	cmd.Env = childEnv(append(bootEnv("cli-log-level:1m", "127.0.0.1:0"), "LOG_LEVEL=debug"))
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		t.Fatalf("stderr pipe: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start knell: %v", err)
-	}
-	t.Cleanup(func() { _ = cmd.Process.Kill() })
-
-	var lines []string
-	var addr string
-	scanner := bufio.NewScanner(stderr)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-		if _, rest, found := strings.Cut(scanner.Text(), "msg=listening addr="); found {
-			if fields := strings.Fields(rest); len(fields) > 0 {
-				addr = fields[0]
-			}
-			break
-		}
-	}
-	if addr == "" {
-		t.Fatalf("knell never reported a bound listener; log:\n%s", strings.Join(lines, "\n"))
-	}
+	// LOG_LEVEL=debug is appended AFTER childEnv's pinned info and os/exec keeps
+	// the last duplicate, so it is the variable under test.
+	child := startServingKnell(t, append(bootEnv("cli-log-level:1m", "127.0.0.1:0"), "LOG_LEVEL=debug"))
+	cmd, addr, lines, scanner := child.cmd, child.addr, child.lines, child.scanner
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/healthz", nil)
 	if err != nil {

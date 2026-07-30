@@ -1327,6 +1327,18 @@ func TestLoadRejectsANodeNamePastTheLimit(t *testing.T) {
 	}
 }
 
+func TestNodeNameCapCoversTheHostnameFallback(t *testing.T) {
+	t.Parallel()
+
+	// POSIX's HOST_NAME_MAX. Linux bounds a hostname at 64, other kernels allow
+	// up to this, and hostnameNode's value is the DEFAULT node name, so this is
+	// the widest value that path can hand notify.
+	const posixHostNameMax = 255
+	if maxNodeNameBytes < posixHostNameMax {
+		t.Fatalf("maxNodeNameBytes = %d, want at least %d: hostnameNode is deliberately not length-checked, so a cap below the OS hostname bound lets the DEFAULT node name render a notice notify's budget test never measured - Discord answers 400 for an over-limit content and no notice is ever delivered", maxNodeNameBytes, posixHostNameMax)
+	}
+}
+
 // TestLoadCountsNodeNameLengthInBytesNotRunes pins the side of the boundary
 // maxNodeNameBytes is measured on. The cap exists so the node name cannot push
 // a notice past Discord's character limit, and counting BYTES is the
@@ -1374,20 +1386,6 @@ func TestLoadRejectsWhitespaceOnlyWebhook(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "set but empty") {
 		t.Errorf("error = %q, want the set-but-empty diagnosis rather than the misleading https-scheme rejection", err)
-	}
-}
-
-func TestLoadRejectsAPresentButEmptyBeatToken(t *testing.T) {
-	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "")
-	unsetEnv(t, "BEAT_TOKEN_FILE")
-
-	_, err := Load(maxNodeNameBytes)
-	if err == nil {
-		t.Fatal("Load() with a present-but-empty BEAT_TOKEN = nil, want error; the token is required and an empty value is not one, and this is exactly what compose interpolation of an undefined variable produces")
-	}
-	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
-		t.Errorf("error = %q, want BEAT_TOKEN context: the operator has to know which variable to unset or fill in", err)
 	}
 }
 

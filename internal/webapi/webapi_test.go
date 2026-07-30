@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/slogx/capture"
@@ -27,15 +28,15 @@ type fakeBeater struct {
 	closed bool
 }
 
-func (f *fakeBeater) Beat(id string) (recorded, accepting bool) {
+func (f *fakeBeater) Beat(id string) watch.BeatOutcome {
 	if f.closed {
-		return false, false
+		return watch.BeatClosed
 	}
 	if !f.known[id] {
-		return false, true
+		return watch.BeatUnknown
 	}
 	f.seen = append(f.seen, id)
-	return true, true
+	return watch.BeatRecorded
 }
 
 // testBeatToken is the credential every test handler is built with. BEAT_TOKEN
@@ -509,13 +510,39 @@ func TestNoStoreOnEveryRoute(t *testing.T) {
 			}
 		})
 	}
+
+	// The throttle answers its 429 itself, ahead of webhttp.Logging, so the two
+	// header baselines hoisted above it in the chain are the only thing that can
+	// give that refusal an envelope: every routed case above would still pass
+	// with them back inside the throttle.
+	t.Run("throttled 429", func(t *testing.T) {
+		h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
+		var rec *httptest.ResponseRecorder
+		for range authFailBurst + 1 {
+			req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
+			req.Header.Set("Authorization", "Bearer wrong")
+			rec = httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+		}
+		if rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("attempt %d = %d, want 429: this case needs the throttle to have fired (body %s)",
+				authFailBurst+1, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("Cache-Control on the throttled 429 = %q, want %q: a cache may not re-serve \"you are throttled\" to a sender whose budget has refilled",
+				got, "no-store")
+		}
+		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("X-Content-Type-Options on the throttled 429 = %q, want %q", got, "nosniff")
+		}
+	})
 }
 
 // panicBeater panics on every ping, standing in for a bug anywhere below the
 // beat handler.
 type panicBeater struct{}
 
-func (panicBeater) Beat(string) (bool, bool) { panic("beat exploded") }
+func (panicBeater) Beat(string) watch.BeatOutcome { panic("beat exploded") }
 
 func TestPanicUnderBeatHandlerAnswers500AndIsLogged(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
@@ -948,38 +975,6 @@ func TestFailedAuthIsThrottledInAggregate(t *testing.T) {
 	})
 }
 
-// TestGetAndHeadNeverRecordABeat pins that the two fetch-shaped methods cannot
-// feed the switch, WITH a valid credential in hand. A recording GET is what an
-// <img>, a link preview, a crawler or an uptime prober can reach by accident, so
-// GET and HEAD are registered to refuse rather than left to fall through: only
-// POST records. The valid token is the point of the test — the refusal must be
-// the METHOD's, not the credential's, or a sender that holds the token could
-// still re-arm the switch from a URL somebody fetched for it.
-func TestGetAndHeadNeverRecordABeat(t *testing.T) {
-	for _, method := range []string{http.MethodGet, http.MethodHead} {
-		t.Run(method, func(t *testing.T) {
-			b := &fakeBeater{known: map[string]bool{"api": true}}
-			h := newTestHandler(b, testBeatToken)
-
-			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, newBeatRequest(method, "/beat/api", nil))
-
-			if rec.Code != http.StatusMethodNotAllowed {
-				t.Fatalf("authorized %s /beat/api = %d, want 405: only POST records (body %s)",
-					method, rec.Code, rec.Body.String())
-			}
-			if len(b.seen) != 0 {
-				t.Errorf("authorized %s recorded %v, want nothing: a fetched URL must never re-arm the switch", method, b.seen)
-			}
-			// The refusal is coded and names POST, so a misconfigured sender
-			// learns what to send instead of reading a bare 404.
-			if !strings.Contains(rec.Body.String(), "method_not_allowed") {
-				t.Errorf("%s body = %s, want the method_not_allowed coded envelope", method, rec.Body.String())
-			}
-		})
-	}
-}
-
 // TestEveryRejectedMethodAnswersTheSameRefusal pins that the Allow header is
 // TRUE for every rejected method. Without the method-agnostic /beat/{id} route,
 // PUT/DELETE/PATCH/OPTIONS fall to net/http's built-in 405, which assembles
@@ -1327,7 +1322,8 @@ func assertBeatRefused(t *testing.T, h http.Handler, method, path string) {
 // ping accepted in that window is recorded behind a sender that no longer
 // exists, so from the instant the context is cancelled the recording method must
 // refuse and say so honestly. GET and HEAD need no case here: they are refused
-// as methods in every lifecycle phase (TestGetAndHeadNeverRecordABeat).
+// as methods in every lifecycle phase
+// (TestEveryRejectedMethodAnswersTheSameRefusal).
 // What accepting one would cost is pinned by
 // the siblings below: TestCancelledBeatLeavesMetricsUnchanged (the exposition),
 // TestCancelledUnknownBeatMintsNoSeries (label cardinality),
@@ -1971,17 +1967,15 @@ const (
 	truncationMarker = "...(truncated)"
 )
 
-// hostPolicy builds the allowlist exactly as internal/config does, so this
-// file exercises the policy shape knell actually ships (loopback exempt, the
-// ALLOWED_HOSTS-naming 403).
+// hostPolicy builds the allowlist by calling the SHIPPED builder
+// (config.ParseAllowedHosts), so this file exercises the policy shape knell
+// actually serves (loopback exempt, the ALLOWED_HOSTS-naming 403) rather than a
+// hand-copied twin that cannot fail when production's option set changes.
 func hostPolicy(t *testing.T, entries string) *webhttp.HostPolicy {
 	t.Helper()
-	policy, invalid := webhttp.ParseHostList(strings.Split(entries, ","),
-		webhttp.WithLoopbackExempt(),
-		webhttp.WithHostAllowlistError("host_not_allowed",
-			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"))
+	policy, invalid := config.ParseAllowedHosts(strings.Split(entries, ","))
 	if len(invalid) > 0 {
-		t.Fatalf("ParseHostList(%q) reported invalid entries %v; the fixture must be usable", entries, invalid)
+		t.Fatalf("ParseAllowedHosts(%q) reported invalid entries %v; the fixture must be usable", entries, invalid)
 	}
 	return policy
 }
@@ -2154,5 +2148,94 @@ func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 	}
 	if len(b.seen) != 0 {
 		t.Errorf("recorded beats = %v, want none", b.seen)
+	}
+}
+
+// TestThrottledAuthFailureWritesNoAccessLine pins WHY beatAuthFailureLimiter is
+// the OUTERMOST wrapper in New's chain: an over-budget attempt must be answered
+// before webhttp.Logging, so a guessing run at wire speed cannot write one
+// access line per attempt and push knell's permanently-lost-notice WARNs out of
+// the retained log window. Nothing else pins that ordering -- the throttle's
+// other tests assert the 429 and its reason counter, both of which survive the
+// limiter being moved inside Logging, which restores the flood with the suite
+// green. So: the unthrottled attempts each leave exactly one line, and the
+// throttled ones leave none at all.
+func TestThrottledAuthFailureWritesNoAccessLine(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and must be installed BEFORE New, because webhttp.Logging
+	// resolves slog.Default() when the chain is built.
+	logs := capture.Default(t)
+	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
+
+	badBearer := func() int {
+		req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
+		req.Header.Set("Authorization", "Bearer wrong")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// The burst reaches the handler, so each of these IS logged: the bound is on
+	// the flood, not on reporting a failed authentication at all.
+	for i := range authFailBurst {
+		if got := badBearer(); got != http.StatusUnauthorized {
+			t.Fatalf("attempt %d = %d, want 401", i+1, got)
+		}
+	}
+	if got := logs.CountExact("http"); got != authFailBurst {
+		t.Fatalf("access lines after %d unthrottled 401s = %d, want %d: a refused ping must still be greppable",
+			authFailBurst, got, authFailBurst)
+	}
+
+	const flood = 50
+	for i := range flood {
+		if got := badBearer(); got != http.StatusTooManyRequests {
+			t.Fatalf("throttled attempt %d = %d, want 429", i+1, got)
+		}
+	}
+	if got := logs.CountExact("http"); got != authFailBurst {
+		t.Errorf("%d throttled attempts added %d access lines, want 0: the throttle must answer OUTSIDE webhttp.Logging, or a guessing run writes knell's log at wire speed",
+			flood, got-authFailBurst)
+	}
+}
+
+// TestFailedAuthDrawsATokenForEverySpellingTheGateAnswers pins the throttle
+// against the ROUTE rather than one spelling of it. The bucket exempts a
+// request whose path is not a single segment under /beat/, but ServeMux matches
+// patterns on the ESCAPED path, so an encoded slash keeps the request on
+// POST /beat/{id} and the bearer gate still answers it 401. Any spelling the
+// gate answers is a guessing attempt against the endpoint's only credential and
+// one access line per attempt, so it has to draw from the same bucket:
+// otherwise a caller who appends %2F to the id has an unbounded oracle and an
+// unbounded log flood, and every existing throttle test stays green.
+func TestFailedAuthDrawsATokenForEverySpellingTheGateAnswers(t *testing.T) {
+	for _, target := range []string{"/beat/api", "/beat/%61pi", "/beat/a%2Fb", "/beat/ghost%2F"} {
+		t.Run(target, func(t *testing.T) {
+			b := &fakeBeater{known: map[string]bool{"api": true}}
+			h := newTestHandler(b, testBeatToken)
+
+			var throttled bool
+			for i := range authFailBurst * 3 {
+				req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(""))
+				req.Header.Set("Authorization", "Bearer wrong")
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+				if rec.Code == http.StatusTooManyRequests {
+					throttled = true
+					break
+				}
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("attempt %d on %s with a bad bearer = %d, want 401 or 429 (body %s)",
+						i+1, target, rec.Code, rec.Body.String())
+				}
+			}
+			if !throttled {
+				t.Errorf("POST %s answered %d failed authentications unthrottled: the token is the endpoint's only gate, so every spelling the gate answers must draw from the same bucket",
+					target, authFailBurst*3)
+			}
+			if len(b.seen) != 0 {
+				t.Errorf("recorded %v, want nothing: no failed-auth attempt may record", b.seen)
+			}
+		})
 	}
 }

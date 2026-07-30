@@ -55,10 +55,14 @@
 // none of its own to get wrong.
 //
 // RecordPreRouteRefusal is reached from internal/webapi too, and its label is
-// bounded by CONSTRUCTION rather than by a contract on the caller: its only
-// argument type is Refusal, whose legal values are the constants declared in
-// this file, so no request-derived string can reach the label. That is
-// deliberate — every one of its call sites sits on an unauthenticated path.
+// narrowed by its argument TYPE rather than by a documented contract on the
+// caller: Refusal is not string, so no request-derived value reaches the label
+// without an explicit Refusal(...) conversion written at the call site. The set
+// is still not closed to the compiler — that conversion, and any untyped
+// literal, remain legal — so the rule is the same as Kind's: pass one of the
+// constants declared in this file, never a converted runtime string. That
+// matters more here than anywhere else in this package, because every one of
+// its call sites sits on an unauthenticated path.
 //
 // Runtime enforcement inside this package is deliberately NOT the answer: it
 // would add state plus an init-order dependency on config to defend against a
@@ -306,7 +310,7 @@ var notificationsSent = metricslib.NewLabeledCounter(
 // counted per record on outageRecordsDropped.
 var notificationsFailed = metricslib.NewLabeledCounter(
 	"notifications_failed_total",
-	"Webhook delivery attempts that failed after retries, by kind ("+notificationKindsText+"); one per failed message.",
+	"Webhook delivery attempts that failed after retries, by kind ("+notificationKindsText+"); one per failed message. kind=recovered never moves here: recovered is fire-once with nothing left to retry, so a failed recovered send is counted on notifications_dropped_total instead.",
 	[]string{kindLabel},
 )
 
@@ -374,7 +378,7 @@ var preRouteRefusals = metricslib.NewLabeledCounter(
 // is named on preRouteRefusals instead.
 var httpRequests = metricslib.NewLabeledCounter(
 	"http_requests_total",
-	"Served HTTP requests by matched route template, method and status.",
+	"Served HTTP requests by matched route template, method and status. Series are not pre-minted, so a status series is born with its first request and increase() cannot see that first event; alert on the absolute value (status=401 > 0), which latches until restart.",
 	[]string{methodLabel, pathLabel, statusLabel},
 )
 

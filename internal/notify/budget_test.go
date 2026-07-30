@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/watch"
 )
 
@@ -34,24 +35,24 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 	// escapeMarkdown expansion is inside the measured worst case: escaping
 	// doubles every markup character, so the widest rendered node is the
 	// 256-byte cap of "*" (512 runes) and the widest id config's grammar admits
-	// is "b" + 63 underscores (127 runes). Plain letters would measure a notice
+	// is derived from config.MaxBeatIDLen. Plain letters would measure a notice
 	// hundreds of characters shorter than the one the cap must cover. The
 	// silence is a 200-year span, long enough to exercise a wide multi-year
 	// duration. The assertion below measures the final rendered message directly
 	// rather than duplicating its template budget in prose.
 	d := New(srv.URL, strings.Repeat("*", MaxNodeNameBytes))
 	defer d.Close()
-	id := "b" + strings.Repeat("_", 63)
+	id := "b" + strings.Repeat("_", config.MaxBeatIDLen-1)
 	started := time.Date(1970, time.January, 1, 0, 0, 0, 0, time.UTC)
 	observed := started.Add(200 * 365 * 24 * time.Hour)
 	live := watch.Transition{Started: started, Observed: observed}
 
 	// The single-outage notice carries the longest of the two lateClause
 	// branches; the batch carries the MIXED batchLateClause, the longest of the
-	// four late clauses, at watch's missingQueueSize bound of 8 records.
+	// four late clauses, at watch's MaxHistoryBatch bound.
 	single := []watch.Outage{{Started: started, Recovered: observed, LateReason: watch.LateEndedBeforeDetection}}
-	mixed := make([]watch.Outage, 0, 8)
-	for i := range 8 {
+	mixed := make([]watch.Outage, 0, watch.MaxHistoryBatch)
+	for i := range watch.MaxHistoryBatch {
 		reason := watch.LateUndelivered
 		if i%2 == 0 {
 			reason = watch.LateEndedBeforeDetection

@@ -38,6 +38,8 @@ import (
 	"github.com/cplieger/knell/internal/metrics"
 )
 
+// --- Notification contract and the value types it carries ---
+
 // Notifier delivers the transition notifications. Implementations are
 // expected to retry transient failures internally and return the final
 // outcome.
@@ -238,6 +240,11 @@ type Beat struct {
 	Deadline time.Duration
 }
 
+// MaxHistoryBatch is the largest number of ended outages one
+// BeatOutageHistory notice can carry: the per-beat queue bound, and therefore
+// the batch size a notifier's rendering budget must cover.
+const MaxHistoryBatch = 8
+
 // missingQueueSize bounds the per-beat queue of detected-but-undelivered
 // missing transitions. Every queued entry costs a full deadline of silence
 // (30s minimum, minutes to hours in practice) plus a ping, while the head
@@ -246,7 +253,9 @@ type Beat struct {
 // actionable ones, and the bound keeps a stuck webhook from growing state
 // without limit. Overflow drops the NEWEST record; recordEndedOutage and
 // recordOngoingOutage own what a full queue MEANS for their case.
-const missingQueueSize = 8
+const missingQueueSize = MaxHistoryBatch
+
+// --- Per-beat detection state: the pending-missing queue and its accounting ---
 
 // overdueBeat is one detected missing transition: a beat past its deadline,
 // captured as the silence interval it was measured over. silence.Started is
@@ -504,6 +513,8 @@ type recoveryEvent struct {
 	id      string
 }
 
+// --- The watcher: construction, ping admission, and the Run loop ---
+
 // Watcher tracks beat freshness and drives transition notifications. Beat is
 // safe for concurrent use; Run is the single background sender so notify
 // calls never hold the lock.
@@ -535,25 +546,48 @@ func New(beats []Beat, notifier Notifier, now func() time.Time, start time.Time)
 		recoveries: make(chan recoveryEvent, len(beats)),
 		accepting:  true,
 	}
+	// The boot-armed clock's own claim, MEASURED rather than assumed: wiring can
+	// reach New more than a deadline after the baseline (main captures start at
+	// process entry, ahead of the marker probe and the mounted-secret reads), and
+	// a gauge that reports fresh then contributes a false vote to the quorum sum.
+	bootSilence := now().Sub(start)
 	for _, b := range beats {
 		w.beats[b.ID] = &beatState{lastSeen: start, deadline: b.Deadline}
 		// InitBeat publishes the beat's boot-armed baseline (start as
 		// last-seen) and pre-mints its per-beat counters at zero, so
 		// increase() has an earlier sample from a cold start.
 		metrics.InitBeat(b.ID, b.Deadline, start)
-		// The boot-armed clock's own claim: a beat that has never pinged is
-		// fresh until its first deadline passes. It goes through the same
-		// door as every later verdict, so overdue stays its only source.
-		publishFreshness(b.ID, 0, b.Deadline)
+		// A beat that has never pinged is fresh until its first deadline passes.
+		// It goes through the same door as every later verdict, so overdue stays
+		// its only source of the boundary -- and now of the reading too.
+		publishFreshness(b.ID, bootSilence, b.Deadline)
 	}
 	return w
 }
 
-// Beat records a ping for id. recorded is false when id is not a configured
-// beat (the caller answers 404 and nothing is recorded); accepting is false
-// once shutdown has closed admission (the caller answers 503 and nothing is
-// recorded). A ping on an alerted beat queues the recovered notification for
-// the Run loop, so this never blocks on the webhook.
+// BeatOutcome is what recording a ping resulted in: the three states the beat
+// endpoint answers for. A single value rather than a pair of booleans, so the
+// combination the state machine never produces ("recorded, but admission is
+// closed") cannot be constructed or mishandled by a caller.
+type BeatOutcome uint8
+
+const (
+	// BeatRecorded means the ping was accepted and the beat's state was updated.
+	BeatRecorded BeatOutcome = iota
+	// BeatUnknown means id is not a configured beat; nothing was recorded and no
+	// metric series was minted for the id (it is a label).
+	BeatUnknown
+	// BeatClosed means shutdown has closed admission for the rest of the
+	// process's life; nothing was recorded.
+	BeatClosed
+)
+
+// Beat records a ping for id and reports which of the three outcomes it was:
+// BeatUnknown when id is not a configured beat (the caller answers 404 and
+// nothing is recorded), BeatClosed once shutdown has closed admission (the
+// caller answers 503 and nothing is recorded), BeatRecorded otherwise. A ping
+// on an alerted beat queues the recovered notification for the Run loop, so
+// this never blocks on the webhook.
 //
 // Admission is decided HERE, under the same mutex as the state mutation and
 // the recovered enqueue, because that is the only way the decision can be
@@ -563,16 +597,16 @@ func New(beats []Beat, notifier Notifier, now func() time.Time, start time.Time)
 // reported. Since stopAccepting takes this mutex too, every ping either
 // completes before admission closes — and is therefore visible to
 // logUndelivered — or observes accepting=false and records nothing at all.
-func (w *Watcher) Beat(id string) (recorded, accepting bool) {
+func (w *Watcher) Beat(id string) BeatOutcome {
 	w.mu.Lock()
 	if !w.accepting {
 		w.mu.Unlock()
-		return false, false
+		return BeatClosed
 	}
 	st, ok := w.beats[id]
 	if !ok {
 		w.mu.Unlock()
-		return false, true
+		return BeatUnknown
 	}
 	now := w.now()
 	previousSeen := st.lastSeen
@@ -648,7 +682,7 @@ func (w *Watcher) Beat(id string) (recorded, accepting bool) {
 		slog.Warn("recovery queue full, dropping recovered notification, nothing retries it and no notice for this recovery will ever arrive",
 			"beat", id, "down_for", silence.DownFor().String(), "retryable", false)
 	}
-	return true, true
+	return BeatRecorded
 }
 
 // stopAccepting closes beat admission for the rest of the process's life.
@@ -727,6 +761,8 @@ func (w *Watcher) refreshFreshness() {
 		publishFreshness(id, now.Sub(st.lastSeen), st.deadline)
 	}
 }
+
+// --- Shutdown: tallying and reporting the notices that die with the process ---
 
 // logUndelivered reports the notices this process will never deliver, on the
 // way out. Both queues die with the process: a pendingMissing record whose
@@ -840,6 +876,8 @@ func logPendingLoss(p pendingLoss) {
 	slog.Warn("shutting down with undelivered ended-outage records, no notice for them will ever arrive",
 		"beat", p.id, "records", p.lost, "still_ongoing", p.ongoing, "retryable", false)
 }
+
+// --- Detection and delivery: the freshness boundary, the sweep, and the senders ---
 
 // overdue reports whether an observed silence has passed the beat's deadline.
 // It is the single home of the freshness boundary: publishFreshness maps it to

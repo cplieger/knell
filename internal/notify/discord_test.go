@@ -116,6 +116,37 @@ func TestBeatMissingDelivers(t *testing.T) {
 	}
 }
 
+func TestMissingNoticeDoesNotPresumeTheBeatEverPinged(t *testing.T) {
+	t.Parallel()
+
+	// BeatMissing's wording has to fit a beat that was configured in BEATS and
+	// never wired to a sender at all -- a typo'd id, a sender pointed at the
+	// wrong observer -- because the boot-armed clock fires this very notice one
+	// deadline after start, and notify cannot tell that case from a sender that
+	// pinged for weeks and stopped (watch.Transition carries no "was ever seen"
+	// bit, and Started collapses the last ping and the process-start baseline
+	// into one field). A rewording that presumes a previous ping sends the
+	// operator to inspect a sender that never existed, and every other
+	// assertion on this notice -- the MISSING keyword, the beat id, the
+	// truncated duration, the length budget -- still passes.
+	rec := newWebhookRecorder(http.StatusNoContent)
+	srv := httptest.NewServer(rec.handler(t))
+	t.Cleanup(srv.Close)
+
+	d := New(srv.URL, "node-1")
+	t.Cleanup(d.Close)
+
+	if err := d.BeatMissing(context.Background(), "api", liveSilence(time.Hour)); err != nil {
+		t.Fatalf("BeatMissing: %v", err)
+	}
+	content := <-rec.contents
+	for _, want := range []string{"check the sender", "anything is pinging this beat id at all"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("the missing notice = %q, want it to say %q: the beat may never have been pinged at all, and this notice is the only place that says so", content, want)
+		}
+	}
+}
+
 func TestBeatRecoveredDelivers(t *testing.T) {
 	t.Parallel()
 
@@ -1706,6 +1737,38 @@ func TestBeatMissingEscapesEveryDiscordMarkdownCharacterInNodeName(t *testing.T)
 				t.Errorf("BeatMissing node = %q, want %q", content, want)
 			}
 		})
+	}
+}
+
+func TestEscapeMarkdownLeavesEveryOtherCharacterAlone(t *testing.T) {
+	t.Parallel()
+
+	// The other half of escapeMarkdown's contract, the half its doc states and
+	// nothing measures: ONLY Discord's own markup characters are escaped.
+	// Discord strips a backslash solely in front of its markup, so an entry
+	// added for anything else publishes the backslash itself and the operator
+	// can no longer copy the value out of the alert. Every mapping that DOES
+	// exist has a named oracle above; nothing rejects a mapping that should
+	// not. Only the hyphen is covered incidentally today, by the "node-1"
+	// substring every delivery assertion in this file happens to use.
+	const markup = "\\*_~`|[]"
+	for r := rune(0x20); r < 0x7f; r++ {
+		if strings.ContainsRune(markup, r) {
+			continue
+		}
+		in := "a" + string(r) + "b"
+		if got := escapeMarkdown(in); got != in {
+			t.Errorf("escapeMarkdown(%q) = %q, want it unchanged: %q is not one of Discord's markup characters, so Discord leaves the backslash visible and the configured beat id or node name cannot be read off the notice", in, got, string(r))
+		}
+	}
+	// Whole values a deployment really configures, including the shapes the
+	// loop's single-character cases cannot show: a hyphenated beat id (every
+	// README example and both homelab beats) and a non-ASCII node name, since
+	// NODE_NAME is only trimmed and byte-capped.
+	for _, in := range []string{"cron-backup", "watchdog-mimir", "caf\u00e9", "obs\u00a01"} {
+		if got := escapeMarkdown(in); got != in {
+			t.Errorf("escapeMarkdown(%q) = %q, want it unchanged: it carries no Discord markup character", in, got)
+		}
 	}
 }
 

@@ -241,8 +241,8 @@ func beatSeriesValue(t *testing.T, name, id string) (string, bool) {
 // leg of the exposition contract: the kind vocabulary is published as
 // exposition METADATA, and an operator writing a KnellNotifyFailing selector
 // reads the HELP text to learn which kind values exist. Rendered literally
-// rather than via joinKinds, so a changed separator or a dropped kind fails
-// here instead of silently reshaping the advertised set.
+// rather than via joinLabelValues, so a changed separator or a dropped kind
+// fails here instead of silently reshaping the advertised set.
 func TestNotificationCountersAdvertiseTheKindListInTheirHelpText(t *testing.T) {
 	const kindList = "(missing, recovered, history)"
 	want := []string{
@@ -251,17 +251,8 @@ func TestNotificationCountersAdvertiseTheKindListInTheirHelpText(t *testing.T) {
 		"knell_notifications_dropped_total",
 	}
 
-	body := exposition(t)
-
 	for _, name := range want {
-		prefix := "# HELP " + name + " "
-		var help string
-		for line := range strings.Lines(body) {
-			if v, ok := strings.CutPrefix(line, prefix); ok {
-				help = v
-				break
-			}
-		}
+		help, _ := helpText(t, name)
 		if help == "" {
 			t.Errorf("%s has no HELP line: the exposition lost the metadata an operator reads to learn the metric's meaning", name)
 			continue
@@ -270,6 +261,40 @@ func TestNotificationCountersAdvertiseTheKindListInTheirHelpText(t *testing.T) {
 			t.Errorf("%s HELP = %q, want it to advertise %s: the rendered kind list is what tells an operator which kind label values a selector may match", name, strings.TrimSpace(help), kindList)
 		}
 	}
+}
+
+// TestPreRouteRefusalsAdvertiseTheReasonListInTheirHelpText is the refusal
+// counter's half of the same metadata contract, and the reason joinLabelValues
+// is shared at all: an operator investigating a missing beat reads this HELP
+// text to learn which reason values a selector may match. Nothing else observes
+// it - the cold-start test reads SAMPLES, so pinning the vocabulary in the
+// sample lines leaves the advertised list free to go stale, naming reasons that
+// no longer exist or omitting one that does.
+func TestPreRouteRefusalsAdvertiseTheReasonListInTheirHelpText(t *testing.T) {
+	const reasonList = "(non_canonical_beat_path, host_not_allowed, auth_throttled)"
+	const name = "knell_pre_route_refusals_total"
+
+	help, ok := helpText(t, name)
+	if !ok {
+		t.Fatalf("%s has no HELP line: the exposition lost the metadata an operator reads to learn the metric's meaning", name)
+	}
+	if !strings.Contains(help, reasonList) {
+		t.Errorf("%s HELP = %q, want it to advertise %s: the rendered reason list is what tells an operator which reason label values a selector may match", name, strings.TrimSpace(help), reasonList)
+	}
+}
+
+// helpText returns the HELP text of one metric out of the rendered exposition,
+// and whether the metric had a HELP line at all. Shared by the two metadata
+// tests so both read the advertised vocabulary the way an operator does.
+func helpText(t *testing.T, name string) (string, bool) {
+	t.Helper()
+	prefix := "# HELP " + name + " "
+	for line := range strings.Lines(exposition(t)) {
+		if v, ok := strings.CutPrefix(line, prefix); ok {
+			return v, true
+		}
+	}
+	return "", false
 }
 
 // TestRecordHTTPRecordsBothTheCounterAndTheDuration pins that RecordHTTP wires

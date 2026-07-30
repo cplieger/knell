@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cplieger/knell/internal/metrics"
+	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/webhttp"
 )
 
@@ -46,8 +47,9 @@ const bearerPrefix = "Bearer "
 //
 // They are pg-autodump's numbers deliberately: the two apps guard the same
 // shape (one static bearer on one POST route), the bounded resource is the same
-// (a log line and a SHA-256 per attempt, not the beat recording itself), and one
-// tuning across the fleet is one thing to reason about. Ten back-to-back
+// (a log line and the token digests an attempt costs, not the beat recording
+// itself), and one tuning across the fleet is one thing to reason about. Ten
+// back-to-back
 // attempts absorb an operator retrying a rotated token by hand; the 6s refill
 // turns a guessing run at wire speed into ten attempts per minute.
 const (
@@ -57,10 +59,11 @@ const (
 
 // Beater records pings. Implemented by watch.Watcher.
 type Beater interface {
-	// Beat records id when admission is open. recorded is false for an
-	// unknown id; accepting is false once the watcher has closed admission
-	// for shutdown, in which case nothing was recorded.
-	Beat(id string) (recorded, accepting bool)
+	// Beat records id when admission is open and reports which of the three
+	// outcomes it was: watch.BeatUnknown for an unknown id, watch.BeatClosed
+	// once the watcher has closed admission for shutdown (nothing recorded in
+	// either case), watch.BeatRecorded otherwise.
+	Beat(id string) watch.BeatOutcome
 }
 
 // Deps carries what the composition root supplies and webapi cannot reach on
@@ -179,12 +182,27 @@ func New(appCtx context.Context, b Beater, deps Deps) http.Handler {
 	mux.Handle("GET /metrics", metrics.Handler())
 
 	return webhttp.Chain(mux,
-		// OUTERMOST, ahead of the access logger on purpose: a request that
-		// presents no valid beat token is answered 429 here without reaching
-		// Logging, so a guessing run at wire speed cannot flood the log it
-		// would otherwise write one line per attempt to. A ping with a valid
-		// token never draws a token from the bucket, so knell's own senders
-		// can never throttle themselves. See beatAuthFailureLimiter.
+		// Header baselines first, ahead of the throttle below: that refusal is
+		// answered before webhttp.Logging runs, and it is still a knell response
+		// -- as uncacheable as the success it replaces, and entitled to the same
+		// security headers. Both middlewares only Set headers before next runs,
+		// so wrapping the throttle costs a routed request nothing.
+		webhttp.SecurityHeaders(),
+		// Every route knell serves is dynamic state: a ping acknowledgement, a
+		// liveness verdict, and the freshness exposition that IS the quorum
+		// ground truth. None of it may be answered from a cache, and every
+		// refusal is as time-dependent as the success it replaces, so no-store
+		// goes on the whole surface rather than one route -- including the
+		// throttle's 429 and the Host policy's 403, both of which are answered
+		// before any route runs.
+		webhttp.NoStore(),
+		// OUTERMOST among the refusing middleware, ahead of the access logger on
+		// purpose: a request that presents no valid beat token is answered 429
+		// here without reaching Logging, so a guessing run at wire speed cannot
+		// flood the log it would otherwise write one line per attempt to. A
+		// ping with a valid token never draws a token from the bucket, so
+		// knell's own senders can never throttle themselves. See
+		// beatAuthFailureLimiter.
 		beatAuthFailureLimiter(verifier),
 		// /healthz and /metrics are machine probes, so they ride the
 		// fleet-standard ProbeLogLevel rather than a skip list: a HEALTHY
@@ -225,15 +243,6 @@ func New(appCtx context.Context, b Beater, deps Deps) http.Handler {
 			webhttp.WithRecordRouteMetric(metrics.RecordHTTP),
 		),
 		webhttp.Recoverer(),
-		webhttp.SecurityHeaders(),
-		// Every route knell serves is dynamic state: a ping acknowledgement, a
-		// liveness verdict, and the freshness exposition that IS the quorum
-		// ground truth. None of it may be answered from a cache, and every
-		// refusal is as time-dependent as the success it replaces, so no-store
-		// goes on the whole surface rather than one route. Placed here rather
-		// than innermost (webhttp's usual advice) so the Host policy's own 403
-		// is wrapped too: keep it before deps.Hosts.Middleware.
-		webhttp.NoStore(),
 		// Immediately outside the Host policy, counting the refusal the policy
 		// itself answers: a pre-route 403 collapses onto the request counter's
 		// "unmatched" path label, so its cause is only nameable here. Refuses
@@ -365,7 +374,7 @@ func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
 // — so the refusal leaks as little as the 404 path does about which ids are
 // configured, and it is the single home of the refusal all three admission
 // checks in beatRecorder answer with (the two context checks and the watcher's
-// authoritative accepting result).
+// authoritative BeatClosed outcome).
 func writeShuttingDown(w http.ResponseWriter, r *http.Request) {
 	webhttp.WriteError(w, r, http.StatusServiceUnavailable, "shutting_down",
 		"knell is shutting down and is no longer accepting beats")
@@ -436,14 +445,20 @@ func beatEndpointRequest(r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	id, found := strings.CutPrefix(r.URL.Path, "/beat/")
+	// EscapedPath, not Path: ServeMux matches patterns against the ESCAPED
+	// path, so an encoded slash (%2F) stays inside the {id} segment and still
+	// routes to POST /beat/{id}, where the gate answers 401. The DECODED path
+	// reads as a deeper path instead, which would exempt exactly that request
+	// from the throttle the gate depends on.
+	id, found := strings.CutPrefix(r.URL.EscapedPath(), "/beat/")
 	return found && id != "" && !strings.Contains(id, "/")
 }
 
 // failedBeatAuth reports whether r is a FAILED authentication on the beat
-// endpoint: the exact class the throttle bounds. Shared by the limiter's own
-// predicate and by the 429-counting wrapper around it, so the two can never
-// disagree on which requests the throttle can possibly refuse.
+// endpoint: the exact class the throttle bounds. beatAuthFailureLimiter is its
+// only caller and gates BOTH the bucket and the 429 attribution on this one
+// verdict, so there is no second predicate that could disagree about which
+// requests the throttle can possibly refuse.
 func failedBeatAuth(verifier webhttp.StaticTokenVerifier, r *http.Request) bool {
 	return beatEndpointRequest(r) && !presentsValidBeatToken(verifier, r)
 }
@@ -471,10 +486,12 @@ func failedBeatAuth(verifier webhttp.StaticTokenVerifier, r *http.Request) bool 
 // failed authentication that reaches the handler answers 401), so the status
 // test attributes the refusal exactly without duplicating the bucket's state.
 func beatAuthFailureLimiter(verifier webhttp.StaticTokenVerifier) webhttp.Middleware {
+	// No WithRateLimitWhen: the wrapper below hands the limiter ONLY
+	// predicate-matching requests, so the bucket already sees exactly the
+	// failed-auth class and a second copy of the predicate could only
+	// disagree with the first. One evaluation per request, so one token
+	// digest per attempt rather than two.
 	limit := webhttp.RateLimiter(authFailBurst, authFailRefill,
-		webhttp.WithRateLimitWhen(func(r *http.Request) bool {
-			return failedBeatAuth(verifier, r)
-		}),
 		webhttp.WithRateLimitError("too_many_auth_failures",
 			"too many failed beat token attempts"),
 	)
@@ -482,7 +499,11 @@ func beatAuthFailureLimiter(verifier webhttp.StaticTokenVerifier) webhttp.Middle
 		limited := limit(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !failedBeatAuth(verifier, r) {
-				limited.ServeHTTP(w, r)
+				// Straight to next, never through the bucket: with the When
+				// option gone, the limiter draws a token from every request it
+				// sees, so this class must not reach it. Under the old option
+				// this branch's pass through `limited` was the same no-op hop.
+				next.ServeHTTP(w, r)
 				return
 			}
 			recorder := webhttp.NewStatusRecorder(w)
@@ -574,28 +595,26 @@ func beatRecorder(appCtx context.Context, b Beater) http.HandlerFunc {
 		// context check never can be, because this goroutine can be
 		// descheduled between the two while watch.Run reports and abandons its
 		// undelivered work - so Beat decides admission under the mutex that
-		// guards the state change (see watch.Watcher.Beat) and its accepting
-		// result is the authoritative refusal. This check is still not
+		// guards the state change (see watch.Watcher.Beat) and its returned
+		// outcome is the authoritative refusal. This check is still not
 		// redundant: watch.Run only closes admission when its ctx.Done arm
 		// runs, so for the whole interval between cancellation and that arm
-		// Beat still reports accepting=true, and this is the only refusal
+		// Beat still admits pings, and this is the only refusal
 		// covering a ping admitted pre-cancel that resumes in it. Do not
-		// delete it as duplicated by the accepting result below.
+		// delete it as duplicated by the outcome below.
 		if appCtx.Err() != nil {
 			writeShuttingDown(w, r)
 			return
 		}
-		recorded, accepting := b.Beat(id)
-		if !accepting {
+		switch b.Beat(id) {
+		case watch.BeatClosed:
 			// The watcher closed admission while this handler was in flight:
 			// nothing was recorded, so the sender must not be told 200.
 			writeShuttingDown(w, r)
-			return
-		}
-		if !recorded {
+		case watch.BeatUnknown:
 			writeUnknownBeat(w, r)
-			return
+		case watch.BeatRecorded:
+			webhttp.Ok(w)
 		}
-		webhttp.Ok(w)
 	}
 }

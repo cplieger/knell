@@ -195,8 +195,7 @@ func newTestWatcher(beats ...Beat) (*Watcher, *fakeClock, *fakeNotifier) {
 // tests that care about the configured-id verdict rather than about shutdown
 // admission (which TestBeatAfterAdmissionClosedRecordsNothing covers).
 func recordedBeat(w *Watcher, id string) bool {
-	recorded, _ := w.Beat(id)
-	return recorded
+	return w.Beat(id) == BeatRecorded
 }
 
 // drainRecoveries synchronously delivers queued recovered transitions, in
@@ -216,7 +215,7 @@ func TestBeatUnknownID(t *testing.T) {
 	t.Parallel()
 
 	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
-	if recorded, _ := w.Beat("ghost"); recorded {
+	if recordedBeat(w, "ghost") {
 		t.Error("Beat(ghost) = true, want false")
 	}
 	if got := n.snapshot(); len(got) != 0 {
@@ -262,9 +261,8 @@ func TestBeatAfterAdmissionClosedRecordsNothing(t *testing.T) {
 	w.stopAccepting()
 	clock.Advance(time.Minute)
 
-	recorded, accepting := w.Beat(id)
-	if recorded || accepting {
-		t.Fatalf("Beat after stopAccepting = (%v, %v), want (false, false)", recorded, accepting)
+	if got := w.Beat(id); got != BeatClosed {
+		t.Fatalf("Beat after stopAccepting = %v, want BeatClosed", got)
 	}
 	if got := w.beats[id].lastSeen; !got.Equal(lastSeenBefore) {
 		t.Errorf("lastSeen = %v, want %v: a refused ping must not re-arm the switch", got, lastSeenBefore)
@@ -289,7 +287,7 @@ func TestFreshBeatNeverNotifies(t *testing.T) {
 	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
 	for range 10 {
 		clock.Advance(5 * time.Minute)
-		if recorded, _ := w.Beat("api"); !recorded {
+		if !recordedBeat(w, "api") {
 			t.Fatal("Beat(api) = false")
 		}
 		w.sweep(context.Background())
@@ -672,7 +670,7 @@ func TestRecoveryQueueOverflowDropKeepsBeatArmed(t *testing.T) {
 	// recovered notification is dropped.
 	last := beats[len(beats)-1].ID
 	for _, b := range beats {
-		if recorded, _ := w.Beat(b.ID); !recorded {
+		if !recordedBeat(w, b.ID) {
 			t.Fatalf("Beat(%s) = false", b.ID)
 		}
 	}
@@ -740,6 +738,83 @@ func TestOneBeatsFailedSendDoesNotStarveTheOthers(t *testing.T) {
 
 	if n.attempts != 3 {
 		t.Errorf("missing delivery attempts = %d, want 3 (one failed beat must not starve the others)", n.attempts)
+	}
+}
+
+// failFirstHistoryNotifier fails the FIRST attempted history send whichever
+// beat it is for, records that beat, and counts every attempt. Which beat comes
+// first is deliberately irrelevant: Watcher stores beats in a map and therefore
+// promises no iteration order, so a notifier keyed on a named beat would let a
+// give-up-on-failure regression pass whenever map order put the failing beat
+// last.
+type failFirstHistoryNotifier struct {
+	failed   string
+	attempts int
+}
+
+func (n *failFirstHistoryNotifier) BeatOutageHistory(_ context.Context, id string, _ []Outage) error {
+	n.attempts++
+	if n.attempts == 1 {
+		n.failed = id
+		return errors.New("discord down")
+	}
+	return nil
+}
+
+func (*failFirstHistoryNotifier) BeatMissing(context.Context, string, Transition) error { return nil }
+
+func (*failFirstHistoryNotifier) BeatRecovered(context.Context, string, Transition) error {
+	return nil
+}
+
+func TestOneBeatsFailedHistorySendDoesNotStarveTheOthers(t *testing.T) {
+	t.Parallel()
+
+	// A failed history send is per-beat: its records stay queued and the next
+	// sweep retries THAT beat, and the sweep must still deliver every other
+	// beat's past-tense notice in the same pass. Abandoning the sweep on a
+	// plain failure would let one permanently failing beat starve the rest for
+	// as long as it keeps failing -- the observers would go quiet about outages
+	// that are over and about the live ones queued behind them.
+	// TestOneBeatsFailedSendDoesNotStarveTheOthers pins the live half of that
+	// contract; every other history test uses a single beat, where giving up
+	// after a failure and carrying on are indistinguishable.
+	const deadline = 10 * time.Minute
+	beats := budgetProbeBeats("history-starve-probe", 3, deadline)
+	clock := newFakeClock()
+	n := &failFirstHistoryNotifier{}
+	w := New(beats, n, clock.Now, clock.Now())
+
+	// Give every beat one outage that is already over when the sweep runs: a
+	// ping, a full deadline of silence, then a late ping. Every beat's queue
+	// head is a closed record, so this sweep owes each of them one notice.
+	for _, b := range beats {
+		if !recordedBeat(w, b.ID) {
+			t.Fatalf("Beat(%s) = false", b.ID)
+		}
+	}
+	clock.Advance(deadline + time.Minute)
+	for _, b := range beats {
+		if !recordedBeat(w, b.ID) {
+			t.Fatalf("late Beat(%s) = false", b.ID)
+		}
+	}
+
+	w.sweep(context.Background())
+
+	if n.attempts != len(beats) {
+		t.Fatalf("history delivery attempts = %d, want %d: one beat's failed history send must not starve the others",
+			n.attempts, len(beats))
+	}
+	for _, b := range beats {
+		want := 0
+		if b.ID == n.failed {
+			want = 1
+		}
+		if got := len(w.beats[b.ID].pendingMissing); got != want {
+			t.Errorf("beat %s holds %d queued record(s) after the sweep, want %d (a delivered notice drops its run, a failed one keeps it)",
+				b.ID, got, want)
+		}
 	}
 }
 
@@ -826,7 +901,7 @@ func TestLatePingBeforeSweepPreservesOutage(t *testing.T) {
 	start := clock.Now()
 	clock.Advance(11 * time.Minute)
 
-	if recorded, _ := w.Beat("api"); !recorded {
+	if !recordedBeat(w, "api") {
 		t.Fatal("late Beat(api) = false")
 	}
 	if calls := n.snapshot(); len(calls) != 0 {
@@ -874,7 +949,7 @@ func TestLatePingDuringPendingRecoveryPreservesSecondOutage(t *testing.T) {
 	// behind the pending recovery so Discord observes the transitions in
 	// chronological order.
 	clock.Advance(11 * time.Minute)
-	if recorded, _ := w.Beat("api"); !recorded {
+	if !recordedBeat(w, "api") {
 		t.Fatal("late Beat(api) = false")
 	}
 	w.sweep(context.Background())
@@ -916,7 +991,7 @@ func TestSecondOutageDuringUndeliveredMissingIsNotErased(t *testing.T) {
 	clock.Advance(11 * time.Minute)
 	n.setFail(errors.New("discord down"))
 	w.sweep(context.Background())
-	if recorded, _ := w.Beat("api"); !recorded {
+	if !recordedBeat(w, "api") {
 		t.Fatal("Beat(api) = false")
 	}
 
@@ -925,7 +1000,7 @@ func TestSecondOutageDuringUndeliveredMissingIsNotErased(t *testing.T) {
 	// Detection must not be gated on A's delivery, or B leaves no trace at
 	// all -- no notification, no counter movement, the outage erased.
 	clock.Advance(11 * time.Minute)
-	if recorded, _ := w.Beat("api"); !recorded {
+	if !recordedBeat(w, "api") {
 		t.Fatal("late Beat(api) = false")
 	}
 	if calls := n.snapshot(); len(calls) != 0 {
@@ -963,7 +1038,7 @@ func TestThreeOutagesQueueWhileNoticesAreUndelivered(t *testing.T) {
 	// Outage A (11m): sweep-detected, then ended by a ping.
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
-	if recorded, _ := w.Beat("api"); !recorded {
+	if !recordedBeat(w, "api") {
 		t.Fatal("Beat(api) = false ending outage A")
 	}
 
@@ -971,14 +1046,14 @@ func TestThreeOutagesQueueWhileNoticesAreUndelivered(t *testing.T) {
 	// sweep itself must record a crossing behind an undelivered notice.
 	clock.Advance(13 * time.Minute)
 	w.sweep(context.Background())
-	if recorded, _ := w.Beat("api"); !recorded {
+	if !recordedBeat(w, "api") {
 		t.Fatal("Beat(api) = false ending outage B")
 	}
 
 	// Outage C (17m): no sweep ever sees it -- a late ping records the
 	// whole closed outage while A and B are both still queued.
 	clock.Advance(17 * time.Minute)
-	if recorded, _ := w.Beat("api"); !recorded {
+	if !recordedBeat(w, "api") {
 		t.Fatal("late Beat(api) = false ending outage C")
 	}
 	if calls := n.snapshot(); len(calls) != 0 {
@@ -1020,7 +1095,7 @@ func TestLiveOutageIsNotDelayedBehindHistory(t *testing.T) {
 	const ended = missingQueueSize - 1
 	for range ended {
 		clock.Advance(11 * time.Minute)
-		if recorded, _ := w.Beat(id); !recorded {
+		if !recordedBeat(w, id) {
 			t.Fatalf("Beat(%s) = false", id)
 		}
 	}
@@ -1060,7 +1135,7 @@ func TestFailedHistoryDeliveryKeepsRecordsAndRetries(t *testing.T) {
 	// Two ended outages queue up while the webhook is down.
 	for range 2 {
 		clock.Advance(11 * time.Minute)
-		if recorded, _ := w.Beat(id); !recorded {
+		if !recordedBeat(w, id) {
 			t.Fatalf("Beat(%s) = false", id)
 		}
 	}
@@ -1100,7 +1175,7 @@ func fillMissingQueue(t *testing.T, w *Watcher, clock *fakeClock, id string) {
 	t.Helper()
 	for range missingQueueSize {
 		clock.Advance(11 * time.Minute)
-		if recorded, _ := w.Beat(id); !recorded {
+		if !recordedBeat(w, id) {
 			t.Fatalf("Beat(%s) = false", id)
 		}
 	}
@@ -1117,7 +1192,7 @@ func fillMissingQueue(t *testing.T, w *Watcher, clock *fakeClock, id string) {
 func queueOutageNoSweepEverSaw(t *testing.T, w *Watcher, clock *fakeClock, id string) {
 	t.Helper()
 	clock.Advance(11 * time.Minute)
-	if recorded, _ := w.Beat(id); !recorded {
+	if !recordedBeat(w, id) {
 		t.Fatalf("late Beat(%s) = false", id)
 	}
 	queued := w.beats[id].pendingMissing
@@ -1186,14 +1261,14 @@ func TestFailedHistorySendBlamesDeliveryForEveryRecordItCovered(t *testing.T) {
 		outages  = 3
 	)
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: deadline})
-	if recorded, _ := w.Beat(id); !recorded {
+	if !recordedBeat(w, id) {
 		t.Fatalf("Beat(%s) = false", id)
 	}
 	// Three outages that each began AND ended between two sweeps, so every
 	// record starts out blaming nothing (LateEndedBeforeDetection).
 	for range outages {
 		clock.Advance(deadline + time.Minute)
-		if recorded, _ := w.Beat(id); !recorded {
+		if !recordedBeat(w, id) {
 			t.Fatalf("late Beat(%s) = false", id)
 		}
 	}
@@ -1275,7 +1350,7 @@ func TestPendingMissingQueueOverflowIsAccountedNotSilent(t *testing.T) {
 	recordsDroppedBefore := beatCounterValue(t, "knell_outage_records_dropped_total", id)
 	outagesBefore := beatCounterValue(t, "knell_beat_outages_total", id)
 	clock.Advance(droppedSilence)
-	if recorded, _ := w.Beat(id); !recorded {
+	if !recordedBeat(w, id) {
 		t.Fatalf("overflow Beat(%s) = false", id)
 	}
 	if got, want := beatCounterValue(t, "knell_outage_records_dropped_total", id), recordsDroppedBefore+1; got != want {
@@ -1340,11 +1415,11 @@ func TestRecoveryPointIsTheFirstPingAfterTheOutage(t *testing.T) {
 	// First ping after the outage at t+12m ends it; a later ping at
 	// t+17m must NOT move the recovery point (first ping wins).
 	clock.Advance(time.Minute)
-	if recorded, _ := w.Beat("downfor-first-ping"); !recorded {
+	if !recordedBeat(w, "downfor-first-ping") {
 		t.Fatal("Beat = false")
 	}
 	clock.Advance(5 * time.Minute)
-	if recorded, _ := w.Beat("downfor-first-ping"); !recorded {
+	if !recordedBeat(w, "downfor-first-ping") {
 		t.Fatal("second Beat = false")
 	}
 
@@ -1476,7 +1551,7 @@ func TestOutageDetectedWhileTheQueueWasFullBlamesDeliveryNotTheSweep(t *testing.
 
 	// The ping that ends it records the whole closed outage, and the next
 	// sweep reports it.
-	if recorded, _ := w.Beat(id); !recorded {
+	if !recordedBeat(w, id) {
 		t.Fatalf("Beat(%s) = false ending the overflowed outage", id)
 	}
 	w.sweep(context.Background())
@@ -1505,7 +1580,7 @@ func TestQueuedOngoingOutageReportsLiveSilenceWhenPromoted(t *testing.T) {
 	// Outage A: detected, ended by a ping, notice still undelivered.
 	clock.Advance(11 * time.Minute)
 	w.sweep(context.Background())
-	if recorded, _ := w.Beat(id); !recorded {
+	if !recordedBeat(w, id) {
 		t.Fatalf("Beat(%s) = false ending outage A", id)
 	}
 
@@ -1583,7 +1658,7 @@ func TestEveryBeatCanQueueItsRecoveryWithoutADrop(t *testing.T) {
 	// those recoveries must find a slot.
 	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "recovered")
 	for _, b := range beats {
-		if recorded, _ := w.Beat(b.ID); !recorded {
+		if !recordedBeat(w, b.ID) {
 			t.Fatalf("Beat(%s) = false", b.ID)
 		}
 	}
@@ -1665,13 +1740,13 @@ func TestHistorySendsAreBoundedByTheSweepBudget(t *testing.T) {
 	// runs (ping, a full deadline of silence, late ping), while the live beats
 	// stay on their boot-armed baseline and are simply overdue.
 	for _, b := range histBeats {
-		if recorded, _ := w.Beat(b.ID); !recorded {
+		if !recordedBeat(w, b.ID) {
 			t.Fatalf("Beat(%s) = false", b.ID)
 		}
 	}
 	clock.Advance(deadline + time.Minute)
 	for _, b := range histBeats {
-		if recorded, _ := w.Beat(b.ID); !recorded {
+		if !recordedBeat(w, b.ID) {
 			t.Fatalf("late Beat(%s) = false", b.ID)
 		}
 	}
@@ -1982,6 +2057,43 @@ func TestFastSendsDeliverEveryDueBeatInOneSweep(t *testing.T) {
 	}
 }
 
+func TestSweepStartsTheSendWhoseCheckLandsExactlyOnTheBudget(t *testing.T) {
+	t.Parallel()
+
+	// The budget is spent once the elapsed time is PAST it, so a check landing
+	// exactly on it still starts one more send. Every other budget test uses a
+	// per-send cost that steps over the boundary rather than onto it (three 2s
+	// sends against a 5s budget), which is what leaves an off-by-one here
+	// invisible: comparing for "reached" instead of "passed" satisfies all of
+	// them while cutting one beat early on every storm sweep, delaying that
+	// beat's notice by a whole tick.
+	const (
+		total    = 3
+		deadline = 10 * time.Minute
+	)
+	wantSent := sendsBeforeBudgetCut(sweepSendBudget)
+	if wantSent >= total {
+		t.Fatalf("test precondition: %d sends fit in the %s budget at %s each, want fewer than the %d due beats",
+			wantSent, sweepSendBudget, sweepSendBudget, total)
+	}
+
+	beats := budgetProbeBeats("budget-boundary-probe", total, deadline)
+	clock := newFakeClock()
+	n := &fakeNotifier{}
+	w := New(beats, n, clock.Now, clock.Now())
+
+	clock.Advance(deadline + time.Minute)
+	// Every send burns the WHOLE budget, so the check after the first one sees
+	// an elapsed time exactly equal to it.
+	slowSends(n, clock, sweepSendBudget)
+	w.sweep(context.Background())
+
+	if got := len(n.snapshot()); got != wantSent {
+		t.Errorf("notices in the sweep = %d, want %d: the send whose check lands exactly on the %s budget must still start",
+			got, wantSent, sweepSendBudget)
+	}
+}
+
 // newStormWatcher builds the delivery-storm fixture both send-ordering tests
 // need: one short-deadline beat (recoverID) alerted on its own BEFORE the
 // storm, plus storm beats named from prefix that all cross their deadline
@@ -2107,7 +2219,7 @@ func TestHandleTickPrioritizesQueuedRecovery(t *testing.T) {
 
 	// The state the ticker arm sees when a send overran the tick: the whole
 	// storm fleet is due AND a recovery is already sitting in the queue.
-	if recorded, _ := w.Beat(recoverID); !recorded {
+	if !recordedBeat(w, recoverID) {
 		t.Fatalf("Beat(%s) = false, want the ping recorded so its recovery is queued", recoverID)
 	}
 	n.onMissing = func() { clock.Advance(perSend) } // spends the sweep budget
@@ -2121,6 +2233,37 @@ func TestHandleTickPrioritizesQueuedRecovery(t *testing.T) {
 	if stormsBefore != 0 {
 		t.Errorf("storm notices ahead of the recovery = %d, want 0: the ticker arm must drain the queued recovery BEFORE the sweep it consumed that tick for",
 			stormsBefore)
+	}
+}
+
+func TestHandleTickSkipsTheSweepOnAnAlreadyCancelledContext(t *testing.T) {
+	t.Parallel()
+
+	// The ticker arm drains a queued recovery before sweeping, and that
+	// recovery's send is where shutdown is observed, so the context can already
+	// be cancelled by the time the sweep would start. It must not start one: a
+	// sweep on a dead context detects crossings, counts their outages and marks
+	// beats alerted for notices it abandons in the same breath -- and an
+	// alerted beat announces nothing after the restart until it crosses its
+	// deadline again. Every other handleTick and Run test passes a live
+	// context, and the skipped branch has no statement of its own.
+	const id = "tick-cancelled-probe"
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+	clock.Advance(11 * time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w.handleTick(ctx)
+
+	if got := n.snapshot(); len(got) != 0 {
+		t.Errorf("calls = %v, want none: a tick on a cancelled context must not start a sweep", got)
+	}
+	st := w.beats[id]
+	if st.openMissing() != nil {
+		t.Error("the cancelled tick queued a missing record, so its sweep ran")
+	}
+	if st.alerted {
+		t.Error("the cancelled tick marked the beat alerted, so its outage would go unannounced after the restart")
 	}
 }
 
@@ -2166,7 +2309,7 @@ func TestLiveNoticesCarryTheInstantsTheyClaim(t *testing.T) {
 	n := &anchorNotifier{}
 	w := New([]Beat{{ID: id, Deadline: 10 * time.Minute}}, n, clock.Now, clock.Now())
 
-	if recorded, _ := w.Beat(id); !recorded {
+	if !recordedBeat(w, id) {
 		t.Fatalf("Beat(%s) = false", id)
 	}
 	lastPing := clock.Now()
@@ -2177,7 +2320,7 @@ func TestLiveNoticesCarryTheInstantsTheyClaim(t *testing.T) {
 
 	clock.Advance(2 * time.Minute)
 	endedAt := clock.Now()
-	if recorded, _ := w.Beat(id); !recorded {
+	if !recordedBeat(w, id) {
 		t.Fatalf("late Beat(%s) = false", id)
 	}
 	drainRecoveries(w)
