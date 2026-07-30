@@ -135,23 +135,11 @@ func run() error {
 
 	watcher := watch.New(watchBeats(cfg.Beats), notifier, time.Now, processStart)
 
-	// The app context goes into webapi so the beat endpoint starts REFUSING at
-	// the same instant the watch loop begins stopping: watcher.Run returns on
-	// ctx.Done() after snapshotting its undelivered work, while the HTTP surface
-	// stays live for up to the shutdown grace below. The pre-drain hook is the
-	// wrong signal for that: it runs on webhttp.Run's goroutine while Run
-	// returns on its own, so the two race, and a flag one of them owns leaves
-	// /beat/{id} fully live for the rest of the drain.
-	//
-	// This is an early refusal, NOT the admission boundary. A ping that passes
-	// webapi's context check can still win the watcher mutex before Run calls
-	// stopAccepting, and it is watch.Watcher.Beat that makes that safe: Beat,
-	// stopAccepting and the undelivered-work snapshot serialize on the one
-	// mutex, so such a ping completes before admission closes and IS counted in
-	// the tally. Do not read this wiring as the guarantee and drop that
-	// mutex-ordered `accepting` flag as redundant — it is what keeps a recorded
-	// ping from landing behind a tally already taken.
-	handler := webapi.New(ctx, watcher, webapi.Deps{
+	// The watcher is the single owner of beat admission: webapi asks Beat and
+	// reports the outcome, and the pre-drain hook below closes admission before
+	// the HTTP drain begins. So the endpoint holds no lifecycle state and no
+	// context of its own.
+	handler := webapi.New(watcher, webapi.Deps{
 		Healthz:   health.Handler(marker),
 		BeatToken: cfg.BeatToken,
 		Hosts:     cfg.AllowedHosts,
@@ -179,6 +167,17 @@ func run() error {
 	// listener closure does not cover — would call a draining container healthy
 	// for the whole window.
 	preDrain := webhttp.WithPreDrain(func(context.Context) {
+		// Close beat admission FIRST, and here rather than only in the
+		// watcher's own ctx.Done arm: webhttp calls this hook inline and only
+		// then calls srv.Shutdown, so this is the one place that runs strictly
+		// before the HTTP drain. Without it the window between cancellation and
+		// the watch loop's exit is served by a fully live /beat/{id}, and a ping
+		// answered 200 there is a heartbeat recorded with no sender behind it.
+		// It precedes beginTeardown because that announcement can block on a
+		// stalled container log driver, and admission must not stay open for
+		// however long that takes. Closing twice is a no-op (see
+		// watch.Watcher.StopAccepting), so the watcher's own close still stands.
+		watcher.StopAccepting()
 		// No cause attribute: signal.NotifyContext cancels through a plain
 		// context.WithCancel and nothing here uses context.WithCancelCause, so
 		// context.Cause(ctx) can only ever render "context canceled". webhttp
@@ -204,14 +203,15 @@ func run() error {
 	// webhttp.Run invokes either this hook or the graceful shutdown hooks,
 	// never both; teardownAfterServeExit owns what that path must do.
 	serveExit := webhttp.WithServeExit(func(exitCtx context.Context) {
-		watchLoopStopped = teardownAfterServeExit(exitCtx, marker, stop, watcherDone)
+		watchLoopStopped = teardownAfterServeExit(exitCtx, marker, watcher.StopAccepting, stop, watcherDone)
 	})
 	err = webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
 	return classifyAbandonedWatchLoop(classifyServeError(err), watchLoopStopped)
 }
 
-// newServer builds knell's HTTP server: the request bounds above plus the
-// error-log bridge, in one place a test can build without a listener.
+// newServer builds knell's HTTP server: the request bounds above, the header
+// ceiling config owns, and the error-log bridge, in one place a test can build
+// without a listener.
 //
 // WithSlogErrorLog resolves slog.Default() as NewServer applies it, so this
 // must run after the process handler is installed -- which it does, since
@@ -220,6 +220,14 @@ func newServer(handler http.Handler) *http.Server {
 	return webhttp.NewServer(handler,
 		webhttp.WithReadTimeout(requestTimeout),
 		webhttp.WithWriteTimeout(requestTimeout),
+		// The header ceiling is config's, not a number restated here:
+		// config derives it from the BEAT_TOKEN maximum it enforces at
+		// startup, so the bound a token is checked against and the bound the
+		// server reads cannot drift apart (see config.MaxRequestHeaderBytes).
+		// webhttp's default is net/http's 1 MiB, which lets one
+		// unauthenticated caller make this process read a megabyte of header
+		// per connection.
+		webhttp.WithMaxHeaderBytes(config.MaxRequestHeaderBytes),
 		// Connection-level errors net/http reports itself -- above all
 		// "http: Accept error: ...; retrying", the trace of an exhausted fd
 		// budget that stops every beat from being received -- default to the
@@ -232,13 +240,21 @@ func newServer(handler http.Handler) *http.Server {
 
 // teardownAfterServeExit runs the teardown for the non-graceful exit where
 // Serve returns before a signal: webhttp skips the drain hooks on that path,
-// so this is the only place that marks the process unhealthy, cancels the
-// watcher and waits for it, all under the one grace budget carried by exitCtx.
+// so this is the only place that closes beat admission, marks the process
+// unhealthy, cancels the watcher and waits for it, all under the one grace
+// budget carried by exitCtx.
+//
+// closeAdmission is the watcher's StopAccepting. It has to be called here as
+// well as in the pre-drain hook precisely because this path SKIPS pre-drain:
+// the listener is already gone, but a connection accepted just before it closed
+// can still be inside a handler, and it must not record a ping behind the tally
+// the watch loop is about to take.
 //
 // The stop() is this path's own, not a duplicate of main's defer: the app
 // context is still live here (no signal arrived), so without it awaitWatchLoop
 // would wait out the whole grace for a watch loop nobody asked to stop.
-func teardownAfterServeExit(exitCtx context.Context, marker *health.Marker, stop context.CancelFunc, watcherDone <-chan struct{}) bool {
+func teardownAfterServeExit(exitCtx context.Context, marker *health.Marker, closeAdmission func(), stop context.CancelFunc, watcherDone <-chan struct{}) bool {
+	closeAdmission()
 	// The graceful path's "shutting down" does not run here (webhttp skips
 	// pre-drain when Serve returns on its own), and the serve error itself is
 	// logged only after this teardown returns. Without this line the watch

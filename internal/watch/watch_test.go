@@ -231,13 +231,15 @@ func TestBeatUnknownID(t *testing.T) {
 }
 
 // TestBeatAfterAdmissionClosedRecordsNothing pins the atomic shutdown
-// boundary. Once Run has closed admission (stopAccepting, which it calls
-// before tallying undelivered work), a ping already in flight must change
-// NOTHING — not lastSeen, not the alerted state, not the received counter, not
-// the freshness gauge, and not the recovery queue — and must report
-// accepting=false so webapi answers 503 rather than 200. Before the watcher
-// owned admission, such a ping could pass the handler's context check, be
-// descheduled, and then record behind a tally Run had already reported.
+// boundary. Once admission is closed (StopAccepting, which the composition root
+// calls from the pre-drain hook and Run calls before tallying undelivered
+// work), a ping already in flight must change NOTHING — not lastSeen, not the
+// alerted state, not the received counter, not the freshness gauge, and not the
+// recovery queue — and must report accepting=false so webapi answers 503 rather
+// than 200. This is the endpoint's ONLY shutdown refusal: webapi keeps no
+// lifecycle check of its own, precisely because one made before this call could
+// pass and then be descheduled, and the ping would record behind a tally Run had
+// already reported.
 func TestBeatAfterAdmissionClosedRecordsNothing(t *testing.T) {
 	t.Parallel()
 
@@ -258,7 +260,7 @@ func TestBeatAfterAdmissionClosedRecordsNothing(t *testing.T) {
 	lastSeenBefore := w.beats[id].lastSeen
 	receivedBefore := beatCounterValue(t, "knell_beats_received_total", id)
 
-	w.stopAccepting()
+	w.StopAccepting()
 	clock.Advance(time.Minute)
 
 	// The zero BeatOutcome must be the refusal, not the success: a Beater
@@ -270,7 +272,7 @@ func TestBeatAfterAdmissionClosedRecordsNothing(t *testing.T) {
 	}
 
 	if got := w.Beat(id); got != BeatClosed {
-		t.Fatalf("Beat after stopAccepting = %v, want BeatClosed", got)
+		t.Fatalf("Beat after StopAccepting = %v, want BeatClosed", got)
 	}
 	if got := w.beats[id].lastSeen; !got.Equal(lastSeenBefore) {
 		t.Errorf("lastSeen = %v, want %v: a refused ping must not re-arm the switch", got, lastSeenBefore)
@@ -286,6 +288,56 @@ func TestBeatAfterAdmissionClosedRecordsNothing(t *testing.T) {
 	}
 	if got := len(w.recoveries); got != 0 {
 		t.Errorf("queued recoveries = %d, want 0: a refused ping must not queue a notice no reader will take", got)
+	}
+}
+
+// TestAdmissionClosedBeforeRunExitsStillTalliesUndeliveredWork pins the
+// double-close production now performs: the composition root closes admission in
+// webhttp's pre-drain hook, and Run closes it AGAIN when its ctx.Done arm runs.
+// Closing is an assignment, not a transition, so the second call must be an
+// inert no-op — and above all it must not cost the shutdown tally, which is the
+// operator's only trace of the notices this process will never send. A
+// StopAccepting that ever grew a one-shot guard, an early return, or any work
+// beyond the flag would break exactly here, silently: the log line would go
+// missing or arrive with the wrong counts while every other test still passed.
+func TestAdmissionClosedBeforeRunExitsStillTalliesUndeliveredWork(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default.
+	const id = "double-close-probe"
+	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+
+	// A queue with something to lose: one ENDED record (a permanent loss) and
+	// one ongoing outage behind it, so a dropped or truncated tally is visible
+	// in the counts rather than only in the line's presence.
+	clock.Advance(11 * time.Minute)
+	if !recordedBeat(w, id) {
+		t.Fatalf("Beat(%s) = false during setup", id)
+	}
+	clock.Advance(11 * time.Minute)
+	w.collectDue()
+
+	// The pre-drain close, ahead of Run's own.
+	w.StopAccepting()
+	if got := w.Beat(id); got != BeatClosed {
+		t.Fatalf("Beat after the pre-drain close = %v, want BeatClosed", got)
+	}
+
+	rec := capture.Default(t)
+
+	// An already-cancelled context: Run takes its ctx.Done arm immediately,
+	// which closes admission a SECOND time and then tallies.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w.Run(ctx, time.Minute)
+
+	if !rec.HasAttr("watch loop stopped", "undelivered_records", "2") {
+		t.Errorf("shutdown summary does not count both queued records after a double close: %v", rec.Records())
+	}
+	if !rec.HasAttr("watch loop stopped", "permanent_loss", "1") {
+		t.Errorf("shutdown summary does not classify the ended record as permanently lost after a double close: %v", rec.Records())
+	}
+	if got := w.Beat(id); got != BeatClosed {
+		t.Errorf("Beat after the second close = %v, want BeatClosed: closing twice must leave admission closed", got)
 	}
 }
 

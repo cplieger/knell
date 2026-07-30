@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cplieger/health"
+	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/slogx/capture"
 )
@@ -686,12 +687,15 @@ func TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace(t *testing.T) {
 
 // TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits pins the
 // non-graceful teardown: webhttp skips the drain hooks when Serve returns
-// before a signal, so this path is the only thing that stops a dead process
-// from reporting itself healthy and the only thing that cancels the watch
-// loop. A dropped marker flip leaves `knell health` calling a container with
-// no listener healthy until it is killed; a missing stop() leaves the watcher
-// alerting behind a server that no longer answers, and makes the teardown burn
-// the whole grace on a loop nobody asked to stop.
+// before a signal, so this path is the only thing that closes beat admission,
+// the only thing that stops a dead process from reporting itself healthy, and
+// the only thing that cancels the watch loop. A dropped admission close lets a
+// connection accepted just before the listener died record a ping behind the
+// tally the watch loop is about to take; a dropped marker flip leaves
+// `knell health` calling a container with no listener healthy until it is
+// killed; a missing stop() leaves the watcher alerting behind a server that no
+// longer answers, and makes the teardown burn the whole grace on a loop nobody
+// asked to stop.
 //
 // The stop func closes watcherDone: the wait can only finish if cancellation
 // happened FIRST, so a teardown that waits before cancelling fails here
@@ -710,6 +714,8 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	exitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	watcherDone := make(chan struct{})
+	admissionClosed := 0
+	closeAdmission := func() { admissionClosed++ }
 	stopCalls := 0
 	stop := func() {
 		stopCalls++
@@ -717,9 +723,12 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	}
 
 	start := time.Now()
-	teardownAfterServeExit(exitCtx, marker, stop, watcherDone)
+	teardownAfterServeExit(exitCtx, marker, closeAdmission, stop, watcherDone)
 	waited := time.Since(start)
 
+	if admissionClosed != 1 {
+		t.Errorf("admission closed %d times, want exactly 1: this path SKIPS webhttp's pre-drain hook, so nothing else closes beat admission, and a connection accepted just before the listener died could still record a ping behind the watch loop's tally", admissionClosed)
+	}
 	if stopCalls != 1 {
 		t.Errorf("stop() called %d times, want exactly 1: an uncancelled watcher keeps alerting behind a server that stopped serving", stopCalls)
 	}
@@ -762,14 +771,22 @@ func TestClassifyAbandonedWatchLoopDeniesACleanExitOverAnAbandonedLoop(t *testin
 }
 
 // TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog pins the
-// two server wirings nothing else in the suite can see. Both are silent when
+// three server wirings nothing else in the suite can see. All are silent when
 // dropped: without WithReadTimeout/WithWriteTimeout a trickled body or a client
 // that never reads /metrics holds a handler goroutine for as long as it likes
-// (webhttp leaves both unset by default, bounding only the headers), and
-// without WithSlogErrorLog net/http's own connection-level lines -- above all
-// "http: Accept error: ...; retrying", the trace of an exhausted fd budget that
-// stops every beat from being received -- fall back to the standard logger as
-// unstructured, level-less text no level-based rule can match.
+// (webhttp leaves both unset by default, bounding only the headers), without
+// WithMaxHeaderBytes the header block falls back to net/http's 1 MiB default --
+// so one unauthenticated caller makes this process read a megabyte of header per
+// connection, and the BEAT_TOKEN maximum config refuses startup over stops
+// bounding anything real -- and without WithSlogErrorLog net/http's own
+// connection-level lines -- above all "http: Accept error: ...; retrying", the
+// trace of an exhausted fd budget that stops every beat from being received --
+// fall back to the standard logger as unstructured, level-less text no
+// level-based rule can match.
+//
+// The header assertion reads config.MaxRequestHeaderBytes rather than 8704: the
+// number is one decision made in one place (config derives it from the token
+// maximum it enforces), so a literal here would let the two drift and still pass.
 //
 // The timeout halves assert the configured bound rather than a real trickle:
 // requestTimeout is 30s, so the behavioral version of this test would have to
@@ -787,6 +804,9 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 	}
 	if srv.WriteTimeout != requestTimeout {
 		t.Errorf("WriteTimeout = %s, want %s: an unbounded write lets a client that requests /metrics and never reads the response pin the goroutine in Write", srv.WriteTimeout, requestTimeout)
+	}
+	if srv.MaxHeaderBytes != config.MaxRequestHeaderBytes {
+		t.Errorf("MaxHeaderBytes = %d, want %d: the default is net/http's 1 MiB, so an unauthenticated caller can make this process read a megabyte of header per connection, and the BEAT_TOKEN maximum config enforces at startup stops bounding what a ping can actually carry", srv.MaxHeaderBytes, config.MaxRequestHeaderBytes)
 	}
 	if srv.ErrorLog == nil {
 		t.Fatal("ErrorLog is nil, so net/http's connection-level errors go to the standard logger: an accept failure -- a whole-service outage here -- arrives as an unstructured, level-less line no log rule matches")

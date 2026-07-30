@@ -21,7 +21,7 @@ import (
 )
 
 // fakeBeater accepts a fixed id set and records what was recorded. closed
-// stands in for a watcher that has shut admission (watch.Watcher.stopAccepting).
+// stands in for a watcher that has shut admission (watch.Watcher.StopAccepting).
 type fakeBeater struct {
 	known  map[string]bool
 	seen   []string
@@ -46,24 +46,19 @@ func (f *fakeBeater) Beat(id string) watch.BeatOutcome {
 const testBeatToken = "unit-test-beat-token"
 
 // newTestHandler assembles the routed handler around b with a healthy
-// liveness endpoint and a LIVE application context (nothing shutting down);
-// token is the required beat credential, exactly as in production.
+// liveness endpoint; token is the required beat credential, exactly as in
+// production. Beat acceptance is whatever b reports: a fakeBeater with
+// closed=true is a watcher that has shut admission (watch.Watcher.StopAccepting),
+// which is the endpoint's only shutdown state.
 func newTestHandler(b *fakeBeater, token string) http.Handler {
-	return newTestHandlerCtx(context.Background(), b, token)
+	return newTestHandlerHealthz(b, token, http.StatusOK)
 }
 
-// newTestHandlerCtx is newTestHandler with the shared application context
-// under test control, so a test can close beat acceptance the way SIGTERM
-// does: cancel it, and every later ping must be refused.
-func newTestHandlerCtx(appCtx context.Context, b *fakeBeater, token string) http.Handler {
-	return newTestHandlerHealthz(appCtx, b, token, http.StatusOK)
-}
-
-// newTestHandlerHealthz is newTestHandlerCtx with the liveness status under
+// newTestHandlerHealthz is newTestHandler with the liveness status under
 // test control, so a test can drive a FAILING probe: health.Handler answers 503
 // whenever the liveness marker is absent (boot, or after the pre-drain flip).
-func newTestHandlerHealthz(appCtx context.Context, b *fakeBeater, token string, healthzStatus int) http.Handler {
-	return New(appCtx, b, Deps{Healthz: staticHealthz(healthzStatus), BeatToken: token})
+func newTestHandlerHealthz(b *fakeBeater, token string, healthzStatus int) http.Handler {
+	return New(b, Deps{Healthz: staticHealthz(healthzStatus), BeatToken: token})
 }
 
 // newBeatRequest builds a request presenting testBeatToken. The bearer gate is
@@ -448,7 +443,7 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 			// slog default. It must be installed BEFORE New, because
 			// webhttp.Logging resolves slog.Default() when the chain is built.
 			rec := capture.Default(t)
-			h := newTestHandlerHealthz(context.Background(), &fakeBeater{known: map[string]bool{"api": true}}, testBeatToken, tt.healthzStatus)
+			h := newTestHandlerHealthz(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken, tt.healthzStatus)
 
 			req := newBeatRequest(tt.method, tt.path, nil)
 			w := httptest.NewRecorder()
@@ -553,7 +548,7 @@ func TestPanicUnderBeatHandlerAnswers500AndIsLogged(t *testing.T) {
 	// net/http: the sender sees a reset connection rather than a 500, and the
 	// access log never reports a status for the endpoint that feeds the switch.
 	rec := capture.Default(t)
-	h := New(context.Background(), panicBeater{}, Deps{
+	h := New(panicBeater{}, Deps{
 		Healthz:   staticHealthz(http.StatusOK),
 		BeatToken: testBeatToken,
 	})
@@ -839,7 +834,7 @@ func TestTokenGateScopedToBeatEndpoint(t *testing.T) {
 // verifier refuses everything instead, including the bare scheme.
 func TestEmptyBeatTokenFailsClosed(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := New(context.Background(), b, Deps{Healthz: staticHealthz(http.StatusOK)})
+	h := New(b, Deps{Healthz: staticHealthz(http.StatusOK)})
 
 	for _, auth := range []string{"", "Bearer ", "Bearer", "Bearer anything"} {
 		t.Run("auth "+auth, func(t *testing.T) {
@@ -1276,27 +1271,26 @@ func beatRequest(t *testing.T, h http.Handler, method, path string) *httptest.Re
 }
 
 // newShutdownHarness builds the routed handler over the real state machine for
-// one beat, on a fake clock, behind a cancellable application context —
-// cancel() is SIGTERM's effect on the app, and the only trigger the acceptance
-// guard may key on. Each caller passes its OWN beat id: the metrics registry is
+// one beat, on a fake clock. The returned func closes beat admission the way
+// the composition root does at the start of the drain (webhttp's pre-drain hook
+// calls watch.Watcher.StopAccepting), and it is the only trigger the endpoint's
+// refusal keys on. Each caller passes its OWN beat id: the metrics registry is
 // a package-level singleton shared by the whole test binary. capture.Default is
 // installed before New because webhttp.Logging resolves slog.Default() when the
 // chain is built; it swaps the process-global default, so every caller stays
 // serial (no t.Parallel).
-func newShutdownHarness(t *testing.T, id string) (http.Handler, context.CancelFunc, *fakeClock, time.Time) {
+func newShutdownHarness(t *testing.T, id string) (http.Handler, func(), *fakeClock, time.Time) {
 	t.Helper()
 	capture.Default(t)
 	start := time.Unix(1_700_000_000, 0).UTC()
 	clock := &fakeClock{now: start}
 	watcher := watch.New([]watch.Beat{{ID: id, Deadline: time.Minute}}, &deliveringNotifier{}, clock.Now, start)
-	appCtx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	h := New(appCtx, watcher, Deps{Healthz: staticHealthz(http.StatusOK), BeatToken: testBeatToken})
-	return h, cancel, clock, start
+	h := New(watcher, Deps{Healthz: staticHealthz(http.StatusOK), BeatToken: testBeatToken})
+	return h, watcher.StopAccepting, clock, start
 }
 
-// assertBeatRefused drives one ping into a handler whose application context is
-// already cancelled and pins the whole refusal envelope: 503, the shutting_down
+// assertBeatRefused drives one ping into a handler whose watcher has already
+// closed admission and pins the whole refusal envelope: 503, the shutting_down
 // code so a sender can tell a refusal from a 404, and no echo of the beat id —
 // configured or not — so the refusal leaks as little as the 404 path does about
 // which ids exist.
@@ -1304,7 +1298,7 @@ func assertBeatRefused(t *testing.T, h http.Handler, method, path string) {
 	t.Helper()
 	rec := beatRequest(t, h, method, path)
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("%s %s after cancellation = %d, want 503 (body %s)", method, path, rec.Code, rec.Body.String())
+		t.Fatalf("%s %s with admission closed = %d, want 503 (body %s)", method, path, rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
 	if !strings.Contains(body, "shutting_down") {
@@ -1315,39 +1309,37 @@ func assertBeatRefused(t *testing.T, h http.Handler, method, path string) {
 	}
 }
 
-// TestBeatRefusedOnceTheApplicationContextIsCancelled pins the acceptance
-// window against the real state machine. On SIGTERM the shared context is
-// cancelled, which returns watch.Run (after it snapshots its undelivered work)
-// while webhttp keeps the HTTP surface live for up to the shutdown grace. A
-// ping accepted in that window is recorded behind a sender that no longer
-// exists, so from the instant the context is cancelled the recording method must
-// refuse and say so honestly. GET and HEAD need no case here: they are refused
-// as methods in every lifecycle phase
-// (TestEveryRejectedMethodAnswersTheSameRefusal).
+// TestBeatRefusedOnceTheWatcherClosesAdmission pins the acceptance window
+// against the real state machine. On SIGTERM the composition root closes beat
+// admission in webhttp's pre-drain hook, before the HTTP drain begins, while the
+// surface itself stays live for up to the shutdown grace. A ping accepted after
+// that point is recorded behind a sender that no longer exists, so from the
+// instant admission closes the recording method must refuse and say so honestly.
+// GET and HEAD need no case here: they are refused as methods in every lifecycle
+// phase (TestEveryRejectedMethodAnswersTheSameRefusal).
 // What accepting one would cost is pinned by
-// the siblings below: TestCancelledBeatLeavesMetricsUnchanged (the exposition),
-// TestCancelledUnknownBeatMintsNoSeries (label cardinality),
-// TestCancelledBeatDoesNotReadBody (the drain), and
+// the siblings below: TestRefusedBeatLeavesMetricsUnchanged (the exposition),
+// TestRefusedUnknownBeatMintsNoSeries (label cardinality), and
 // TestProbeRoutesServeWhileBeatAcceptanceIsClosed (the probes keep serving).
-func TestBeatRefusedOnceTheApplicationContextIsCancelled(t *testing.T) {
+func TestBeatRefusedOnceTheWatcherClosesAdmission(t *testing.T) {
 	const id = "webapi-shutdown-guard"
-	h, cancel, _, _ := newShutdownHarness(t, id)
+	h, closeAdmission, _, _ := newShutdownHarness(t, id)
 
-	cancel()
+	closeAdmission()
 
 	assertBeatRefused(t, h, http.MethodPost, "/beat/"+id)
 }
 
-// TestCancelledBeatLeavesMetricsUnchanged pins the exposition across the
+// TestRefusedBeatLeavesMetricsUnchanged pins the exposition across the
 // refusal. A ping accepted during the drain moves lastSeen, moves
 // knell_beats_received_total, and republishes knell_beat_fresh as 1 — a false
 // "all good" sample for the quorum rules, behind a sender that no longer exists
 // (and for an alerted beat, a recovered notification queued on a channel nobody
 // reads again). The tally the endpoint carries into the drain must stay the one
 // watch.Run already reported.
-func TestCancelledBeatLeavesMetricsUnchanged(t *testing.T) {
+func TestRefusedBeatLeavesMetricsUnchanged(t *testing.T) {
 	const id = "webapi-shutdown-metrics"
-	h, cancel, clock, start := newShutdownHarness(t, id)
+	h, closeAdmission, clock, start := newShutdownHarness(t, id)
 
 	receivedSeries := `knell_beats_received_total{beat="` + id + `"}`
 	lastSeenSeries := `knell_beat_last_seen_timestamp_seconds{beat="` + id + `"}`
@@ -1377,8 +1369,9 @@ func TestCancelledBeatLeavesMetricsUnchanged(t *testing.T) {
 	// than landing on the same second as the live one.
 	clock.advance(time.Hour)
 
-	// SIGTERM's effect on the app, and the only trigger the guard may key on.
-	cancel()
+	// The composition root's pre-drain close, and the only trigger the
+	// refusal may key on.
+	closeAdmission()
 
 	assertBeatRefused(t, h, http.MethodPost, "/beat/"+id)
 
@@ -1398,16 +1391,16 @@ func TestCancelledBeatLeavesMetricsUnchanged(t *testing.T) {
 	}
 }
 
-// TestCancelledUnknownBeatMintsNoSeries pins label cardinality on the refusal
+// TestRefusedUnknownBeatMintsNoSeries pins label cardinality on the refusal
 // path: an unknown id is a metric label an unauthenticated caller controls, so a
 // refused ping must mint no series at all, exactly like the 404 path it replaces
 // during the drain.
-func TestCancelledUnknownBeatMintsNoSeries(t *testing.T) {
+func TestRefusedUnknownBeatMintsNoSeries(t *testing.T) {
 	const id = "webapi-shutdown-ghost-guard"
 	const ghost = "webapi-shutdown-ghost-unknown"
-	h, cancel, _, _ := newShutdownHarness(t, id)
+	h, closeAdmission, _, _ := newShutdownHarness(t, id)
 
-	cancel()
+	closeAdmission()
 
 	assertBeatRefused(t, h, http.MethodPost, "/beat/"+ghost)
 	if exposition := scrapeExposition(t, h); strings.Contains(exposition, ghost) {
@@ -1415,15 +1408,21 @@ func TestCancelledUnknownBeatMintsNoSeries(t *testing.T) {
 	}
 }
 
-// TestCancelledBeatDoesNotReadBody pins that the refusal lands BEFORE the body
-// drain, like the 401 one: a ping arriving during the drain must not be able to
-// hold a handler goroutine — and with it srv.Shutdown — open by trickling a
-// payload.
-func TestCancelledBeatDoesNotReadBody(t *testing.T) {
+// TestRefusedBeatStillDrainsTheBody pins the accepted cost of letting the
+// watcher own admission alone: the verdict comes from watch.Watcher.Beat, which
+// is only asked on the far side of the ignored body, so a ping refused during
+// the drain has been READ before it is refused. That is deliberate — the read is
+// what keeps the connection reusable, and it is bounded twice over (maxBeatBody
+// caps the bytes, the server's read timeout caps the time), so a trickling
+// sender delays only its own refusal. The assertion is here so the cost is
+// visible and pinned rather than rediscovered: if a future change wants to
+// refuse before reading, it needs a second lifecycle view in this package, which
+// is exactly what New explains it must not have.
+func TestRefusedBeatStillDrainsTheBody(t *testing.T) {
 	const id = "webapi-shutdown-body"
-	h, cancel, _, _ := newShutdownHarness(t, id)
+	h, closeAdmission, _, _ := newShutdownHarness(t, id)
 
-	cancel()
+	closeAdmission()
 
 	body := &countingReader{}
 	req := newBeatRequest(http.MethodPost, "/beat/"+id, body)
@@ -1432,8 +1431,8 @@ func TestCancelledBeatDoesNotReadBody(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
-	if body.reads != 0 {
-		t.Errorf("body reads = %d, want 0 (a refused ping must not be drained)", body.reads)
+	if body.reads == 0 {
+		t.Errorf("body reads = 0, want the body drained before the watcher's verdict: the refusal is Beat's answer, which is asked after the drain, and skipping the drain would leave the connection unreusable")
 	}
 }
 
@@ -1442,29 +1441,33 @@ func TestCancelledBeatDoesNotReadBody(t *testing.T) {
 // health flip, and a last scrape during the drain is useful.
 func TestProbeRoutesServeWhileBeatAcceptanceIsClosed(t *testing.T) {
 	const id = "webapi-shutdown-probes"
-	h, cancel, _, _ := newShutdownHarness(t, id)
+	h, closeAdmission, _, _ := newShutdownHarness(t, id)
 
-	cancel()
+	closeAdmission()
 
 	for _, path := range []string{"/healthz", "/metrics"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
-			t.Errorf("GET %s with the app context cancelled = %d, want 200", path, rec.Code)
+			t.Errorf("GET %s with beat admission closed = %d, want 200", path, rec.Code)
 		}
 	}
 }
 
-// TestBeatRefusedWhenCancellationHappensDuringBodyDrain pins the lifecycle
-// check after the ignored request body is drained. The pipe write proves the
-// handler passed the first context check and entered the body read before
-// cancellation, so a 503 can only come from the post-drain check.
-func TestBeatRefusedWhenCancellationHappensDuringBodyDrain(t *testing.T) {
-	appCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// TestBeatRefusedWhenAdmissionClosesDuringBodyDrain pins the refusal for the
+// request that motivates the whole ordering: one ADMITTED while the app was
+// live, held inside the ignored body read (which the 30s read timeout bounds, so
+// this is routine rather than exotic), and finishing after admission closed. The
+// pipe write proves the handler really entered the body read before the close,
+// so a 503 can only come from the watcher's verdict on the far side of it — the
+// one check that is atomic with the recording. A 200 here would tell a sender its
+// heartbeat landed while the watcher recorded nothing.
+func TestBeatRefusedWhenAdmissionClosesDuringBodyDrain(t *testing.T) {
+	t.Parallel()
+
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandlerCtx(appCtx, b, testBeatToken)
+	h := newTestHandler(b, testBeatToken)
 
 	bodyReader, bodyWriter := io.Pipe()
 	req := newBeatRequest(http.MethodPost, "/beat/api", bodyReader)
@@ -1494,17 +1497,20 @@ func TestBeatRefusedWhenCancellationHappensDuringBodyDrain(t *testing.T) {
 		// goroutine has finished.
 		t.Fatalf("handler returned without reading the body (status %d): the barrier write would have deadlocked", rec.Code)
 	}
-	cancel()
+	// Close admission while the handler is parked in the read, then release the
+	// read. The write below and the pipe close order this against the handler
+	// goroutine's later Beat call, so the flip needs no lock of its own.
+	b.closed = true
 	if err := bodyWriter.Close(); err != nil {
 		t.Fatalf("close request body: %v", err)
 	}
 	<-done
 
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("POST canceled during body drain = %d, want 503 (body %s)", rec.Code, rec.Body.String())
+		t.Fatalf("POST refused mid-drain = %d, want 503 (body %s)", rec.Code, rec.Body.String())
 	}
 	if len(b.seen) != 0 {
-		t.Fatalf("beats recorded after cancellation during body drain = %v, want none", b.seen)
+		t.Fatalf("beats recorded after admission closed during the body drain = %v, want none", b.seen)
 	}
 	if !strings.Contains(rec.Body.String(), "shutting_down") {
 		t.Errorf("503 body = %s, want the shutting_down code", rec.Body.String())
@@ -1569,17 +1575,9 @@ func httpRequestSeries(exposition string) map[string]bool {
 func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 	const id = "api"
 
-	// cancelledCtx is the drain state: the shared application context is
-	// cancelled, so beat acceptance is closed for the rest of the process.
-	cancelledCtx := func() context.Context {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		return ctx
-	}
-
 	tests := map[string]struct {
 		token      string
-		ctx        context.Context
+		closed     bool
 		method     string
 		path       string
 		wantStatus int
@@ -1590,21 +1588,21 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 		// counting everything as a refusal, and it is the denominator an
 		// operator compares a refusal rate against.
 		"accepted ping": {
-			token: testBeatToken, ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id,
+			token: testBeatToken, method: http.MethodPost, path: "/beat/" + id,
 			wantStatus: http.StatusOK, wantSeen: 1,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="200"}`,
 		},
 		// A rotated or mistyped BEAT_TOKEN. The gate is outermost, so this is
 		// the refusal an unauthenticated caller reaches first.
 		"unauthorized ping": {
-			token: "a-different-token-entirely", ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id,
+			token: "a-different-token-entirely", method: http.MethodPost, path: "/beat/" + id,
 			wantStatus: http.StatusUnauthorized,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="401"}`,
 		},
 		// A typo in a sender's URL: the beat stays silent while the sender
 		// believes it is pinging.
 		"unknown beat id": {
-			token: testBeatToken, ctx: context.Background(), method: http.MethodPost, path: "/beat/ghost",
+			token: testBeatToken, method: http.MethodPost, path: "/beat/ghost",
 			wantStatus: http.StatusNotFound,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="404"}`,
 		},
@@ -1612,21 +1610,21 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 		// /beat/{$}, so the refusal keeps the coded envelope and its own
 		// series instead of falling into net/http's unmatched-bucket 404.
 		"empty beat id": {
-			token: testBeatToken, ctx: context.Background(), method: http.MethodPost, path: "/beat/",
+			token: testBeatToken, method: http.MethodPost, path: "/beat/",
 			wantStatus: http.StatusNotFound,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{$}",status="404"}`,
 		},
 		// A trailing-slash or extra-segment URL join: routes to
 		// /beat/{id}/{rest...}, same coded 404, its own series.
 		"nested beat path": {
-			token: testBeatToken, ctx: context.Background(), method: http.MethodPost, path: "/beat/" + id + "/",
+			token: testBeatToken, method: http.MethodPost, path: "/beat/" + id + "/",
 			wantStatus: http.StatusNotFound,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}/{rest...}",status="404"}`,
 		},
 		// HEAD has its own registered route (so a HEAD probe cannot record a
 		// ping), and that route NAMES the method, so the label is truthful.
 		"head refused": {
-			token: testBeatToken, ctx: context.Background(), method: http.MethodHead, path: "/beat/" + id,
+			token: testBeatToken, method: http.MethodHead, path: "/beat/" + id,
 			wantStatus: http.StatusMethodNotAllowed,
 			wantSeries: `knell_http_requests_total{method="HEAD",path="/beat/{id}",status="405"}`,
 		},
@@ -1638,7 +1636,7 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 		// which real method a sender is misconfigured to use. See
 		// TestRequestMetricLabelsBoundedByTheRouteTable for the bucket half.
 		"disallowed method refused": {
-			token: testBeatToken, ctx: context.Background(), method: http.MethodPut, path: "/beat/" + id,
+			token: testBeatToken, method: http.MethodPut, path: "/beat/" + id,
 			wantStatus: http.StatusMethodNotAllowed,
 			wantSeries: `knell_http_requests_total{method="PUT",path="/beat/{id}",status="405"}`,
 		},
@@ -1646,14 +1644,14 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 		// anything that fetched the URL for one) learns the method is not the
 		// recording one, and the label names the method truthfully.
 		"get refused": {
-			token: testBeatToken, ctx: context.Background(), method: http.MethodGet, path: "/beat/" + id,
+			token: testBeatToken, method: http.MethodGet, path: "/beat/" + id,
 			wantStatus: http.StatusMethodNotAllowed,
 			wantSeries: `knell_http_requests_total{method="GET",path="/beat/{id}",status="405"}`,
 		},
 		// A ping arriving during the drain, after watch.Run already took its
 		// undelivered-work snapshot.
 		"ping during drain": {
-			token: testBeatToken, ctx: cancelledCtx(), method: http.MethodPost, path: "/beat/" + id,
+			token: testBeatToken, closed: true, method: http.MethodPost, path: "/beat/" + id,
 			wantStatus: http.StatusServiceUnavailable,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="503"}`,
 		},
@@ -1661,8 +1659,8 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			b := &fakeBeater{known: map[string]bool{id: true}}
-			h := newTestHandlerCtx(tt.ctx, b, tt.token)
+			b := &fakeBeater{known: map[string]bool{id: true}, closed: tt.closed}
+			h := newTestHandler(b, tt.token)
 
 			// Deltas, not absolutes: the registry is a package-level singleton
 			// shared by the whole test binary (and by a -count=2 rerun).
@@ -1810,7 +1808,7 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 	}
 
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandlerCtx(context.Background(), b, testBeatToken)
+	h := newTestHandler(b, testBeatToken)
 	before := httpRequestSeries(scrapeExposition(t, h))
 
 	hostile := hostileRequestSet()
@@ -1879,7 +1877,7 @@ func TestUnroutedRequestsAreCountedUnderTheCollapsedSeries(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			b := &fakeBeater{known: map[string]bool{"api": true}}
-			h := newTestHandlerCtx(context.Background(), b, testBeatToken)
+			h := newTestHandler(b, testBeatToken)
 			want := `knell_http_requests_total{method="` + tt.wantMethod +
 				`",path="` + unmatchedPathLabel + `",status="` + tt.wantStatus + `"}`
 			// Deltas, not absolutes: the registry is a package-level singleton
@@ -1990,7 +1988,7 @@ func hostPolicy(t *testing.T, entries string) *webhttp.HostPolicy {
 // /beat case below proves the allowlist answers before the route's own refusals.
 func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := New(context.Background(), b, Deps{
+	h := New(b, Deps{
 		Healthz:   staticHealthz(http.StatusOK),
 		Hosts:     hostPolicy(t, "knell.example"),
 		BeatToken: testBeatToken,
@@ -2106,7 +2104,7 @@ func scrapeAs(t *testing.T, h http.Handler, host string) string {
 // exists to close for the other 403.
 func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := New(context.Background(), b, Deps{
+	h := New(b, Deps{
 		Healthz:   staticHealthz(http.StatusOK),
 		Hosts:     hostPolicy(t, "knell.example"),
 		BeatToken: testBeatToken,

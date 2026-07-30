@@ -449,6 +449,51 @@ func digitRuns(s string) []string {
 	return runs
 }
 
+// TestBeatTokenLengthCeiling pins both edges of the token maximum. The bound is
+// not about credential strength — a 512-byte token is absurd, not weak — but
+// about whether the credential can TRAVEL: MaxRequestHeaderBytes caps the header
+// block knell reads, so one byte past the maximum and POST /beat/{id} answers 431
+// to every ping while startup reported the endpoint gated, and one deadline later
+// every configured beat posts a false MISSING notice. Both edges are asserted
+// because either mistake is silent in production: a maximum that refused a token
+// the header budget can carry would stop deployments that work today, and one
+// that admitted an oversized token would restore the 431 the bound exists to
+// prevent.
+func TestBeatTokenLengthCeiling(t *testing.T) {
+	atMax := strings.Repeat("a", maxTokenLength)
+
+	t.Run("a token at the maximum starts", func(t *testing.T) {
+		setValidLoadEnv(t)
+		t.Setenv("BEAT_TOKEN", atMax)
+		unsetEnv(t, "BEAT_TOKEN_FILE")
+
+		cfg, err := Load(maxNodeNameBytes)
+		if err != nil {
+			t.Fatalf("Load() with a %d-byte BEAT_TOKEN error = %v, want nil: the maximum is a value knell accepts, and the header budget reserves headerOverheadAllowance bytes on top of it", maxTokenLength, err)
+		}
+		if cfg.BeatToken != atMax {
+			t.Error("BeatToken differs from the configured value: the credential is verified verbatim, so any rewrite 401s every ping")
+		}
+	})
+
+	t.Run("one byte past the maximum refuses startup", func(t *testing.T) {
+		setValidLoadEnv(t)
+		t.Setenv("BEAT_TOKEN", atMax+"a")
+		unsetEnv(t, "BEAT_TOKEN_FILE")
+
+		_, err := Load(maxNodeNameBytes)
+		if err == nil {
+			t.Fatalf("Load() with a %d-byte BEAT_TOKEN = nil, want a startup refusal: it leaves no room inside the %d-byte header budget for the request line, Host and the \"Bearer \" prefix, so every ping would be answered 431 by an endpoint reporting itself gated", maxTokenLength+1, MaxRequestHeaderBytes)
+		}
+		if !strings.Contains(err.Error(), strconv.Itoa(maxTokenLength)) {
+			t.Errorf("refusal = %q, want it to name the %d-byte maximum: it is the number the operator has to act on", err, maxTokenLength)
+		}
+		if strings.Contains(err.Error(), atMax) {
+			t.Error("refusal echoes the token value into the startup log")
+		}
+	})
+}
+
 func TestLoadBeatTokenFromFile(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "beat-token")
 	if err := os.WriteFile(tokenFile, []byte("file-borne-beat-token\n"), 0o600); err != nil {
@@ -728,10 +773,12 @@ func TestLoadRejectsEmptyBeatTokenFile(t *testing.T) {
 // which is asserted anywhere in this package: unset must stay INACTIVE (the
 // documented default that accepts every Host - an accidental deny-all here 403s
 // every beat in every default deployment and turns the whole switch silent),
-// blank entries must not engage the gate, and an allowlist whose entries are all
-// unusable must stay ACTIVE (fail closed) and SAY so, because that configuration
-// rejects every non-loopback sender. webapi's tests cover the policy's
-// request-time behaviour; this covers the env-to-policy mapping.
+// blank entries must not engage the gate, and any entry knell cannot use must
+// REFUSE STARTUP, because a dropped entry leaves an allowlist that is not the one
+// configured: every non-loopback request under that hostname is refused 403,
+// including the pings, which then surface as missing-beat alerts for healthy
+// services. webapi's tests cover the policy's request-time behaviour; this covers
+// the env-to-policy mapping.
 func TestAllowedHostsGate(t *testing.T) {
 	tests := map[string]struct {
 		raw        string
@@ -739,21 +786,25 @@ func TestAllowedHostsGate(t *testing.T) {
 		wantActive bool
 		wantSize   int
 		wantWarn   string
+		wantErr    string
 	}{
-		"unset accepts every host":          {wantActive: false},
-		"one hostname engages the gate":     {set: true, raw: "knell.internal", wantActive: true, wantSize: 1},
-		"blank entries are skipped":         {set: true, raw: "knell.internal, ,10.0.0.5", wantActive: true, wantSize: 2},
-		"present but blank is reported":     {set: true, raw: "", wantActive: false, wantWarn: "is set but blank"},
-		"malformed entries are dropped":     {set: true, raw: "knell.internal,http://x/y", wantActive: true, wantSize: 1, wantWarn: "dropping malformed ALLOWED_HOSTS entries"},
-		"all entries unusable fails closed": {set: true, raw: ":9190", wantActive: true, wantSize: 0, wantWarn: "rejecting every non-loopback request"},
+		"unset accepts every host":      {wantActive: false},
+		"one hostname engages the gate": {set: true, raw: "knell.internal", wantActive: true, wantSize: 1},
+		"blank entries are skipped":     {set: true, raw: "knell.internal, ,10.0.0.5", wantActive: true, wantSize: 2},
+		"present but blank is reported": {set: true, raw: "", wantActive: false, wantWarn: "is set but blank"},
+		"one unusable entry refuses":    {set: true, raw: "knell.internal,http://x/y", wantErr: "http://x/y"},
+		// Formerly pinned as active-size-zero, warned about and STARTED: the
+		// oracle is unchanged (this configuration rejects every non-loopback
+		// sender, so no beat can be recorded), and the verdict is now the
+		// refusal that makes it impossible to reach production.
+		"all entries unusable refuses": {set: true, raw: ":9190", wantErr: ":9190"},
 		// A PADDED blank is the same compose accident as the empty one above
 		// (ALLOWED_HOSTS="${HOSTS} " with HOSTS undefined), and which of the two
 		// outcomes it lands on is decided inside webhttp, not here: if
 		// ParseHostList ever stopped trimming an entry, "   " would become a
-		// non-blank unusable entry, the gate would ENGAGE with nothing in it, and
-		// every non-loopback ping would 403 until every beat posted a false
-		// MISSING notice. Pinned so a webhttp bump has to fail here rather than
-		// in production.
+		// non-blank unusable entry and startup would refuse instead of accepting
+		// every Host. Pinned so a webhttp bump has to fail here rather than in
+		// production.
 		"padded blank never engages": {set: true, raw: "   ", wantActive: false, wantWarn: "is set but blank"},
 	}
 	for name, tt := range tests {
@@ -768,7 +819,19 @@ func TestAllowedHostsGate(t *testing.T) {
 
 			rec := capture.Default(t)
 
-			policy := allowedHosts()
+			policy, err := allowedHosts()
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("allowedHosts() with %q = nil error, want a startup refusal: knell would serve an allowlist the operator never configured, and every non-loopback ping it should have admitted 403s until one deadline later every beat posts a false MISSING notice", tt.raw)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("refusal = %q, want it to name the unusable entry %q: it is the only part of the value the operator can act on", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("allowedHosts() with %q error = %v, want nil: a usable configuration must start", tt.raw, err)
+			}
 			if policy.Active() != tt.wantActive {
 				t.Errorf("Active() = %v, want %v: an inactive policy accepts every Host and an active one rejects every Host it does not list, so this is the difference between the documented default and a deny-all", policy.Active(), tt.wantActive)
 			}

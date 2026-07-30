@@ -41,6 +41,43 @@ const minDeadline = 30 * time.Second
 // behind it, which is the one failure this app exists to prevent.
 const minTokenLength = 16
 
+// maxTokenLength is the longest BEAT_TOKEN knell will start with, and it exists
+// only because the token has to TRAVEL: every ping carries it in an HTTP header,
+// and MaxRequestHeaderBytes below caps the header block knell will read, so the
+// two bounds are one decision made in one place. Without the pair, an oversized
+// token passes startup and then makes every ping fail 431 while the endpoint
+// reports itself gated — the fail-silent direction for a dead-man switch, and one
+// deadline later every configured beat posts a false MISSING notice.
+//
+// 512 bytes is 16x the 32-byte token `openssl rand -hex 16` produces, so no
+// credential an operator would actually write is refused; what reaches the cap is
+// a BEAT_TOKEN_FILE pointing at the wrong file, which envx will hand over at up
+// to 1 MiB.
+const maxTokenLength = 512
+
+// headerOverheadAllowance is the room MaxRequestHeaderBytes reserves for
+// everything in a request that is NOT the beat token: the request line, Host, the
+// "Bearer " prefix the verifier compares against (see internal/webapi), and
+// whatever sits in front of knell adds — X-Forwarded-*, tracing headers, the
+// cookies a browser sends to /metrics. 8 KiB is the allowance nginx and Apache
+// give a whole header block by default, so a request no other server in the path
+// would refuse is not refused here either.
+//
+// It is stated as headroom ON TOP of maxTokenLength rather than folded into a
+// single number because a ceiling EQUAL to the token maximum would refuse a
+// maximum-length token the moment it is sent with anything else at all, which is
+// the same 431 the token bound exists to prevent.
+const headerOverheadAllowance = 8 << 10
+
+// MaxRequestHeaderBytes is the request-header cap the composition root applies to
+// the HTTP server, derived from the token bound so the two cannot drift: a token
+// checkBeatToken accepted always fits, with headerOverheadAllowance to spare.
+// Exported for main.go the same way MaxBeatIDLen is exported for the notifier —
+// the bound is owned where the rule that produces it lives. net/http's own
+// default is 1 MiB, which lets one unauthenticated caller make this process read
+// a megabyte of header per connection.
+const MaxRequestHeaderBytes = maxTokenLength + headerOverheadAllowance
+
 // asciiWhitespace is the cutset of edge characters checkBeatToken REFUSES in a
 // BEAT_TOKEN. Two different mechanisms reach that one verdict:
 //   - SP and HTAB are legal field-value bytes the wire NORMALIZES. The verifier
@@ -121,12 +158,11 @@ func (c Config) LogValue() slog.Value {
 	// draws nothing at all, so without this attribute an operator believes the
 	// DNS-rebinding guard is armed and no line contradicts them.
 	//
-	// The COUNT is state, not decoration: malformed entries are
-	// warned-and-dropped, so an active policy can hold zero usable hosts and
-	// then rejects every non-loopback request (fail closed) — a distinct and
-	// dangerous configuration a bare on/off value would render identically to a
-	// working allowlist. Active and Size are nil-safe, so a zero Config (and any
-	// Config built without going through Load) renders "any" rather than panicking.
+	// The COUNT is state, not decoration: it is the number of hostnames the gate
+	// actually holds, which is what an operator checks the startup line for after
+	// editing the variable (the README's ALLOWED_HOSTS row tells them to). Active
+	// and Size are nil-safe, so a zero Config (and any Config built without going
+	// through Load) renders "any" rather than panicking.
 	allowedHosts := "any"
 	if c.AllowedHosts.Active() {
 		allowedHosts = fmt.Sprintf("allowlist(%d)", c.AllowedHosts.Size())
@@ -178,7 +214,11 @@ func Load(maxNodeNameBytes int) (Config, error) {
 
 	cfg.ListenAddr = listenAddr()
 
-	cfg.AllowedHosts = allowedHosts()
+	hosts, err := allowedHosts()
+	if err != nil {
+		return cfg, err
+	}
+	cfg.AllowedHosts = hosts
 
 	beatToken, err := loadBeatToken()
 	if err != nil {
@@ -330,18 +370,24 @@ func ParseAllowedHosts(entries []string) (policy *webhttp.HostPolicy, invalid []
 // Host that request carries. Matching is textual on the Host header,
 // the one value the attacker cannot forge away, and no name is resolved.
 //
-// Malformed entries WARN rather than fail startup, unlike the required values
-// this package refuses: an allowlist knell cannot use degrades browser access,
-// while a startup refusal takes the whole observer down and a dead-man switch
-// that does not run detects nothing. ParseHostList still fails CLOSED when every
-// entry was unusable (any non-blank entry engages the gate), which the second
-// warning names. WithLoopbackExempt keeps an in-container client (a `curl
+// Any malformed entry FAILS STARTUP, like every other malformed value this
+// package refuses. Dropping it instead would leave a PARTIAL allowlist: the
+// operator believes a host is permitted, the gate does not list it, and every
+// non-loopback request under that name is refused 403 — including the /beat/{id}
+// pings, which then surface as missing-beat alerts for services that are healthy.
+// A single scheme (`ALLOWED_HOSTS=https://knell.internal`, a plausible first
+// attempt) reduces the whole allowlist to nothing, and the guard engages on it
+// anyway, so the difference between a working allowlist and a deny-all is one
+// invisible mistake. A refusal at startup is the one signal an operator cannot
+// mistake for a working observer.
+//
+// WithLoopbackExempt keeps an in-container client (a `curl
 // http://127.0.0.1:9190/healthz`) working under any allowlist: it admits a
 // request only when BOTH the socket peer and the Host are loopback, so a
 // rebinding request, which carries the attacker's hostname in Host, never
 // qualifies. The baked `knell health` probe needs no exemption at all — it
 // stats the marker file and sends no request (see main.go).
-func allowedHosts() *webhttp.HostPolicy {
+func allowedHosts() (*webhttp.HostPolicy, error) {
 	const key = "ALLOWED_HOSTS"
 	// LookupEnv, not Getenv: a PRESENT-but-blank value is the same compose
 	// accident listenAddr and nodeName already report, and here it leaves the
@@ -350,19 +396,13 @@ func allowedHosts() *webhttp.HostPolicy {
 	raw, present := os.LookupEnv(key)
 	policy, invalid := ParseAllowedHosts(strings.Split(raw, ","))
 	if len(invalid) > 0 {
-		slog.Warn("dropping malformed "+key+" entries; they cannot match any Host a sender or browser sends",
-			"invalid", invalid,
-			"hint", "use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,10.0.0.5,knell.example.com; a lone port like :9190 belongs in LISTEN_ADDR")
-	}
-	if policy.Active() && policy.Size() == 0 {
-		slog.Warn(key+" has no usable entries; rejecting every non-loopback request (fail closed), so no sender can record a beat",
-			"hint", "fix the entries listed in the preceding warning, or unset the variable to accept every Host")
+		return nil, fmt.Errorf("%s has entries no Host can ever match, so the allowlist knell would serve is not the one configured: %v; use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,10.0.0.5,knell.example.com — a lone port like :9190 belongs in LISTEN_ADDR", key, invalid)
 	}
 	if present && !policy.Active() {
 		slog.Warn(key+" is set but blank and was ignored; every Host is accepted, so the DNS-rebinding guard is off",
 			"hint", "unset the variable to accept every Host on purpose, or list the hostnames knell is reached by, e.g. knell.internal,10.0.0.5")
 	}
-	return policy
+	return policy, nil
 }
 
 // logLevel resolves the log level: LOG_LEVEL when it parses, else info. A
@@ -544,6 +584,12 @@ var errBeatTokenSetButEmpty = fmt.Errorf("BEAT_TOKEN is set but empty: it is the
 // presentable, and so is a guess at it. Since the token is the endpoint's only
 // gate, a guessable one lets a stranger keep the switch armed with no heartbeat
 // behind it.
+//
+// A token longer than maxTokenLength returns to the first reason at the other end
+// of the scale: MaxRequestHeaderBytes bounds the header block knell will read, so
+// a token past the maximum has no room to travel and the endpoint would 431 every
+// ping. The two length bounds are declared together with that budget, so neither
+// can be moved without the other.
 func checkBeatToken(token string) error {
 	if strings.Trim(token, asciiWhitespace) != token {
 		// The value is never echoed: the message names the variable and the
@@ -588,6 +634,20 @@ func checkBeatToken(token string) error {
 		// so the minimum is the only number they need.
 		return fmt.Errorf("BEAT_TOKEN is shorter than the %d-byte minimum: it is the only gate on /beat/{id}, so a token short enough to guess lets a stranger who can reach this port keep every beat reading fresh while the thing it watches is dead; set a random token of at least %d bytes (e.g. `openssl rand -hex 16`)", minTokenLength, minTokenLength)
 	}
+	if len(token) > maxTokenLength {
+		// Presentable byte for byte, and still unsendable — this time because of
+		// its size rather than its content. knell caps the header block it reads
+		// at MaxRequestHeaderBytes, so a token past maxTokenLength cannot fit
+		// that budget alongside the request line, Host and the "Bearer " prefix,
+		// and POST /beat/{id} would answer 431 to every ping while reporting
+		// itself gated. That is the same fail-silent outcome the padding and
+		// control-byte refusals above prevent, so it is refused at startup for
+		// the same reason. What actually reaches here is a BEAT_TOKEN_FILE
+		// pointing at a bundle or an archive the mount picked up (envx reads a
+		// secret file of up to 1 MiB), which is why the remedy names the value
+		// and not the cap.
+		return fmt.Errorf("BEAT_TOKEN is longer than the %d-byte maximum: knell reads at most %d bytes of request headers, and a token past the maximum leaves no room for the request line, the Host header and the \"Bearer \" prefix it travels with, so POST /beat/{id} would reject every ping with 431 while reporting itself gated; set a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or check that BEAT_TOKEN_FILE names the secret file itself rather than a bundle the mount picked up", maxTokenLength, MaxRequestHeaderBytes, minTokenLength)
+	}
 	if strings.TrimFunc(token, invisibleInURL) == "" {
 		// Invisible end to end by invisibleInURL — all Unicode spaces (NBSP,
 		// U+2000...) and every other unprintable rune (a zero-width space, a
@@ -626,8 +686,8 @@ func checkBeatToken(token string) error {
 // there is no configuration in which knell serves the endpoint without it. An
 // unset variable, a present-but-empty one, and any value no sender could present
 // as configured — one carrying leading or trailing ASCII whitespace, one
-// carrying an HTTP-forbidden control byte, or one under the minTokenLength floor
-// — all FAIL STARTUP, like an empty BEAT_TOKEN_FILE.
+// carrying an HTTP-forbidden control byte, or one outside the minTokenLength /
+// maxTokenLength bounds — all FAIL STARTUP, like an empty BEAT_TOKEN_FILE.
 //
 // The value is stored EXACTLY as configured, so
 // the token knell verifies is the one the operator wrote; nothing is rewritten.

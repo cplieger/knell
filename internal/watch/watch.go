@@ -524,10 +524,12 @@ type Watcher struct {
 	beats      map[string]*beatState
 	recoveries chan recoveryEvent
 	mu         sync.Mutex
-	// accepting is the authoritative beat-admission state, guarded by mu so
-	// it orders against the beat mutation itself: stopAccepting, Beat and the
-	// shutdown snapshot are one serialized sequence, which is what a context
-	// check in the HTTP handler cannot be (see Beat and stopAccepting).
+	// accepting is the authoritative beat-admission state, and the only one:
+	// it is guarded by mu so it orders against the beat mutation itself, so
+	// StopAccepting, Beat and the shutdown snapshot are one serialized
+	// sequence. The watcher owns the whole decision — the HTTP handler asks
+	// Beat and reports what it answers, rather than keeping a second, racy
+	// view of the same question (see Beat and StopAccepting).
 	accepting bool
 }
 
@@ -593,11 +595,12 @@ const (
 //
 // Admission is decided HERE, under the same mutex as the state mutation and
 // the recovered enqueue, because that is the only way the decision can be
-// atomic with respect to shutdown: a caller-side context check can pass and
-// then be descheduled while Run takes its undelivered-work snapshot and
+// atomic with respect to shutdown: any check the CALLER made instead could pass
+// and then be descheduled while Run takes its undelivered-work snapshot and
 // returns, so the ping would land behind a tally that has already been
-// reported. Since stopAccepting takes this mutex too, every ping either
-// completes before admission closes — and is therefore visible to
+// reported. That is why the HTTP handler keeps no lifecycle check of its own and
+// simply reports this outcome. Since StopAccepting takes this mutex too, every
+// ping either completes before admission closes — and is therefore visible to
 // logUndelivered — or observes accepting=false and records nothing at all.
 func (w *Watcher) Beat(id string) BeatOutcome {
 	w.mu.Lock()
@@ -687,11 +690,22 @@ func (w *Watcher) Beat(id string) BeatOutcome {
 	return BeatRecorded
 }
 
-// stopAccepting closes beat admission for the rest of the process's life.
+// StopAccepting closes beat admission for the rest of the process's life.
 // It takes the mutex Beat mutates under, so once it returns no ping can still
 // be between its admission check and its state change: that ordering is what
 // makes logUndelivered's tally complete rather than merely narrow.
-func (w *Watcher) stopAccepting() {
+//
+// The watcher is the single owner of this decision, and it is exported because
+// the shutdown SEQUENCE is the composition root's: main closes admission from
+// webhttp's pre-drain hook (and from the serve-exit path, which skips
+// pre-drain), so the beat endpoint stops accepting before the HTTP drain begins
+// instead of only when Run reaches its own ctx.Done arm. Run still calls it
+// there, so the ordering above holds whether or not anything called it first.
+//
+// Calling it more than once is safe and expected: it assigns a state, it does
+// not transition one, so the second call is a no-op that changes nothing the
+// tally or the recovery drain then reads.
+func (w *Watcher) StopAccepting() {
 	w.mu.Lock()
 	w.accepting = false
 	w.mu.Unlock()
@@ -722,10 +736,13 @@ func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Close admission before tallying: stopAccepting and the snapshot
+			// Close admission before tallying: StopAccepting and the snapshot
 			// serialize on the same mutex, so nothing can be recorded between
-			// them (see Beat).
-			w.stopAccepting()
+			// them (see Beat). The composition root normally closed admission
+			// already, from webhttp's pre-drain hook; this call stands whether
+			// it did or not, because a second close is a no-op and Run must
+			// not depend on someone else having gone first.
+			w.StopAccepting()
 			w.logUndelivered()
 			return
 		case ev := <-w.recoveries:
@@ -781,14 +798,15 @@ func (w *Watcher) refreshFreshness() {
 // never attempted and never discarded, so the log line is the operator's only
 // trace of it.
 //
-// The tally below is complete by construction, and mechanically so: Run closes
-// admission (stopAccepting) before taking the snapshot, and both take the same
+// The tally below is complete by construction, and mechanically so: admission
+// is closed (StopAccepting) before the snapshot is taken, and both take the same
 // mutex Beat mutates under, so a ping either finished before admission closed
 // — and is counted here — or observes accepting=false, records nothing, and is
-// refused with 503. webapi.New additionally gates /beat/{id} on the shared
-// application context, which refuses the long drain window early (before the
-// body is even read) rather than deep in the watcher; the atomic boundary is
-// Beat's, whichever order the HTTP drain and this loop's exit happen to run in.
+// refused with 503. In production the composition root closes admission earlier
+// still, from webhttp's pre-drain hook, so most of the HTTP drain window is
+// already refusing by the time Run gets here; that only narrows the window, it
+// does not move the boundary, which is Beat's mutex whichever order the drain
+// and this loop's exit happen to run in.
 func (w *Watcher) logUndelivered() {
 	beats, total, lostTotal := w.snapshotUndelivered()
 	lostRecoveries := drainRecoveryIDs(w.recoveries)

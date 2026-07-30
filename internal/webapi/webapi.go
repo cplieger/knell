@@ -4,7 +4,6 @@
 package webapi
 
 import (
-	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -105,27 +104,16 @@ type Deps struct {
 // New assembles the routed and middleware-wrapped root handler.
 // deps.BeatToken is the required credential gating the beat endpoint.
 //
-// appCtx is the shared application context: the one main cancels on SIGTERM,
-// and the very same one watch.Run stops on. Cancelling it closes the beat
-// endpoint's two EARLY refusal points at once — a ping that arrives after
-// cancellation is refused with 503 before its body is touched, and one already
-// draining a body is refused when that read returns — so a shutting-down
-// endpoint does no recording work it does not have to.
-//
-// Those checks read the context rather than a flag flipped by the server's
-// pre-drain hook because pre-drain runs on webhttp.Run's goroutine while
-// watch.Run returns on its own, so which of the two happens first is a race,
-// and a flag one of them owns leaves /beat/{id} fully live for the rest of the
-// drain. Cancellation is the one instant both goroutines observe.
-//
-// What cancellation does NOT do is decide acceptance. A ping that passes the
-// final context check can still be descheduled and then win the watcher mutex
-// before watch.Run reaches its ctx.Done arm and calls stopAccepting; that ping
-// is accepted and fully recorded. That is safe, and it is why the boundary
-// lives there: Beat decides admission under the same mutex that guards the
-// state change, so such a ping completes before admission closes and is
-// therefore counted in the shutdown tally logUndelivered reports (see
-// watch.Watcher.Beat) rather than landing behind a tally already taken.
+// The beat endpoint keeps NO lifecycle state of its own. Whether a ping is
+// still accepted is one question with one owner: watch.Watcher decides it under
+// the mutex that guards the beat mutation, and this package asks (b.Beat) and
+// reports what it answers — 503 with the shutting_down code for BeatClosed. A
+// second view of the same question here could only ever approximate the
+// watcher's, because no check made before Beat is atomic with the recording
+// (this goroutine can be descheduled between the two), so it would add a source
+// of drift and nothing else. The composition root closes admission at the start
+// of the drain (webhttp's pre-drain hook), which is what keeps the window in
+// which a ping is answered 503 narrow.
 //
 // Only the beat endpoint refuses. /healthz and /metrics keep serving through
 // the whole drain: the orchestrator has to see the liveness marker flip, and a
@@ -133,7 +121,7 @@ type Deps struct {
 // statement about the DRAIN only — an active ALLOWED_HOSTS allowlist refuses a
 // foreign Host on all three routes at every point in the lifecycle, drain
 // included (see Deps.Hosts).
-func New(appCtx context.Context, b Beater, deps Deps) http.Handler {
+func New(b Beater, deps Deps) http.Handler {
 	mux := http.NewServeMux()
 	// POST is the ONLY method that records. GET and HEAD are registered
 	// explicitly to REFUSE, for the same reason: a recording GET is reachable
@@ -144,7 +132,7 @@ func New(appCtx context.Context, b Beater, deps Deps) http.Handler {
 	// neither can ever fall through to the recorder. Do not delete either as
 	// redundant boilerplate.
 	verifier := beatTokenVerifier(deps.BeatToken)
-	mux.HandleFunc("POST /beat/{id}", beatHandler(appCtx, b, verifier))
+	mux.HandleFunc("POST /beat/{id}", beatHandler(b, verifier))
 	mux.HandleFunc("GET /beat/{id}", writeMethodNotAllowed)
 	mux.HandleFunc("HEAD /beat/{id}", writeMethodNotAllowed)
 	// Every OTHER method (PUT, DELETE, PATCH, OPTIONS, an unknown verb) would
@@ -372,9 +360,8 @@ func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
 // writeShuttingDown refuses a beat because admission is closed: 503 in this
 // file's standard coded envelope. It names no beat id — not even an unknown one
 // — so the refusal leaks as little as the 404 path does about which ids are
-// configured, and it is the single home of the refusal all three admission
-// checks in beatRecorder answer with (the two context checks and the watcher's
-// authoritative BeatClosed outcome).
+// configured. One caller, the watcher's authoritative BeatClosed outcome, since
+// admission has one owner (see New).
 func writeShuttingDown(w http.ResponseWriter, r *http.Request) {
 	webhttp.WriteError(w, r, http.StatusServiceUnavailable, "shutting_down",
 		"knell is shutting down and is no longer accepting beats")
@@ -555,10 +542,10 @@ func countHostRefusals(hosts *webhttp.HostPolicy) webhttp.Middleware {
 // is not configured. Unknown ids are never recorded or counted: the id feeds
 // a metric label, so arbitrary paths must not mint series. Senders must present
 // Authorization: Bearer <token>; the credential is required, so there is no
-// ungated mode. Once appCtx is cancelled the endpoint accepts nothing more
-// (see New).
-func beatHandler(appCtx context.Context, b Beater, verifier webhttp.StaticTokenVerifier) http.HandlerFunc {
-	record := beatRecorder(appCtx, b)
+// ungated mode. Once the watcher has closed admission the endpoint accepts
+// nothing more and answers 503 (see New).
+func beatHandler(b Beater, verifier webhttp.StaticTokenVerifier) http.HandlerFunc {
+	record := beatRecorder(b)
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Authorize before touching the body: a rejected sender must not
 		// be able to hold the handler open by trickling a payload. The
@@ -578,49 +565,26 @@ func beatHandler(appCtx context.Context, b Beater, verifier webhttp.StaticTokenV
 	}
 }
 
-// beatRecorder builds the recording half of the beat endpoint: the two lifecycle
-// checks around the body drain, watcher admission and the unknown-id 404.
-// beatHandler composes it with the bearer gate, so this constructor holds the
-// request-ordering decisions and beatHandler holds the credential one.
-func beatRecorder(appCtx context.Context, b Beater) http.HandlerFunc {
+// beatRecorder builds the recording half of the beat endpoint: the body drain,
+// watcher admission and the unknown-id 404. beatHandler composes it with the
+// bearer gate, so this constructor holds the request-ordering decisions and
+// beatHandler holds the credential one.
+func beatRecorder(b Beater) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Acceptance is closed for the rest of this process's life: refuse
-		// before the body is touched, so a ping arriving during the drain
-		// cannot hold a handler goroutine (and with it the drain) open by
-		// trickling a payload. A refused request is left undrained exactly
-		// like the 401 one in beatHandler.
-		if appCtx.Err() != nil {
-			writeShuttingDown(w, r)
-			return
-		}
 		// Cap and drain the body (the payload is deliberately ignored) so
 		// keep-alive connections stay reusable; an over-cap sender is reported,
 		// never refused. See drainBeatBody.
 		drainBeatBody(w, r)
 		id := r.PathValue("id")
-		// Re-check on the far side of the body read: the read above can block
-		// for the whole 30s read timeout, so a request ADMITTED while the app
-		// was still live routinely arrives here after cancellation — that is
-		// the window srv.Shutdown keeps open by design, since it waits for
-		// in-flight requests. This check is not atomic with the recording - a
-		// context check never can be, because this goroutine can be
-		// descheduled between the two while watch.Run reports and abandons its
-		// undelivered work - so Beat decides admission under the mutex that
-		// guards the state change (see watch.Watcher.Beat) and its returned
-		// outcome is the authoritative refusal. This check is still not
-		// redundant: watch.Run only closes admission when its ctx.Done arm
-		// runs, so for the whole interval between cancellation and that arm
-		// Beat still admits pings, and this is the only refusal
-		// covering a ping admitted pre-cancel that resumes in it. Do not
-		// delete it as duplicated by the outcome below.
-		if appCtx.Err() != nil {
-			writeShuttingDown(w, r)
-			return
-		}
+		// Beat is the ONE lifecycle check, and it is the authoritative one: it
+		// decides admission under the mutex that guards the state change, so
+		// its outcome cannot be stale by the time the state would be mutated
+		// (see watch.Watcher.Beat). A ping that arrives during the drain
+		// therefore gets its verdict here, on the far side of the body read.
 		switch b.Beat(id) {
 		case watch.BeatClosed:
-			// The watcher closed admission while this handler was in flight:
-			// nothing was recorded, so the sender must not be told 200.
+			// The watcher closed admission: nothing was recorded, so the
+			// sender must not be told 200.
 			writeShuttingDown(w, r)
 		case watch.BeatUnknown:
 			writeUnknownBeat(w, r)
