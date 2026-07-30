@@ -258,10 +258,12 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 	)
 }
 
-// markdownEscaper quotes the characters Discord's markdown consumes. Every
-// entry IS a Discord formatting character, which matters: Discord strips a
-// backslash only in front of one of its own markup characters, so escaping
-// anything else (a "-", a "#") would publish the backslash itself. The
+// markdownEscaper neutralizes the markup Discord's renderer consumes, in two
+// ways. Every ESCAPED entry is a Discord formatting character, which matters:
+// Discord strips a backslash only in front of one of its own markup
+// characters, so escaping anything else (a "-", a "#") would publish the
+// backslash itself. Line breaks are COLLAPSED instead, for that same reason:
+// they enable line-anchored markup a backslash cannot suppress. The
 // masked-link delimiters "[" and "]" are in the set for the same reason as the
 // rest: NODE_NAME is only trimmed and byte-capped, so a name like
 // "a[b](https://example)c" would otherwise be consumed as a link and displayed
@@ -274,9 +276,10 @@ var markdownEscaper = strings.NewReplacer(
 	// removing the break can. NODE_NAME is the one value that can carry one:
 	// config trims surrounding whitespace and caps bytes, so an interior
 	// "\r\n" survives and would render the single-line notice as several.
-	// A space keeps the byte count identical, so MaxNodeNameBytes's
-	// derivation is unchanged. CRLF precedes its halves because
-	// strings.Replacer matches patterns in argument order.
+	// A space is never wider than the break it replaces (identical for a lone
+	// "\r" or "\n", one byte shorter for "\r\n"), so MaxNodeNameBytes's
+	// derivation still bounds the rendered notice. CRLF precedes its halves
+	// because strings.Replacer matches patterns in argument order.
 	"\r\n", " ",
 	"\r", " ",
 	"\n", " ",
@@ -300,7 +303,10 @@ var markdownEscaper = strings.NewReplacer(
 // is to name the beat to act on, so the id has to survive rendering. A
 // backslash is Discord's own escape and is stripped before display, so an id
 // with no markup character (every hyphenated id, and every example in the
-// README) renders exactly as it does today.
+// README) renders exactly as it does today. One class is not preserved but
+// replaced: an interior line break (only NODE_NAME can carry one) becomes a
+// space, because Discord's heading, blockquote and list markup is
+// line-anchored and no escape reaches it.
 func escapeMarkdown(s string) string {
 	return markdownEscaper.Replace(s)
 }

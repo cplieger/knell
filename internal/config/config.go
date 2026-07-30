@@ -570,7 +570,7 @@ func checkBeatToken(token string) error {
 		//
 		// Checked BEFORE the armed-with-an-invisible-value warning below: a
 		// value like "\u00a0\n\u00a0" passes the ASCII-edge refusal and reads
-		// blank to strings.TrimSpace, so warning first would log "the gate is
+		// blank to invisibleInURL, so warning first would log "the gate is
 		// armed" for a configuration this very check then refuses to start.
 		return fmt.Errorf("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it; use a token of at least %d printable characters", minTokenLength)
 	}
@@ -589,9 +589,11 @@ func checkBeatToken(token string) error {
 		return fmt.Errorf("BEAT_TOKEN is shorter than the %d-byte minimum: it is the only gate on /beat/{id}, so a token short enough to guess lets a stranger who can reach this port keep every beat reading fresh while the thing it watches is dead; set a random token of at least %d bytes (e.g. `openssl rand -hex 16`)", minTokenLength, minTokenLength)
 	}
 	if strings.TrimFunc(token, invisibleInURL) == "" {
-		// All whitespace by Unicode rules, yet long enough, free of ASCII edge
-		// padding and legal in a header, so every rune survives the header (a
-		// non-ASCII space): the token IS presentable, so it is kept verbatim and
+		// Invisible end to end by invisibleInURL — all Unicode spaces (NBSP,
+		// U+2000...) and every other unprintable rune (a zero-width space, a
+		// soft hyphen, a BOM) — yet long enough, free of ASCII edge padding and
+		// legal in a header, so every rune survives the header: the token IS
+		// presentable, so it is kept verbatim and
 		// the gate stays armed. Reachable past the length floor because those
 		// runes are multi-byte — eight NBSPs are sixteen bytes — so the floor
 		// does not stand in for this warning. Say so, because nothing else in

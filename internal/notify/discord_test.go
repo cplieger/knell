@@ -1744,7 +1744,9 @@ func TestEscapeMarkdownLeavesEveryOtherCharacterAlone(t *testing.T) {
 	t.Parallel()
 
 	// The other half of escapeMarkdown's contract, the half its doc states and
-	// nothing measures: ONLY Discord's own markup characters are escaped.
+	// nothing measures: ONLY Discord's own markup characters are
+	// backslash-escaped (line breaks are collapsed, not escaped, and sit
+	// below this loop's 0x20 floor).
 	// Discord strips a backslash solely in front of its markup, so an entry
 	// added for anything else publishes the backslash itself and the operator
 	// can no longer copy the value out of the alert. Every mapping that DOES

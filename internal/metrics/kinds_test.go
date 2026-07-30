@@ -79,7 +79,7 @@ func TestEveryRefusalConstantIsPreMinted(t *testing.T) {
 // TestDeclaredKindConstantsSeesTheConversionShape is the oracle for the untyped
 // `Name = Kind("x")` branch. Every kind the committed package declares is
 // explicitly typed, so TestEveryKindConstantIsPreMinted's real-source scan never
-// reaches collectKindConversions: a regression that stops recognizing the
+// reaches collectLabelConversions: a regression that stops recognizing the
 // conversion shape stays green until someone declares a kind that way - the
 // exact day the guard is needed, when the kind would slip through un-minted and
 // the pre-minting test would still pass. The source is synthetic so the real

@@ -572,14 +572,16 @@ func New(beats []Beat, notifier Notifier, now func() time.Time, start time.Time)
 type BeatOutcome uint8
 
 const (
-	// BeatRecorded means the ping was accepted and the beat's state was updated.
-	BeatRecorded BeatOutcome = iota
+	// BeatClosed means shutdown has closed admission for the rest of the
+	// process's life; nothing was recorded. It is deliberately the zero value:
+	// an omitted outcome fails closed, matching the pre-migration zero pair
+	// (false, false) that beatRecorder mapped to the shutdown refusal.
+	BeatClosed BeatOutcome = iota
 	// BeatUnknown means id is not a configured beat; nothing was recorded and no
 	// metric series was minted for the id (it is a label).
 	BeatUnknown
-	// BeatClosed means shutdown has closed admission for the rest of the
-	// process's life; nothing was recorded.
-	BeatClosed
+	// BeatRecorded means the ping was accepted and the beat's state was updated.
+	BeatRecorded
 )
 
 // Beat records a ping for id and reports which of the three outcomes it was:

@@ -737,6 +737,30 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	}
 }
 
+// TestClassifyAbandonedWatchLoopDeniesACleanExitOverAnAbandonedLoop pins run's
+// exit contract for the teardown verdict: an error already in hand names the
+// earlier failure and wins, a loop that stopped keeps the stop clean, and a nil
+// serve error over an unstopped loop must NOT read as a clean stop -- that exit 0
+// would sit on top of the still-running WARN and vouch for notices the loop was
+// still holding.
+func TestClassifyAbandonedWatchLoopDeniesACleanExitOverAnAbandonedLoop(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("serve failed")
+	if got := classifyAbandonedWatchLoop(sentinel, false); !errors.Is(got, sentinel) {
+		t.Errorf("error in hand = %v, want the sentinel to win: it names an earlier failure of the same sequence", got)
+	}
+	if got := classifyAbandonedWatchLoop(nil, true); got != nil {
+		t.Errorf("clean stop = %v, want nil: a stopped loop must not fail the exit", got)
+	}
+	got := classifyAbandonedWatchLoop(nil, false)
+	if got == nil {
+		t.Fatal("nil over an unstopped loop, want an error: exit 0 would claim a clean stop over abandoned notices")
+	}
+	if !strings.Contains(got.Error(), shutdownGrace.String()) {
+		t.Errorf("abandonment error %q does not name the grace constant an operator would raise", got)
+	}
+}
+
 // TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog pins the
 // two server wirings nothing else in the suite can see. Both are silent when
 // dropped: without WithReadTimeout/WithWriteTimeout a trickled body or a client

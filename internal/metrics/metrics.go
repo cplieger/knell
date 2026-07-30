@@ -55,8 +55,8 @@
 // none of its own to get wrong.
 //
 // RecordPreRouteRefusal is reached from internal/webapi too, and its label is
-// narrowed by its argument TYPE rather than by a documented contract on the
-// caller: Refusal is not string, so no request-derived value reaches the label
+// narrowed by its argument TYPE and closed by the caller contract below:
+// Refusal is not string, so no request-derived value reaches the label
 // without an explicit Refusal(...) conversion written at the call site. The set
 // is still not closed to the compiler — that conversion, and any untyped
 // literal, remain legal — so the rule is the same as Kind's: pass one of the
@@ -117,10 +117,10 @@ var notificationKindsText = joinLabelValues(notificationKinds)
 
 // Refusal distinguishes pre-route refusal reason values from runtime strings,
 // the same way Kind does for the notification counters. The label it feeds is
-// bounded by CONSTRUCTION rather than by a caller contract: the only values
-// preRouteRefusals can carry are the constants below, so nothing off a request
-// can reach it. It is not a closed set to the compiler — untyped literals
-// remain assignable — so callers must use the constants and keep
+// NARROWED by this type, not closed by it: no plain string reaches the label
+// without an explicit Refusal(...) conversion written at the call site, and
+// that conversion stays legal. It is not a closed set to the compiler — untyped
+// literals remain assignable — so callers must use the constants and keep
 // refusalReasons in sync.
 type Refusal string
 
@@ -352,8 +352,9 @@ var notificationsDropped = metricslib.NewLabeledCounter(
 // This counter explains such a notice; alerting on it too would page twice for
 // one condition.
 //
-// The reason label is bounded by construction (see the Refusal type), which is
-// the whole difference from the marker this counter replaced: that one was a
+// The reason label is narrowed by the Refusal type and kept closed by its
+// callers (see that type), which is the whole difference from the marker this
+// counter replaced: that one was a
 // server-assigned value on the request counter's path label, written by
 // assigning r.Pattern — a field webhttp documents as mux-populated — so the
 // class could have stopped being counted silently on a library change, and the
@@ -507,8 +508,9 @@ func RecordHTTP(method, path string, status int, d time.Duration) {
 }
 
 // RecordPreRouteRefusal counts one request refused before the mux routed it,
-// under the reason knell refused it. The label is bounded by the Refusal type,
-// so no request-derived value can reach it (see the package doc). Its callers
+// under the reason knell refused it. The label is narrowed by the Refusal type
+// and no caller converts a request-derived value into it (see the package doc).
+// Its callers
 // are internal/webapi's pre-route guards: the non-canonical /beat path 404, the
 // ALLOWED_HOSTS 403 and the failed-auth throttle's 429, all of which collapse
 // onto http_requests_total's "unmatched" path label and are otherwise

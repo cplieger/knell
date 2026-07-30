@@ -72,6 +72,31 @@ func TestBeatFreshGaugeTracksOverdueAndRecovery(t *testing.T) {
 	}
 }
 
+func TestBeatFreshGaugeAtConstructionMeasuresTheBootSilence(t *testing.T) {
+	t.Parallel()
+
+	// New publishes each beat's first freshness reading, and it must MEASURE
+	// now()-start rather than assume 0: main captures start at process entry,
+	// ahead of the marker probe and the mounted-secret reads, so wiring can
+	// reach New after a short deadline has already passed. A gauge that reports
+	// fresh in that window feeds a false vote into the quorum sum
+	// knell_beat_fresh exists to carry, and stays wrong until the first
+	// refreshFreshness one tick after Run starts. Every other construction in
+	// this package passes start == now, where a measured reading and a
+	// hardcoded 0 are indistinguishable.
+	//
+	// Unique beat id: the metric registry is package-global, so a label value
+	// no other test uses keeps this test's series isolated under t.Parallel.
+	const id = "boot-silence-gauge-probe"
+	clock := newFakeClock()
+	start := clock.Now().Add(-11 * time.Minute)
+	New([]Beat{{ID: id, Deadline: 10 * time.Minute}}, &fakeNotifier{}, clock.Now, start)
+
+	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "0" {
+		t.Errorf("beat_fresh at construction = %s, want 0: 11m of process life had already passed with no ping", got)
+	}
+}
+
 func TestCanceledNotificationsAreNotCountedAsFailed(t *testing.T) {
 	// Serial (no t.Parallel): it asserts deltas on the package-global
 	// failure counters, which the parallel tests also increment.

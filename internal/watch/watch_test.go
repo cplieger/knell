@@ -261,6 +261,14 @@ func TestBeatAfterAdmissionClosedRecordsNothing(t *testing.T) {
 	w.stopAccepting()
 	clock.Advance(time.Minute)
 
+	// The zero BeatOutcome must be the refusal, not the success: a Beater
+	// implementation that returns an unset outcome then fails closed, the way
+	// the pre-migration zero pair (false, false) did.
+	var unset BeatOutcome
+	if unset != BeatClosed {
+		t.Errorf("zero BeatOutcome = %v, want BeatClosed: an omitted outcome must not read as a recorded ping", unset)
+	}
+
 	if got := w.Beat(id); got != BeatClosed {
 		t.Fatalf("Beat after stopAccepting = %v, want BeatClosed", got)
 	}

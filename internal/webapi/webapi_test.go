@@ -2209,7 +2209,13 @@ func TestThrottledAuthFailureWritesNoAccessLine(t *testing.T) {
 // otherwise a caller who appends %2F to the id has an unbounded oracle and an
 // unbounded log flood, and every existing throttle test stays green.
 func TestFailedAuthDrawsATokenForEverySpellingTheGateAnswers(t *testing.T) {
-	for _, target := range []string{"/beat/api", "/beat/%61pi", "/beat/a%2Fb", "/beat/ghost%2F"} {
+	// The two families the mux reaches by different rules: an escaped character
+	// inside the {id} segment (matched on the ESCAPED path) and an escaped
+	// character in the LITERAL segment (matched after unescaping it).
+	for _, target := range []string{
+		"/beat/api", "/beat/%61pi", "/beat/a%2Fb", "/beat/ghost%2F",
+		"/%62eat/api", "/%62eat/%61pi",
+	} {
 		t.Run(target, func(t *testing.T) {
 			b := &fakeBeater{known: map[string]bool{"api": true}}
 			h := newTestHandler(b, testBeatToken)

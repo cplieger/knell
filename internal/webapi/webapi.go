@@ -445,12 +445,22 @@ func beatEndpointRequest(r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	// EscapedPath, not Path: ServeMux matches patterns against the ESCAPED
-	// path, so an encoded slash (%2F) stays inside the {id} segment and still
-	// routes to POST /beat/{id}, where the gate answers 401. The DECODED path
-	// reads as a deeper path instead, which would exempt exactly that request
-	// from the throttle the gate depends on.
-	id, found := strings.CutPrefix(r.URL.EscapedPath(), "/beat/")
+	// BOTH spellings, because neither alone covers the class the gate answers:
+	// ServeMux matches patterns against the ESCAPED path, so an encoded slash
+	// (/beat/a%2Fb) stays inside the {id} segment and routes to POST
+	// /beat/{id}, while it also unescapes each request segment before comparing
+	// it to a literal one, so an escaped letter in the literal segment
+	// (/%62eat/api) routes there too. Reading only one of the two exempts the
+	// other from the throttle the gate depends on. Over-inclusion is harmless
+	// (a spelling the mux 404s draws a token it would otherwise not), while
+	// under-inclusion is an unbounded guessing oracle and log flood.
+	return singleSegmentUnderBeat(r.URL.EscapedPath()) || singleSegmentUnderBeat(r.URL.Path)
+}
+
+// singleSegmentUnderBeat reports whether p is exactly one non-empty segment
+// under /beat/, the shape the POST /beat/{id} route matches.
+func singleSegmentUnderBeat(p string) bool {
+	id, found := strings.CutPrefix(p, "/beat/")
 	return found && id != "" && !strings.Contains(id, "/")
 }
 
@@ -489,8 +499,9 @@ func beatAuthFailureLimiter(verifier webhttp.StaticTokenVerifier) webhttp.Middle
 	// No WithRateLimitWhen: the wrapper below hands the limiter ONLY
 	// predicate-matching requests, so the bucket already sees exactly the
 	// failed-auth class and a second copy of the predicate could only
-	// disagree with the first. One evaluation per request, so one token
-	// digest per attempt rather than two.
+	// disagree with the first. One predicate evaluation here rather than two,
+	// so a failed attempt costs two token digests (this wrapper's and
+	// beatHandler's own gate) instead of three.
 	limit := webhttp.RateLimiter(authFailBurst, authFailRefill,
 		webhttp.WithRateLimitError("too_many_auth_failures",
 			"too many failed beat token attempts"),

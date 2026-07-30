@@ -19,10 +19,6 @@ services:
       NODE_NAME: "server-1"  # names this observer in notifications
 
     ports:
-      # published to every host interface: a ping needs BEAT_TOKEN, but /healthz
-      # and /metrics stay open, and /metrics enumerates every beat. A trusted
-      # network is not enough on its own: a browser inside it can reach knell
-      # under a hostname an attacker controls (DNS rebinding). Set ALLOWED_HOSTS
-      # to the hostnames your senders, probes and scraper use, and front it with
-      # TLS -- see README "Configuration reference".
+      # /metrics is unauthenticated and enumerates beats; set ALLOWED_HOSTS
+      # and restrict exposure -- see README "Security".
       - "9190:9190"

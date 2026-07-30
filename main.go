@@ -36,23 +36,6 @@ import (
 // to finish and exit under its own power.
 const shutdownGrace = 8 * time.Second
 
-// maxHeaderBytes bounds the request line plus headers of every request,
-// tightening net/http's 1 MiB default (which webhttp.NewServer restates and
-// deliberately leaves to the app to choose). knell's largest legitimate
-// request is POST /beat/<id> with an id capped at 64 bytes plus Host,
-// Authorization, Content-Type, Content-Length and a User-Agent -- under 1 KiB
-// even behind a proxy adding X-Forwarded-* -- so 16 KiB is ~16x headroom for
-// every documented sender while cutting the pre-auth memory a single
-// connection can make knell hold by 64x. The bound matters because it is
-// charged BEFORE any gate: the failed-auth throttle, the ALLOWED_HOSTS policy
-// and the beat token all run after net/http has read the headers, so on a
-// memory-limited deployment (the hardened profile in the README provisions
-// knell small) a handful of connections sending maximal headers can OOM the
-// process -- and every restart re-arms all boot-armed deadlines, which is the
-// one failure that silences the missing notice instead of raising it (see the
-// README's KnellRestartChurn rule). Over-limit requests get net/http's 431.
-const maxHeaderBytes = 16 << 10
-
 // requestTimeout bounds a whole request, read and write alike. No route
 // streams, so both bounds are safe: the read bound stops a slow-trickled
 // body from holding a handler goroutine forever (the 1 MiB drain cap bounds
@@ -237,7 +220,6 @@ func newServer(handler http.Handler) *http.Server {
 	return webhttp.NewServer(handler,
 		webhttp.WithReadTimeout(requestTimeout),
 		webhttp.WithWriteTimeout(requestTimeout),
-		webhttp.WithMaxHeaderBytes(maxHeaderBytes),
 		// Connection-level errors net/http reports itself -- above all
 		// "http: Accept error: ...; retrying", the trace of an exhausted fd
 		// budget that stops every beat from being received -- default to the
@@ -344,10 +326,11 @@ func beginTeardown(marker *health.Marker, msg string) {
 // process will never send.
 //
 // webhttp.AwaitDone, not a two-case select: teardownCtx carries the SAME
-// deadline srv.Shutdown just spent, so it is routinely already expired, and a
-// select with both cases ready would report a stopped loop as hung about half
-// the time. AwaitDone rechecks completion after ctx fires; the logging policy
-// (what, at which level, naming which constant) stays here.
+// deadline srv.Shutdown just spent, so a drain that used the whole grace hands
+// this function an already-expired context, and a select with both cases ready
+// would report a stopped loop as hung about half the time. AwaitDone rechecks
+// completion after ctx fires; the logging policy (what, at which level, naming
+// which constant) stays here.
 func awaitWatchLoop(teardownCtx context.Context, watcherDone <-chan struct{}) bool {
 	start := time.Now()
 	if webhttp.AwaitDone(teardownCtx, watcherDone) {
