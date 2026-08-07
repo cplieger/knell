@@ -37,6 +37,17 @@ func TestSecretFileErrorNamesEveryFailureClass(t *testing.T) {
 		err      error
 		wantText string
 	}{
+		// The class an operator actually meets: envx refuses a path that is not
+		// already clean or that contains "..", and the credential pasted into
+		// the file variable instead of a path to it lands here (an "https://"
+		// doubles a separator, so it never survives the clean check). Folding it
+		// into the catch-all sends that operator off to check a mount instead of
+		// telling them to unset the _FILE variable, and no other assertion in
+		// this package reads the message for this class.
+		"a path envx refuses": {
+			err:      fmt.Errorf("%w: %s", envx.ErrSecretFilePathRejected, canary),
+			wantText: "does not name a usable path",
+		},
 		"already over the size limit": {
 			err:      fmt.Errorf("%w (1048577 bytes): %s", envx.ErrSecretFileTooLarge, canary),
 			wantText: "larger than the 1 MiB secret-file limit",

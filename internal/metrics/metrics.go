@@ -184,9 +184,7 @@ func mintNotificationKinds() {
 // reason, for exactly the reason mintNotificationKinds exists: a counter series
 // born at a nonzero value has no earlier sample for increase() to diff against,
 // so the very first refusal of a reason would be invisible to any windowed
-// query over it. That flaw is what retired this counter's predecessor — a
-// request-counter path label minted on its first use — so the pre-minting is
-// the whole point of the shape rather than a nicety. Called from init() below,
+// query over it. Called from init() below,
 // after the registrations, so the guarantee holds on every path that serves
 // /metrics.
 func mintRefusalReasons() {
@@ -338,9 +336,11 @@ var notificationsDropped = metricslib.NewLabeledCounter(
 )
 
 // preRouteRefusals counts requests knell refuses BEFORE the mux routes, by
-// the reason knell refused them. Every such refusal is invisible to
-// httpRequests' path label — nothing has populated the matched pattern yet, so
-// they all share the "unmatched" bucket with scanner traffic — and each one
+// the reason knell refused them. None of them is nameable on httpRequests:
+// the /beat-path 404 and the ALLOWED_HOSTS 403 are answered with no matched
+// pattern, so they share its "unmatched" bucket with scanner traffic, while the
+// failed-auth 429 is answered OUTSIDE webhttp.Logging and so reaches that
+// counter not at all. Each one
 // means something an operator investigating a missing beat wants named: a sender
 // pinging a malformed URL, a Host the deployment did not list (or a rebinding
 // attempt), and failed authentication arriving faster than the throttle's
@@ -353,12 +353,8 @@ var notificationsDropped = metricslib.NewLabeledCounter(
 // one condition.
 //
 // The reason label is narrowed by the Refusal type and kept closed by its
-// callers (see that type), which is the whole difference from the marker this
-// counter replaced: that one was a
-// server-assigned value on the request counter's path label, written by
-// assigning r.Pattern — a field webhttp documents as mux-populated — so the
-// class could have stopped being counted silently on a library change, and the
-// series was born on its first refusal where increase() can never see it.
+// callers (see that type), so no request-derived value can widen it and no
+// library change can silently stop the class being counted.
 var preRouteRefusals = metricslib.NewLabeledCounter(
 	"pre_route_refusals_total",
 	"Requests refused before the mux routes, by reason ("+refusalReasonsText+"); a diagnostic for a missing beat, not an alert source.",
@@ -375,8 +371,10 @@ var preRouteRefusals = metricslib.NewLabeledCounter(
 // pair webhttp derives from the matched route and a closed method set rather
 // than anything off the request line (see the package doc's RecordHTTP
 // contract). A refusal answered BEFORE the mux routes has no matched pattern,
-// so it lands in the "unmatched" bucket here beside scanner traffic; its cause
-// is named on preRouteRefusals instead.
+// so it lands in the "unmatched" bucket here beside scanner traffic — except
+// the failed-auth 429, which is answered outside webhttp.Logging and is absent
+// from this counter entirely. Every pre-route cause is named on
+// preRouteRefusals instead.
 var httpRequests = metricslib.NewLabeledCounter(
 	"http_requests_total",
 	"Served HTTP requests by matched route template, method and status. Series are not pre-minted, so a status series is born with its first request and increase() cannot see that first event; alert on the absolute value (status=401 > 0), which latches until restart.",
@@ -510,11 +508,11 @@ func RecordHTTP(method, path string, status int, d time.Duration) {
 // RecordPreRouteRefusal counts one request refused before the mux routed it,
 // under the reason knell refused it. The label is narrowed by the Refusal type
 // and no caller converts a request-derived value into it (see the package doc).
-// Its callers
-// are internal/webapi's pre-route guards: the non-canonical /beat path 404, the
-// ALLOWED_HOSTS 403 and the failed-auth throttle's 429, all of which collapse
-// onto http_requests_total's "unmatched" path label and are otherwise
-// indistinguishable from scanner traffic. Read it while investigating a missing
+// Its callers are internal/webapi's pre-route guards: the non-canonical /beat
+// path 404 and the ALLOWED_HOSTS 403, which collapse onto
+// http_requests_total's "unmatched" path label beside scanner traffic, and the
+// failed-auth throttle's 429, which is answered outside webhttp.Logging and is
+// therefore on no other series at all. Read it while investigating a missing
 // beat; it is deliberately not an alert source (see preRouteRefusals).
 func RecordPreRouteRefusal(reason Refusal) {
 	preRouteRefusals.Inc(string(reason))

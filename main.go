@@ -361,7 +361,13 @@ func awaitWatchLoop(teardownCtx context.Context, watcherDone <-chan struct{}) bo
 	// constant to raise — the same reason classifyServeError names it.
 	slog.Warn("watch loop still running at the end of the shutdown grace",
 		"waited", time.Since(start).Truncate(time.Millisecond).String(),
-		"grace", shutdownGrace.String())
+		"grace", shutdownGrace.String(),
+		// Every notification-loss line in internal/watch carries this field so
+		// a log rule can key on consequence instead of level. This WARN is the
+		// only trace of the notices an abandoned loop still held -- it never
+		// reached its ctx.Done arm, so logUndelivered's per-beat tally never
+		// ran -- and nothing will retry them, so it belongs on the same channel.
+		"retryable", false)
 	return false
 }
 

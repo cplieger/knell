@@ -8,13 +8,13 @@ services:
     environment:
       BEATS: "cron-backup:26h,pipeline-watchdog:20m"  # id:deadline list, see README
       # the URL path IS the credential: DISCORD_WEBHOOK_URL_FILE reads it from a
-      # mounted secret file instead of embedding it here (see README).
-      DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/..."  # https only
-      # required, and the only gate on /beat/{id}: senders present it as
-      # "Authorization: Bearer <token>". This placeholder is deliberately too
-      # short to start with, so an un-replaced paste fails at boot instead of
-      # gating the endpoint with a token published in this file: replace it with
-      # `openssl rand -hex 16`. BEAT_TOKEN_FILE reads it from a file instead.
+      # mounted secret file instead of embedding it here (see README). This
+      # placeholder carries no webhook path on purpose, so an un-replaced paste
+      # fails at boot instead of booting a switch that can never ring: replace it
+      # with the full URL Discord gives you (/api/webhooks/{id}/{token}).
+      DISCORD_WEBHOOK_URL: "https://discord.com/"  # https only
+      # the only gate on /beat/{id}, and deliberately too short to boot, so an
+      # un-replaced paste fails fast: `openssl rand -hex 16`. See README.
       BEAT_TOKEN: "CHANGEME"
       NODE_NAME: "server-1"  # names this observer in notifications
 

@@ -346,15 +346,14 @@ func (st *beatState) pushMissing(rec *overdueBeat) bool {
 }
 
 // popMissing removes and returns the head, promoting the next queued
-// transition. It returns the zero record on an empty queue: only the single
-// sender pops, and only for a head collectDue handed it, so an empty pop
-// cannot happen and the zero record degrades to the pre-queue behavior.
+// transition. The queue must be non-empty: only the single sender pops, and
+// only for a head collectDue handed it, so an empty pop is a caller bug and
+// panics rather than degrading. Degrading is the worse failure here — a zero
+// record carries no recovery point, so markDelivered would read it as an
+// outage still open and mark the beat alerted with nothing queued, silently
+// retiring the switch for that beat.
 func (st *beatState) popMissing() overdueBeat {
-	head := st.headMissing()
-	if head == nil {
-		return overdueBeat{}
-	}
-	rec := *head
+	rec := st.pendingMissing[0]
 	st.pendingMissing = st.pendingMissing[1:]
 	return rec
 }
@@ -362,9 +361,10 @@ func (st *beatState) popMissing() overdueBeat {
 // dropMissing removes the first n queued records: the run of already-ended
 // outages a delivered history notice covered. Only the single sender pops,
 // and it drops exactly the count it collected from the head, so n can never
-// exceed the queue length; the clamp keeps a future caller in range.
+// exceed the queue length; a larger n is a caller bug and panics rather than
+// silently discarding records the delivered notice never covered.
 func (st *beatState) dropMissing(n int) {
-	st.pendingMissing = st.pendingMissing[min(n, len(st.pendingMissing)):]
+	st.pendingMissing = st.pendingMissing[n:]
 }
 
 // blameDelivery sets the late reason of the first n queued records to
@@ -378,9 +378,10 @@ func (st *beatState) dropMissing(n int) {
 // The write only ever goes toward blaming delivery, never back: that is the
 // direction the zero value already points (see LateUndelivered), so the reason
 // can only get safer, and a record whose reason is already LateUndelivered is
-// unchanged. The same clamp as dropMissing keeps a future caller in range.
+// unchanged. n can never exceed the queue length, for the reason dropMissing
+// gives, so a larger n is a caller bug and panics.
 func (st *beatState) blameDelivery(n int) {
-	for i := range min(n, len(st.pendingMissing)) {
+	for i := range n {
 		st.pendingMissing[i].late = LateUndelivered
 	}
 }
@@ -438,16 +439,27 @@ func (st *beatState) queueDetectedOutage(rec *overdueBeat) bool {
 // loses it for good, so it counts a dropped outage RECORD and warns. The record,
 // not a message: nothing was ever built or attempted for it, and a history
 // message can cover several records, so the per-record counter is the honest
-// unit (metrics.RecordOutageRecordDropped). The warning is ungated: it is
-// reachable at most once per outage (only a ping brings a
-// closed record, and the same ping re-arms the beat), so gating it would hide
-// the loss in exactly the sequence that produces it. Contrast
-// recordOngoingOutage. Callers hold w.mu.
-func (st *beatState) recordEndedOutage(rec *overdueBeat) {
+// unit (metrics.RecordOutageRecordDropped). It reports whether the record was
+// dropped so the CALLER can announce it (logEndedOutageDropped) after releasing
+// w.mu; the announcement is ungated because it is reachable at most once per
+// outage (only a ping brings a closed record, and the same ping re-arms the
+// beat), so gating it would hide the loss in exactly the sequence that produces
+// it. Contrast recordOngoingOutage. Callers hold w.mu for this function; the
+// logging is theirs to do outside it.
+func (st *beatState) recordEndedOutage(rec *overdueBeat) bool {
 	if st.queueDetectedOutage(rec) {
-		return
+		return false
 	}
 	metrics.RecordOutageRecordDropped(rec.id)
+	return true
+}
+
+// logEndedOutageDropped announces a dropped ended-outage record. Beat emits it
+// AFTER w.mu is released, like the recovery-queue-full warning beside it: slogx
+// installs a synchronous stderr handler, so a stalled container log driver would
+// otherwise block ping admission, the freshness-gauge refresh and the pre-drain
+// StopAccepting for as long as the write blocks.
+func logEndedOutageDropped(rec *overdueBeat) {
 	// The two instants go in as time.Time values, not RFC3339 strings: slog
 	// stores a time.Time as a typed Time attr (slog.AnyValue special-cases it),
 	// so the UTC pin holds, sub-second precision survives, and a future JSON
@@ -466,21 +478,29 @@ func (st *beatState) recordEndedOutage(rec *overdueBeat) {
 // in progress: a full queue costs nothing but a deferral, since the outage
 // stays detected (openMissing stays nil) and the next sweep with a free slot
 // records and delivers it. Nothing was dropped, so no delivery counter and no
-// dropped-record counter moves, and the back-pressure is logged at DEBUG once
-// per affected outage via
-// overflowAccounted rather than once per tick. Contrast recordEndedOutage.
-// Callers hold w.mu.
-func (st *beatState) recordOngoingOutage(rec *overdueBeat) {
+// dropped-record counter moves, and the back-pressure is announced at DEBUG once
+// per affected outage via overflowAccounted rather than once per tick — this
+// function reports whether that announcement is owed, and the CALLER emits it
+// (logOngoingOutageDeferred) outside w.mu. Contrast recordEndedOutage.
+// Callers hold w.mu for this function; the logging is theirs to do outside it.
+func (st *beatState) recordOngoingOutage(rec *overdueBeat) bool {
 	if st.queueDetectedOutage(rec) {
-		return
+		return false
 	}
 	if st.overflowAccounted {
 		// The same ongoing outage a previous sweep already reported: logging
 		// it every tick would spam one affected outage as dozens.
-		return
+		return false
 	}
 	st.overflowAccounted = true
-	// A time.Time value, for the reason recordEndedOutage's log gives.
+	return true
+}
+
+// logOngoingOutageDeferred announces the back-pressure of a full queue, emitted
+// by collectDue outside w.mu for the reason logEndedOutageDropped gives. Debug,
+// not Warn: nothing was lost.
+func logOngoingOutageDeferred(rec *overdueBeat) {
+	// A time.Time value, for the reason logEndedOutageDropped's log gives.
 	slog.Debug("pending missing queue full, ongoing outage stays detected and is queued once a slot frees",
 		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.DownFor().String(),
 		"since", rec.silence.Started.UTC())
@@ -576,8 +596,7 @@ type BeatOutcome uint8
 const (
 	// BeatClosed means shutdown has closed admission for the rest of the
 	// process's life; nothing was recorded. It is deliberately the zero value:
-	// an omitted outcome fails closed, matching the pre-migration zero pair
-	// (false, false) that beatRecorder mapped to the shutdown refusal.
+	// an omitted outcome fails closed.
 	BeatClosed BeatOutcome = iota
 	// BeatUnknown means id is not a configured beat; nothing was recorded and no
 	// metric series was minted for the id (it is a label).
@@ -635,15 +654,19 @@ func (w *Watcher) Beat(id string) BeatOutcome {
 	// delivered), while recording a closed outage names the reason from what
 	// the sweep managed to see of it (lateReasonForUnqueuedOutage). Read
 	// overflowAccounted before the reset below clears it.
+	var droppedEnded *overdueBeat
 	if open := st.openMissing(); open != nil {
 		open.recoveredAt = now
 	} else if !wasAlerted && overdue(silence.DownFor(), st.deadline) {
-		st.recordEndedOutage(&overdueBeat{
+		ended := overdueBeat{
 			id:          id,
 			silence:     silence,
 			recoveredAt: now,
 			late:        st.lateReasonForUnqueuedOutage(),
-		})
+		}
+		if st.recordEndedOutage(&ended) {
+			droppedEnded = &ended
+		}
 	}
 	// This ping ends the beat's outage, so a later queue-full overflow
 	// belongs to the NEXT outage and is accounted on its own.
@@ -678,6 +701,9 @@ func (w *Watcher) Beat(id string) BeatOutcome {
 	}
 	w.mu.Unlock()
 
+	if droppedEnded != nil {
+		logEndedOutageDropped(droppedEnded)
+	}
 	if recoveryDropped {
 		// Reported outside the lock: neither the counter nor the log line is
 		// part of the state transition. Nothing retries a dropped recovery
@@ -975,8 +1001,8 @@ func (w *Watcher) sweep(ctx context.Context) {
 // record is still there for the next sweep, which is why a cut can never
 // swallow an outage. The one thing a cut does rewrite is the late reason of the
 // records behind a deferred HISTORY notice, upgraded to LateUndelivered
-// (blameDeferredHistory), because this budget only bites when delivery is slow
-// and a past-tense notice must not vouch for a webhook that is behind. DEBUG
+// (blameDeferredHistory), because a past-tense notice must never vouch for
+// delivery it cannot defend, and a deferral means no attempt was made. DEBUG
 // matches recordOngoingOutage:
 // like a full pending queue during a webhook outage, this is back-pressure
 // that costs a tick, not a fault.
@@ -984,10 +1010,13 @@ func (w *Watcher) sweep(ctx context.Context) {
 // A deferral is also a third way a notice becomes late: if the beat pings
 // before the next sweep reaches it, its queued open record is sealed and the
 // outage is reported as history. That record was queued by collectDue, so it
-// reports LateUndelivered, which is the true reason — the alert that was due
-// was not delivered before the beat returned — and pointing at the webhook
-// fits: this budget only bites when sends are slow enough to spend 5s, which a
-// healthy webhook never is (TestFastSendsDeliverEveryDueBeatInOneSweep).
+// reports LateUndelivered: the alert that was due was not delivered before the
+// beat returned, whatever held it back. Note the budget is NOT evidence that
+// the webhook was slow — 5s across the 64-beat cap (internal/config maxBeats)
+// is 78ms per notification, under a normal HTTPS round trip, so a full-fleet
+// storm can spend it against a healthy webhook. LateUndelivered is the
+// fail-safe reason (it is the zero value for exactly this reason), not a
+// diagnosis.
 func (w *Watcher) budgetSpent(budget time.Time, deferred int) bool {
 	if !w.now().After(budget) {
 		return false
@@ -1014,11 +1043,14 @@ type beatOutages struct {
 // earlier notices are still queued; only beats mid-recovery are held back,
 // keeping transitions chronological.
 func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
+	var deferredOverflow []overdueBeat
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	now := w.now()
 	for id, st := range w.beats {
-		due, run := collectBeatDue(id, st, now)
+		due, run, overflow := collectBeatDue(id, st, now)
+		if overflow != nil {
+			deferredOverflow = append(deferredOverflow, *overflow)
+		}
 		if len(run) > 0 {
 			history = append(history, beatOutages{id: id, outages: run})
 			continue
@@ -1026,6 +1058,12 @@ func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
 		if due != nil {
 			live = append(live, *due)
 		}
+	}
+	w.mu.Unlock()
+	// Emitted outside the lock: a synchronous stderr write must not hold the
+	// mutex Beat, refreshFreshness and StopAccepting all take.
+	for i := range deferredOverflow {
+		logOngoingOutageDeferred(&deferredOverflow[i])
 	}
 	return live, history
 }
@@ -1036,7 +1074,10 @@ func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
 // missing notice, a run of ended outages to collapse into one history notice,
 // or neither. The caller holds w.mu; the returned record is a COPY, so no
 // pointer into pendingMissing escapes the critical section.
-func collectBeatDue(id string, st *beatState, now time.Time) (*overdueBeat, []Outage) {
+//
+// The third result is a record whose overflow the CALLER must log, outside
+// w.mu (see logOngoingOutageDeferred); nil when there is nothing to say.
+func collectBeatDue(id string, st *beatState, now time.Time) (live *overdueBeat, history []Outage, deferredOverflow *overdueBeat) {
 	// This sweep's reading of the beat's silence, as the two instants that
 	// bound it: the last accepted ping and this sweep. The freshness gauge,
 	// a queued record and the live notice all read their span from it.
@@ -1053,15 +1094,18 @@ func collectBeatDue(id string, st *beatState, now time.Time) (*overdueBeat, []Ou
 	// earlier recovery, or sweepSendBudget deferred it to a later sweep.
 	// All three are one fact — the alert that was due had not been
 	// delivered — so the reason is LateUndelivered for every one of them,
-	// stated here rather than left to the zero value.
+	// stated here rather than left to the zero value. It is the fail-safe
+	// reason, not a claim about the webhook: a budget cut can defer a notice
+	// while delivery is perfectly healthy.
 	if !fresh && !st.alerted && st.openMissing() == nil {
-		st.recordOngoingOutage(&overdueBeat{
-			id: id, silence: silence, late: LateUndelivered,
-		})
+		pending := overdueBeat{id: id, silence: silence, late: LateUndelivered}
+		if st.recordOngoingOutage(&pending) {
+			deferredOverflow = &pending
+		}
 	}
 	head := st.headMissing()
 	if head == nil {
-		return nil, nil
+		return nil, nil, deferredOverflow
 	}
 	// Only the still-open current outage refreshes its silence, so a
 	// retry reports how long the beat has been quiet: its observation
@@ -1070,29 +1114,26 @@ func collectBeatDue(id string, st *beatState, now time.Time) (*overdueBeat, []Ou
 	// the observation taken when the outage was detected; a history notice
 	// reports the outage's full span (Outage.DownFor) instead, so the
 	// frozen reading is only supplementary detail.
-	// The lastSeen match is a defensive second guard, the twin of
-	// markDelivered's: an open head is always the tail (openMissing), and
-	// a ping seals the open tail in the same critical section that moves
-	// lastSeen, so today it cannot disagree with recoveredAt. Keep it, so
-	// a record whose start no longer matches lastSeen can never have a
-	// later beat's observation written over its own reading.
-	if head.recoveredAt.IsZero() && head.silence.Started.Equal(st.lastSeen) {
+	// An unsealed head is the still-open outage: Beat seals the open tail in
+	// the same critical section that advances lastSeen, so a zero recoveredAt
+	// means the record's Started anchor is still the beat's lastSeen.
+	if head.recoveredAt.IsZero() {
 		head.silence.Observed = now
 	}
 	// Held while an earlier recovery is queued or in flight, so
 	// transitions reach Discord in chronological order.
 	if st.recovering {
-		return nil, nil
+		return nil, nil, deferredOverflow
 	}
 	// An ended head is history: collapse its whole run into one notice.
 	// An open head is a live incident and keeps the present-tense path.
 	if run := st.closedRun(); len(run) > 0 {
-		return nil, run
+		return nil, run, deferredOverflow
 	}
 	// Copy the record before it leaves the critical section, so the sweep
 	// never holds a pointer into pendingMissing.
 	due := *head
-	return &due, nil
+	return &due, nil, deferredOverflow
 }
 
 // sendMissing delivers one due missing transition and reports whether
@@ -1182,11 +1223,13 @@ func (w *Watcher) markHistoryUndelivered(id string, n int) {
 }
 
 // blameDeferredHistory blames delivery for the records of every history notice
-// this sweep's send budget cut deferred (see beatState.blameDelivery). The
-// budget only bites once sends are slow enough to spend 5s, so a notice it
-// defers IS late because delivery is behind: a record still claiming
-// LateEndedBeforeDetection would tell the operator "nothing was wrong with
-// delivery" about a notice a struggling webhook pushed to a later sweep. Each
+// this sweep's send budget cut deferred (see beatState.blameDelivery). A
+// deferred notice was never attempted, so it cannot vouch for delivery: a
+// record still claiming LateEndedBeforeDetection would tell the operator
+// "nothing was wrong with delivery" about a notice nothing tried to send. The
+// cut is not proof the webhook is slow — a full-fleet storm can spend the 5s
+// budget against a healthy one — which is why the upgrade is fail-safe rather
+// than diagnostic. Each
 // entry's outage count is exactly the run collectDue took from that beat's
 // head, for the reason dropDelivered gives.
 //
@@ -1216,19 +1259,15 @@ func (w *Watcher) markDelivered(id string, started time.Time) (recoveryEvent, bo
 	defer w.mu.Unlock()
 	st := w.beats[id]
 	delivered := st.popMissing()
-	if delivered.recoveredAt.IsZero() && st.lastSeen.Equal(started) {
+	if delivered.recoveredAt.IsZero() {
 		st.alerted = true
 		return recoveryEvent{}, false
 	}
 	st.recovering = true
-	// The sealed record is the authoritative recovery point (the FIRST ping
-	// after the outage); st.lastSeen is only a defensive fallback for a
-	// popped record that carries none, since a ping that moves lastSeen
-	// seals the open head in the same critical section.
-	recoveredAt := st.lastSeen
-	if !delivered.recoveredAt.IsZero() {
-		recoveredAt = delivered.recoveredAt
-	}
+	// The sealed record carries the authoritative recovery point: the FIRST
+	// ping after the outage, written by Beat in the same critical section that
+	// advanced lastSeen.
+	recoveredAt := delivered.recoveredAt
 	// The recovered notice reports the same silence the missing notice just
 	// reported, ending at the recovery point instead of at the sweep.
 	return recoveryEvent{id: id, silence: Transition{Started: started, Observed: recoveredAt}}, true

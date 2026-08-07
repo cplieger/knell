@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cplieger/envx"
+	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/slogx"
 	"github.com/cplieger/webhttp"
 )
@@ -246,18 +247,19 @@ func Load(maxNodeNameBytes int) (Config, error) {
 // pins it).
 func nodeName(maxNodeNameBytes int) (string, error) {
 	raw, present := os.LookupEnv("NODE_NAME")
-	node := strings.TrimSpace(raw)
-	// TrimSpace's definition of blank is Unicode SPACES only, so a name built
-	// entirely from runes the operator cannot see (a zero-width space, a soft
-	// hyphen, a BOM) survives it and names nothing: every notice then reads
-	// "[knell ]" and no startup line says the value was useless. invisibleInURL
-	// is this package's own wider predicate for "the operator cannot see it"
-	// (it refuses such a rune in the webhook URL and warns about one at a
-	// token's edge), so both definitions of blank stay one definition and the
-	// existing warn-and-fall-back-to-hostname path covers this shape too.
-	if strings.TrimFunc(node, invisibleInURL) == "" {
-		node = ""
-	}
+	// Trimmed with this package's own predicate for "the operator cannot see it"
+	// rather than TrimSpace, whose definition of blank is Unicode SPACES only: a
+	// name built entirely from invisible runes (a zero-width space, a soft
+	// hyphen, a BOM) survives TrimSpace and names nothing, so every notice reads
+	// "[knell ]", and a name merely PADDED with one is stored and prefixes every
+	// notice with a character the operator cannot see (notify's escapeMarkdown
+	// replaces line breaks, not invisible runes). Trimming is safe here for the
+	// reason listenAddr gives: nothing reproduces the node name byte for byte, so
+	// no verifier can disagree with the trim — BEAT_TOKEN is REFUSED rather than
+	// trimmed for exactly that reason. One predicate covers both the blank value
+	// and the padded one, and the existing warn-and-fall-back-to-hostname path
+	// still covers the blank case.
+	node := strings.TrimFunc(raw, invisibleInURL)
 	if node == "" {
 		if present {
 			// Same rule as listenAddr: an unset NODE_NAME is the documented
@@ -313,7 +315,14 @@ func listenAddr() string {
 	// produces exactly it), and envx.String collapses that with "unset",
 	// which is the documented default case and must stay silent.
 	raw, present := os.LookupEnv("LISTEN_ADDR")
-	if addr := strings.TrimSpace(raw); addr != "" {
+	// TrimFunc with invisibleInURL, not TrimSpace: the padding this trim exists
+	// to absorb includes the invisible runes a value pasted out of a rendered
+	// page or a chat client carries (a zero-width space, a soft hyphen, a BOM),
+	// which TrimSpace keeps and net.Listen then fails to resolve — a crash loop
+	// whose cause is invisible in the log line, which is the outcome this trim
+	// exists to prevent. An entirely invisible value now reaches the documented
+	// blank path (warn + defaultListenAddr) instead of a bind failure.
+	if addr := strings.TrimFunc(raw, invisibleInURL); addr != "" {
 		warnEphemeralListenPort(addr)
 		return addr
 	}
@@ -353,10 +362,15 @@ func warnEphemeralListenPort(addr string) {
 // loopback-exempt, with the ALLOWED_HOSTS-naming 403 envelope. Exported so
 // internal/webapi's tests exercise the shipped shape rather than a hand-copied
 // twin that cannot fail when this one changes.
+//
+// The envelope code IS metrics.RefusalHostNotAllowed, read from there rather
+// than re-spelled here: the 403 an operator sees and the
+// knell_pre_route_refusals_total{reason=...} label they select on are one
+// published identifier, and it has one home.
 func ParseAllowedHosts(entries []string) (policy *webhttp.HostPolicy, invalid []string) {
 	return webhttp.ParseHostList(entries,
 		webhttp.WithLoopbackExempt(),
-		webhttp.WithHostAllowlistError("host_not_allowed",
+		webhttp.WithHostAllowlistError(string(metrics.RefusalHostNotAllowed),
 			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"))
 }
 
@@ -560,12 +574,20 @@ func invisibleEdge(value string) bool {
 }
 
 // errBeatTokenSetButEmpty is the refusal for a BEAT_TOKEN that is present and
-// carries no value. Two guards reach the same verdict — loadBeatToken's, because
-// envx cannot tell present-but-empty from unset, and checkBeatToken's, which
-// stops an empty token from reaching webapi, where it would leave the gate with
-// no credential to verify against — so they share one message and cannot come to
-// describe the misconfiguration differently.
+// carries no value. It is loadBeatToken's, and only loadBeatToken's: envx cannot
+// tell present-but-empty from unset, so the *MissingError arm has to discriminate
+// the two with its own os.LookupEnv and give the empty case the message written
+// for it. checkBeatToken never needs the verdict — envx.SecretWithSource returns
+// a non-empty value on every success path (Require refuses an empty variable, and
+// a blank secret file is ErrBlankSecretFile), so no empty token reaches it.
 var errBeatTokenSetButEmpty = fmt.Errorf("BEAT_TOKEN is set but empty: it is the only thing standing between a stranger who can reach this port and a forged ping, so there is no configuration in which knell serves /beat/{id} without it; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
+
+// errWebhookSetButEmpty is the refusal for a DISCORD_WEBHOOK_URL that is
+// present and carries no value. Both of loadWebhook's empty-value paths return
+// it — the present-but-empty variable envx reports as missing, and the
+// whitespace-only value that survives to the trim — so the two cannot come to
+// describe the same misconfiguration differently.
+var errWebhookSetButEmpty = errors.New("DISCORD_WEBHOOK_URL is set but empty: point it at the https webhook URL, or use DISCORD_WEBHOOK_URL_FILE")
 
 // checkBeatToken validates a configured BEAT_TOKEN as the exact credential
 // senders must present, or refuses it. It never rewrites the value.
@@ -597,13 +619,6 @@ func checkBeatToken(token string) error {
 		// names the whole CUTSET rather than one member's mechanism, because
 		// both mechanisms above reach the same verdict.
 		return errors.New("BEAT_TOKEN has leading or trailing ASCII whitespace: a trailing space or tab is stripped from the header value on the wire, and CR, LF, VT and FF cannot be sent in one at all, so such a token never reaches the verifier as configured and POST /beat/{id} would reject every ping while the endpoint reports itself gated; a leading space or tab is refused too, because it authenticates as part of the credential while being invisible in the value you read; knell will not silently rewrite a credential, so remove the surrounding whitespace")
-	}
-	if token == "" {
-		// Nothing to present at all: fails startup like a present-but-empty
-		// BEAT_TOKEN and a blank BEAT_TOKEN_FILE. Checked before the length
-		// floor below so an empty value gets the message written for it rather
-		// than being reported as merely too short.
-		return errBeatTokenSetButEmpty
 	}
 	if !beatTokenFitsHeader(token) {
 		// Free of edge padding, yet still unpresentable: a control byte (a
@@ -760,6 +775,16 @@ func loadWebhook() (string, error) {
 	webhook, src, err := envx.SecretWithSource("DISCORD_WEBHOOK_URL")
 	if err != nil {
 		if errors.As(err, new(*envx.MissingError)) {
+			// envx.Require cannot tell present-but-empty from unset, and the
+			// operator's next move differs: one has to supply a webhook URL,
+			// the other already tried to and the secret pipeline delivered
+			// nothing (compose interpolation of an undefined variable produces
+			// exactly this shape). Same split loadBeatToken makes for
+			// BEAT_TOKEN, and the same diagnosis the whitespace-only value
+			// below already gets.
+			if v, ok := os.LookupEnv("DISCORD_WEBHOOK_URL"); ok && v == "" {
+				return "", errWebhookSetButEmpty
+			}
 			return "", fmt.Errorf("DISCORD_WEBHOOK_URL is required: %w", err)
 		}
 		// Provided via _FILE but unreadable/empty: not a missing-variable
@@ -785,7 +810,7 @@ func loadWebhook() (string, error) {
 		// secret pipeline, not a missing setting. Reported as such instead
 		// of falling through to the shape check, which would answer
 		// "scheme must be https" for a value that carries no scheme.
-		return "", errors.New("DISCORD_WEBHOOK_URL is set but empty (whitespace only): point it at the https webhook URL, or use DISCORD_WEBHOOK_URL_FILE")
+		return "", errWebhookSetButEmpty
 	}
 	if _, err := parseWebhookURL(webhook); err != nil {
 		return "", fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)

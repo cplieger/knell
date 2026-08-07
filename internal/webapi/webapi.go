@@ -27,9 +27,20 @@ const maxBeatBody = 1 << 20
 // line's path attribute, tightening the library's 512-byte default. Every path
 // knell legitimately serves is short (/healthz, /metrics, /beat/{id} with an id
 // capped at 64 chars by internal/config), while r.URL.Path is
-// attacker-controlled and net/http accepts a megabyte of it, so 128 keeps the
-// concrete beat id an operator needs intact while a flood cannot push knell's
-// own undelivered-notice warnings out of the retained log window.
+// attacker-controlled, so 128 keeps the concrete beat id an operator needs
+// intact and truncates whatever a scanner sends in its place.
+//
+// It bounds one line's SIZE, and that is the whole of what it bounds. The path
+// is already bounded upstream, well below net/http's own 1 MiB default: main.go
+// serves with WithMaxHeaderBytes(config.MaxRequestHeaderBytes) = 8704 and
+// net/http counts the request line inside that ceiling. And a per-line cap
+// cannot bound the NUMBER of lines — only failed auth on POST /beat/{id} is
+// rate-limited (beatAuthFailureLimiter), so every other request an anonymous
+// caller can reach this port with still writes one access line, and bounding
+// that flood is the deployment's job (the README's trusted-network-or-proxy
+// stance). The diagnosis survives such a flood either way, since it also lands
+// on knell_http_requests_total{status} and
+// knell_pre_route_refusals_total{reason}.
 const loggedPathCap = 128
 
 // bearerPrefix is the Authorization scheme senders present the beat token
@@ -378,16 +389,15 @@ func writeShuttingDown(w http.ResponseWriter, r *http.Request) {
 // to notice.
 func drainBeatBody(w http.ResponseWriter, r *http.Request) {
 	webhttp.LimitBody(w, r, maxBeatBody)
-	if _, err := io.Copy(io.Discard, r.Body); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			// No beat id and no sender-supplied text: the id here is still an
-			// unvalidated path segment (the 404 gate is downstream), so
-			// correlate through the access line via the request id.
-			slog.WarnContext(r.Context(), "beat body exceeded the cap and was not fully read",
-				"limit_bytes", maxBeatBody,
-				"request_id", webhttp.RequestIDFromContext(r.Context()))
-		}
+	_, err := io.Copy(io.Discard, r.Body)
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		// No beat id and no sender-supplied text: the id here is still an
+		// unvalidated path segment (the 404 gate is downstream), so correlate
+		// through the access line via the request id.
+		slog.WarnContext(r.Context(), "beat body exceeded the cap and was not fully read",
+			"limit_bytes", maxBeatBody,
+			"request_id", webhttp.RequestIDFromContext(r.Context()))
 	}
 }
 
@@ -497,10 +507,9 @@ func beatAuthFailureLimiter(verifier webhttp.StaticTokenVerifier) webhttp.Middle
 		limited := limit(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !failedBeatAuth(verifier, r) {
-				// Straight to next, never through the bucket: with the When
-				// option gone, the limiter draws a token from every request it
-				// sees, so this class must not reach it. Under the old option
-				// this branch's pass through `limited` was the same no-op hop.
+				// Straight to next, never through the bucket: the limiter draws
+				// a token from every request it sees, so this class must not
+				// reach it.
 				next.ServeHTTP(w, r)
 				return
 			}

@@ -277,8 +277,8 @@ func TestLoadDefaultsAndFailures(t *testing.T) {
 
 	t.Setenv("BEATS", "api:20m")
 	t.Setenv("DISCORD_WEBHOOK_URL", "")
-	if _, err := Load(maxNodeNameBytes); err == nil || !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL is required") {
-		t.Errorf("Load() with empty DISCORD_WEBHOOK_URL error = %v, want it to name DISCORD_WEBHOOK_URL as required", err)
+	if _, err := Load(maxNodeNameBytes); err == nil || !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL is set but empty") {
+		t.Errorf("Load() with a present-but-empty DISCORD_WEBHOOK_URL error = %v, want the set-but-empty diagnosis: the operator DID set the variable, so \"is required\" sends them to look for a missing key instead of the secret pipeline that delivered nothing", err)
 	}
 
 	t.Setenv("DISCORD_WEBHOOK_URL", "not-a-url")
@@ -851,6 +851,30 @@ func TestAllowedHostsGate(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsAnUnusableAllowedHostsEntry pins that allowedHosts' refusal
+// reaches STARTUP. TestAllowedHostsGate calls allowedHosts directly, so
+// nothing asserts that Load propagates its error: dropping that check leaves
+// cfg.AllowedHosts nil, an inactive policy accepts every Host, and knell
+// starts happily with the DNS-rebinding guard OFF while the operator reads
+// their allowlist in the compose file. /metrics enumerates every beat and its
+// freshness, and the bearer gate does not cover it, so that is the one
+// endpoint the allowlist exists to protect.
+func TestLoadRejectsAnUnusableAllowedHostsEntry(t *testing.T) {
+	setValidLoadEnv(t)
+	t.Setenv("ALLOWED_HOSTS", "knell.internal,http://x/y")
+
+	_, err := Load(maxNodeNameBytes)
+	if err == nil {
+		t.Fatal("Load() with an unusable ALLOWED_HOSTS entry = nil, want the refusal propagated: an unpropagated error leaves the policy nil, so every Host is accepted and the rebinding guard is off while the operator believes the allowlist is armed")
+	}
+	if !strings.Contains(err.Error(), "ALLOWED_HOSTS") {
+		t.Errorf("Load() error = %q, want ALLOWED_HOSTS named so the operator knows which variable to fix", err)
+	}
+	if !strings.Contains(err.Error(), "http://x/y") {
+		t.Errorf("Load() error = %q, want it to name the unusable entry: it is the only part of the value the operator can act on", err)
+	}
+}
+
 func TestLoadRejectsBlankBeatTokenFileVar(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "env-fallback-token")
@@ -1344,6 +1368,62 @@ func TestLoadTrimsPaddedListenAddr(t *testing.T) {
 	}
 	if cfg.ListenAddr != "0.0.0.0:9999" {
 		t.Errorf("ListenAddr = %q, want the trimmed address: net.Listen resolves a padded address as a hostname lookup, so the container crash-loops with the padding invisible in the log line", cfg.ListenAddr)
+	}
+}
+
+// TestLoadWarnsWhenListenAddrAsksForAnEphemeralPort pins the port-0
+// diagnostic, the one LISTEN_ADDR signal nothing else in this package
+// asserts. Port 0 BINDS, so net.Listen never refuses it and startup reports
+// itself healthy while the kernel hands out a fresh random port on every
+// boot: no sender's POST /beat/{id} URL and no scrape target can name it, so
+// every configured beat goes missing one deadline after start while the
+// observer looks up. Both directions are pinned because both are silent - a
+// dropped or inverted zero check loses the only signal that says so, and a
+// warning on a usable address trains the operator to ignore the ones that
+// matter.
+func TestLoadWarnsWhenListenAddrAsksForAnEphemeralPort(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and t.Setenv forbids parallel tests anyway.
+	tests := map[string]struct {
+		addr     string
+		wantWarn bool
+	}{
+		"port zero on every interface": {addr: ":0", wantWarn: true},
+		"port zero on one interface":   {addr: "127.0.0.1:0", wantWarn: true},
+		"an explicit port stays quiet": {addr: "127.0.0.1:9999", wantWarn: false},
+		// A service NAME is resolved by net.Listen and is never zero, and a
+		// value that is not a host:port at all is refused at bind time and
+		// named by main's classifyBindError, so neither is this warning's job.
+		"a service name stays quiet": {addr: "127.0.0.1:http", wantWarn: false},
+		"a value net.Listen refuses": {addr: "9190", wantWarn: false},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			t.Setenv("LISTEN_ADDR", tt.addr)
+
+			rec := capture.Default(t)
+
+			cfg, err := Load(maxNodeNameBytes)
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if cfg.ListenAddr != tt.addr {
+				t.Errorf("ListenAddr = %q, want %q kept verbatim: the address is handed to net.Listen as configured, so a rewrite here binds a port nobody scrapes", cfg.ListenAddr, tt.addr)
+			}
+			if got := rec.Contains("asks for port 0"); got != tt.wantWarn {
+				t.Errorf("LISTEN_ADDR=%q: warned = %v, want %v; the warning is the only signal that the listener moves to a fresh random port on every boot, and a warning on a usable address trains the operator to ignore it: %v",
+					tt.addr, got, tt.wantWarn, rec.Messages())
+			}
+			if !tt.wantWarn {
+				return
+			}
+			// The hint carries the way out. Without it the operator reads that
+			// the port is random with nothing telling them what to set instead.
+			if !rec.HasAttr("asks for port 0", "hint", "set an explicit port, e.g. "+defaultListenAddr) {
+				t.Errorf("the port-0 warning does not carry the %q hint: %v", defaultListenAddr, rec.Records())
+			}
+		})
 	}
 }
 

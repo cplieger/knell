@@ -639,8 +639,7 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 	// to it. That error's text is remote-authored (net/http renders a
 	// malformed chunked trailer as `malformed MIME header: missing colon:
 	// "<remote bytes>"`, and a webhook edge echoing the request URI puts the
-	// path that IS the credential in those bytes), which is why knell carried
-	// a local drain until the library dropped the attribute at the source.
+	// path that IS the credential in those bytes).
 	// TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError keeps
 	// asserting it here, because a regression in httpx would reopen the leak
 	// in knell's own log stream.
