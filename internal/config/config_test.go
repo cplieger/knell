@@ -1411,9 +1411,22 @@ func TestLoadWarnsWhenListenAddrAsksForAnEphemeralPort(t *testing.T) {
 			if cfg.ListenAddr != tt.addr {
 				t.Errorf("ListenAddr = %q, want %q kept verbatim: the address is handed to net.Listen as configured, so a rewrite here binds a port nobody scrapes", cfg.ListenAddr, tt.addr)
 			}
-			if got := rec.Contains("asks for port 0"); got != tt.wantWarn {
-				t.Errorf("LISTEN_ADDR=%q: warned = %v, want %v; the warning is the only signal that the listener moves to a fresh random port on every boot, and a warning on a usable address trains the operator to ignore it: %v",
-					tt.addr, got, tt.wantWarn, rec.Messages())
+			// Counted per LEVEL, not merely present: capture.Default records
+			// every level, so a Contains check stays green if the diagnostic
+			// is demoted to Debug or Info — and a demoted line is invisible at
+			// the WARN-and-above level a deployment runs at, which is the whole
+			// signal. The exact count also closes the other direction: a
+			// spurious second record at any level is a warning the operator
+			// learns to ignore.
+			wantCount := 0
+			if tt.wantWarn {
+				wantCount = 1
+			}
+			gotAny := rec.Count("asks for port 0")
+			gotWarn := rec.CountLevel(slog.LevelWarn, "asks for port 0")
+			if gotAny != wantCount || gotWarn != wantCount {
+				t.Errorf("LISTEN_ADDR=%q: matching records = %d, WARN records = %d, want %d; the diagnostic is the only signal that the listener moves to a fresh random port on every boot, so it must be absent or emitted exactly once at WARN: %v",
+					tt.addr, gotAny, gotWarn, wantCount, rec.Records())
 			}
 			if !tt.wantWarn {
 				return
@@ -1438,6 +1451,71 @@ func TestLoadTrimsPaddedNodeName(t *testing.T) {
 	if cfg.Node != "node-1" {
 		t.Errorf("Node = %q, want \"node-1\": the node name prefixes every Discord notice, so padding misattributes which observer reported the outage", cfg.Node)
 	}
+}
+
+// TestLoadTrimsInvisibleConfigPadding pins the part of NODE_NAME's and
+// LISTEN_ADDR's trim that strings.TrimSpace does NOT do. The two padded tests
+// above use ASCII spaces, so they stay green against either predicate and
+// cannot tell them apart; every value here survives TrimSpace (a zero-width
+// space, a soft hyphen and a BOM are Cf format runes, not Unicode White_Space),
+// so reverting either strings.TrimFunc(…, invisibleInURL) call to TrimSpace
+// fails exactly one case below. Without this test the invisible-padding
+// behavior is unpinned in both places: a padded LISTEN_ADDR goes back to
+// crash-looping on a bind error whose cause cannot be seen in the log line, and
+// a padded NODE_NAME goes back to prefixing every notice with a character the
+// operator cannot see.
+func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, and the last subtest swaps the
+	// process-global slog default via capture.Default.
+	const (
+		zeroWidthSpace = "\u200b"
+		softHyphen     = "\u00ad"
+		byteOrderMark  = "\ufeff"
+	)
+
+	t.Run("a NODE_NAME padded with invisible runes is trimmed", func(t *testing.T) {
+		setValidLoadEnv(t)
+		t.Setenv("NODE_NAME", zeroWidthSpace+"node-1"+byteOrderMark)
+
+		cfg, err := Load(maxNodeNameBytes)
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if cfg.Node != "node-1" {
+			t.Errorf("Node = %q, want \"node-1\": TrimSpace keeps these runes, so every Discord notice would read as this observer's name plus a character nobody can see", cfg.Node)
+		}
+	})
+
+	t.Run("a LISTEN_ADDR padded with invisible runes is trimmed", func(t *testing.T) {
+		setValidLoadEnv(t)
+		t.Setenv("LISTEN_ADDR", zeroWidthSpace+"0.0.0.0:9999"+softHyphen)
+
+		cfg, err := Load(maxNodeNameBytes)
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if cfg.ListenAddr != "0.0.0.0:9999" {
+			t.Errorf("ListenAddr = %q, want the trimmed address: net.Listen resolves a value carrying these runes as a hostname lookup and fails, and the padding is invisible in the resulting crash-loop log line", cfg.ListenAddr)
+		}
+	})
+
+	t.Run("an entirely invisible LISTEN_ADDR falls back to the default", func(t *testing.T) {
+		setValidLoadEnv(t)
+		t.Setenv("LISTEN_ADDR", zeroWidthSpace+byteOrderMark)
+
+		rec := capture.Default(t)
+
+		cfg, err := Load(maxNodeNameBytes)
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if cfg.ListenAddr != defaultListenAddr {
+			t.Errorf("ListenAddr = %q, want the default %q: a value with nothing visible in it reaches the documented blank path, not a bind failure", cfg.ListenAddr, defaultListenAddr)
+		}
+		if !rec.Contains("LISTEN_ADDR is set but blank") {
+			t.Errorf("no blank-LISTEN_ADDR warning for a value that is entirely invisible: the operator set a value this process threw away and nothing says so: %v", rec.Messages())
+		}
+	})
 }
 
 func TestLoadAcceptsANodeNameAtTheLimit(t *testing.T) {

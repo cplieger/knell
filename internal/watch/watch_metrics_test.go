@@ -361,6 +361,73 @@ func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
 	}
 }
 
+// TestQueueFullLogsAreEmittedWithTheWatcherMutexReleased pins WHERE the two
+// queue-full lines are written, which the level and attribute assertions above
+// cannot see. slogx installs a synchronous stderr handler, so a record emitted
+// while w.mu is held blocks every other holder of that mutex — ping admission
+// (Beat), the freshness gauge the quorum rule reads (refreshFreshness) and the
+// pre-drain StopAccepting — for as long as a stalled container log driver holds
+// the write, while /healthz keeps passing off its marker file. Both lines were
+// emitted under the lock until this was fixed, and the content assertions above
+// stay green either way (the record is byte-identical from either position), so
+// this is the only guard against an inline that puts them back.
+func TestQueueFullLogsAreEmittedWithTheWatcherMutexReleased(t *testing.T) {
+	// Serial (no t.Parallel): swaps the process-global slog default.
+	const id = "missing-overflow-mutex-probe"
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+	fillMissingQueue(t, w, clock, id)
+
+	probe := &mutexProbeHandler{t: t, w: w}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(probe))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	// The sweep path: the full queue defers an ongoing outage, and collectDue
+	// announces the back-pressure at Debug.
+	n.setFail(errors.New("discord down"))
+	clock.Advance(11 * time.Minute)
+	w.sweep(context.Background())
+	// The ping path: the queue is still full, so this ping's already-ended
+	// outage loses its record and Beat announces the permanent loss at Warn.
+	clock.Advance(47 * time.Minute)
+	if !recordedBeat(w, id) {
+		t.Fatalf("overflow Beat(%s) = false", id)
+	}
+	if probe.seen != 2 {
+		t.Fatalf("queue-full records seen = %d, want 2 (the deferred-ongoing Debug and the dropped-ended Warn); the probe never observed the lines it exists to place: %v", probe.seen, probe.messages)
+	}
+}
+
+// mutexProbeHandler asserts, from inside the log write itself, that the
+// Watcher's mutex is free. TryLock is the whole test: a handler that can take
+// w.mu is a handler no caller is holding it across.
+type mutexProbeHandler struct {
+	t        *testing.T
+	w        *Watcher
+	messages []string
+	seen     int
+}
+
+func (h *mutexProbeHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *mutexProbeHandler) Handle(_ context.Context, r slog.Record) error {
+	h.messages = append(h.messages, r.Message)
+	if !strings.HasPrefix(r.Message, "pending missing queue full") {
+		return nil
+	}
+	h.seen++
+	if !h.w.mu.TryLock() {
+		h.t.Errorf("%q was written while w.mu was held: a synchronous handler here blocks Beat, refreshFreshness and StopAccepting for the duration of the write", r.Message)
+		return nil
+	}
+	h.w.mu.Unlock()
+	return nil
+}
+
+func (h *mutexProbeHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *mutexProbeHandler) WithGroup(string) slog.Handler      { return h }
+
 // TestQueueFullDropKeepsTimestampAttrsTyped pins the ATTRIBUTE KINDS of the
 // queue-full loss log, which the level/message assertions above cannot see: the
 // drop warning is the lost outage's only trace, so its two instants must stay
