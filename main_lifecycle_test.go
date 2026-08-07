@@ -700,6 +700,10 @@ func TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace(t *testing.T) {
 // The stop func closes watcherDone: the wait can only finish if cancellation
 // happened FIRST, so a teardown that waits before cancelling fails here
 // instead of only being slow in production.
+//
+// It passes a never-started server, so srv.Shutdown returns immediately over
+// zero connections and this test cannot see the drain at all;
+// TestTeardownAfterServeExitDrainsAcceptedHandlers owns that half.
 func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default.
@@ -743,6 +747,72 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	}
 	if waited > time.Second {
 		t.Errorf("teardown took %s, want it to cancel the watch loop before waiting for it", waited)
+	}
+}
+
+// TestTeardownAfterServeExitDrainsAcceptedHandlers pins the srv.Shutdown drain: a
+// handler accepted before the listener failed must finish (its post-unlock loss
+// diagnostic included) before teardown lets the process exit. Closing beat
+// admission does NOT cover a handler already past its admission check: watch.Beat
+// counts a discarded ended-outage record under the mutex and emits its WARN -- the
+// only line naming the beat and the window an operator must reconstruct -- after
+// releasing it, and the record was never queued, so the watch loop's tally cannot
+// report it either. The sibling test above passes a never-started server, so
+// Shutdown returns immediately there and cannot see this drain being dropped.
+func TestTeardownAfterServeExitDrainsAcceptedHandlers(t *testing.T) {
+	// Serial (no t.Parallel): the teardown logs through the process-global slog
+	// default.
+	marker := health.NewMarker(t.TempDir() + "/healthy")
+	marker.Set(true)
+	if !marker.Healthy() {
+		t.Skip("cannot plant a health marker in the test temp dir")
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	handlerDone := make(chan struct{})
+	srv := newServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		close(handlerDone)
+		w.WriteHeader(http.StatusOK)
+	}))
+	ln, lnErr := net.Listen("tcp", "127.0.0.1:0")
+	if lnErr != nil {
+		t.Fatalf("listen: %v", lnErr)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	go func() {
+		resp, getErr := http.Get("http://" + ln.Addr().String() + "/")
+		if getErr == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	<-entered
+
+	watcherDone := make(chan struct{})
+	exitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	returned := make(chan struct{})
+	go func() {
+		teardownAfterServeExit(exitCtx, srv, marker, func() {}, func() { close(watcherDone) }, watcherDone)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+		t.Fatal("teardownAfterServeExit returned while an accepted handler was still in flight: srv.Shutdown must drain it, or a handler's own loss diagnostic (the only trace of a discarded outage record) is cut off by process exit")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("teardownAfterServeExit did not return after the accepted handler finished")
+	}
+	select {
+	case <-handlerDone:
+	default:
+		t.Fatal("teardown returned without the handler having completed")
 	}
 }
 

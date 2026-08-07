@@ -464,10 +464,11 @@ func (st *beatState) recordEndedOutage(rec *overdueBeat) bool {
 }
 
 // logEndedOutageDropped announces a dropped ended-outage record. Beat emits it
-// AFTER w.mu is released, like the recovery-queue-full warning beside it: slogx
+// AFTER w.mu is released, like logOngoingOutageDeferred on the sweep path: slogx
 // installs a synchronous stderr handler, so a stalled container log driver would
 // otherwise block ping admission, the freshness-gauge refresh and the pre-drain
-// StopAccepting for as long as the write blocks.
+// StopAccepting for as long as the write blocks. Both placements are pinned by
+// TestQueueFullLogsAreEmittedWithTheWatcherMutexReleased.
 func logEndedOutageDropped(rec *overdueBeat) {
 	// The two instants go in as time.Time values, not RFC3339 strings: slog
 	// stores a time.Time as a typed Time attr (slog.AnyValue special-cases it),

@@ -1639,17 +1639,16 @@ func budgetProbeBeats(prefix string, n int, deadline time.Duration) []Beat {
 
 // TestEveryBeatCanQueueItsRecoveryWithoutADrop pins the size New gives the
 // recovered-transition queue. It is sized from the beat count because each beat
-// can hold at most one pending recovery, which is what makes the drop path in
-// Beat unreachable in production; the whole fleet pinging at once (the fan-out
-// source coming back) is the ordinary case that would otherwise hit it and lose
-// recovered notices for good, since nothing retries one.
-// TestRecoveryQueueOverflowDropKeepsBeatArmed deliberately SHRINKS the channel
-// to exercise that drop path, so it asserts the other side of this boundary,
-// and every other recovery test uses a single beat, where a capacity of 1 is
-// indistinguishable from len(beats).
+// can hold at most one pending recovery. That pairing is the closed capacity
+// proof Beat now ASSERTS on rather than degrades from: a short queue no longer
+// drops a recovered notice, it panics, so this test is the only thing standing
+// between a mis-sized channel and a fleet-wide ping storm (the fan-out source
+// coming back) taking the beat handler down with it. Every other recovery test
+// uses a single beat, where a capacity of 1 is indistinguishable from
+// len(beats).
 func TestEveryBeatCanQueueItsRecoveryWithoutADrop(t *testing.T) {
-	// Serial (no t.Parallel): asserts a delta on the package-global
-	// notification counters, which the parallel tests also move.
+	// Serial (no t.Parallel): drives the package-global metric registry through
+	// the same beat ids on every run.
 	const (
 		total    = 5
 		deadline = 10 * time.Minute
@@ -1668,15 +1667,16 @@ func TestEveryBeatCanQueueItsRecoveryWithoutADrop(t *testing.T) {
 
 	// The whole fleet pings before the Run loop services anything: every one of
 	// those recoveries must find a slot.
-	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "recovered")
 	for _, b := range beats {
 		if !recordedBeat(w, b.ID) {
 			t.Fatalf("Beat(%s) = false", b.ID)
 		}
 	}
-	if got := counterValue(t, "knell_notifications_dropped_total", "recovered"); got != droppedBefore {
-		t.Errorf("dropped{recovered} = %v after the whole fleet pinged, want unchanged %v: the queue must hold one recovery per beat, and nothing retries a dropped recovered notice",
-			got, droppedBefore)
+	// Every ping above found a slot, which is what the panic in Beat relies on: a
+	// queue one slot short would have taken the last ping down instead.
+	if got := len(w.recoveries); got != total {
+		t.Errorf("queued recoveries = %d, want one per beat (%d): New must size w.recoveries from the beat count, or Beat's capacity assertion fires on a fleet-wide ping storm",
+			got, total)
 	}
 
 	drainRecoveries(w)
@@ -1718,15 +1718,22 @@ func slowHistorySends(n *fakeNotifier, clock *fakeClock, perSend time.Duration) 
 }
 
 // TestHistorySendsAreBoundedByTheSweepBudget pins the send budget on the
-// history half of a sweep. History is delivered FIRST, so a backlog of ended
-// outages -- the shape a webhook outage leaves behind -- is what actually
-// spends the budget in production; without a cut there, one sweep pushes every
-// queued beat's past-tense notice through a slow webhook back to back while
-// Run's select (and every queued recovery) waits out the whole storm, which is
-// the exact failure sweepSendBudget exists to prevent. The deferred count must
-// also cover the LIVE notices this cut defers, not only the remaining history
-// ones: a cut in the history loop defers both orderings, and that term appears
-// nowhere else.
+// history notices of a sweep. A backlog of ended outages -- the shape a webhook
+// outage leaves behind -- is what actually spends the budget in production;
+// without a cut, one sweep pushes every queued beat's past-tense notice through
+// a slow webhook back to back while Run's select (and every queued recovery)
+// waits out the whole storm, which is the exact failure sweepSendBudget exists
+// to prevent.
+//
+// History has NO global priority over live notices (sweep walks one
+// byAttemptThenAge-ordered list; that priority was the starvation it was
+// removed to fix). The six history notices lead here because every beat ties on
+// lastAttempt (none attempted yet) AND on started (the history beats were pinged
+// at the clock's base instant, so their records' Started equals the live beats'
+// boot-armed anchor), which falls through to the ordering's third key, the
+// past-tense-ahead-of-live tie-break. The deferred count therefore covers the
+// whole remainder of that one ordering, live entries included -- the term that
+// appears nowhere else.
 func TestHistorySendsAreBoundedByTheSweepBudget(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and this asserts deltas on the package-global counters.
@@ -1780,7 +1787,7 @@ func TestHistorySendsAreBoundedByTheSweepBudget(t *testing.T) {
 	delivered := make(map[string]bool, len(got))
 	for i, c := range got {
 		if c.kind != "history" {
-			t.Errorf("calls[%d] = %+v, want a history notice: the cut must return from the sweep, not fall through to the live notices", i, c)
+			t.Errorf("calls[%d] = %+v, want a history notice: the cut must return from the sweep, not carry on down the ordering to the live notices behind it", i, c)
 		}
 		delivered[c.id] = true
 	}
@@ -2068,6 +2075,64 @@ func TestFastSendsDeliverEveryDueBeatInOneSweep(t *testing.T) {
 		}
 	}
 }
+
+// TestBudgetCutRotatesAttemptsAcrossContinuouslyDueBeats pins the sweep's fairness
+// mechanism itself (byAttemptThenAge + markAttempted): with every send failing and
+// spending more than the whole budget, each sweep attempts exactly one beat and every
+// beat stays due, so the rotation must reach every beat before revisiting one. The
+// budget tests above cannot catch a regression here: their sends succeed, so an
+// attempted beat leaves the due set and any ordering eventually drains the storm.
+func TestBudgetCutRotatesAttemptsAcrossContinuouslyDueBeats(t *testing.T) {
+	t.Parallel()
+
+	const total = 4
+	beats := budgetProbeBeats("budget-rotation-probe", total, 10*time.Minute)
+	clock := newFakeClock()
+	n := &slowFailNotifier{clock: clock, perSend: sweepSendBudget + time.Second}
+	w := New(beats, n, clock.Now, clock.Now())
+	clock.Advance(11 * time.Minute)
+
+	for sweep := 1; sweep <= 2*total; sweep++ {
+		w.sweep(context.Background())
+		if got := len(n.attempts); got != sweep {
+			t.Fatalf("attempts after sweep %d = %d, want %d (one send spends the whole budget)", sweep, got, sweep)
+		}
+	}
+	perBeat := map[string]int{}
+	for _, id := range n.attempts {
+		perBeat[id]++
+	}
+	for _, b := range beats {
+		if perBeat[b.ID] != 2 {
+			t.Errorf("beat %s attempted %d times across %d sweeps, want exactly 2: least-recently-attempted rotation must reach every continuously-due beat before revisiting one", b.ID, perBeat[b.ID], 2*total)
+		}
+	}
+	for i, id := range n.attempts[total:] {
+		if id != n.attempts[i] {
+			t.Errorf("second-rotation attempt %d = %s, want %s (the least-recently-attempted beat leads)", i, id, n.attempts[i])
+		}
+	}
+}
+
+// slowFailNotifier makes every missing send fail after burning perSend of the
+// budget: the shape a wedged webhook leaves, which keeps every beat due. The
+// shared fakeNotifier cannot express it — its fail check precedes the onMissing
+// clock hook, so a failing send neither spends budget nor records the attempt.
+type slowFailNotifier struct {
+	clock    *fakeClock
+	perSend  time.Duration
+	attempts []string
+}
+
+func (n *slowFailNotifier) BeatMissing(_ context.Context, id string, _ Transition) error {
+	n.attempts = append(n.attempts, id)
+	n.clock.Advance(n.perSend)
+	return errors.New("webhook stalled")
+}
+
+func (n *slowFailNotifier) BeatRecovered(context.Context, string, Transition) error { return nil }
+
+func (n *slowFailNotifier) BeatOutageHistory(context.Context, string, []Outage) error { return nil }
 
 func TestSweepStartsTheSendWhoseCheckLandsExactlyOnTheBudget(t *testing.T) {
 	t.Parallel()

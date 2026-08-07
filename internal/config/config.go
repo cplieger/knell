@@ -563,8 +563,9 @@ func beatTokenFitsHeader(value string) bool {
 
 // errWebhookSetButEmpty is the refusal for a DISCORD_WEBHOOK_URL that is
 // present and carries no value. Both of loadWebhook's empty-value paths return
-// it — the present-but-empty variable envx reports as missing, and the
-// whitespace-only value that survives to the trim — so the two cannot come to
+// it — the present-but-empty variable envx reports as missing, and the value
+// with nothing visible left after the trim (every invisible rune at either edge
+// is padding here, not only a Unicode space) — so the two cannot come to
 // describe the same misconfiguration differently.
 var errWebhookSetButEmpty = errors.New("DISCORD_WEBHOOK_URL is set but empty: point it at the https webhook URL, or use DISCORD_WEBHOOK_URL_FILE")
 
@@ -724,6 +725,11 @@ func loadBeatToken() (string, error) {
 		// client that can reach the port keeps every beat reading fresh, which
 		// disarms the switch silently — and a startup failure is the one signal
 		// that cannot be mistaken for a working observer.
+		//
+		// This is the ONLY empty-token refusal, and checkBeatToken deliberately
+		// carries none: envx.SecretWithSource returns a non-empty value on every
+		// success path (Require refuses an empty variable, and a blank secret file
+		// is ErrBlankSecretFile), so no empty token can reach it.
 		if v, ok := os.LookupEnv("BEAT_TOKEN"); ok && v == "" {
 			return "", fmt.Errorf("BEAT_TOKEN is set but empty: it is the only thing standing between a stranger who can reach this port and a forged ping, so there is no configuration in which knell serves /beat/{id} without it; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
 		}
@@ -759,8 +765,8 @@ func loadWebhook() (string, error) {
 			// the other already tried to and the secret pipeline delivered
 			// nothing (compose interpolation of an undefined variable produces
 			// exactly this shape). Same split loadBeatToken makes for
-			// BEAT_TOKEN, and the same diagnosis the whitespace-only value
-			// below already gets.
+			// BEAT_TOKEN, and the same diagnosis the value that trims to
+			// nothing visible below already gets.
 			if v, ok := os.LookupEnv("DISCORD_WEBHOOK_URL"); ok && v == "" {
 				return "", errWebhookSetButEmpty
 			}

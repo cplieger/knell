@@ -1459,17 +1459,19 @@ func TestLoadTrimsPaddedNodeName(t *testing.T) {
 	}
 }
 
-// TestLoadTrimsInvisibleConfigPadding pins the part of NODE_NAME's and
-// LISTEN_ADDR's trim that strings.TrimSpace does NOT do. The two padded tests
-// above use ASCII spaces, so they stay green against either predicate and
-// cannot tell them apart; every value here survives TrimSpace (a zero-width
-// space, a soft hyphen and a BOM are Cf format runes, not Unicode White_Space),
-// so reverting either strings.TrimFunc(…, invisibleInURL) call to TrimSpace
-// fails exactly one case below. Without this test the invisible-padding
-// behavior is unpinned in both places: a padded LISTEN_ADDR goes back to
-// crash-looping on a bind error whose cause cannot be seen in the log line, and
-// a padded NODE_NAME goes back to prefixing every notice with a character the
-// operator cannot see.
+// TestLoadTrimsInvisibleConfigPadding pins the part of NODE_NAME's,
+// LISTEN_ADDR's and DISCORD_WEBHOOK_URL's trim that strings.TrimSpace does NOT
+// do. The padded tests above use ASCII spaces, so they stay green against
+// either predicate and cannot tell them apart; every value here survives
+// TrimSpace (a zero-width space, a soft hyphen and a BOM are Cf format runes,
+// not Unicode White_Space), so reverting any of the three
+// strings.TrimFunc(…, invisibleInURL) calls to TrimSpace fails exactly one case
+// below. Without this test the invisible-padding behavior is unpinned in all
+// three places: a padded LISTEN_ADDR goes back to
+// crash-looping on a bind error whose cause cannot be seen in the log line, a
+// padded NODE_NAME goes back to prefixing every notice with a character the
+// operator cannot see, and a padded DISCORD_WEBHOOK_URL goes back to refusing
+// startup through parseWebhookURL over a rune nobody can see in the value.
 func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, and the last subtest swaps the
 	// process-global slog default via capture.Default.
@@ -1502,6 +1504,19 @@ func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
 		}
 		if cfg.ListenAddr != "0.0.0.0:9999" {
 			t.Errorf("ListenAddr = %q, want the trimmed address: net.Listen resolves a value carrying these runes as a hostname lookup and fails, and the padding is invisible in the resulting crash-loop log line", cfg.ListenAddr)
+		}
+	})
+
+	t.Run("a DISCORD_WEBHOOK_URL padded with invisible runes is trimmed", func(t *testing.T) {
+		setValidLoadEnv(t)
+		t.Setenv("DISCORD_WEBHOOK_URL", zeroWidthSpace+"https://discord.example/api/webhooks/1/abc"+byteOrderMark)
+
+		cfg, err := Load(maxNodeNameBytes)
+		if err != nil {
+			t.Fatalf("Load() error: %v: TrimSpace keeps these runes, so parseWebhookURL refuses a URL pasted out of a rendered page and the observer never starts", err)
+		}
+		if cfg.WebhookURL != "https://discord.example/api/webhooks/1/abc" {
+			t.Errorf("WebhookURL = %q, want the invisible padding trimmed: an untrimmed rune is percent-encoded on every POST, so Discord answers 404 forever and the switch can never ring", cfg.WebhookURL)
 		}
 	})
 
