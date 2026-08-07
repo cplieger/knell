@@ -21,7 +21,7 @@
 // carries a retryable attribute: true when the record survives and the next
 // sweep sends it again (the missing and history send failures), false when
 // nothing is left to attempt and no notice for that transition will ever
-// arrive (a discarded record, a dropped or failed recovered notice, the
+// arrive (a discarded record, a failed recovered notice, the
 // notices abandoned at shutdown). The LEVEL is deliberately not that signal — a
 // retried send stays at Error rather than spamming Warn every sweep — so this
 // attribute is what a log rule keys on to tell "wait for it" from
@@ -32,6 +32,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -282,6 +283,14 @@ type overdueBeat struct {
 // beatState is the per-beat tracking record.
 type beatState struct {
 	lastSeen time.Time
+	// lastAttempt is when this beat last had a notification send ATTEMPTED
+	// for it, zero while none ever has been. It is the sweep's ordering key
+	// (see collectDue and sweep): stamping it when the attempt STARTS is what
+	// bounds how long a continuously-due beat can wait, because a beat that
+	// has taken its turn sorts behind every beat still waiting for a first
+	// one — whether its send succeeded, failed, or ran long enough to spend
+	// the sweep's whole budget.
+	lastAttempt time.Time
 	// pendingMissing is the FIFO of detected missing transitions whose
 	// notification is not yet delivered, oldest first. It retains the
 	// evidence of an outage so a ping cannot erase it by moving lastSeen.
@@ -686,32 +695,33 @@ func (w *Watcher) Beat(id string) BeatOutcome {
 	// unlock would reopen the race one step further along — the channel's only
 	// reader could have drained and returned in between. The channel send is
 	// non-blocking, so holding the lock across it cannot stall a ping.
-	recoveryDropped := false
+	//
+	// The slot is guaranteed, by a closed capacity proof rather than by
+	// optimism: New sizes w.recoveries at one slot per configured beat, and a
+	// beat can occupy at most one of them at a time — this ping is the one that
+	// cleared alerted and set recovering, and collectBeatDue starts no further
+	// missing notice (so produces no further recovery) for the beat until
+	// finishRecovery clears that flag. The default arm below is therefore
+	// unreachable unless a maintainer breaks the capacity bound or the
+	// per-beat exclusion, and a recovered notice nothing retries must not be
+	// silently swallowed by a broken invariant: assert instead. Non-blocking
+	// deliberately — a plain blocking send here would deadlock the watcher
+	// against the only reader that can drain it, which must take this mutex.
 	if wasAlerted {
 		select {
 		case w.recoveries <- recoveryEvent{id: id, silence: silence}:
 		default:
-			// Cannot happen while the queue bound matches the beat count
-			// (one pending recovery per beat), but never block a ping.
-			// The dropped recovery is no longer pending, so un-mark it or
-			// the beat could never alert again.
-			st.recovering = false
-			recoveryDropped = true
+			// Release the mutex before failing: net/http recovers a panic
+			// raised in a handler, and a mutex left held would turn a loud
+			// bug report into a silently wedged watcher.
+			w.mu.Unlock()
+			panic("watch: recovery queue full for beat " + id + ": capacity is one slot per configured beat and a beat holds at most one recovery, so this is unreachable unless that invariant was broken")
 		}
 	}
 	w.mu.Unlock()
 
 	if droppedEnded != nil {
 		logEndedOutageDropped(droppedEnded)
-	}
-	if recoveryDropped {
-		// Reported outside the lock: neither the counter nor the log line is
-		// part of the state transition. Nothing retries a dropped recovery
-		// notice, so this is a permanent loss like a dropped missing record,
-		// not a failed delivery attempt.
-		metrics.RecordNotificationDropped(metrics.KindRecovered)
-		slog.Warn("recovery queue full, dropping recovered notification, nothing retries it and no notice for this recovery will ever arrive",
-			"beat", id, "down_for", silence.DownFor().String(), "retryable", false)
 	}
 	return BeatRecorded
 }
@@ -817,8 +827,7 @@ func (w *Watcher) refreshFreshness() {
 // transition is gone with the channel. This is the one
 // permanent-loss path no counter can show: notifications_dropped_total
 // counts a MESSAGE that is lost for good once its delivery was ATTEMPTED and
-// failed (sendRecovered) or its queued transition was discarded
-// (Beat's full recovery channel), and outage_records_dropped_total counts a
+// failed (sendRecovered), and outage_records_dropped_total counts a
 // RECORD discarded by a full pending queue (recordEndedOutage), while a record
 // still sitting in a queue here was
 // never attempted and never discarded, so the log line is the operator's only
@@ -952,38 +961,50 @@ func publishFreshness(id string, silence, deadline time.Duration) bool {
 // A delivered send for an outage that is already over (a ping raced the
 // notice) emits the recovered transition immediately and leaves the beat
 // armed for the next outage.
-// One notification per beat per sweep, and history goes first so the oldest
-// events lead: a beat whose queue head is an outage that already ended
-// delivers every consecutive ended outage as ONE past-tense notice in this
-// sweep, which is why a live outage queued behind a backlog waits a single
-// tick rather than one tick per stale record. Run calls sweep on every tick;
-// in-package tests call it directly.
+// One notification per beat per sweep: a beat whose queue head is an outage
+// that already ended delivers every consecutive ended outage as ONE past-tense
+// notice in this sweep, which is why a live outage queued behind a backlog
+// waits a single tick rather than one tick per stale record. Run calls sweep on
+// every tick; in-package tests call it directly.
 //
 // Sending is bounded by sweepSendBudget: once it is spent the sweep stops
 // starting sends and returns, so Run can service the recoveries channel
 // instead of waiting out a whole storm of missing notices. The cut lands at
 // the tail of this sweep's ordering — a beat is never skipped to reach a later
 // one — and a beat left unreached is untouched, so the next sweep sends it.
+//
+// That last sentence is a GUARANTEE, and the ORDER is what makes it one.
+// collectDue returns a single worklist ordered least-recently-attempted first
+// (see byAttemptThenAge), and every send stamps the beat's attempt time before
+// it starts, so a beat this sweep reached sorts behind every beat it did not.
+// A continuously-due beat therefore receives an attempt within as many sweeps
+// as there are due beats, however slow the webhook is and whichever beat the
+// budget cut lands on: no class of notice has global priority over another, so
+// freshly-ended outages cannot keep arriving ahead of a live missing notice,
+// and a beat whose send keeps failing cannot hold the front of a worklist that
+// is rebuilt from scratch every tick.
 func (w *Watcher) sweep(ctx context.Context) {
-	live, history := w.collectDue()
+	due := w.collectDue()
 	budget := w.now().Add(sweepSendBudget)
-	for i, past := range history {
+	for i := range due {
 		// Every unsent entry is one beat, history and live alike (collectDue
-		// yields at most one notice per beat), so the whole remainder of both
-		// orderings is what a cut here defers.
-		if w.budgetSpent(budget, len(history)-i+len(live)) {
-			w.blameDeferredHistory(history[i:])
+		// yields at most one notice per beat), so the whole remainder of the
+		// ordering is what a cut here defers.
+		if w.budgetSpent(budget, len(due)-i) {
+			w.blameDeferredHistory(deferredHistory(due[i:]))
 			return
 		}
-		if w.sendHistory(ctx, past) {
-			return
+		// Before the send, not after: the beat has taken its turn either way,
+		// and a send that is slow, fails, or is abandoned mid-flight must not
+		// keep its place at the front of the next sweep's ordering.
+		w.markAttempted(due[i].beatID(), w.now())
+		if due[i].history != nil {
+			if w.sendHistory(ctx, *due[i].history) {
+				return
+			}
+			continue
 		}
-	}
-	for i := range live {
-		if w.budgetSpent(budget, len(live)-i) {
-			return
-		}
-		if w.sendMissing(ctx, &live[i]) {
+		if w.sendMissing(ctx, due[i].live) {
 			return
 		}
 	}
@@ -1033,39 +1054,152 @@ type beatOutages struct {
 	outages []Outage
 }
 
+// dueNotice is the ONE notice a beat owes this sweep, carried with the keys
+// sweep orders the work by. Exactly one of history and live is set: the beat's
+// own queue head decides which (collectBeatDue), exactly as it always has.
+// What dueNotice adds is only that both shapes now share ONE ordering, so no
+// class of notice can starve the other.
+type dueNotice struct {
+	// started is when the outage this notice reports began: the first outage
+	// of a history run, or the live record's own lastSeen anchor. It is the
+	// tie-break among beats with the same attempt history, so the oldest
+	// outage leads.
+	started time.Time
+	// lastAttempt is the beat's attempt stamp when this sweep collected it
+	// (see beatState.lastAttempt), the primary ordering key.
+	lastAttempt time.Time
+	// history is the collapsed run of already-ended outages when the beat's
+	// queue head is closed, nil for a live notice.
+	history *beatOutages
+	// live is the still-open record when the beat's queue head is open, nil
+	// for a history notice. It points at the copy collectBeatDue took under
+	// the lock, never at a queued record.
+	live *overdueBeat
+}
+
+// beatID is the beat this notice belongs to, read from whichever payload the
+// beat's queue head produced. Not stored a third time: the id already lives on
+// both payload types, and the notice is small enough to pass by value to the
+// ordering function only while it stays that way (gocritic hugeParam).
+func (n *dueNotice) beatID() string {
+	if n.history != nil {
+		return n.history.id
+	}
+	return n.live.id
+}
+
+// byAttemptThenAge orders one sweep's due notices, and it is the whole of the
+// sweep's fairness mechanism (see sweep):
+//
+//   - least-recently-attempted first, so a beat that has taken a turn falls
+//     behind every beat still waiting for one. Never-attempted beats carry the
+//     zero time and therefore lead;
+//   - oldest outage next, so among beats with the same attempt history the
+//     longest-running incident is served first;
+//   - a past-tense notice ahead of a live one that began at the very same
+//     instant, which only decides beats that tie on both keys above (the
+//     boot-armed fleet, where every beat's anchor is the process-start
+//     baseline). It is a tie-break, NOT the global history-before-live
+//     priority this ordering replaced: a freshly-ended outage sorts by its own
+//     start like everything else, so it cannot arrive ahead of an older live
+//     notice.
+func byAttemptThenAge(a, b dueNotice) int {
+	if c := a.lastAttempt.Compare(b.lastAttempt); c != 0 {
+		return c
+	}
+	if c := a.started.Compare(b.started); c != 0 {
+		return c
+	}
+	switch {
+	case a.history != nil && b.history == nil:
+		return -1
+	case a.history == nil && b.history != nil:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// deferredHistory names the history notices in the deferred tail of a sweep's
+// ordering: the entries whose late reason the budget cut rewrites (see
+// blameDeferredHistory). A deferred LIVE record needs no rewrite — its outage
+// is still open, so its notice makes no claim about delivery yet.
+func deferredHistory(deferred []dueNotice) []beatOutages {
+	past := make([]beatOutages, 0, len(deferred))
+	for i := range deferred {
+		if deferred[i].history != nil {
+			past = append(past, *deferred[i].history)
+		}
+	}
+	return past
+}
+
+// markAttempted stamps the beat's attempt time, which is what keeps the
+// sweep's ordering fair across ticks: collectDue reads the stamp back on every
+// later sweep, so a beat whose send was slow, failed, or was abandoned moves
+// behind the beats that have not had a turn instead of leading a worklist
+// rebuilt from a map range. No separate cursor is stored anywhere: the
+// priority function IS the mechanism.
+func (w *Watcher) markAttempted(id string, at time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.beats[id].lastAttempt = at
+}
+
 // collectDue publishes every beat's freshness gauge and returns this sweep's
-// due notifications, at most one per beat: either the beat's live missing
-// notice (the head of its pending queue is an outage still in progress: a
-// newly detected deadline crossing, or an earlier one whose send failed and
-// is being retried) or its history notice (the head already ended, so every
-// consecutive ended record at the head is collapsed into one notice).
+// due notifications in the order they must be attempted, at most one per beat:
+// either the beat's live missing notice (the head of its pending queue is an
+// outage still in progress: a newly detected deadline crossing, or an earlier
+// one whose send failed and is being retried) or its history notice (the head
+// already ended, so every consecutive ended record at the head is collapsed
+// into one notice).
 // Detection is independent of delivery, so a crossing is recorded even while
 // earlier notices are still queued; only beats mid-recovery are held back,
 // keeping transitions chronological.
-func (w *Watcher) collectDue() (live []overdueBeat, history []beatOutages) {
+//
+// The RETURNED ORDER is load-bearing and is why this returns one list rather
+// than a class-partitioned pair: w.beats is a map, so the collection order is
+// unspecified and differs between sweeps, and sweep always starts at the
+// front. byAttemptThenAge turns that arbitrary order into a total one keyed on
+// each beat's own attempt stamp, which is what bounds how many sweeps a
+// continuously-due beat can wait when the send budget keeps cutting the tick
+// short.
+func (w *Watcher) collectDue() []dueNotice {
+	var due []dueNotice
 	var deferredOverflow []overdueBeat
 	w.mu.Lock()
 	now := w.now()
 	for id, st := range w.beats {
-		due, run, overflow := collectBeatDue(id, st, now)
+		live, run, overflow := collectBeatDue(id, st, now)
 		if overflow != nil {
 			deferredOverflow = append(deferredOverflow, *overflow)
 		}
-		if len(run) > 0 {
-			history = append(history, beatOutages{id: id, outages: run})
-			continue
-		}
-		if due != nil {
-			live = append(live, *due)
+		switch {
+		case len(run) > 0:
+			due = append(due, dueNotice{
+				started:     run[0].Started,
+				lastAttempt: st.lastAttempt,
+				history:     &beatOutages{id: id, outages: run},
+			})
+		case live != nil:
+			due = append(due, dueNotice{
+				started:     live.silence.Started,
+				lastAttempt: st.lastAttempt,
+				live:        live,
+			})
 		}
 	}
 	w.mu.Unlock()
+	// Ordered outside the lock: every key was copied out above, so the sort
+	// touches no shared state and must not hold the mutex Beat,
+	// refreshFreshness and StopAccepting all take.
+	slices.SortFunc(due, byAttemptThenAge)
 	// Emitted outside the lock: a synchronous stderr write must not hold the
 	// mutex Beat, refreshFreshness and StopAccepting all take.
 	for i := range deferredOverflow {
 		logOngoingOutageDeferred(&deferredOverflow[i])
 	}
-	return live, history
+	return due
 }
 
 // collectBeatDue is collectDue's per-beat state transition: it publishes the
@@ -1137,10 +1271,10 @@ func collectBeatDue(id string, st *beatState, now time.Time) (live *overdueBeat,
 }
 
 // sendMissing delivers one due missing transition and reports whether
-// shutdown cancellation should stop the sweep. beat points into the sweep's
-// OWN slice of records collectDue copied out under the lock — never at a
-// queued record — so reading it here without the lock is safe; the pointer
-// only avoids copying the record again (gocritic hugeParam).
+// shutdown cancellation should stop the sweep. beat points at the record
+// collectBeatDue COPIED out under the lock — never at a queued record — so
+// reading it here without the lock is safe; the pointer only avoids copying
+// the record again (gocritic hugeParam).
 func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 	if err := w.notifier.BeatMissing(ctx, beat.id, beat.silence); err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -1156,7 +1290,7 @@ func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 	}
 	metrics.RecordNotificationSent(metrics.KindMissing)
 	slog.Info("beat missing, notified", "beat", beat.id, "silence", beat.silence.DownFor().String())
-	if event, raced := w.markDelivered(beat.id, beat.silence.Started); raced {
+	if event, raced := w.markDelivered(beat.id); raced {
 		w.sendRecovered(ctx, event)
 	}
 	return false
@@ -1244,17 +1378,19 @@ func (w *Watcher) blameDeferredHistory(deferred []beatOutages) {
 	}
 }
 
-// markDelivered records the outcome of a delivered missing send for id, given
-// the start of the silence that notice reported (the lastSeen the sweep
-// measured it from). It pops the delivered transition, promoting any later
-// queued outage to the head for the next sweep. Normally it marks the beat
-// alerted. When the outage is
+// markDelivered records the outcome of a delivered missing send for id. It
+// pops the delivered transition, promoting any later queued outage to the head
+// for the next sweep. Normally it marks the beat alerted. When the outage is
 // already over — the popped record carries the recovery point a ping sealed
 // into it, including a ping that raced this very send — marking alerted
 // would swallow the NEXT outage's missing notice, so the beat stays
 // re-armed and the pending recovered transition is returned for immediate
 // delivery.
-func (w *Watcher) markDelivered(id string, started time.Time) (recoveryEvent, bool) {
+//
+// Both endpoints of the returned transition come from the popped record, which
+// is the same record the sweep copied the missing notice from: there is no
+// second source for the silence's start that a later edit could make disagree.
+func (w *Watcher) markDelivered(id string) (recoveryEvent, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	st := w.beats[id]
@@ -1270,7 +1406,7 @@ func (w *Watcher) markDelivered(id string, started time.Time) (recoveryEvent, bo
 	recoveredAt := delivered.recoveredAt
 	// The recovered notice reports the same silence the missing notice just
 	// reported, ending at the recovery point instead of at the sweep.
-	return recoveryEvent{id: id, silence: Transition{Started: started, Observed: recoveredAt}}, true
+	return recoveryEvent{id: id, silence: Transition{Started: delivered.silence.Started, Observed: recoveredAt}}, true
 }
 
 // finishRecovery clears the pending-recovery mark for id, re-enabling sweep
@@ -1291,8 +1427,7 @@ func (w *Watcher) finishRecovery(id string) {
 // unconditionally on the way out, so nothing holds a record to retry from: a
 // failed attempt means no recovered notice for that outage will ever arrive.
 // That is the dropped counter's meaning, not the failed counter's, so a
-// non-cancellation failure counts as DROPPED — the same accounting a
-// recovery discarded by a full queue gets in Beat. Contrast sendMissing and
+// non-cancellation failure counts as DROPPED. Contrast sendMissing and
 // sendHistory, whose records stay queued: their failures are genuinely
 // retried on the next sweep and belong on failed.
 //
@@ -1301,8 +1436,7 @@ func (w *Watcher) finishRecovery(id string) {
 // event was already taken off w.recoveries by Run's select, so the drain
 // there cannot see it and queued_recoveries excludes it. The Info line below is
 // this loss's ONLY trace, which is why it names the beat and its span.
-// The failure log below stays at Error rather than the Warn the queue-full
-// drops use, because unlike them something WAS attempted and the webhook is
+// The failure log below is at Error: something WAS attempted and the webhook is
 // broken.
 func (w *Watcher) sendRecovered(ctx context.Context, ev recoveryEvent) {
 	defer w.finishRecovery(ev.id)

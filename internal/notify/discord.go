@@ -405,48 +405,17 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 		// without the alarm, which is what WithExhaustedLevel is for.
 		httpx.WithExhaustedLevel(slog.LevelDebug))
 	if err != nil {
-		return fmt.Errorf("delivering %s notification: %w", label, logSafe(err))
+		return fmt.Errorf("delivering %s notification: %w", label, httpx.LogSafeError(err))
 	}
 	return nil
 }
 
-// logSafe reduces err to a form that cannot carry the webhook URL. The
-// reduction is purely STRUCTURAL: httpx.LogSafeError unwraps the *url.Error
-// net/http builds around a transport failure, which is the one error shape
-// that embeds the full request URL, and returns everything else untouched. A
-// *url.Error carrying NO cause reduces to httpx's own contentless stand-in
-// rather than to nil (v4.2.0 fixed that at the source), so a real failure can
-// never be reduced to a success signal here — nil in, nil out, and non-nil in,
-// non-nil out.
-//
-// There is deliberately no string search-and-replace backstop: text-matching
-// redaction can only defend text knell chose to publish, and this package
-// publishes none (see post for that invariant).
-//
-// Stripping the wrapper leaves the CAUSE's text, which is why the transport
-// path must NOT return this error as-is; safeTransportError, immediately
-// below, names those causes and adds the classification step. This function
-// is the reduction those callers share.
-//
-// The reduced error is returned as-is rather than re-wrapped, which keeps
-// errors.Is/As intact: the sweep relies on it for context.Canceled and
-// httpx.Do for transient classification. httpx.RedactSecret cannot be used
-// here — it returns a bare errors.New and would break both.
-//
-// It is a thin wrapper over one library call and stays for two reasons: it is
-// the named home of the invariant above (three call sites, one place to read
-// why), and safeTransportError's reduction loop is written against its
-// "reduce, never nil" contract.
-func logSafe(err error) error {
-	return httpx.LogSafeError(err)
-}
-
 // safeTransportError reports a failed transport call in knell's own words.
 // It is what postAttempt returns for every error client.Do produces, and it
-// exists because logSafe alone is not enough there: stripping the *url.Error
-// wrapper leaves the cause's own TEXT, and two of net/http's causes are
-// written from the response's Location header — a malformed one is rendered as
-// `failed to parse Location header "<remote bytes>"`, and a refused hop as
+// exists because httpx.LogSafeError alone is not enough there: stripping the
+// *url.Error wrapper leaves the cause's own TEXT, and two of net/http's causes
+// are written from the response's Location header — a malformed one is rendered
+// as `failed to parse Location header "<remote bytes>"`, and a refused hop as
 // httpx's `refusing redirect to <remote host>`. Both are remote-authored, and
 // an endpoint that answers with a redirect echoing the request URI would put
 // the webhook path (which IS the credential) into httpx.Do's per-attempt logs
@@ -457,16 +426,26 @@ func logSafe(err error) error {
 // Unwrap. That keeps every consumer of the chain intact — watch's
 // context.Canceled exemption and httpx's transient classification both use
 // errors.Is/As, which traverse Unwrap without ever formatting the error.
+//
+// The reduction this and post share is httpx.LogSafeError, and it is purely
+// STRUCTURAL: it unwraps the *url.Error net/http builds around a transport
+// failure (the one error shape that embeds the full request URL) and returns
+// everything else untouched, so errors.Is/As keep working. A *url.Error
+// carrying NO cause reduces to httpx's own contentless stand-in rather than to
+// nil (v4.2.0 fixed that at the source), so a real failure can never be
+// reduced to a success signal and the loop below can rely on "reduce, never
+// nil". There is deliberately no string search-and-replace backstop:
+// text-matching redaction can only defend text knell chose to publish, and
+// this package publishes none (see post for that invariant). httpx.RedactSecret
+// cannot stand in for it — it returns a bare errors.New and would break both
+// classifications.
 func safeTransportError(err error) error {
-	if err == nil {
-		return nil
-	}
 	// Reduce until no *url.Error is left ANYWHERE in the chain, not just at
 	// the top. httpx.LogSafeError searches the chain with errors.As and
 	// RETURNS what it finds, so a url.Error still nested under the cause would
 	// let it unwrap past this wrapper and render that error's cause instead of
 	// the phrase below — in httpx.Do's attempt lines and in post's own
-	// logSafe. The loop terminates: each pass either strips a url.Error or
+	// reduction. The loop terminates: each pass either strips a url.Error or
 	// (for one with a nil Err) substitutes httpx's contentless stand-in, which
 	// is not a url.Error.
 	// maxURLErrorDepth bounds the reduction. Real chains are one or two
@@ -478,20 +457,20 @@ func safeTransportError(err error) error {
 	// delivery attempt, which no context can interrupt, and knell's only
 	// sender goroutine would stop notifying with /healthz still green.
 	const maxURLErrorDepth = 8
-	cause := logSafe(err)
+	cause := httpx.LogSafeError(err)
 	for range maxURLErrorDepth {
 		var nested *url.Error
 		if !errors.As(cause, &nested) {
 			break
 		}
-		cause = logSafe(cause)
+		cause = httpx.LogSafeError(cause)
 	}
 	var unreduced *url.Error
 	if errors.As(cause, &unreduced) {
 		// The cap was reached with a *url.Error still in the chain, so the
 		// full webhook URL is still reachable through it -- and post's own
-		// logSafe SEARCHES the chain with errors.As and RETURNS what it
-		// finds, so it would discard this wrapper and render that error's
+		// httpx.LogSafeError SEARCHES the chain with errors.As and RETURNS what
+		// it finds, so it would discard this wrapper and render that error's
 		// cause (net/http writes two of those from the Location header).
 		// Fail closed like every other reduction here: publish the phrase
 		// with no cause at all. The cost is the classification httpx and
@@ -613,13 +592,13 @@ func isProxyConnectError(err error) bool {
 // filtering: a transport error is reduced and classified by
 // safeTransportError, and a rejected response contributes only statusDetail's
 // numbers and knell's own wording for them. The reduction happens here rather
-// than in post's logSafe because httpx.Do logs each attempt's error before
-// post ever sees it.
+// than in post's own httpx.LogSafeError call because httpx.Do logs each
+// attempt's error before post ever sees it.
 func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error) {
 	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, d.url, bytes.NewReader(body))
 	if reqErr != nil {
 		// The raw error would embed the URL; report the cause only.
-		return struct{}{}, fmt.Errorf("building webhook request: %w", logSafe(reqErr))
+		return struct{}{}, fmt.Errorf("building webhook request: %w", httpx.LogSafeError(reqErr))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", userAgent)
@@ -659,8 +638,8 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 // transient and find *RateLimitError for the 429 wait.
 //
 // Nothing the other end authored is added. The detail is built HERE rather
-// than by post's logSafe because httpx.Do logs each attempt's error through
-// the type-based LogSafeError only, which passes a wrapped status error
+// than by post's own reduction because httpx.Do logs each attempt's error
+// through the type-based LogSafeError only, which passes a wrapped status error
 // through unchanged — so anything the body's own text contributed would reach
 // the retry and exhausted log lines, and for a webhook whose edge echoes the
 // request URI that text IS the credential. statusDetail therefore publishes

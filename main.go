@@ -203,7 +203,7 @@ func run() error {
 	// webhttp.Run invokes either this hook or the graceful shutdown hooks,
 	// never both; teardownAfterServeExit owns what that path must do.
 	serveExit := webhttp.WithServeExit(func(exitCtx context.Context) {
-		watchLoopStopped = teardownAfterServeExit(exitCtx, marker, watcher.StopAccepting, stop, watcherDone)
+		watchLoopStopped = teardownAfterServeExit(exitCtx, srv, marker, watcher.StopAccepting, stop, watcherDone)
 	})
 	err = webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
 	return classifyAbandonedWatchLoop(classifyServeError(err), watchLoopStopped)
@@ -241,8 +241,8 @@ func newServer(handler http.Handler) *http.Server {
 // teardownAfterServeExit runs the teardown for the non-graceful exit where
 // Serve returns before a signal: webhttp skips the drain hooks on that path,
 // so this is the only place that closes beat admission, marks the process
-// unhealthy, cancels the watcher and waits for it, all under the one grace
-// budget carried by exitCtx.
+// unhealthy, drains the handlers that were already accepted, cancels the
+// watcher and waits for it, all under the one grace budget carried by exitCtx.
 //
 // closeAdmission is the watcher's StopAccepting. It has to be called here as
 // well as in the pre-drain hook precisely because this path SKIPS pre-drain:
@@ -253,7 +253,19 @@ func newServer(handler http.Handler) *http.Server {
 // The stop() is this path's own, not a duplicate of main's defer: the app
 // context is still live here (no signal arrived), so without it awaitWatchLoop
 // would wait out the whole grace for a watch loop nobody asked to stop.
-func teardownAfterServeExit(exitCtx context.Context, marker *health.Marker, closeAdmission func(), stop context.CancelFunc, watcherDone <-chan struct{}) bool {
+//
+// srv.Shutdown is what closing admission does NOT cover, and skipping it loses
+// a diagnostic for good. StopAccepting only serializes with watch.Beat until
+// Beat releases the mutex: an ended-outage record a full queue discarded is
+// counted under that lock and its WARN — the only line naming the beat and the
+// window an operator has to reconstruct — is emitted AFTER the unlock, and the
+// record was never queued, so the watch loop's own shutdown tally cannot report
+// it either. Without the drain this callback can take the mutex in that gap,
+// finish the teardown and let the process exit while that line is still
+// pending, taking the process-local counter with it. Shutdown runs AFTER stop()
+// so the watch loop tallies concurrently rather than serially behind the drain,
+// and both share the one exitCtx budget.
+func teardownAfterServeExit(exitCtx context.Context, srv *http.Server, marker *health.Marker, closeAdmission func(), stop context.CancelFunc, watcherDone <-chan struct{}) bool {
 	closeAdmission()
 	// The graceful path's "shutting down" does not run here (webhttp skips
 	// pre-drain when Serve returns on its own), and the serve error itself is
@@ -261,6 +273,14 @@ func teardownAfterServeExit(exitCtx context.Context, marker *health.Marker, clos
 	// loop's abandoned-delivery lines are read before anything says why.
 	beginTeardown(marker, "serve loop exited, tearing down")
 	stop()
+	if err := srv.Shutdown(exitCtx); err != nil {
+		// retryable=false for the same reason every loss line in
+		// internal/watch carries it: a handler cut off here never finished its
+		// response and never emitted whatever loss diagnostic it still owed,
+		// and nothing retries either.
+		slog.Warn("accepted requests were still in flight at the end of the shutdown grace, so a handler's own loss diagnostic may never have been logged",
+			"grace", shutdownGrace.String(), "error", err, "retryable", false)
+	}
 	return awaitWatchLoop(exitCtx, watcherDone)
 }
 

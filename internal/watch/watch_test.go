@@ -704,54 +704,6 @@ func TestPendingRecoveryBlocksNextMissingUntilDelivered(t *testing.T) {
 	}
 }
 
-func TestRecoveryQueueOverflowDropKeepsBeatArmed(t *testing.T) {
-	t.Parallel()
-
-	// New sizes the recovery queue from the beat count, so the full-queue
-	// path is defensive-only in production. Shrink the queue to one slot
-	// short of the beat count before anything runs, so the final ping finds
-	// it full and its recovered notification is dropped.
-	const beatCount = 3
-	beats := make([]Beat, beatCount)
-	for i := range beats {
-		beats[i] = Beat{ID: fmt.Sprintf("overflow-%02d", i), Deadline: 10 * time.Minute}
-	}
-	w, clock, n := newTestWatcher(beats...)
-	w.recoveries = make(chan recoveryEvent, beatCount-1)
-
-	clock.Advance(11 * time.Minute)
-	w.sweep(context.Background())
-	if got := len(n.snapshot()); got != len(beats) {
-		t.Fatalf("missing notifications = %d, want %d", got, len(beats))
-	}
-
-	// Ping every beat without draining the queue: the first beatCount-1
-	// pings queue their recovery, the last one finds the queue full and its
-	// recovered notification is dropped.
-	last := beats[len(beats)-1].ID
-	for _, b := range beats {
-		if !recordedBeat(w, b.ID) {
-			t.Fatalf("Beat(%s) = false", b.ID)
-		}
-	}
-
-	// The dropped beat goes silent again while the queue is still full.
-	// The drop path must un-mark recovering, or this beat could never
-	// alert again -- the worst failure a dead-man switch can have.
-	clock.Advance(11 * time.Minute)
-	before := len(n.snapshot())
-	w.sweep(context.Background())
-	var reAlerted bool
-	for _, c := range n.snapshot()[before:] {
-		if c.kind == "missing" && c.id == last {
-			reAlerted = true
-		}
-	}
-	if !reAlerted {
-		t.Fatalf("dropped-recovery beat %s did not re-alert; recovering flag leaked", last)
-	}
-}
-
 // failFirstNotifier fails the FIRST attempted missing send whichever beat it
 // is for, and counts every attempt. Which beat comes first is deliberately
 // irrelevant: Watcher stores beats in a map and therefore promises no

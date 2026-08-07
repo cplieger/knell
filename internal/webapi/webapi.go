@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -442,23 +443,32 @@ func beatEndpointRequest(r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	// BOTH spellings, because neither alone covers the class the gate answers:
-	// ServeMux matches patterns against the ESCAPED path, so an encoded slash
-	// (/beat/a%2Fb) stays inside the {id} segment and routes to POST
-	// /beat/{id}, while it also unescapes each request segment before comparing
+	// Read the ESCAPED path and decode it the way ServeMux does — split the
+	// path into segments FIRST, then unescape each one — because neither raw
+	// view alone covers the class the gate answers. The mux matches patterns
+	// against the escaped path, so an encoded slash (/beat/a%2Fb) stays inside
+	// the {id} segment; and it unescapes each request segment before comparing
 	// it to a literal one, so an escaped letter in the literal segment
-	// (/%62eat/api) routes there too. Reading only one of the two exempts the
-	// other from the throttle the gate depends on. Over-inclusion is harmless
-	// (a spelling the mux 404s draws a token it would otherwise not), while
-	// under-inclusion is an unbounded guessing oracle and log flood.
-	return singleSegmentUnderBeat(r.URL.EscapedPath()) || singleSegmentUnderBeat(r.URL.Path)
+	// (/%62eat/api) matches too. A request needing BOTH at once
+	// (/%62eat/a%2Fb) routes to POST /beat/{id} while satisfying neither raw
+	// view, which is exactly the exemption an unbounded guessing oracle and log
+	// flood would ride through. Over-inclusion is harmless (a spelling the mux
+	// 404s draws a token it would otherwise not); under-inclusion is a bypass.
+	return singleSegmentUnderBeat(r.URL.EscapedPath())
 }
 
-// singleSegmentUnderBeat reports whether p is exactly one non-empty segment
-// under /beat/, the shape the POST /beat/{id} route matches.
+// singleSegmentUnderBeat reports whether the ESCAPED path p is exactly one
+// non-empty segment under /beat/, the shape the POST /beat/{id} route matches.
+// It decodes segment-wise like ServeMux: the literal segment is unescaped
+// before it is compared, while an escaped slash inside the id is not a
+// separator and keeps the id a single segment.
 func singleSegmentUnderBeat(p string) bool {
-	id, found := strings.CutPrefix(p, "/beat/")
-	return found && id != "" && !strings.Contains(id, "/")
+	literal, id, found := strings.Cut(strings.TrimPrefix(p, "/"), "/")
+	if !found || id == "" || strings.Contains(id, "/") {
+		return false
+	}
+	decoded, unescapeErr := url.PathUnescape(literal)
+	return unescapeErr == nil && decoded == "beat"
 }
 
 // failedBeatAuth reports whether r is a FAILED authentication on the beat

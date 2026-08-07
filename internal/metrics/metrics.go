@@ -313,11 +313,10 @@ var notificationsFailed = metricslib.NewLabeledCounter(
 )
 
 // notificationsDropped counts notification MESSAGES that will never be
-// delivered, by kind. Both causes are recovered-shaped, because recovered is
-// the only fire-once kind: a recovered transition discarded when the recovery
-// channel was full (so no send was ever attempted), and a recovered send that
-// FAILED — recovered is dequeued before the send and finishRecovery runs
-// unconditionally, so nothing holds a record to retry from. That is the line
+// delivered, by kind. The cause is recovered-shaped, because recovered is the
+// only fire-once kind: a recovered send that FAILED — recovered is dequeued
+// before the send and finishRecovery runs unconditionally, so nothing holds a
+// record to retry from. That is the line
 // against notificationsFailed, which is drawn by what SURVIVES rather than by
 // whether a send was attempted: a notification counted failed still has its
 // record and retries, while a dropped one has nothing left to retry from, so no
@@ -331,7 +330,7 @@ var notificationsFailed = metricslib.NewLabeledCounter(
 // a slot frees — is counted nowhere, because nothing was dropped.
 var notificationsDropped = metricslib.NewLabeledCounter(
 	"notifications_dropped_total",
-	"Notification messages that will never be delivered, by kind ("+notificationKindsText+"); a fire-once recovered notice discarded by a full queue or whose send failed with nothing left to retry from; distinct from a delivery that failed and will retry.",
+	"Notification messages that will never be delivered, by kind ("+notificationKindsText+"); a fire-once recovered notice whose send failed with nothing left to retry from; distinct from a delivery that failed and will retry.",
 	[]string{kindLabel},
 )
 
@@ -532,8 +531,8 @@ func RecordNotificationFailed(kind Kind) {
 }
 
 // RecordNotificationDropped counts one notification message of kind that will
-// never be delivered: a fire-once recovered notice discarded by a full recovery
-// queue, or one whose send failed and left no record behind. Nothing retries
+// never be delivered: a fire-once recovered notice whose send failed and left
+// no record behind. Nothing retries
 // it. A discarded outage RECORD is not a message and goes to
 // RecordOutageRecordDropped instead.
 func RecordNotificationDropped(kind Kind) {

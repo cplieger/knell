@@ -723,7 +723,7 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	}
 
 	start := time.Now()
-	teardownAfterServeExit(exitCtx, marker, closeAdmission, stop, watcherDone)
+	teardownAfterServeExit(exitCtx, newServer(http.NewServeMux()), marker, closeAdmission, stop, watcherDone)
 	waited := time.Since(start)
 
 	if admissionClosed != 1 {

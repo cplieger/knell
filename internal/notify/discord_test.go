@@ -504,12 +504,12 @@ func TestErrorsNeverLeakWebhookURL(t *testing.T) {
 func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 	t.Parallel()
 
-	// logSafe's whole remaining job, and the one that matters: the *url.Error
-	// net/http builds around a transport failure is the only error shape that
-	// embeds the full request URL, and for a webhook that URL's path IS the
-	// credential. Reducing it to its cause is what keeps the URL out of post's
-	// returned error and out of httpx.Do's retry lines, and the reduction must
-	// not cost the errors.Is chain watch keys shutdown handling on
+	// httpx.LogSafeError's whole remaining job, and the one that matters: the
+	// *url.Error net/http builds around a transport failure is the only error
+	// shape that embeds the full request URL, and for a webhook that URL's path
+	// IS the credential. Reducing it to its cause is what keeps the URL out of
+	// post's returned error and out of httpx.Do's retry lines, and the reduction
+	// must not cost the errors.Is chain watch keys shutdown handling on
 	// (context.Canceled) and httpx.Do keys transient classification on.
 	//
 	// There is deliberately no text-matching backstop for an error that
@@ -521,7 +521,7 @@ func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
 
 	// Both shapes occur: postAttempt hands back client.Do's bare *url.Error,
-	// and post applies logSafe again to what httpx.Do returns, where the same
+	// and post reduces what httpx.Do returns a second time, where the same
 	// error arrives wrapped in the retry plumbing's own text.
 	for name, in := range map[string]error{
 		"bare url error":    &url.Error{Op: "Post", URL: rawURL, Err: context.Canceled},
@@ -530,17 +530,17 @@ func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			got := logSafe(in)
+			got := httpx.LogSafeError(in)
 			if !strings.Contains(in.Error(), secret) {
 				t.Fatalf("setup: input %q does not carry the credential, the assertion would be vacuous", in)
 			}
 			for _, leak := range []string{secret, "/api/webhooks/", "discord.example"} {
 				if strings.Contains(got.Error(), leak) {
-					t.Errorf("logSafe kept %q from the request URL: %v", leak, got)
+					t.Errorf("httpx.LogSafeError kept %q from the request URL: %v", leak, got)
 				}
 			}
 			if !errors.Is(got, context.Canceled) {
-				t.Errorf("logSafe broke the errors.Is chain: %v", got)
+				t.Errorf("httpx.LogSafeError broke the errors.Is chain: %v", got)
 			}
 			// safeTransportError is what postAttempt actually returns, and it
 			// replaces the message entirely -- so the chain it exposes through
@@ -556,9 +556,6 @@ func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 				if strings.Contains(safe.Error(), leak) {
 					t.Errorf("safeTransportError kept %q from the request URL: %v", leak, safe)
 				}
-			}
-			if safeTransportError(nil) != nil {
-				t.Error("safeTransportError(nil) != nil, want nil (a nil must not become a delivery failure)")
 			}
 		})
 	}
@@ -597,13 +594,13 @@ func TestNestedURLErrorsAreFullyReducedBeforeClassification(t *testing.T) {
 	if got.Error() != "webhook transport failed" {
 		t.Errorf("safeTransportError(nested *url.Error).Error() = %q, want knell's own phrase", got.Error())
 	}
-	// The three surfaces the reduction has to hold for: the error itself, the
-	// reduction httpx.Do logs every attempt through, and post's own logSafe of
-	// what httpx.Do returns. They fail independently.
+	// The two surfaces the reduction has to hold for: the error itself, and the
+	// reduction both httpx.Do's attempt lines and post's own terminal wrap put
+	// it through (one function, httpx.LogSafeError, since the app-local alias
+	// was removed). They fail independently.
 	for surface, rendered := range map[string]error{
-		"transport error":                got,
-		"attempt error as httpx logs it": httpx.LogSafeError(got),
-		"post's reduction":               logSafe(got),
+		"transport error":                        got,
+		"reduced error as httpx and post log it": httpx.LogSafeError(got),
 	} {
 		if rendered == nil {
 			t.Errorf("%s = nil, want an error (a nil reports an undelivered notification as delivered)", surface)
@@ -637,17 +634,17 @@ func TestLogSafeNeverReducesAFailureToNil(t *testing.T) {
 	const secret = "verysecretclosedtoken"
 	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
 
-	got := logSafe(&url.Error{Op: "Post", URL: rawURL})
+	got := httpx.LogSafeError(&url.Error{Op: "Post", URL: rawURL})
 	if got == nil {
-		t.Fatal("logSafe(*url.Error with a nil cause) = nil, want an error (a nil reports an undelivered notification as delivered)")
+		t.Fatal("httpx.LogSafeError(*url.Error with a nil cause) = nil, want an error (a nil reports an undelivered notification as delivered)")
 	}
 	if strings.Contains(got.Error(), secret) {
 		t.Errorf("the reduced error leaks the webhook credential: %v", got)
 	}
-	// The nil-in/nil-out half of the contract: post and postAttempt call
-	// logSafe only on a real failure, so a nil must not become an error.
-	if got := logSafe(nil); got != nil {
-		t.Errorf("logSafe(nil) = %v, want nil", got)
+	// The nil-in/nil-out half of the contract: post and postAttempt reduce
+	// only on a real failure, so a nil must not become an error.
+	if got := httpx.LogSafeError(nil); got != nil {
+		t.Errorf("httpx.LogSafeError(nil) = %v, want nil", got)
 	}
 }
 
@@ -736,7 +733,7 @@ func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 	// Deliberately NOT t.Parallel: slog.Default() is process-global.
 	//
 	// The returned-error assertions cannot cover the LOG surface. post
-	// applies logSafe a SECOND time to whatever httpx.Do returns, so an
+	// reduces whatever httpx.Do returns a SECOND time, so an
 	// attempt-level error that embeds the URL is reduced in the error every
 	// other test reads, while httpx.Do's per-attempt retry and exhausted
 	// lines (both Debug here, via WithExhaustedLevel) log the RAW attempt
@@ -772,9 +769,9 @@ func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
 	//
 	// Both surfaces are asserted because they fail independently: post's
 	// returned error, and httpx.Do's retry/exhausted lines, which log the
-	// ATTEMPT error through the type-based LogSafeError alone (post's logSafe
-	// runs too late for them). What survives is knell's own account of the
-	// body: the status, the byte count, and that the detail was dropped —
+	// ATTEMPT error through the type-based LogSafeError alone (post's own
+	// reduction runs too late for them). What survives is knell's own account
+	// of the body: the status, the byte count, and that the detail was dropped —
 	// enough to tell "the webhook answered and rejected us" from "nothing
 	// answered", which is what keeps the failure diagnosable.
 	const secret = "verysecretbodytoken"
@@ -1850,7 +1847,7 @@ func TestCanceledDeliveryErrorIsCanceled(t *testing.T) {
 	// as failed (KnellNotifyFailing would page on every shutdown). That
 	// contract crosses post's whole wrap chain (client error -> safeTransportError,
 	// whose Error() renders only knell's phrase and whose Unwrap is the only thing
-	// carrying the cause -> logSafe -> %w wrap), so pin it against the real
+	// carrying the cause -> httpx.LogSafeError -> %w wrap), so pin it against the real
 	// notifier: dropping transportError.Unwrap fails here, not in watch.
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})

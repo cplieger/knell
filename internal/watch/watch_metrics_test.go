@@ -656,55 +656,6 @@ func TestFailedAndDroppedNeverBothMoveForOneEvent(t *testing.T) {
 	}
 }
 
-func TestRecoveryQueueDropIsCountedAsDroppedNotFailed(t *testing.T) {
-	// Serial (no t.Parallel): asserts deltas on the package-global
-	// notification counters and captures the process-global slog default. A
-	// dropped recovered notice is best-effort and consumed, so nothing will
-	// ever retry it: it belongs on dropped, next to the queue-full missing
-	// drop, not on the counter that means "a delivery attempt failed".
-	beats := []Beat{
-		{ID: "recovery-drop-probe-a", Deadline: 10 * time.Minute},
-		{ID: "recovery-drop-probe-b", Deadline: 10 * time.Minute},
-	}
-	clock := newFakeClock()
-	n := &fakeNotifier{}
-	w := New(beats, n, clock.Now, clock.Now())
-	// New sizes the queue from the beat count, so shrink it by one slot to
-	// reach the drop path at all (defensive-only in production).
-	w.recoveries = make(chan recoveryEvent, len(beats)-1)
-
-	clock.Advance(11 * time.Minute)
-	for range beats {
-		w.sweep(context.Background())
-	}
-	if got := len(n.snapshot()); got != len(beats) {
-		t.Fatalf("missing notifications = %d, want %d (both beats must be alerted before their recoveries)", got, len(beats))
-	}
-
-	failedBefore := counterValue(t, "knell_notifications_failed_total", "recovered")
-	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "recovered")
-	rec := capture.Default(t)
-	// Ping both without draining: the first recovery queues, the second
-	// finds the queue full and its notice is dropped for good.
-	for _, b := range beats {
-		if !recordedBeat(w, b.ID) {
-			t.Fatalf("Beat(%s) = false", b.ID)
-		}
-	}
-	if got, want := counterValue(t, "knell_notifications_dropped_total", "recovered"), droppedBefore+1; got != want {
-		t.Errorf("dropped{recovered} = %v after a full recovery queue, want %v (that notice will never be delivered)", got, want)
-	}
-	if got := counterValue(t, "knell_notifications_failed_total", "recovered"); got != failedBefore {
-		t.Errorf("failed{recovered} = %v after a full recovery queue, want unchanged %v (nothing was attempted)", got, failedBefore)
-	}
-	if got := rec.CountLevel(slog.LevelWarn, "recovery queue full"); got != 1 {
-		t.Errorf("recovery-drop warnings = %d, want exactly 1 (a lost notice is news): %v", got, rec.Messages())
-	}
-	if !rec.HasAttr("recovery queue full", "retryable", "false") {
-		t.Errorf("recovery-drop warning does not report retryable=false, so a log rule cannot tell it from a send that will retry: %v", rec.Records())
-	}
-}
-
 func TestFailedRecoveredSendIsCountedAsDroppedNotFailed(t *testing.T) {
 	// Serial (no t.Parallel): asserts deltas on the package-global
 	// notification counters and captures the process-global slog default.

@@ -86,7 +86,7 @@ const MaxRequestHeaderBytes = maxTokenLength + headerOverheadAllowance
 //     stripped from the header value and the sender's value and the verifier's
 //     then differ, while a LEADING run is INTERIOR to that value and survives.
 //     The leading run is refused anyway, as the ASCII twin of the invisible edge
-//     invisibleEdge only warns about: it is part of the credential while being
+//     the warning below only reports: it is part of the credential while being
 //     absent from the value the operator reads.
 //   - CR, LF, VT and FF are illegal bytes in a field value and are not stripped
 //     at all, so no sender can put them on the wire.
@@ -561,27 +561,6 @@ func beatTokenFitsHeader(value string) bool {
 	return true
 }
 
-// invisibleEdge reports whether value begins or ends with a rune the operator
-// cannot see. It shares the webhook URL guard's predicate (invisibleInURL)
-// because the misconfiguration is the same one: strings.TrimSpace alone covers
-// only Unicode SPACES, so a token carrying a zero-width space, a soft hyphen or
-// a BOM at an edge reads identical to its visible form and draws no warning at
-// all, while arming the gate for a value one rune longer than the one the
-// operator reads. The predicate's ASCII space is unreachable from
-// checkBeatToken: ASCII edge padding is refused before this runs.
-func invisibleEdge(value string) bool {
-	return strings.TrimFunc(value, invisibleInURL) != value
-}
-
-// errBeatTokenSetButEmpty is the refusal for a BEAT_TOKEN that is present and
-// carries no value. It is loadBeatToken's, and only loadBeatToken's: envx cannot
-// tell present-but-empty from unset, so the *MissingError arm has to discriminate
-// the two with its own os.LookupEnv and give the empty case the message written
-// for it. checkBeatToken never needs the verdict — envx.SecretWithSource returns
-// a non-empty value on every success path (Require refuses an empty variable, and
-// a blank secret file is ErrBlankSecretFile), so no empty token reaches it.
-var errBeatTokenSetButEmpty = fmt.Errorf("BEAT_TOKEN is set but empty: it is the only thing standing between a stranger who can reach this port and a forged ping, so there is no configuration in which knell serves /beat/{id} without it; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
-
 // errWebhookSetButEmpty is the refusal for a DISCORD_WEBHOOK_URL that is
 // present and carries no value. Both of loadWebhook's empty-value paths return
 // it — the present-but-empty variable envx reports as missing, and the
@@ -678,7 +657,7 @@ func checkBeatToken(token string) error {
 		// log is shipped to Loki, where describing a live credential's alphabet
 		// narrows a guess.
 		slog.Warn("BEAT_TOKEN is armed with a value that is easy to mistake for absent; the /beat/{id} gate requires it and every sender must present it verbatim, so set a random token of visible characters instead")
-	} else if invisibleEdge(token) {
+	} else if strings.TrimFunc(token, invisibleInURL) != token {
 		// Presentable, non-blank, long enough, and carrying an edge rune the
 		// operator cannot see. ASCII edge padding was already REFUSED above, so
 		// what reaches here is a non-ASCII space, a zero-width space, a soft
@@ -746,7 +725,7 @@ func loadBeatToken() (string, error) {
 		// disarms the switch silently — and a startup failure is the one signal
 		// that cannot be mistaken for a working observer.
 		if v, ok := os.LookupEnv("BEAT_TOKEN"); ok && v == "" {
-			return "", errBeatTokenSetButEmpty
+			return "", fmt.Errorf("BEAT_TOKEN is set but empty: it is the only thing standing between a stranger who can reach this port and a forged ping, so there is no configuration in which knell serves /beat/{id} without it; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
 		}
 		return "", fmt.Errorf("BEAT_TOKEN is required: it is the only gate on /beat/{id}, so without it any client that can reach this port can keep every beat reading fresh while the thing it watches is dead; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one: %w", minTokenLength, err)
 	default:
@@ -804,11 +783,21 @@ func loadWebhook() (string, error) {
 	// own, and it applies to both channels. The webhook is trimmed where
 	// BEAT_TOKEN is refused because knell is this URL's only sender: there is no
 	// second party that must reproduce the value byte for byte.
-	webhook = strings.TrimSpace(webhook)
+	//
+	// TrimFunc with invisibleInURL, not TrimSpace: EVERY invisible rune at
+	// either edge is copy/paste padding here, exactly as it is for NODE_NAME
+	// and LISTEN_ADDR, and TrimSpace covers only Unicode SPACES. A zero-width
+	// space, a soft hyphen or a BOM at an edge — the shapes a URL pasted out of
+	// a rendered page or a chat client carries — would otherwise survive this
+	// trim and refuse startup through parseWebhookURL, whose own contract says
+	// the invisible runes reaching it are INTERIOR ones. Interior runes and
+	// invalid UTF-8 still fail there, and an operator who really needs an
+	// invisible rune inside the credential percent-encodes it themselves.
+	webhook = strings.TrimFunc(webhook, invisibleInURL)
 	if webhook == "" {
-		// Whitespace-only: the variable WAS provided, so this is a broken
-		// secret pipeline, not a missing setting. Reported as such instead
-		// of falling through to the shape check, which would answer
+		// Nothing visible at all: the variable WAS provided, so this is a
+		// broken secret pipeline, not a missing setting. Reported as such
+		// instead of falling through to the shape check, which would answer
 		// "scheme must be https" for a value that carries no scheme.
 		return "", errWebhookSetButEmpty
 	}
