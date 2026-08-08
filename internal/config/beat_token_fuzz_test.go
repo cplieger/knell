@@ -6,8 +6,6 @@ import (
 	"net/http"
 	"net/textproto"
 	"testing"
-
-	"github.com/cplieger/slogx/capture"
 )
 
 // FuzzCheckBeatToken pins the invariant the BEAT_TOKEN gate rests on: every
@@ -52,10 +50,6 @@ func FuzzCheckBeatToken(f *testing.F) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, token string) {
-		// checkBeatToken warns on two of the shapes it accepts; capture keeps
-		// the fuzz output readable and restores the default logger per input.
-		_ = capture.Default(t)
-
 		if err := checkBeatToken(token); err != nil {
 			return
 		}

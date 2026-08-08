@@ -1403,11 +1403,9 @@ func (w *Watcher) markDelivered(id string) (recoveryEvent, bool) {
 	st.recovering = true
 	// The sealed record carries the authoritative recovery point: the FIRST
 	// ping after the outage, written by Beat in the same critical section that
-	// advanced lastSeen.
-	recoveredAt := delivered.recoveredAt
-	// The recovered notice reports the same silence the missing notice just
-	// reported, ending at the recovery point instead of at the sweep.
-	return recoveryEvent{id: id, silence: Transition{Started: delivered.silence.Started, Observed: recoveredAt}}, true
+	// advanced lastSeen. The recovered notice reports the same silence the
+	// missing notice just reported, ending at that point instead of at the sweep.
+	return recoveryEvent{id: id, silence: Transition{Started: delivered.silence.Started, Observed: delivered.recoveredAt}}, true
 }
 
 // finishRecovery clears the pending-recovery mark for id, re-enabling sweep

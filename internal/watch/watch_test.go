@@ -2453,3 +2453,74 @@ func TestOutageEndedRequiresARecoveryPointNoEarlierThanItsStart(t *testing.T) {
 		})
 	}
 }
+
+// TestByAttemptThenAgeOrdersAttemptThenAgeThenHistory pins the sweep's whole
+// fairness ordering as a table over the comparison function itself: the
+// least-recently-attempted beat leads, the oldest outage breaks an attempt
+// tie, and a past-tense notice leads a live one only when both keys tie.
+func TestByAttemptThenAgeOrdersAttemptThenAgeThenHistory(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	live := func(started, attempted time.Time) dueNotice {
+		return dueNotice{
+			started:     started,
+			lastAttempt: attempted,
+			live:        &overdueBeat{id: "live", silence: Transition{Started: started, Observed: started.Add(time.Hour)}},
+		}
+	}
+	history := func(started, attempted time.Time) dueNotice {
+		return dueNotice{
+			started:     started,
+			lastAttempt: attempted,
+			history: &beatOutages{id: "past", outages: []Outage{
+				{Started: started, Recovered: started.Add(time.Minute)},
+			}},
+		}
+	}
+
+	cases := map[string]struct {
+		a, b dueNotice
+		want int
+	}{
+		"never-attempted leads whatever the outage ages say": {
+			a:    live(base, time.Time{}),
+			b:    live(base.Add(-time.Hour), base),
+			want: -1,
+		},
+		"the beat that took the later turn sorts behind": {
+			a:    live(base, base.Add(time.Second)),
+			b:    live(base, base),
+			want: 1,
+		},
+		"the older outage leads among equal attempt stamps": {
+			a:    live(base.Add(-time.Hour), base),
+			b:    live(base, base),
+			want: -1,
+		},
+		"history leads a live notice on a full key tie": {
+			a:    history(base, base),
+			b:    live(base, base),
+			want: -1,
+		},
+		"a live notice yields to history on the same tie": {
+			a:    live(base, base),
+			b:    history(base, base),
+			want: 1,
+		},
+		"a full tie between two live notices is stable": {
+			a:    live(base, base),
+			b:    live(base, base),
+			want: 0,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := byAttemptThenAge(tc.a, tc.b); got != tc.want {
+				t.Errorf("byAttemptThenAge(a, b) = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

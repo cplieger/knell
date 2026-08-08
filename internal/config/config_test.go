@@ -297,6 +297,31 @@ func TestLoadDefaultsAndFailures(t *testing.T) {
 	}
 }
 
+// TestLoadRefusesWithoutAWebhook pins the required webhook for the truly-ABSENT
+// case, the half TestLoadDefaultsAndFailures does not cover (it pins
+// present-but-empty). With neither DISCORD_WEBHOOK_URL nor
+// DISCORD_WEBHOOK_URL_FILE set, Load must refuse startup with the is-required
+// diagnosis: a regression that returned an empty webhook instead would start a
+// switch that can never ring while /healthz reports ready, and the
+// set-but-empty wording would send a fresh deployment hunting a secret
+// pipeline it never configured.
+func TestLoadRefusesWithoutAWebhook(t *testing.T) {
+	setValidLoadEnv(t)
+	unsetEnv(t, "DISCORD_WEBHOOK_URL")
+	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
+
+	_, err := Load(maxNodeNameBytes)
+	if err == nil {
+		t.Fatal("Load() with no webhook configured = nil, want a startup refusal: a dead-man switch with no webhook can never ring, and startup is the only moment the operator is watching")
+	}
+	if !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL is required") {
+		t.Errorf("error = %q, want the is-required diagnosis: the operator has to supply a webhook, and any other wording sends them to the wrong next move", err)
+	}
+	if strings.Contains(err.Error(), "set but empty") {
+		t.Errorf("error = %q uses the set-but-empty diagnosis for an unset variable; the two refusals deliberately ask for different next moves (supply a value vs fix the pipeline that delivered nothing)", err)
+	}
+}
+
 func TestLoadRejectsMalformedBeats(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEATS", "api:1s")
@@ -1068,90 +1093,25 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 	// strips only spaces and tabs: an NBSP-only token IS presented verbatim
 	// and DOES authenticate, so refusing it would fail startup on a working
 	// configuration, and trimming it to "" would leave webapi's gate with no
-	// credential to verify. Accepted verbatim, gate armed, with the warning —
-	// it is still almost certainly an accident.
+	// credential to verify. Accepted verbatim, gate armed.
 	//
 	// Eight NBSPs, because the token has to clear the minTokenLength floor to
-	// reach the warning at all: NBSP encodes as two bytes, so this is exactly a
-	// 16-byte token. That is also why the floor does NOT make this warning
-	// unreachable — a value can be long enough and still read as blank.
-	//
-	// Serial (t.Setenv forbids t.Parallel): swaps the process-global slog
-	// default to assert the warning.
+	// be accepted at all: NBSP encodes as two bytes, so this is exactly a
+	// 16-byte token — a value can read as blank and still be long enough.
 	const token = "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0"
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", token)
 	unsetEnv(t, "BEAT_TOKEN_FILE")
-
-	rec := capture.Default(t)
 
 	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
 		t.Fatalf("Load() with an NBSP-only BEAT_TOKEN = %v, want accepted: textproto keeps a non-ASCII space, so the token is presentable and the gate must stay armed", err)
 	}
 	if len(token) != minTokenLength {
-		t.Fatalf("fixture is %d bytes, want exactly %d: the case only reaches the warning past the length floor", len(token), minTokenLength)
+		t.Fatalf("fixture is %d bytes, want exactly %d: the case only clears the length floor at that size", len(token), minTokenLength)
 	}
 	if cfg.BeatToken != token {
 		t.Errorf("BeatToken = %q, want %q preserved verbatim: trimming it would leave webapi's gate with a credential no sender presents", cfg.BeatToken, token)
-	}
-	// The shape, not just the length: without this assertion the one warning
-	// that names the actual misconfiguration can be dropped and the log still
-	// looks populated. The asserted text deliberately does not describe the
-	// token's character class — the startup log ships to Loki, so it must not
-	// narrow a guess at a live credential's alphabet.
-	if !rec.Contains("mistake for absent") {
-		t.Errorf("log output %v never says the gate is armed with a value that looks absent; nothing else in the startup log distinguishes this token from one the operator can read, while senders must reproduce an invisible character", rec.Messages())
-	}
-	if rec.Contains("whitespace") {
-		t.Errorf("log output %v describes the token's character class; the startup log is shipped to Loki, so it must say the gate is armed without disclosing the credential's alphabet", rec.Messages())
-	}
-}
-
-// TestLoadWarnsWhenBeatTokenCarriesAnInvisibleEdgeCharacter pins the diagnostic
-// for the one unpresentable-in-practice token shape this package accepts. ASCII
-// edge padding is refused, and an all-invisible token draws the
-// mistake-for-absent warning, but a REAL token carrying a non-ASCII space at an
-// edge (an NBSP pasted along with the value out of a rendered page) is
-// presentable, so the gate arms for a string one character longer than the one
-// the operator reads: every sender presenting the visible token gets 401, and
-// one deadline later every configured beat posts a false MISSING notice. Without
-// this warning that configuration starts, reports itself gated, and says
-// nothing.
-func TestLoadWarnsWhenBeatTokenCarriesAnInvisibleEdgeCharacter(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
-	// Every shape is a rune HTTP carries verbatim and the operator cannot see,
-	// so each arms the gate for a value longer than the one they read.
-	for name, token := range map[string]string{
-		"leading non-ASCII space":   "\u00a0unit-test-beat-token",
-		"trailing zero-width space": "unit-test-beat-token\u200b",
-		"leading byte-order mark":   "\ufeffunit-test-beat-token",
-	} {
-		t.Run(name, func(t *testing.T) {
-			setValidLoadEnv(t)
-			t.Setenv("BEAT_TOKEN", token)
-			unsetEnv(t, "BEAT_TOKEN_FILE")
-
-			rec := capture.Default(t)
-
-			cfg, err := Load(maxNodeNameBytes)
-			if err != nil {
-				t.Fatalf("Load() with an invisible-edge BEAT_TOKEN = %v, want accepted: HTTP carries every byte >= 0x80, so the token is presentable and the gate must stay armed", err)
-			}
-			if cfg.BeatToken != token {
-				t.Errorf("BeatToken = %q, want the configured value verbatim", cfg.BeatToken)
-			}
-			if !rec.Contains("invisible but part of the credential") {
-				t.Errorf("log output %v never says the armed token carries an invisible edge character; the operator reads a visible token, configures senders with it, and every ping 401s until every beat goes falsely missing", rec.Messages())
-			}
-			if rec.Contains("mistake for absent") {
-				t.Errorf("log output %v used the all-invisible wording for a token that has visible content: %q", rec.Messages(), token)
-			}
-			if rec.Contains("unit-test-beat-token") || rec.AttrContains("", "", "unit-test-beat-token") {
-				t.Errorf("log output leaks the token value: %v", rec.Messages())
-			}
-		})
 	}
 }
 
@@ -1991,21 +1951,15 @@ func TestLoadDoesNotLeakACredentialPastedIntoASecretFileVariable(t *testing.T) {
 	}
 }
 
-// TestLoadRefusesAHeaderIllegalTokenWithoutCallingItArmed pins the ORDER of
-// checkBeatToken's two remaining checks. A plain BEAT_TOKEN of Unicode spaces
-// around a control byte passes the ASCII-edge refusal and reads blank to
-// strings.TrimSpace, so warning first logged "the gate is armed" for a value
-// the very next check refuses to start on — two contradictory startup signals
-// for one value, of which only the failure ever happened.
-// TestLoadKeepsANonASCIISpaceBeatTokenArmed pins the warning itself for a valid
-// NBSP-only token, so the two together fix the order.
+// TestLoadRefusesAHeaderIllegalTokenWithoutCallingItArmed pins that a plain
+// BEAT_TOKEN of Unicode spaces around a control byte is REFUSED: it passes the
+// ASCII-edge refusal and reads blank to strings.TrimSpace, so only the
+// header-legality check stands between it and a gate armed with a value no
+// sender can present.
 func TestLoadRefusesAHeaderIllegalTokenWithoutCallingItArmed(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
+	// Serial (t.Setenv forbids t.Parallel).
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "\u00a0\n\u00a0")
-
-	rec := capture.Default(t)
 
 	_, err := Load(maxNodeNameBytes)
 	if err == nil {
@@ -2013,9 +1967,6 @@ func TestLoadRefusesAHeaderIllegalTokenWithoutCallingItArmed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "control character") {
 		t.Errorf("error = %q, want the control-character refusal", err)
-	}
-	if rec.Contains("mistake for absent") {
-		t.Errorf("startup reported the gate armed for a token it then refused: %v", rec.Messages())
 	}
 }
 

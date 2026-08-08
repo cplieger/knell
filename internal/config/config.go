@@ -60,9 +60,17 @@ const maxTokenLength = 512
 // everything in a request that is NOT the beat token: the request line, Host, the
 // "Bearer " prefix the verifier compares against (see internal/webapi), and
 // whatever sits in front of knell adds — X-Forwarded-*, tracing headers, the
-// cookies a browser sends to /metrics. 8 KiB is the allowance nginx and Apache
-// give a whole header block by default, so a request no other server in the path
-// would refuse is not refused here either.
+// cookies a browser sends to /metrics. 8 KiB matches the default PER-LINE ceiling
+// of the servers likely to sit in front — nginx bounds the request line and each
+// header field to one 8k buffer by default, and Apache's LimitRequestFieldSize
+// default is 8190 — so no single header a default proxy chain delivers can
+// overflow this allowance on its own. Their WHOLE-BLOCK defaults are larger
+// (nginx allows up to four such buffers, Apache up to 100 fields), so a block
+// between this ceiling and theirs passes the proxy and is answered 431 here;
+// that is deliberate, because knell's senders are machine clients with small
+// header blocks, and what the budget must never refuse is an accepted
+// maximum-length token plus knell's own required headers, which total under
+// 1 KiB.
 //
 // It is stated as headroom ON TOP of maxTokenLength rather than folded into a
 // single number because a ceiling EQUAL to the token maximum would refuse a
@@ -85,9 +93,8 @@ const MaxRequestHeaderBytes = maxTokenLength + headerOverheadAllowance
 //     compares "Bearer "+token (see internal/webapi), so a TRAILING run IS
 //     stripped from the header value and the sender's value and the verifier's
 //     then differ, while a LEADING run is INTERIOR to that value and survives.
-//     The leading run is refused anyway, as the ASCII twin of the invisible edge
-//     the warning below only reports: it is part of the credential while being
-//     absent from the value the operator reads.
+//     The leading run is refused anyway, because it is part of the credential
+//     while being absent from the value the operator reads.
 //   - CR, LF, VT and FF are illegal bytes in a field value and are not stripped
 //     at all, so no sender can put them on the wire.
 //
@@ -608,11 +615,6 @@ func checkBeatToken(token string) error {
 		// than arm a gate that 401s every ping and turns every configured beat
 		// falsely missing one deadline later. The value is never echoed: the
 		// message names the variable and the shape of the problem only.
-		//
-		// Checked BEFORE the armed-with-an-invisible-value warning below: a
-		// value like "\u00a0\n\u00a0" passes the ASCII-edge refusal and reads
-		// blank to invisibleInURL, so warning first would log "the gate is
-		// armed" for a configuration this very check then refuses to start.
 		return fmt.Errorf("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it; use a token of at least %d printable characters", minTokenLength)
 	}
 	if len(token) < minTokenLength {
@@ -642,35 +644,6 @@ func checkBeatToken(token string) error {
 		// secret file of up to 1 MiB), which is why the remedy names the value
 		// and not the cap.
 		return fmt.Errorf("BEAT_TOKEN is longer than the %d-byte maximum: knell reads at most %d bytes of request headers, and a token past the maximum leaves no room for the request line, the Host header and the \"Bearer \" prefix it travels with, so POST /beat/{id} would reject every ping with 431 while reporting itself gated; set a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or check that BEAT_TOKEN_FILE names the secret file itself rather than a bundle the mount picked up", maxTokenLength, MaxRequestHeaderBytes, minTokenLength)
-	}
-	if strings.TrimFunc(token, invisibleInURL) == "" {
-		// Invisible end to end by invisibleInURL — all Unicode spaces (NBSP,
-		// U+2000...) and every other unprintable rune (a zero-width space, a
-		// soft hyphen, a BOM) — yet long enough, free of ASCII edge padding and
-		// legal in a header, so every rune survives the header: the token IS
-		// presentable, so it is kept verbatim and
-		// the gate stays armed. Reachable past the length floor because those
-		// runes are multi-byte — eight NBSPs are sixteen bytes — so the floor
-		// does not stand in for this warning. Say so, because nothing else in
-		// the startup log tells this token apart from one the operator can read,
-		// and it is invisible in `docker inspect` output too. The wording
-		// deliberately does NOT name the value's character class: the startup
-		// log is shipped to Loki, where describing a live credential's alphabet
-		// narrows a guess.
-		slog.Warn("BEAT_TOKEN is armed with a value that is easy to mistake for absent; the /beat/{id} gate requires it and every sender must present it verbatim, so set a random token of visible characters instead")
-	} else if strings.TrimFunc(token, invisibleInURL) != token {
-		// Presentable, non-blank, long enough, and carrying an edge rune the
-		// operator cannot see. ASCII edge padding was already REFUSED above, so
-		// what reaches here is a non-ASCII space, a zero-width space, a soft
-		// hyphen or a BOM (the shapes a token pasted out of a rendered page or a
-		// word processor carries) that textproto carries verbatim:
-		// the gate arms for a value one character longer than the one the
-		// operator reads, every sender presenting the visible token gets 401,
-		// and one deadline later every configured beat posts a false MISSING
-		// notice. Warn rather than refuse, because the value IS presentable and
-		// a token containing a non-ASCII space is documented as accepted. As
-		// above, the wording never names the character class.
-		slog.Warn("BEAT_TOKEN is armed with a value whose first or last character is invisible but part of the credential; every sender must present it verbatim, so retype the token from visible characters")
 	}
 	return nil
 }
