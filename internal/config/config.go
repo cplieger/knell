@@ -141,8 +141,9 @@ type Config struct {
 	// variable. It is carried here because it is the one non-secret FACT about
 	// the credential worth publishing at startup (see LogValue) — a webhook
 	// supplied through the plain variable sits in the process environment and in
-	// `docker inspect` output. Load always sets it; a Config built any other way
-	// leaves it empty and LogValue reports SourceNone.
+	// `docker inspect` output. Load is how consumers obtain a Config, and every
+	// successful Load assigns the source loadWebhook returned, so this field is
+	// always populated on the Config the app logs.
 	WebhookSource envx.SecretSource
 	Node          string
 	ListenAddr    string
@@ -178,13 +179,7 @@ func (c Config) LogValue() slog.Value {
 	//
 	// envx's own vocabulary is rendered verbatim ("env", "file") rather than
 	// translated, so the value names the same channel the package that resolved
-	// it does. A Config built without Load carries no source, which is exactly
-	// envx.SourceNone ("none"); the nil-safe fallback matches allowed_hosts
-	// below, so a zero Config renders rather than printing an empty attr.
-	webhook := string(c.WebhookSource)
-	if webhook == "" {
-		webhook = string(envx.SourceNone)
-	}
+	// it does.
 	// The Host allowlist is knell's one OPTIONAL gate, and ABSENCE is the state
 	// that needs publishing: a present-but-blank ALLOWED_HOSTS warns at parse
 	// time, but a MISSPELLED variable name is indistinguishable from unset and
@@ -204,7 +199,7 @@ func (c Config) LogValue() slog.Value {
 		slog.Int("beats", len(c.Beats)),
 		slog.String("node", c.Node),
 		slog.String("listen_addr", c.ListenAddr),
-		slog.String("webhook", webhook),
+		slog.String("webhook", string(c.WebhookSource)),
 		slog.String("allowed_hosts", allowedHosts),
 		slog.String("log_level", c.LogLevel.String()),
 	)
@@ -942,12 +937,22 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		// then fail as a transport error exactly when the switch must ring.
 		return nil, errors.New("missing host")
 	}
-	if !webhookPortValid(u.Port()) {
-		// The number is the operator's own value, not part of the credential,
-		// but the message still omits it for the same reason every refusal here
-		// does: the startup error ships to Loki, and a fixed constant cannot
-		// leak a mis-parsed secret.
-		return nil, errors.New("port must be between 1 and 65535")
+	// url.Parse validates a port's SYNTAX (digits only), never its RANGE, so
+	// "https://discord.example:99999/hook" parses, passes every other gate here,
+	// and starts the process healthy — while net/http refuses the address on
+	// every POST ("invalid port"), httpx retries the transport failure and the
+	// sweep retries forever. A permanently undeliverable webhook is the one
+	// failure a dead-man switch cannot afford, and startup is the only moment
+	// the operator is watching. An absent port is legal: https defaults to 443.
+	if port := u.Port(); port != "" {
+		n, convErr := strconv.Atoi(port)
+		if convErr != nil || n < 1 || n > 65535 {
+			// The number is the operator's own value, not part of the credential,
+			// but the message still omits it for the same reason every refusal here
+			// does: the startup error ships to Loki, and a fixed constant cannot
+			// leak a mis-parsed secret.
+			return nil, errors.New("port must be between 1 and 65535")
+		}
 	}
 	if u.Path == "" || u.Path == "/" {
 		// The webhook's PATH is the credential, so a URL that carries none is
@@ -981,20 +986,4 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		return nil, errors.New("contains a space or an invisible character (it is percent-encoded on every request, so the webhook host and path that reach the other end are not the configured ones; remove it, or percent-encode it yourself if it really belongs to the credential)")
 	}
 	return u, nil
-}
-
-// webhookPortValid reports whether an authority's optional port is in range.
-// url.Parse validates a port's SYNTAX (digits only), never its RANGE, so
-// "https://discord.example:99999/hook" parses, passes every other gate in
-// parseWebhookURL, and starts the process healthy — while net/http refuses the
-// address on every POST ("invalid port"), httpx retries the transport failure
-// and the sweep retries forever. A permanently undeliverable webhook is the one
-// failure a dead-man switch cannot afford, and startup is the only moment the
-// operator is watching.
-func webhookPortValid(port string) bool {
-	if port == "" {
-		return true
-	}
-	n, err := strconv.Atoi(port)
-	return err == nil && n >= 1 && n <= 65535
 }

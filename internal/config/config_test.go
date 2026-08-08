@@ -1763,18 +1763,6 @@ func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 	if _, reported := got["beat_auth"]; reported {
 		t.Errorf("LogValue renders beat_auth = %q; the token is required, so the attr can only ever say \"required\" and reports no state", got["beat_auth"])
 	}
-
-	// A Config built without Load carries no source. It must render envx's own
-	// name for that rather than an empty attr, the same way a nil host policy
-	// renders "any" instead of panicking.
-	empty := Config{LogLevel: slog.LevelInfo}
-	got = map[string]string{}
-	for _, attr := range empty.LogValue().Group() {
-		got[attr.Key] = attr.Value.String()
-	}
-	if got["webhook"] != string(envx.SourceNone) {
-		t.Errorf("unconfigured: webhook = %q, want %q", got["webhook"], envx.SourceNone)
-	}
 }
 
 // TestConfigLogValueReportsTheWebhookCredentialSource pins the attr's whole

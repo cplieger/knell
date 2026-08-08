@@ -59,12 +59,8 @@ func main() {
 		switch os.Args[1] {
 		case "health":
 			// RunProbe exits with the probe's verdict (0 healthy, 1 not) and
-			// never returns. The explicit exit keeps this case terminal: a
-			// future health release that returned instead of exiting would
-			// otherwise leave the switch and boot the server from a probe
-			// invocation; exiting 1 instead fails the probe closed.
+			// never returns.
 			health.RunProbe(health.DefaultPath)
-			os.Exit(1)
 		default:
 			// slog, not fmt: a mistyped container command crash-loops publishing no
 			// metrics, so this line is the only trace of the cause, and a level-less

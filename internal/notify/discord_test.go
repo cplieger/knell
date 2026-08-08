@@ -414,26 +414,6 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 	}
 }
 
-func TestBeatOutageHistoryWithoutOutagesIsNotDelivered(t *testing.T) {
-	t.Parallel()
-
-	// watch never sends an empty history notice; if a future caller does,
-	// posting a message that reports nothing is worse than refusing it.
-	rec := newWebhookRecorder(http.StatusNoContent)
-	srv := httptest.NewServer(rec.handler(t))
-	defer srv.Close()
-
-	d := New(srv.URL, "node-1")
-	defer d.Close()
-
-	if err := d.BeatOutageHistory(context.Background(), "api", nil); err == nil {
-		t.Fatal("BeatOutageHistory with no outages = nil, want error")
-	}
-	if got := rec.hits.Load(); got != 0 {
-		t.Errorf("webhook hits = %d, want 0 (nothing to report must post nothing)", got)
-	}
-}
-
 func TestTransientFailureRetries(t *testing.T) {
 	t.Parallel()
 

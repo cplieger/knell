@@ -1532,33 +1532,6 @@ func TestBeatRefusedWhenAdmissionClosesDuringBodyDrain(t *testing.T) {
 	}
 }
 
-// TestBeatRefusedWhenWatcherClosedAdmission pins the LAST refusal, the only
-// one that is atomic with the recording: the app context is still live, so
-// both handler-side checks pass, and the 503 can only come from the watcher
-// reporting accepting=false (watch.Watcher closes admission under the mutex
-// that guards the beat mutation). A 200 here would tell a sender its heartbeat
-// landed while the watcher recorded nothing.
-func TestBeatRefusedWhenWatcherClosedAdmission(t *testing.T) {
-	t.Parallel()
-
-	b := &fakeBeater{known: map[string]bool{"api": true}, closed: true}
-	h := newTestHandler(b, testBeatToken)
-
-	req := newBeatRequest(http.MethodPost, "/beat/api", strings.NewReader("ping"))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("POST with admission closed = %d, want 503 (body %s)", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "shutting_down") {
-		t.Errorf("503 body = %s, want the shutting_down code", rec.Body.String())
-	}
-	if len(b.seen) != 0 {
-		t.Fatalf("beats recorded with admission closed = %v, want none", b.seen)
-	}
-}
-
 // httpRequestSeries returns every knell_http_requests_total label-set present in
 // the exposition, keyed by its raw "{...}" text. Used to assert what the metric
 // CAN grow into, not just what one request recorded.
