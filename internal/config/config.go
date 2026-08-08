@@ -470,7 +470,12 @@ func logLevel() slog.Level {
 	}
 	level, ok := slogx.ParseLevel(raw, slog.LevelInfo)
 	if !ok {
-		slog.Warn("invalid LOG_LEVEL, using info", "value", raw)
+		// strconv.Quote, because the one mistake here an operator cannot SEE is
+		// an invisible rune (slogx.ParseLevel trims only Unicode spaces, so a
+		// zero-width-padded "debug" lands here rendering exactly like the valid
+		// spelling) — the same legibility %q already gives the allowedHosts and
+		// parseBeatEntry refusals.
+		slog.Warn("invalid LOG_LEVEL, using info", "value", strconv.Quote(raw))
 	}
 	return level
 }

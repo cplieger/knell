@@ -41,8 +41,9 @@
 // makes Mimir's label set grow without bound, and the growth is not
 // recoverable by fixing the caller afterwards.
 //
-// RecordHTTP is the one recording function reached from internal/webapi in
-// PRODUCTION, and it is deliberately not id-taking: it carries no beat label,
+// RecordHTTP is one of the two recording functions reached from
+// internal/webapi in PRODUCTION (RecordPreRouteRefusal below is the other),
+// and it is deliberately not id-taking: it carries no beat label,
 // so it is outside the contract above and adding it did not widen the set of
 // packages allowed to mint a per-beat series. It has its own bounded-label
 // contract instead, and the same reasoning drives it — its method and path

@@ -651,6 +651,9 @@ func TestAwaitWatchLoopWarnsOnceWhenTheLoopOutlivesTheGrace(t *testing.T) {
 	if _, reported := rec.AttrValue(stillRunningWarn, "waited"); !reported {
 		t.Errorf("still-running warning omits the waited attr: the line cannot then tell a drain that consumed the whole budget from a wedged watch loop; records = %v", rec.Records())
 	}
+	if !rec.HasAttr(stillRunningWarn, "retryable", "false") {
+		t.Errorf("still-running warning omits retryable=false: this WARN is the only trace of the notices an abandoned loop still held, and the loss family promises the attribute so a log rule can key on consequence; records = %v", rec.Records())
+	}
 }
 
 // TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace pins that the hook
@@ -843,6 +846,93 @@ func TestTeardownAfterServeExitDrainsAcceptedHandlers(t *testing.T) {
 	case <-handlerDone:
 	default:
 		t.Fatal("teardown returned without the handler having completed")
+	}
+}
+
+// TestTeardownAfterServeExitWarnsWhenTheDrainOutlivesTheGrace pins the one
+// loss-family line in main.go nothing drives: srv.Shutdown returning with an
+// accepted handler still in flight. That WARN is the operator's only notice
+// that a handler's own loss diagnostic (the queue-full drop line watch.Beat
+// emits after releasing its mutex) may never have been logged, and it carries
+// the structured retryable=false attribute the whole loss family promises, so
+// a Loki rule keyed on consequence can match it. Swallowing the Shutdown
+// error, dropping the attribute, or demoting the level currently breaks no
+// test.
+func TestTeardownAfterServeExitWarnsWhenTheDrainOutlivesTheGrace(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default.
+	rec := capture.Default(t)
+
+	marker := health.NewMarker(t.TempDir() + "/healthy")
+	marker.Set(true)
+	if !marker.Healthy() {
+		t.Skip("cannot plant a health marker in the test temp dir")
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	srv := newServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	ln, lnErr := net.Listen("tcp", "127.0.0.1:0")
+	if lnErr != nil {
+		t.Fatalf("listen: %v", lnErr)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve(ln) }()
+	go func() {
+		resp, getErr := http.Get("http://" + ln.Addr().String() + "/")
+		if getErr == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	<-entered
+
+	released := false
+	releaseHandler := func() {
+		if !released {
+			released = true
+			close(release)
+		}
+	}
+	// On an early failure the handler is still parked on <-release and the
+	// listener is still open: free both, or a failing run hangs at exit.
+	t.Cleanup(func() {
+		releaseHandler()
+		_ = srv.Close()
+	})
+
+	// An already-expired grace: Shutdown still closes the listener, cannot
+	// drain the parked handler, and returns the deadline error -- the branch
+	// under test, unreachable while a drain succeeds.
+	exitCtx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	<-exitCtx.Done()
+
+	watcherDone := make(chan struct{})
+	teardownAfterServeExit(exitCtx, srv, marker, func() {}, func() { close(watcherDone) }, watcherDone)
+
+	const inFlightWarn = "accepted requests were still in flight"
+	if n := rec.CountLevel(slog.LevelWarn, inFlightWarn); n != 1 {
+		t.Errorf("%q at WARN = %d, want exactly 1: this line is the only notice that a cut-off handler's loss diagnostic may be missing; messages = %v", inFlightWarn, n, rec.Messages())
+	}
+	if !rec.HasAttr(inFlightWarn, "retryable", "false") {
+		t.Errorf("in-flight warning omits retryable=false: the loss family promises the attribute so a log rule can key on consequence; records = %v", rec.Records())
+	}
+	if !rec.HasAttr(inFlightWarn, "grace", shutdownGrace.String()) {
+		t.Errorf("in-flight warning omits grace=%s: nothing then names the constant an operator would raise; records = %v", shutdownGrace, rec.Records())
+	}
+
+	releaseHandler()
+	select {
+	case serveErr := <-serveDone:
+		if !errors.Is(serveErr, http.ErrServerClosed) {
+			t.Errorf("Serve returned %v, want http.ErrServerClosed: even an expired grace must still close the listener", serveErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve never returned after the handler was released")
 	}
 }
 

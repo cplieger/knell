@@ -1278,6 +1278,11 @@ func (w *Watcher) collectDue() []dueNotice {
 // for, which is the silent failure the panic exists to avoid. Callers hold w.mu
 // and must not hold it after this returns abnormally.
 func (w *Watcher) assertSealedRun(id string, run []Outage) {
+	// The ordering check compares against a CARRIED instant rather than
+	// run[i-1]: the same comparison, but the record ahead of this one is
+	// something the loop already held, so neither a reader nor a bounds
+	// analysis has to re-derive it from the i > 0 guard.
+	var prevRecovered time.Time
 	for i := range run {
 		var broken string
 		switch {
@@ -1285,15 +1290,15 @@ func (w *Watcher) assertSealedRun(id string, run []Outage) {
 			broken = "has no recovery point at or after its start"
 		case run[i].Started.IsZero():
 			broken = "has no start, so its silence cannot be measured"
-		case i > 0 && run[i].Recovered.Before(run[i-1].Recovered):
+		case i > 0 && run[i].Recovered.Before(prevRecovered):
 			broken = "recovered before the record ahead of it, so the notice cannot report the most recent recovery"
 		}
-		if broken == "" {
-			continue
+		if broken != "" {
+			w.mu.Unlock()
+			panic(fmt.Sprintf("watch: beat %s history record %d of %d %s: records are appended in outage order and sealed only at the tail, under one mutex, so this is unreachable unless that invariant was broken",
+				id, i+1, len(run), broken))
 		}
-		w.mu.Unlock()
-		panic(fmt.Sprintf("watch: beat %s history record %d of %d %s: records are appended in outage order and sealed only at the tail, under one mutex, so this is unreachable unless that invariant was broken",
-			id, i+1, len(run), broken))
+		prevRecovered = run[i].Recovered
 	}
 }
 
