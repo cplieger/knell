@@ -86,13 +86,16 @@ type Notifier interface {
 	// implementation must report rather than assume: one batch can hold all
 	// three.
 	//
-	// Those guarantees are the CALLER's, and this package ASSERTS them before
-	// it calls (see assertSealedRun), so an implementation must not re-check
-	// them: it has no way to report a producer bug. Every error it returns is
-	// read as a delivery failure, so a refusal would keep the malformed records
-	// queued and re-offered every sweep, hold that beat's live notices behind
-	// them, and leave /healthz reporting a healthy observer (Meyer's
-	// non-redundancy principle, with a concrete price attached).
+	// Those guarantees are the CALLER's, and this package holds them before it
+	// calls: non-emptiness by construction (collectDue collapses a run only
+	// under `len(run) > 0`; assertSealedRun iterates the run, so it would pass
+	// an empty one vacuously) and the per-record properties by assertion
+	// (assertSealedRun). So an implementation must not re-check them: it has no
+	// way to report a producer bug. Every error it returns is read as a
+	// delivery failure, so a refusal would keep the malformed records queued
+	// and re-offered every sweep, hold that beat's live notices behind them,
+	// and leave /healthz reporting a healthy observer (Meyer's non-redundancy
+	// principle, with a concrete price attached).
 	BeatOutageHistory(ctx context.Context, id string, outages []Outage) error
 }
 

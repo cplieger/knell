@@ -470,12 +470,15 @@ func logLevel() slog.Level {
 	}
 	level, ok := slogx.ParseLevel(raw, slog.LevelInfo)
 	if !ok {
-		// strconv.Quote, because the one mistake here an operator cannot SEE is
-		// an invisible rune (slogx.ParseLevel trims only Unicode spaces, so a
-		// zero-width-padded "debug" lands here rendering exactly like the valid
-		// spelling) — the same legibility %q already gives the allowedHosts and
-		// parseBeatEntry refusals.
-		slog.Warn("invalid LOG_LEVEL, using info", "value", strconv.Quote(raw))
+		// The value is NOT pre-quoted: slog's TextHandler, the handler
+		// slogx.Options{} installs, already applies strconv.Quote to any attr
+		// value that needs it, and an invisible rune needs it (U+200B is
+		// non-printable), so a zero-width-padded "debug" renders
+		// value="debug\u200b" on its own. Quoting at the call site only makes
+		// the handler quote the quotes. The %q in the allowedHosts and
+		// parseBeatEntry refusals is a different case: those are fmt.Errorf
+		// strings, where nothing escapes them on the way out.
+		slog.Warn("invalid LOG_LEVEL, using info", "value", raw)
 	}
 	return level
 }
