@@ -999,7 +999,7 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 	srv := newServer(http.NotFoundHandler())
 
 	if srv.ReadHeaderTimeout != requestHeaderTimeout {
-		t.Errorf("ReadHeaderTimeout = %s, want %s: net/http arms only the header deadline while the headers are being read (the whole-request read deadline is installed after they are parsed), so webhttp's 10s default is a live slowloris window the read bound never cuts short and puts the worst-case active request at 10s + write, past shutdownGrace", srv.ReadHeaderTimeout, requestHeaderTimeout)
+		t.Errorf("ReadHeaderTimeout = %s, want %s: net/http arms only the header deadline while the headers are being read (the whole-request read deadline is installed after they are parsed), so webhttp's 10s default is a live slowloris window the read bound never cuts short -- a header term on its own past the whole-request budget the grace-margin check below keeps inside shutdownGrace", srv.ReadHeaderTimeout, requestHeaderTimeout)
 	}
 	if srv.ReadTimeout != requestReadTimeout {
 		t.Errorf("ReadTimeout = %s, want %s: webhttp leaves it unset by default, and an unbounded read lets a trickled beat body hold a handler goroutine indefinitely", srv.ReadTimeout, requestReadTimeout)

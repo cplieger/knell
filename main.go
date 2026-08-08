@@ -238,14 +238,19 @@ func newServer(handler http.Handler) *http.Server {
 		// The header bound is set explicitly rather than left at webhttp's 10s
 		// default, and this option is LOAD-BEARING for the shutdown-grace
 		// invariant above -- do not drop it as redundant with the read bound
-		// below. While the headers are being read, net/http has armed ONLY the
-		// header deadline: readRequest derives both read deadlines from one t0
-		// but installs the whole-request one only AFTER the headers are parsed,
-		// so a 10s header ceiling is a live 10s slowloris window that the 3s
-		// read bound never cuts short. And the write deadline is armed when the
-		// headers finish, not at t0, so the ceiling on one active request would
-		// be 10s + 3s = 13s -- past shutdownGrace, which is the stop that exits
-		// non-zero.
+		// below, which does not cover the header phase at all: while the headers
+		// are being read, net/http has armed ONLY the header deadline
+		// (readRequest derives both read deadlines from one t0 but installs the
+		// whole-request one only AFTER the headers are parsed), so a 10s header
+		// ceiling is a live 10s slowloris window that the 3s read bound never
+		// cuts short. That leaves the header term alone at twice the 5s
+		// whole-request budget the constants above keep inside shutdownGrace.
+		// What a still-trickling header phase costs a stop already in progress
+		// is net/http Shutdown-internal -- it reclaims such a connection rather
+		// than waiting the ceiling out -- and is deliberately not restated here;
+		// the bound this app owns is the budget above, and
+		// TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog
+		// pins it.
 		webhttp.WithReadHeaderTimeout(requestHeaderTimeout),
 		webhttp.WithReadTimeout(requestReadTimeout),
 		webhttp.WithWriteTimeout(requestWriteTimeout),
