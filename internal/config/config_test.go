@@ -841,6 +841,47 @@ func TestAllowedHostsGate(t *testing.T) {
 	}
 }
 
+// TestLoadThreadsTheHostPolicyOptionsThrough pins the hop the cycle-7 refactor
+// introduced. The loopback exemption and the ALLOWED_HOSTS-naming 403 envelope
+// are no longer applied inside allowedHosts; they arrive as a Load PARAMETER
+// (internal/webapi's HostPolicyOptions, passed by the composition root). Every
+// other Load call in this suite passes none, webapi's tests build the policy
+// from HostPolicyOptions directly, and the lifecycle test's host_not_allowed
+// assertion matches webhttp's DEFAULT code — so without this, a Load that
+// forwards nothing keeps the whole suite green while the shipped allowlist 403s
+// the in-container `curl http://127.0.0.1:9190/healthz` the README promises
+// keeps working.
+func TestLoadThreadsTheHostPolicyOptionsThrough(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv.
+	setValidLoadEnv(t)
+	t.Setenv("ALLOWED_HOSTS", "knell.internal")
+
+	// A genuinely local caller: loopback socket peer AND loopback Host, the only
+	// shape WithLoopbackExempt admits. It is NOT in the allowlist, so it is
+	// admitted by the option or by nothing.
+	loopback := func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9190/healthz", nil)
+		r.RemoteAddr = "127.0.0.1:54321"
+		return r
+	}
+
+	exempt, err := Load(maxNodeNameBytes, webhttp.WithLoopbackExempt())
+	if err != nil {
+		t.Fatalf("Load() with the loopback exemption: %v", err)
+	}
+	if !exempt.AllowedHosts.Allows(loopback()) {
+		t.Error("Load did not forward its host-policy options: a loopback peer under a loopback Host is refused, so an in-container curl http://127.0.0.1:9190/healthz 403s under any allowlist and an operator's own probe stops working")
+	}
+
+	bare, err := Load(maxNodeNameBytes)
+	if err != nil {
+		t.Fatalf("Load() with no options: %v", err)
+	}
+	if bare.AllowedHosts.Allows(loopback()) {
+		t.Error("the same request is admitted with NO options passed, so the assertion above pins webhttp's default rather than the parameter Load forwards; pick an option whose effect the default does not already give")
+	}
+}
+
 // TestLoadRejectsAnUnusableAllowedHostsEntry pins that allowedHosts' refusal
 // reaches STARTUP. TestAllowedHostsGate calls allowedHosts directly, so
 // nothing asserts that Load propagates its error: dropping that check leaves
@@ -956,6 +997,12 @@ func TestLoadRejectsAPaddedPlainBeatToken(t *testing.T) {
 			if !strings.Contains(err.Error(), "BEAT_TOKEN") {
 				t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which variable to fix", err)
 			}
+			// The mirror of the file-borne case: the clause fires only on
+			// envx.SourceFile, so a plain-variable refusal must not send the
+			// operator to a mount they never configured.
+			if strings.Contains(err.Error(), "came from BEAT_TOKEN_FILE") {
+				t.Errorf("error = %q blames BEAT_TOKEN_FILE for a value the plain variable supplied", err)
+			}
 			if strings.Contains(err.Error(), "unit-test-beat-token") {
 				t.Errorf("error = %q embeds the token value; the startup error is shipped to Loki, so it must describe the shape and never echo the credential", err)
 			}
@@ -1003,6 +1050,12 @@ func TestLoadRejectsAPaddedFileBorneBeatToken(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "BEAT_TOKEN") {
 				t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which secret to fix", err)
+			}
+			// The CHANNEL, not just the variable: a BEAT_TOKEN_FILE pointing at
+			// the wrong file crash-loops the observer, and a refusal naming only
+			// BEAT_TOKEN describes a variable the operator may never have set.
+			if !strings.Contains(err.Error(), "came from BEAT_TOKEN_FILE") {
+				t.Errorf("error = %q, want it to name the channel the refused value arrived through; the padding refusal itself never mentions the _FILE variable, so only fileSourcedValueError can supply it", err)
 			}
 			if strings.Contains(err.Error(), "unit-test-beat-token") {
 				t.Errorf("error = %q embeds the token value; the startup error is shipped to Loki, so it must describe the shape and never echo the credential", err)
