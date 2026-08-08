@@ -347,6 +347,12 @@ func TestLoadRejectsPlainHTTPWebhook(t *testing.T) {
 	if !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL") {
 		t.Errorf("error = %q, want DISCORD_WEBHOOK_URL context", err)
 	}
+	// The mirror of the file-borne case below: the channel clause fires only on
+	// envx.SourceFile, so a plain-variable refusal must not send the operator to
+	// a mount they never configured.
+	if strings.Contains(err.Error(), "came from DISCORD_WEBHOOK_URL_FILE") {
+		t.Errorf("error = %q blames DISCORD_WEBHOOK_URL_FILE for a value the plain variable supplied", err)
+	}
 	if strings.Contains(err.Error(), "127.0.0.1") || strings.Contains(err.Error(), "/hook") {
 		t.Errorf("error leaks the rejected webhook URL: %v", err)
 	}
@@ -367,6 +373,14 @@ func TestLoadRejectsPlainHTTPWebhookFromFile(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "scheme must be https") {
 		t.Errorf("error = %q, want the https-scheme rejection", err)
+	}
+	// The CHANNEL, not just the variable: DISCORD_WEBHOOK_URL is required, so a
+	// _FILE pointing at the wrong file crash-loops the observer, and a refusal
+	// naming only DISCORD_WEBHOOK_URL sends the operator to a variable they set
+	// to "" on purpose. Only fileSourcedValueError can supply this clause -- the
+	// scheme refusal itself never mentions the _FILE variable.
+	if !strings.Contains(err.Error(), "came from DISCORD_WEBHOOK_URL_FILE") {
+		t.Errorf("error = %q, want it to name the channel the refused value arrived through", err)
 	}
 	if strings.Contains(err.Error(), "discord.example") || strings.Contains(err.Error(), "file-borne-hook") {
 		t.Errorf("error leaks the rejected webhook URL: %v", err)

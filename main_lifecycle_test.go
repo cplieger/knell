@@ -981,12 +981,15 @@ func TestClassifyAbandonedWatchLoopDeniesACleanExitOverAnAbandonedLoop(t *testin
 // The timeout halves assert the configured bound rather than a real trickle: a
 // behavioral version would have to wait the bound out. The grace-margin half is
 // the one assertion here that is not a wiring check -- it pins the INVARIANT the
-// three bounds exist to satisfy (worst-case active request = header + write,
-// since net/http arms the write deadline once the headers are read, and that sum
-// has to leave awaitWatchLoop room inside the single shutdownGrace budget
-// webhttp spends across pre-drain, srv.Shutdown and onShutdown), because
-// otherwise a later bump of any one constant silently re-creates the stop that
-// exits non-zero. The error-log half is behavioral -- the bridge is driven and
+// three bounds exist to satisfy (worst-case active request =
+// max(read, header + write), because net/http runs the whole-request read
+// deadline from the same instant as the header deadline and arms the write
+// deadline only once the headers are read, so the two chains are independent and
+// the longer one decides; that worst case has to leave awaitWatchLoop the 3s the
+// constants' comment reserves, inside the single shutdownGrace budget webhttp
+// spends across pre-drain, srv.Shutdown and onShutdown), because otherwise a
+// later bump of any one constant silently re-creates the stop that exits
+// non-zero. The error-log half is behavioral -- the bridge is driven and
 // the resulting record's LEVEL is the assertion.
 func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *testing.T) {
 	// Serial (no t.Parallel): webhttp.WithSlogErrorLog resolves slog.Default()
@@ -996,7 +999,7 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 	srv := newServer(http.NotFoundHandler())
 
 	if srv.ReadHeaderTimeout != requestHeaderTimeout {
-		t.Errorf("ReadHeaderTimeout = %s, want %s: webhttp's 10s default sits above the whole-request read bound, which leaves the slowloris guard a dead number the read deadline always beats", srv.ReadHeaderTimeout, requestHeaderTimeout)
+		t.Errorf("ReadHeaderTimeout = %s, want %s: net/http arms only the header deadline while the headers are being read (the whole-request read deadline is installed after they are parsed), so webhttp's 10s default is a live slowloris window the read bound never cuts short and puts the worst-case active request at 10s + write, past shutdownGrace", srv.ReadHeaderTimeout, requestHeaderTimeout)
 	}
 	if srv.ReadTimeout != requestReadTimeout {
 		t.Errorf("ReadTimeout = %s, want %s: webhttp leaves it unset by default, and an unbounded read lets a trickled beat body hold a handler goroutine indefinitely", srv.ReadTimeout, requestReadTimeout)
@@ -1007,9 +1010,17 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 	// srv.Shutdown waits for in-flight requests out of the SAME budget as
 	// pre-drain and awaitWatchLoop, so the worst-case active request has to
 	// finish with grace left over or a routine stop exits non-zero through
-	// classifyServeError.
-	if worst := requestHeaderTimeout + requestWriteTimeout; worst >= shutdownGrace {
-		t.Errorf("worst-case active request = %s, want < %s (with margin for the watch-loop teardown): a bound this size lets one authenticated slow caller consume the whole shutdown grace", worst, shutdownGrace)
+	// classifyServeError. net/http derives the whole-request read deadline from
+	// the SAME instant as the header deadline and arms the write deadline only
+	// once the headers are read (readRequest: one t0 for both read deadlines, a
+	// deferred SetWriteDeadline for the write one), so the worst case is
+	// whichever of the two chains is LONGER -- the read bound on its own, or
+	// header + write. Asserting only the second lets a later bump of
+	// requestReadTimeout past that sum sail through the one check that exists to
+	// catch it.
+	const teardownReserve = 3 * time.Second // what the constants' comment promises awaitWatchLoop
+	if worst := max(requestReadTimeout, requestHeaderTimeout+requestWriteTimeout); worst > shutdownGrace-teardownReserve {
+		t.Errorf("worst-case active request = %s, want <= %s (shutdownGrace %s less the %s the constants' comment reserves for the watch-loop teardown): a bound this size lets one authenticated slow caller eat the grace awaitWatchLoop needs to collect the loop and flush its abandoned-notice WARN", worst, shutdownGrace-teardownReserve, shutdownGrace, teardownReserve)
 	}
 	if srv.MaxHeaderBytes != config.MaxRequestHeaderBytes {
 		t.Errorf("MaxHeaderBytes = %d, want %d: the default is net/http's 1 MiB, so an unauthenticated caller can make this process read a megabyte of header per connection, and the BEAT_TOKEN maximum config enforces at startup stops bounding what a ping can actually carry", srv.MaxHeaderBytes, config.MaxRequestHeaderBytes)

@@ -236,8 +236,16 @@ func run() error {
 func newServer(handler http.Handler) *http.Server {
 	return webhttp.NewServer(handler,
 		// The header bound is set explicitly rather than left at webhttp's 10s
-		// default: a header ceiling ABOVE the whole-request bound below is a
-		// dead number, since the read deadline would fire first.
+		// default, and this option is LOAD-BEARING for the shutdown-grace
+		// invariant above -- do not drop it as redundant with the read bound
+		// below. While the headers are being read, net/http has armed ONLY the
+		// header deadline: readRequest derives both read deadlines from one t0
+		// but installs the whole-request one only AFTER the headers are parsed,
+		// so a 10s header ceiling is a live 10s slowloris window that the 3s
+		// read bound never cuts short. And the write deadline is armed when the
+		// headers finish, not at t0, so the ceiling on one active request would
+		// be 10s + 3s = 13s -- past shutdownGrace, which is the stop that exits
+		// non-zero.
 		webhttp.WithReadHeaderTimeout(requestHeaderTimeout),
 		webhttp.WithReadTimeout(requestReadTimeout),
 		webhttp.WithWriteTimeout(requestWriteTimeout),
