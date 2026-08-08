@@ -115,8 +115,11 @@ func run() error {
 	// The NODE_NAME cap is notify's to own (it renders every template the
 	// budget is measured over) and config's to enforce, so the composition root
 	// mediates the value between them — the same translation it performs for
-	// config.Beat -> watch.Beat.
-	cfg, err := config.Load(notify.MaxNodeNameBytes)
+	// config.Beat -> watch.Beat. The ALLOWED_HOSTS policy shape is mediated the
+	// same way and for the same reason: the 403 envelope and the reason code it
+	// carries are webapi's (that is where the refusal is counted), while the
+	// variable and its grammar are config's.
+	cfg, err := config.Load(notify.MaxNodeNameBytes, webapi.HostPolicyOptions()...)
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
 	}

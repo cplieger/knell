@@ -13,7 +13,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/slogx/capture"
@@ -1954,14 +1953,14 @@ const (
 )
 
 // hostPolicy builds the allowlist by calling the SHIPPED builder
-// (config.ParseAllowedHosts), so this file exercises the policy shape knell
+// (HostPolicyOptions), so this file exercises the policy shape knell
 // actually serves (loopback exempt, the ALLOWED_HOSTS-naming 403) rather than a
 // hand-copied twin that cannot fail when production's option set changes.
 func hostPolicy(t *testing.T, entries string) *webhttp.HostPolicy {
 	t.Helper()
-	policy, invalid := config.ParseAllowedHosts(strings.Split(entries, ","))
+	policy, invalid := webhttp.ParseHostList(strings.Split(entries, ","), HostPolicyOptions()...)
 	if len(invalid) > 0 {
-		t.Fatalf("ParseAllowedHosts(%q) reported invalid entries %v; the fixture must be usable", entries, invalid)
+		t.Fatalf("ParseHostList(%q) reported invalid entries %v; the fixture must be usable", entries, invalid)
 	}
 	return policy
 }

@@ -20,7 +20,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/cplieger/envx"
-	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/slogx"
 	"github.com/cplieger/webhttp"
 )
@@ -232,7 +231,15 @@ func (c Config) LogValue() slog.Value {
 // the same mediation main already performs when it translates a config.Beat
 // into a watch.Beat. Taking it as a parameter keeps the environment boundary
 // free of any dependency on the Discord transport.
-func Load(maxNodeNameBytes int) (Config, error) {
+//
+// hostPolicyOpts are the serving-side ALLOWED_HOSTS policy options the
+// composition root supplies (internal/webapi's HostPolicyOptions): the loopback
+// exemption and the 403 envelope are HTTP response shape, so they are authored
+// where the refusal is counted, and this package keeps only the ALLOWED_HOSTS
+// grammar and its startup refusal. Taken as a parameter for the reason
+// maxNodeNameBytes is: it keeps the environment boundary free of any dependency
+// on knell's own transport and exposition packages.
+func Load(maxNodeNameBytes int, hostPolicyOpts ...webhttp.HostAllowlistOption) (Config, error) {
 	var cfg Config
 
 	rawBeats, err := envx.Require("BEATS")
@@ -260,7 +267,7 @@ func Load(maxNodeNameBytes int) (Config, error) {
 
 	cfg.ListenAddr = listenAddr()
 
-	hosts, err := allowedHosts()
+	hosts, err := allowedHosts(hostPolicyOpts)
 	if err != nil {
 		return cfg, err
 	}
@@ -404,22 +411,6 @@ func warnEphemeralListenPort(addr string) {
 		"hint", "set an explicit port, e.g. "+defaultListenAddr)
 }
 
-// ParseAllowedHosts builds the ALLOWED_HOSTS policy SHAPE knell ships:
-// loopback-exempt, with the ALLOWED_HOSTS-naming 403 envelope. Exported so
-// internal/webapi's tests exercise the shipped shape rather than a hand-copied
-// twin that cannot fail when this one changes.
-//
-// The envelope code IS metrics.RefusalHostNotAllowed, read from there rather
-// than re-spelled here: the 403 an operator sees and the
-// knell_pre_route_refusals_total{reason=...} label they select on are one
-// published identifier, and it has one home.
-func ParseAllowedHosts(entries []string) (policy *webhttp.HostPolicy, invalid []string) {
-	return webhttp.ParseHostList(entries,
-		webhttp.WithLoopbackExempt(),
-		webhttp.WithHostAllowlistError(string(metrics.RefusalHostNotAllowed),
-			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"))
-}
-
 // allowedHosts parses the ALLOWED_HOSTS exact-match Host allowlist. Unset (the
 // documented default) yields an inactive policy that accepts every Host, so the
 // guard ships permissive and removes no capability. An active allowlist is what
@@ -441,20 +432,21 @@ func ParseAllowedHosts(entries []string) (policy *webhttp.HostPolicy, invalid []
 // invisible mistake. A refusal at startup is the one signal an operator cannot
 // mistake for a working observer.
 //
-// WithLoopbackExempt keeps an in-container client (a `curl
+// The loopback exemption in the options the composition root supplies
+// (internal/webapi's HostPolicyOptions) keeps an in-container client (a `curl
 // http://127.0.0.1:9190/healthz`) working under any allowlist: it admits a
 // request only when BOTH the socket peer and the Host are loopback, so a
 // rebinding request, which carries the attacker's hostname in Host, never
 // qualifies. The baked `knell health` probe needs no exemption at all — it
 // stats the marker file and sends no request (see main.go).
-func allowedHosts() (*webhttp.HostPolicy, error) {
+func allowedHosts(opts []webhttp.HostAllowlistOption) (*webhttp.HostPolicy, error) {
 	const key = "ALLOWED_HOSTS"
 	// LookupEnv, not Getenv: a PRESENT-but-blank value is the same compose
 	// accident listenAddr and nodeName already report, and here it leaves the
 	// rebinding guard OFF while the operator believes the allowlist is armed.
 	// Unset is the documented default and must stay silent.
 	raw, present := os.LookupEnv(key)
-	policy, invalid := ParseAllowedHosts(strings.Split(raw, ","))
+	policy, invalid := webhttp.ParseHostList(strings.Split(raw, ","), opts...)
 	if len(invalid) > 0 {
 		// %q, not %v: the one mistake in this list an operator cannot SEE is an
 		// invisible rune pasted in with the hostname, and webhttp refuses every
@@ -596,6 +588,22 @@ func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
 	}
 	slog.Warn("both the plain variable and its _FILE companion are set; the file wins and the plain variable is ignored, so unset it to keep the credential out of the process environment",
 		"variable", key, "file_variable", key+"_FILE", "credential", subject)
+}
+
+// fileSourcedValueError names the CHANNEL that supplied a credential whose
+// VALUE this package refused. Every READ-failure refusal here already names the
+// `_FILE` variable (rejectBlankFileVar, and each secretFileError class), because
+// an operator cannot fix a mount they are not told about; the value-validation
+// refusals named only the plain variable, so a `_FILE` pointing at the wrong
+// file crash-looped the observer with a message about a variable the operator
+// may never have set. The wrapped error is unchanged -- %w keeps its wording, so
+// the shape of the problem and its remedy still lead -- and the value is still
+// never echoed: only the channel is named.
+func fileSourcedValueError(key string, src envx.SecretSource, err error) error {
+	if src != envx.SourceFile {
+		return err
+	}
+	return fmt.Errorf("%w (this value came from %s_FILE, not %s: fix the file's content, or the mount it points at)", err, key, key)
 }
 
 // resolveSecret reads one required credential through envx's KEY/KEY_FILE pair
@@ -749,9 +757,11 @@ func checkBeatToken(token string) error {
 		// /beat/{id} answers 431 to every ping while reporting itself gated.
 		// Refusing at startup keeps that fail-silent outcome unreachable, the
 		// same end the padding and control-byte refusals above serve by another
-		// route. What actually reaches here is a BEAT_TOKEN_FILE pointing at a
-		// bundle or an archive the mount picked up (envx reads a secret file of
-		// up to 1 MiB), which is why the remedy names the value and not the cap.
+		// route. A multi-line file -- a bundle, an archive, a log -- never reaches
+		// here: the control-byte refusal above takes it first. What does is a long
+		// SINGLE-LINE printable value (a base64 blob, a PEM body on one line) that
+		// a BEAT_TOKEN_FILE mount picked up, which is why the remedy names the
+		// value and not the cap; loadBeatToken names the channel it came through.
 		return fmt.Errorf("BEAT_TOKEN is longer than the %d-byte maximum: the maximum is the token's share of the %d-byte header block knell reads, so an accepted token always travels with %d bytes left over for the request line, the Host header and the \"Bearer \" prefix, and a longer one is refused at startup rather than left to eat that reserve until POST /beat/{id} answers 431 to every ping while reporting itself gated; a real credential is far shorter than the maximum, so set a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or check that BEAT_TOKEN_FILE names the secret file itself rather than a bundle the mount picked up", maxTokenLength, MaxRequestHeaderBytes, headerOverheadAllowance, minTokenLength)
 	}
 	return nil
@@ -795,7 +805,7 @@ func loadBeatToken() (string, envx.SecretSource, error) {
 	// the operator to unset a variable in the same breath as exiting on the
 	// winning one is advice about a configuration that never ran.
 	if tokenErr := checkBeatToken(token); tokenErr != nil {
-		return "", src, tokenErr
+		return "", src, fileSourcedValueError("BEAT_TOKEN", src, tokenErr)
 	}
 	warnPlainVarIgnored("BEAT_TOKEN", "token", src)
 	return token, src, nil
@@ -839,10 +849,11 @@ func loadWebhook() (string, envx.SecretSource, error) {
 		// broken secret pipeline, not a missing setting. Reported as such
 		// instead of falling through to the shape check, which would answer
 		// "scheme must be https" for a value that carries no scheme.
-		return "", src, errWebhookSetButEmpty
+		return "", src, fileSourcedValueError("DISCORD_WEBHOOK_URL", src, errWebhookSetButEmpty)
 	}
 	if _, err := parseWebhookURL(webhook); err != nil {
-		return "", src, fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
+		return "", src, fileSourcedValueError("DISCORD_WEBHOOK_URL",
+			src, fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err))
 	}
 	// The URL is now fully validated, so the winning-source advisory cannot be
 	// followed by a startup failure about the credential it just described --

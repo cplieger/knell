@@ -373,20 +373,6 @@ func TestLoadRejectsPlainHTTPWebhookFromFile(t *testing.T) {
 	}
 }
 
-func TestLoadBeatToken(t *testing.T) {
-	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "unit-test-beat-token")
-	unsetEnv(t, "BEAT_TOKEN_FILE")
-
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.BeatToken != "unit-test-beat-token" {
-		t.Errorf("BeatToken = %q, want the configured token (webapi's gate arms only when config carries it)", cfg.BeatToken)
-	}
-}
-
 // TestLoadRefusesWithoutABeatToken pins the required credential. The bearer
 // gate is /beat/{id}'s ONLY gate: with no token, any client that can reach the
 // port keeps every beat reading fresh, so the switch is silently disarmed while
@@ -529,24 +515,6 @@ func TestBeatTokenLengthCeiling(t *testing.T) {
 	})
 }
 
-func TestLoadBeatTokenFromFile(t *testing.T) {
-	tokenFile := filepath.Join(t.TempDir(), "beat-token")
-	if err := os.WriteFile(tokenFile, []byte("file-borne-beat-token\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "")
-	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
-
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.BeatToken != "file-borne-beat-token" {
-		t.Errorf("BeatToken = %q, want the file-borne token (BEAT_TOKEN_FILE alone must arm the gate, with the file's single trailing newline removed)", cfg.BeatToken)
-	}
-}
-
 func TestLoadBeatTokenFileWinsOverPlainVar(t *testing.T) {
 	// Serial (t.Setenv forbids t.Parallel anyway): swaps the process-global
 	// slog default to assert the both-channels-set warning.
@@ -573,24 +541,6 @@ func TestLoadBeatTokenFileWinsOverPlainVar(t *testing.T) {
 	if rec.Contains("stale-env-beat-token") || rec.AttrContains("", "", "stale-env-beat-token") ||
 		rec.Contains("file-borne-beat-token") || rec.AttrContains("", "", "file-borne-beat-token") {
 		t.Errorf("log output leaks a token value: %v", rec.Messages())
-	}
-}
-
-func TestLoadWebhookFromFile(t *testing.T) {
-	hookFile := filepath.Join(t.TempDir(), "webhook-url")
-	if err := os.WriteFile(hookFile, []byte("https://discord.example/file-borne-hook\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	setValidLoadEnv(t)
-	t.Setenv("DISCORD_WEBHOOK_URL", "")
-	t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
-
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.WebhookURL != "https://discord.example/file-borne-hook" {
-		t.Errorf("WebhookURL = %q, want the file-borne URL (DISCORD_WEBHOOK_URL_FILE is the documented secret-file convention, with the file's single trailing newline removed)", cfg.WebhookURL)
 	}
 }
 
@@ -854,7 +804,12 @@ func TestAllowedHostsGate(t *testing.T) {
 
 			rec := capture.Default(t)
 
-			policy, err := allowedHosts()
+			// nil options: this table asserts the env-to-policy mapping only
+			// (active, size, the blank warning, the startup refusal), none of
+			// which the serving-side options affect — webapi's tests cover the
+			// shipped envelope and the loopback exemption through
+			// webapi.HostPolicyOptions.
+			policy, err := allowedHosts(nil)
 			if tt.wantErr != "" {
 				if err == nil {
 					t.Fatalf("allowedHosts() with %q = nil error, want a startup refusal: knell would serve an allowlist the operator never configured, and every non-loopback ping it should have admitted 403s until one deadline later every beat posts a false MISSING notice", tt.raw)

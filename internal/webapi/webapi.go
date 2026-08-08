@@ -529,6 +529,27 @@ func countHostRefusals(hosts *webhttp.HostPolicy) webhttp.Middleware {
 	}
 }
 
+// HostPolicyOptions is the ALLOWED_HOSTS policy SHAPE knell ships:
+// loopback-exempt, with the ALLOWED_HOSTS-naming 403 envelope. It lives here
+// rather than beside the parsing because both halves of it are this package's:
+// the envelope is an HTTP response body, and its code is the same
+// metrics.RefusalHostNotAllowed countHostRefusals increments above, so the
+// refusal's shape and its accounting cannot drift apart in different packages.
+// The composition root hands it to config.Load, the mediation main already
+// performs for notify.MaxNodeNameBytes.
+//
+// WithLoopbackExempt keeps an in-container `curl http://127.0.0.1:9190/healthz`
+// working under any allowlist: it admits a request only when BOTH the socket
+// peer and the Host are loopback, so a rebinding request, which carries the
+// attacker's hostname in Host, never qualifies.
+func HostPolicyOptions() []webhttp.HostAllowlistOption {
+	return []webhttp.HostAllowlistOption{
+		webhttp.WithLoopbackExempt(),
+		webhttp.WithHostAllowlistError(string(metrics.RefusalHostNotAllowed),
+			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"),
+	}
+}
+
 // beatHandler records a ping and answers {"ok":true}, or 404 for an id that
 // is not configured. Unknown ids are never recorded or counted: the id feeds
 // a metric label, so arbitrary paths must not mint series. Senders must present
