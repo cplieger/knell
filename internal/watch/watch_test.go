@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -1343,6 +1344,82 @@ func TestCanceledHistorySendKeepsTheLateReasonItWasRecordedWith(t *testing.T) {
 		t.Errorf("late reason after a shutdown-abandoned send = %s, want %s: a cancelled send is not a delivery failure and must not rewrite what the record says",
 			reasonName(got), reasonName(LateEndedBeforeDetection))
 	}
+}
+
+// TestAssertSealedRunPanicsNamingTheBrokenClauseAndReleasesTheMutex pins
+// assertSealedRun's own contract: handed a run that breaks one of the three
+// properties BeatOutageHistory is promised, it panics naming the property that
+// broke, and it releases w.mu on the way out. Nothing else pins it — the commit
+// that introduced it moved this contract from notify's returned errors to this
+// producer-side panic and deleted the notify test that had held all three
+// clauses, so an inverted comparison, a wrong message or a dropped unlock
+// currently breaks no test.
+//
+// Asserted against the FUNCTION rather than through a production path, because
+// no production path can produce a malformed run: collectDue builds every run
+// under one mutex from records appended in outage order and sealed only at the
+// tail. So this is a contract test, not a gate on an unreachable branch — it
+// fails when someone changes what assertSealedRun promises, which is the only
+// way the promise can break.
+func TestAssertSealedRunPanicsNamingTheBrokenClauseAndReleasesTheMutex(t *testing.T) {
+	const id = "sealed-run-assertion-probe"
+	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	sealed := Outage{Started: started, Recovered: started.Add(time.Minute)}
+	cases := map[string]struct {
+		run  []Outage
+		want string
+	}{
+		"unended record": {
+			run:  []Outage{{Started: started}},
+			want: "has no recovery point at or after its start",
+		},
+		"missing start": {
+			run:  []Outage{{Recovered: started}},
+			want: "has no start, so its silence cannot be measured",
+		},
+		"descending recovery": {
+			run:  []Outage{sealed, {Started: started, Recovered: started.Add(30 * time.Second)}},
+			want: "recovered before the record ahead of it",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			w, _, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+			w.mu.Lock()
+			defer func() {
+				r := recover()
+				if r == nil {
+					w.mu.Unlock()
+					t.Fatalf("assertSealedRun(%q, %v) did not panic: a malformed run has to name the producer here, because a notifier can only report it as a delivery failure that retries forever", id, tc.run)
+				}
+				if got := fmt.Sprint(r); !strings.Contains(got, tc.want) {
+					t.Errorf("panic = %q, want it to name %q", got, tc.want)
+				}
+				// The unlock is part of what the function documents ("callers
+				// hold w.mu and must not hold it after this returns
+				// abnormally"): a future caller that DOES recover has to find
+				// the mutex free, or every later ping, the freshness ticker and
+				// the shutdown tally block on it forever.
+				if !w.mu.TryLock() {
+					t.Fatal("w.mu still held after the panic: assertSealedRun must release it before panicking, or a recovering caller wedges every ping on it")
+				}
+				w.mu.Unlock()
+			}()
+			w.assertSealedRun(id, tc.run)
+		})
+	}
+
+	// A well-formed run passes without panicking and leaves the mutex HELD:
+	// the assertion runs inside the critical section that built the run, so
+	// releasing it on the normal path would hand collectDue an unlocked state.
+	w, _, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+	w.mu.Lock()
+	w.assertSealedRun(id, []Outage{sealed, {Started: started.Add(2 * time.Minute), Recovered: started.Add(3 * time.Minute)}})
+	if w.mu.TryLock() {
+		w.mu.Unlock()
+		t.Fatal("w.mu released on a well-formed run: assertSealedRun must return with the caller's lock still held")
+	}
+	w.mu.Unlock()
 }
 
 func TestPendingMissingQueueOverflowIsAccountedNotSilent(t *testing.T) {

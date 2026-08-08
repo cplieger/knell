@@ -180,6 +180,7 @@ func (c Config) LogValue() slog.Value {
 	// envx's own vocabulary is rendered verbatim ("env", "file") rather than
 	// translated, so the value names the same channel the package that resolved
 	// it does.
+	//
 	// The Host allowlist is knell's one OPTIONAL gate, and ABSENCE is the state
 	// that needs publishing: a present-but-blank ALLOWED_HOSTS warns at parse
 	// time, but a MISSPELLED variable name is indistinguishable from unset and

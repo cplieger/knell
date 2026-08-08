@@ -191,12 +191,15 @@ const historyTimeFormat = "2006-01-02 15:04 MST"
 // on its own; several are summarized, because the point of the message is
 // that they are over, not to replay each of them.
 //
-// The batch's shape is the caller's contract and watch ASSERTS it before
-// calling (non-empty, every record ended, every record has a start, recovery
-// points ascend), so nothing here re-checks it: a refusal returns to watch's
-// sendHistory as an ordinary delivery error, which keeps the records queued and
-// re-offered every sweep and holds the beat's live notices behind them, so a
-// producer bug would present as a webhook problem forever.
+// The batch's shape is the caller's contract: watch builds a history notice only
+// from a non-empty run (collectDue collapses one only under `len(run) > 0`, and
+// assertSealedRun iterates the run, so it would pass an empty one vacuously) and
+// asserts the rest record by record before calling (every record ended, every
+// record has a start, recovery points ascend), so nothing here re-checks it: a
+// refusal returns to watch's sendHistory as an ordinary delivery error, which
+// keeps the records queued and re-offered every sweep and holds the beat's live
+// notices behind them, so a producer bug would present as a webhook problem
+// forever.
 func (d *Discord) BeatOutageHistory(ctx context.Context, id string, outages []watch.Outage) error {
 	return d.post(ctx, "history "+id, d.historyMessage(id, outages))
 }
