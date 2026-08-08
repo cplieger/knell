@@ -1116,6 +1116,51 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 	}
 }
 
+// TestLoadKeepsABeatTokenWithInteriorASCIIWhitespaceArmed pins the SCOPE of the
+// padding refusal: it is an EDGE rule, and a space or tab INSIDE the credential
+// is accepted and stored verbatim. asciiWhitespace's two mechanisms both act on
+// the edges only -- the wire strips a TRAILING SP/HTAB run and a LEADING run is
+// invisible in the value the operator reads -- while an interior SP or HTAB is a
+// legal field-value byte that net/textproto delivers untouched, so an
+// interior-whitespace token authenticates exactly as configured.
+//
+// Nothing else in the package pins the ACCEPTING side of that scope.
+// checkBeatToken's refusals are pinned by value, FuzzCheckBeatToken asserts only
+// on tokens it ACCEPTS (a rejection returns early, so an over-strict validator
+// satisfies it vacuously), and the one interior-whitespace fixture in the
+// package ("alpha\tbeta", in the beatTokenFitsHeader tables) never reaches
+// checkBeatToken. So tightening the edge test to refuse SP/HTAB anywhere -- the
+// shape a "harden the credential" edit reaches for -- leaves every existing test
+// green while a passphrase-style BEAT_TOKEN stops the observer from starting at
+// all, which for a dead-man switch is the one refusal nobody is watching for.
+func TestLoadKeepsABeatTokenWithInteriorASCIIWhitespaceArmed(t *testing.T) {
+	// Serial (t.Setenv forbids t.Parallel). A space AND a tab, both interior,
+	// and 20 bytes so the value clears the minTokenLength floor on its own.
+	const token = "unit test beat\ttoken"
+	setValidLoadEnv(t)
+	t.Setenv("BEAT_TOKEN", token)
+	unsetEnv(t, "BEAT_TOKEN_FILE")
+
+	cfg, err := Load(maxNodeNameBytes)
+	if err != nil {
+		t.Fatalf("Load() with BEAT_TOKEN=%q = %v, want accepted: HTTP normalizes only the EDGES of a field value, so an interior space or tab reaches the verifier untouched and refusing it fails startup on a working credential", token, err)
+	}
+	if cfg.BeatToken != token {
+		t.Errorf("BeatToken = %q, want %q verbatim: webapi compares against \"Bearer \"+token, so collapsing or stripping an interior byte arms the gate for a value no sender presents and one deadline later every beat posts a false MISSING notice", cfg.BeatToken, token)
+	}
+	// The transport is the oracle, not this package's own cutset: the accepted
+	// token has to come back off the wire byte for byte, or accepting it was the
+	// mistake rather than refusing it.
+	srv := authEchoServer(t)
+	echoed, doErr := echoAuthHeader(t, srv, token)
+	if doErr != nil {
+		t.Fatalf("the accepted token could not be sent at all: %v", doErr)
+	}
+	if want := "Bearer " + token; echoed != want {
+		t.Errorf("the wire delivered %q, want %q: an accepted token the transport alters is as unpresentable as one it refuses", echoed, want)
+	}
+}
+
 // TestLoadRejectsASCIIPaddingAroundANonASCIISpaceBeatToken is the mixed shape
 // between the two rules above. Trimming the outer spaces (the cycle-8
 // behaviour) armed the gate for "\u00a0" while the operator configured

@@ -142,14 +142,13 @@ func (t Transition) DownFor() time.Duration {
 //	LateUndelivered           (a delivery attempt was made and failed)
 //
 // A record's reason only ever moves ALONG that order, never back, because a
-// notice that vouches for delivery must be able to defend the claim, and a
-// notice that blames delivery must have an attempt to point at. So a CONFIRMED
-// delivery failure always wins over a scheduler deferral when both could apply.
-// blameDelivery and deferDelivery are the only writers and each enforces its own
-// step. The NUMERIC values are deliberately NOT that order — LateUndelivered is
-// the zero value, for the reason its own comment gives — so the order lives in
-// those two setters and nowhere else, and a comparison operator is never the
-// right way to ask about it.
+// notice that blames delivery must have an attempt to point at. Which of the two
+// weaker reasons a record starts on is decided once, where the record is queued
+// (collectBeatDue for an open one, lateReasonForUnqueuedOutage for a closed one),
+// and blameDelivery is the ONLY writer after that: a confirmed delivery failure
+// outranks both. The NUMERIC values are deliberately NOT that order —
+// LateUndelivered is the zero value, for the reason its own comment gives — so a
+// comparison operator is never the right way to ask about it.
 type LateReason uint8
 
 const (
@@ -173,18 +172,20 @@ const (
 	// involved. Reporting it as a delivery problem would send an operator
 	// hunting through a webhook that was working.
 	//
-	// It is the weakest claim in the order above, and therefore the only one a
-	// record can LOSE twice over: a deferral moves it to LateSchedulerDeferred
-	// and a failed send moves it to LateUndelivered.
+	// It is the weakest claim in the order above, and the only thing that ever
+	// moves a record off it is a failed send (blameDelivery, to
+	// LateUndelivered): nothing rewrites it into a deferral, because a record
+	// carries the reason it was queued with.
 	LateEndedBeforeDetection
 	// LateSchedulerDeferred means this observer never STARTED sending anything
 	// for this outage before the beat came back: the notice was deferred by
 	// knell's own scheduling, not refused by the webhook. Three producers, and
 	// not one of them is evidence about delivery:
 	//
-	//   - sweepSendBudget cut the sweep short before this beat's turn came
-	//     (budgetSpent; a full-fleet storm spends the 5s budget against a
-	//     perfectly healthy webhook, so the cut diagnoses nothing);
+	//   - sweepSendBudget cut the sweep short before this beat's turn came, so the
+	//     open record collectBeatDue had already queued with this reason is what
+	//     the sealed outage reports (a full-fleet storm spends the 5s budget
+	//     against a perfectly healthy webhook, so the cut diagnoses nothing);
 	//   - the beat was held behind a queued or in-flight recovered notice, so
 	//     collectBeatDue started no missing notice for it (st.recovering);
 	//   - the beat's pending queue was full when a sweep detected the outage, so
@@ -432,30 +433,12 @@ func (st *beatState) dropMissing(n int) {
 //
 // LateUndelivered is the top of the one-way order LateReason documents, so this
 // write is unconditional and no record ever moves back off it: a confirmed
-// failure outranks a deferral, which is what deferDelivery below enforces from
-// the other side. n can never exceed the queue length, for the reason
-// dropMissing gives, so a larger n is a caller bug and panics.
+// failure outranks the reason the record was queued with. n can never exceed the
+// queue length, for the reason dropMissing gives, so a larger n is a caller bug
+// and panics.
 func (st *beatState) blameDelivery(n int) {
 	for i := range n {
 		st.pendingMissing[i].late = LateUndelivered
-	}
-}
-
-// deferDelivery sets the late reason of the first n queued records to
-// LateSchedulerDeferred: the records whose notice this observer's own
-// scheduling held back with nothing attempted (see LateSchedulerDeferred for
-// the three producers). It is the middle step of LateReason's one-way order, so
-// a record that already blames a CONFIRMED delivery failure is left alone —
-// that is the precedence rule, and this is the only place it is enforced,
-// because blameDelivery sits at the top of the order and needs no test of its
-// own. n can never exceed the queue length, for the reason dropMissing gives,
-// so a larger n is a caller bug and panics.
-func (st *beatState) deferDelivery(n int) {
-	for i := range n {
-		if st.pendingMissing[i].late == LateUndelivered {
-			continue
-		}
-		st.pendingMissing[i].late = LateSchedulerDeferred
 	}
 }
 
@@ -1065,7 +1048,6 @@ func (w *Watcher) sweep(ctx context.Context) {
 		// yields at most one notice per beat), so the whole remainder of the
 		// ordering is what a cut here defers.
 		if w.budgetSpent(budget, len(due)-i) {
-			w.markHistoryDeferred(deferredHistory(due[i:]))
 			return
 		}
 		// Before the send, not after: the beat has taken its turn either way,
@@ -1094,11 +1076,9 @@ func (w *Watcher) sweep(ctx context.Context) {
 // retry that is already the plain behavior here) nor a dropped notice (which
 // would claim it will never arrive). Its outage survives the cut: the queued
 // record is still there for the next sweep, which is why a cut can never
-// swallow an outage. The one thing a cut does rewrite is the late reason of the
-// records behind a deferred HISTORY notice, set to LateSchedulerDeferred
-// (markHistoryDeferred), because a past-tense notice must state which of the
-// three things happened to it, and a cut means nothing was tried. DEBUG
-// matches recordOngoingOutage:
+// swallow an outage. It rewrites nothing either: every record already carries
+// the reason it was queued with, and a cut is not an attempt, so no record's
+// claim about delivery changes. DEBUG matches recordOngoingOutage:
 // like a full pending queue during a webhook outage, this is back-pressure
 // that costs a tick, not a fault.
 //
@@ -1111,7 +1091,8 @@ func (w *Watcher) sweep(ctx context.Context) {
 // full-fleet storm can spend the whole budget against a healthy webhook, and
 // sending the operator to check it would be a diagnosis nothing supports. A
 // record whose own send was attempted and REFUSED says so instead, because
-// blameDelivery outranks deferDelivery (see LateReason).
+// blameDelivery is the only writer that outranks the queued reason (see
+// LateReason).
 func (w *Watcher) budgetSpent(budget time.Time, deferred int) bool {
 	if !w.now().After(budget) {
 		return false
@@ -1192,21 +1173,6 @@ func byAttemptThenAge(a, b dueNotice) int {
 	default:
 		return 0
 	}
-}
-
-// deferredHistory names the history notices in the deferred tail of a sweep's
-// ordering: the entries whose late reason the budget cut rewrites (see
-// markHistoryDeferred). A deferred LIVE record needs no rewrite — its outage
-// is still open, so its notice makes no claim about delivery yet, and the
-// reason it was queued with already says nothing was attempted.
-func deferredHistory(deferred []dueNotice) []beatOutages {
-	past := make([]beatOutages, 0, len(deferred))
-	for i := range deferred {
-		if deferred[i].history != nil {
-			past = append(past, *deferred[i].history)
-		}
-	}
-	return past
 }
 
 // markAttempted stamps the beat's attempt time, which is what keeps the
@@ -1502,28 +1468,6 @@ func (w *Watcher) markMissingUndelivered(id string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.beats[id].blameDelivery(1)
-}
-
-// markHistoryDeferred records that this sweep's send budget deferred the
-// history notices in its cut tail, with nothing attempted for them (see
-// beatState.deferDelivery). A deferred notice was never sent, so it must not
-// blame the webhook: the cut is not proof delivery is slow — a full-fleet storm
-// spends the 5s budget against a healthy webhook — and a record left claiming
-// LateEndedBeforeDetection would tell the operator "nothing was wrong with
-// delivery" about a notice nothing tried to send. Each entry's outage count is
-// exactly the run collectDue took from that beat's head, for the reason
-// dropDelivered gives, and a record already blaming a CONFIRMED failure keeps
-// that claim (deferDelivery enforces the precedence).
-//
-// Cancellation is deliberately NOT routed here (sendHistory returns before the
-// next budget check): a shutdown is not this observer deferring work, and those
-// records die with the process anyway.
-func (w *Watcher) markHistoryDeferred(deferred []beatOutages) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	for _, past := range deferred {
-		w.beats[past.id].deferDelivery(len(past.outages))
-	}
 }
 
 // markDelivered records the outcome of a delivered missing send for id. It

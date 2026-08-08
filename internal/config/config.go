@@ -45,10 +45,13 @@ const minTokenLength = 16
 // maxTokenLength is the longest BEAT_TOKEN knell will start with, and it exists
 // only because the token has to TRAVEL: every ping carries it in an HTTP header,
 // and MaxRequestHeaderBytes below caps the header block knell will read, so the
-// two bounds are one decision made in one place. Without the pair, an oversized
-// token passes startup and then makes every ping fail 431 while the endpoint
-// reports itself gated — the fail-silent direction for a dead-man switch, and one
-// deadline later every configured beat posts a false MISSING notice.
+// two bounds are one decision made in one place. With no maximum at all a token big
+// enough to fill that block — which a BEAT_TOKEN_FILE pointing at the wrong file
+// supplies, envx reading up to 1 MiB — passes startup and then makes every ping
+// fail 431 while the endpoint reports itself gated: the fail-silent direction for a
+// dead-man switch, and one deadline later every configured beat posts a false
+// MISSING notice. The bound below sits far under that breaking point on purpose, so
+// the refusal is a margin rather than a wire limit; see the value's own rationale.
 //
 // 512 bytes is 16x the 32-byte token `openssl rand -hex 16` produces, so no
 // credential an operator would actually write is refused; what reaches the cap is
@@ -440,7 +443,11 @@ func allowedHosts() (*webhttp.HostPolicy, error) {
 	raw, present := os.LookupEnv(key)
 	policy, invalid := ParseAllowedHosts(strings.Split(raw, ","))
 	if len(invalid) > 0 {
-		return nil, fmt.Errorf("%s has entries no Host can ever match, so the allowlist knell would serve is not the one configured: %v; use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,10.0.0.5,knell.example.com — a lone port like :9190 belongs in LISTEN_ADDR", key, invalid)
+		// %q, not %v: the one mistake in this list an operator cannot SEE is an
+		// invisible rune pasted in with the hostname, and webhttp refuses every
+		// non-ASCII name, so exactly those entries land here. %q escapes them
+		// ("knell.internal\u200b"), as parseBeatEntry already does for a beat id.
+		return nil, fmt.Errorf("%s has entries no Host can ever match, so the allowlist knell would serve is not the one configured: %q; use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,10.0.0.5,knell.example.com — a lone port like :9190 belongs in LISTEN_ADDR", key, invalid)
 	}
 	if present && !policy.Active() {
 		slog.Warn(key+" is set but blank and was ignored; every Host is accepted, so the DNS-rebinding guard is off",
@@ -570,6 +577,44 @@ func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
 		"variable", key, "file_variable", key+"_FILE", "credential", subject)
 }
 
+// resolveSecret reads one required credential through envx's KEY/KEY_FILE pair
+// and applies this package's fail-closed policy to every way it can fail. Both
+// credentials go through it so the policy has ONE spelling: a divergence
+// between the webhook's rules and the token's would stay invisible until an
+// operator hit the branch that was only fixed on one side.
+//
+//   - A blank KEY_FILE is refused before envx resolves anything: envx treats it
+//     as unset and falls back to the plain variable, which is not the credential
+//     the operator pointed knell at (rejectBlankFileVar).
+//   - A secret file that cannot be used FAILS STARTUP and never falls back to
+//     the plain variable. The envx error is sanitized by secretFileError and
+//     never wrapped: it embeds the KEY_FILE value, which is the credential
+//     itself whenever the operator pasted the secret into the file variable.
+//   - An absent credential is reported as setButEmpty or missing. envx.Require
+//     cannot tell a present-but-empty variable from an unset one (compose
+//     interpolation of an undefined variable produces exactly the empty shape),
+//     and the operator's next move differs between them.
+//
+// The source is reported as envx reports it on the error paths too, so a caller
+// that publishes it does not re-derive it; only the value is unusable.
+func resolveSecret(key string, setButEmpty, missing error) (string, envx.SecretSource, error) {
+	if err := rejectBlankFileVar(key); err != nil {
+		return "", envx.SourceNone, err
+	}
+	value, src, err := envx.SecretWithSource(key)
+	switch {
+	case err == nil:
+		return value, src, nil
+	case errors.As(err, new(*envx.MissingError)):
+		if v, ok := os.LookupEnv(key); ok && v == "" {
+			return "", src, setButEmpty
+		}
+		return "", src, fmt.Errorf("%w: %w", missing, err)
+	default:
+		return "", src, secretFileError(key, err)
+	}
+}
+
 // beatTokenFitsHeader reports whether value can be carried verbatim in an HTTP
 // field value, ASSUMING edge ASCII whitespace has already been REFUSED (see
 // checkBeatToken and asciiWhitespace). It answers the byte-legality question
@@ -592,12 +637,27 @@ func beatTokenFitsHeader(value string) bool {
 }
 
 // errWebhookSetButEmpty is the refusal for a DISCORD_WEBHOOK_URL that is
-// present and carries no value. Both of loadWebhook's empty-value paths return
-// it — the present-but-empty variable envx reports as missing, and the value
+// present and carries no value. resolveSecret returns it for the
+// present-but-empty variable envx reports as missing, and loadWebhook for the value
 // with nothing visible left after the trim (every invisible rune at either edge
 // is padding here, not only a Unicode space) — so the two cannot come to
 // describe the same misconfiguration differently.
 var errWebhookSetButEmpty = errors.New("DISCORD_WEBHOOK_URL is set but empty: point it at the https webhook URL, or use DISCORD_WEBHOOK_URL_FILE")
+
+// errWebhookRequired is the refusal for a DISCORD_WEBHOOK_URL that was never
+// set; its present-but-empty twin is errWebhookSetButEmpty.
+var errWebhookRequired = errors.New("DISCORD_WEBHOOK_URL is required")
+
+// errBeatTokenSetButEmpty and errBeatTokenRequired are the two diagnoses an
+// absent BEAT_TOKEN gets, kept apart because the operator's next move differs:
+// one already tried to supply a token and delivered nothing, the other has to
+// choose one. Serving /beat/{id} with no credential is not one of the options —
+// any client that can reach the port would keep every beat reading fresh, which
+// disarms the switch silently.
+var (
+	errBeatTokenSetButEmpty = fmt.Errorf("BEAT_TOKEN is set but empty: it is the only thing standing between a stranger who can reach this port and a forged ping, so there is no configuration in which knell serves /beat/{id} without it; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
+	errBeatTokenRequired    = fmt.Errorf("BEAT_TOKEN is required: it is the only gate on /beat/{id}, so without it any client that can reach this port can keep every beat reading fresh while the thing it watches is dead; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
+)
 
 // checkBeatToken validates a configured BEAT_TOKEN as the exact credential
 // senders must present, or refuses it. It never rewrites the value.
@@ -666,7 +726,7 @@ func checkBeatToken(token string) error {
 		// pointing at a bundle or an archive the mount picked up (envx reads a
 		// secret file of up to 1 MiB), which is why the remedy names the value
 		// and not the cap.
-		return fmt.Errorf("BEAT_TOKEN is longer than the %d-byte maximum: knell reads at most %d bytes of request headers, and a token past the maximum leaves no room for the request line, the Host header and the \"Bearer \" prefix it travels with, so POST /beat/{id} would reject every ping with 431 while reporting itself gated; set a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or check that BEAT_TOKEN_FILE names the secret file itself rather than a bundle the mount picked up", maxTokenLength, MaxRequestHeaderBytes, minTokenLength)
+		return fmt.Errorf("BEAT_TOKEN is longer than the %d-byte maximum: the maximum is the token's share of the %d-byte header block knell reads, so an accepted token always travels with %d bytes left over for the request line, the Host header and the \"Bearer \" prefix, and a longer one is refused at startup rather than left to eat that reserve until POST /beat/{id} answers 431 to every ping while reporting itself gated; a real credential is far shorter than the maximum, so set a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or check that BEAT_TOKEN_FILE names the secret file itself rather than a bundle the mount picked up", maxTokenLength, MaxRequestHeaderBytes, headerOverheadAllowance, minTokenLength)
 	}
 	return nil
 }
@@ -695,55 +755,18 @@ func checkBeatToken(token string) error {
 // mounted secret file instead (the same convention DISCORD_WEBHOOK_URL uses),
 // keeping the credential out of `docker inspect` output.
 func loadBeatToken() (string, error) {
-	if err := rejectBlankFileVar("BEAT_TOKEN"); err != nil {
+	token, src, err := resolveSecret("BEAT_TOKEN", errBeatTokenSetButEmpty, errBeatTokenRequired)
+	if err != nil {
 		return "", err
 	}
-	token, tokenSrc, err := envx.SecretWithSource("BEAT_TOKEN")
-	switch {
-	case err == nil:
-		// The ignored-plain-variable advisory is deliberately NOT emitted
-		// here: the checks below can still fail startup (a control byte in a
-		// file-sourced token), and advising the operator to unset a variable
-		// in the same breath as exiting on the winning one is advice about a
-		// configuration that never ran. It is emitted once the token is fully
-		// validated, below.
-		if tokenErr := checkBeatToken(token); tokenErr != nil {
-			return "", tokenErr
-		}
-	case errors.As(err, new(*envx.MissingError)):
-		// Neither BEAT_TOKEN nor BEAT_TOKEN_FILE is set, or BEAT_TOKEN is
-		// present and empty (envx Require cannot tell the two apart, and
-		// compose interpolation of an undefined variable produces exactly the
-		// empty shape). Both fail startup, and they are reported separately
-		// because the operator's next move differs: one has to choose a token,
-		// the other already tried to and supplied nothing. Serving the endpoint
-		// without a credential is not one of the options: unauthenticated, any
-		// client that can reach the port keeps every beat reading fresh, which
-		// disarms the switch silently — and a startup failure is the one signal
-		// that cannot be mistaken for a working observer.
-		//
-		// This is the only branch that gives an explicitly empty BEAT_TOKEN its
-		// set-but-empty diagnosis. checkBeatToken's minimum-length floor also
-		// refuses an empty direct input, but envx.SecretWithSource returns a
-		// non-empty value on every success path (Require refuses an empty
-		// variable, and a blank secret file is ErrBlankSecretFile), so
-		// loadBeatToken never sends one there.
-		if v, ok := os.LookupEnv("BEAT_TOKEN"); ok && v == "" {
-			return "", fmt.Errorf("BEAT_TOKEN is set but empty: it is the only thing standing between a stranger who can reach this port and a forged ping, so there is no configuration in which knell serves /beat/{id} without it; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
-		}
-		return "", fmt.Errorf("BEAT_TOKEN is required: it is the only gate on /beat/{id}, so without it any client that can reach this port can keep every beat reading fresh while the thing it watches is dead; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one: %w", minTokenLength, err)
-	default:
-		// Any other error means the variable WAS provided and could not be
-		// used (unreadable or blank _FILE): fail closed rather than starting
-		// without the credential the operator meant to configure. The envx error
-		// is sanitized, never wrapped: it embeds the BEAT_TOKEN_FILE value, which
-		// is the bearer token itself whenever the operator pasted the
-		// credential into the file variable.
-		return "", secretFileError("BEAT_TOKEN", err)
+	// Validate BEFORE the ignored-plain-variable advisory: checkBeatToken can
+	// still fail startup (a control byte in a file-sourced token), and advising
+	// the operator to unset a variable in the same breath as exiting on the
+	// winning one is advice about a configuration that never ran.
+	if tokenErr := checkBeatToken(token); tokenErr != nil {
+		return "", tokenErr
 	}
-	// The token is now fully validated, so the winning-source advisory cannot
-	// be followed by a startup failure about the credential it just described.
-	warnPlainVarIgnored("BEAT_TOKEN", "token", tokenSrc)
+	warnPlainVarIgnored("BEAT_TOKEN", "token", src)
 	return token, nil
 }
 
@@ -756,31 +779,9 @@ func loadBeatToken() (string, error) {
 // supplied the credential decides whether it is also sitting in the process
 // environment.
 func loadWebhook() (string, envx.SecretSource, error) {
-	if err := rejectBlankFileVar("DISCORD_WEBHOOK_URL"); err != nil {
-		return "", envx.SourceNone, err
-	}
-	webhook, src, err := envx.SecretWithSource("DISCORD_WEBHOOK_URL")
+	webhook, src, err := resolveSecret("DISCORD_WEBHOOK_URL", errWebhookSetButEmpty, errWebhookRequired)
 	if err != nil {
-		if errors.As(err, new(*envx.MissingError)) {
-			// envx.Require cannot tell present-but-empty from unset, and the
-			// operator's next move differs: one has to supply a webhook URL,
-			// the other already tried to and the secret pipeline delivered
-			// nothing (compose interpolation of an undefined variable produces
-			// exactly this shape). Same split loadBeatToken makes for
-			// BEAT_TOKEN, and the same diagnosis the value that trims to
-			// nothing visible below already gets.
-			if v, ok := os.LookupEnv("DISCORD_WEBHOOK_URL"); ok && v == "" {
-				return "", envx.SourceNone, errWebhookSetButEmpty
-			}
-			return "", envx.SourceNone, fmt.Errorf("DISCORD_WEBHOOK_URL is required: %w", err)
-		}
-		// Provided via _FILE but unreadable/empty: not a missing-variable
-		// case, and never a fallback to the plain variable — a webhook the
-		// operator meant to configure must fail startup, not go unset. The
-		// envx error is sanitized, never wrapped: it embeds the
-		// DISCORD_WEBHOOK_URL_FILE value, which is the webhook credential
-		// itself whenever the operator pasted the URL into the file variable.
-		return "", src, secretFileError("DISCORD_WEBHOOK_URL", err)
+		return "", src, err
 	}
 
 	// Neither channel trims: envx returns the plain variable verbatim and the

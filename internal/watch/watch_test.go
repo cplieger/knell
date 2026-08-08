@@ -1810,9 +1810,8 @@ func TestHistorySendsAreBoundedByTheSweepBudget(t *testing.T) {
 	}
 
 	// Every beat the cut deferred keeps its outage: the record is still queued
-	// for the next sweep and nothing about it was counted. The one thing the cut
-	// changes is the record's late reason, which now reports the deferral
-	// (markHistoryDeferred).
+	// for the next sweep, nothing about it was counted, and its late reason is
+	// untouched — the cut attempted nothing, so it is not evidence about anything.
 	for _, b := range histBeats {
 		st := w.beats[b.ID]
 		if delivered[b.ID] {
@@ -1825,17 +1824,13 @@ func TestHistorySendsAreBoundedByTheSweepBudget(t *testing.T) {
 			t.Errorf("beat %s was deferred but holds %d record(s), want its ended-outage record retained for the next sweep", b.ID, len(st.pendingMissing))
 			continue
 		}
-		// The cut itself is the reason this notice is late, and the cut is not
-		// evidence about the webhook: the record was queued as
-		// LateEndedBeforeDetection (no sweep ever saw the outage) and nothing has
-		// been attempted for it since, so it must report the deferral. Leaving it
-		// claiming that nothing was wrong with delivery hides that a notice is
-		// waiting; upgrading it to LateUndelivered — which is what this did
-		// before the causes were split — sends the operator to check a webhook
-		// this sweep never asked to deliver anything.
-		if got := st.pendingMissing[0].late; got != LateSchedulerDeferred {
-			t.Errorf("beat %s deferred by the %s send budget reports %s, want %s: the retried past-tense notice must name this observer's own deferral, not a delivery failure nothing attempted",
-				b.ID, sweepSendBudget, reasonName(got), reasonName(LateSchedulerDeferred))
+		// The record was queued as LateEndedBeforeDetection (no sweep ever saw the
+		// outage) and the cut attempted nothing for it, so its reason is unchanged:
+		// the outage really did end before detection, and a cut is neither a
+		// delivery failure nor a reason to restate why the notice is past tense.
+		if got := st.pendingMissing[0].late; got != LateEndedBeforeDetection {
+			t.Errorf("beat %s deferred by the %s send budget reports %s, want %s: a cut must not rewrite the reason the record was queued with",
+				b.ID, sweepSendBudget, reasonName(got), reasonName(LateEndedBeforeDetection))
 		}
 	}
 	for _, b := range liveBeats {
@@ -1883,86 +1878,6 @@ func TestHistorySendsAreBoundedByTheSweepBudget(t *testing.T) {
 		if got := perBeat[b.ID]; got != 1 {
 			t.Errorf("beat %s received %d history notices across both sweeps, want exactly 1", b.ID, got)
 		}
-	}
-}
-
-// TestABudgetDeferralNeverDowngradesAConfirmedDeliveryFailure pins the
-// precedence between the two reasons that can both apply to one record: the
-// send for this outage was ATTEMPTED and refused, and a later sweep's budget cut
-// then deferred the past-tense notice reporting it. A confirmed delivery failure
-// wins, because it is the only one of the three reasons with evidence behind it —
-// a record downgraded to the deferral would tell the operator nothing was
-// attempted for a notice this very webhook had already turned down, and the
-// webhook it needs looking at would be named nowhere.
-func TestABudgetDeferralNeverDowngradesAConfirmedDeliveryFailure(t *testing.T) {
-	// Serial (no t.Parallel): asserts on the package-global metric registry
-	// through fixed beat ids.
-	const (
-		id        = "defer-precedence-probe"
-		short     = 10 * time.Minute
-		long      = 2 * time.Hour
-		perSend   = 2 * time.Second
-		fillers   = 4
-		clockBase = 11 * time.Minute
-	)
-	// The fillers carry a LONG deadline so they are not due for the first sweep:
-	// that is what leaves their attempt stamps at the zero time, which is what
-	// puts them AHEAD of the probe in byAttemptThenAge on the second sweep, which
-	// is what makes the budget cut land on the probe's history notice.
-	filler := budgetProbeBeats("defer-precedence-filler", fillers, long)
-	clock := newFakeClock()
-	n := &fakeNotifier{}
-	w := New(slices.Concat([]Beat{{ID: id, Deadline: short}}, filler), n, clock.Now, clock.Now())
-	if !recordedBeat(w, id) {
-		t.Fatalf("Beat(%s) = false", id)
-	}
-
-	// The probe's live missing notice is raised and REFUSED, which blames
-	// delivery for the record left queued, and a ping then seals it: one closed
-	// record carrying LateUndelivered on its own evidence.
-	clock.Advance(clockBase)
-	n.setFail(errors.New("discord down"))
-	w.sweep(context.Background())
-	if got := w.beats[id].pendingMissing[0].late; got != LateUndelivered {
-		t.Fatalf("queued late reason after a refused live send = %s, want %s: this test no longer covers the precedence it exists for",
-			reasonName(got), reasonName(LateUndelivered))
-	}
-	if !recordedBeat(w, id) {
-		t.Fatalf("late Beat(%s) = false", id)
-	}
-
-	// The webhook heals and the fillers come due. Their sends are slow enough to
-	// spend the budget, and every one of them leads the probe in the ordering,
-	// so the cut defers the probe's history notice with nothing attempted for it
-	// on THIS sweep.
-	n.setFail(nil)
-	slowSends(n, clock, perSend)
-	clock.Advance(long + time.Minute)
-	wantSent := sendsBeforeBudgetCut(perSend)
-	if wantSent >= fillers {
-		t.Fatalf("test precondition: %d sends fit in the %s budget at %s each, want fewer than the %d filler beats",
-			wantSent, sweepSendBudget, perSend, fillers)
-	}
-	rec := capture.Default(t)
-	w.sweep(context.Background())
-
-	for _, c := range n.snapshot() {
-		if c.kind == "history" {
-			t.Fatalf("the sweep delivered %+v: the probe's history notice must be in the deferred tail for this test to say anything", c)
-		}
-	}
-	// The cut's own line proves the probe was IN the deferred tail rather than
-	// merely absent from the sweep: the ordering held exactly fillers+1 entries,
-	// wantSent of them were attempted, so a deferred count of the remainder is
-	// only reachable with the probe's history notice among them. Without this the
-	// assertion below would pass for a record nothing ever deferred.
-	if wantDeferred := fillers - wantSent + 1; !rec.HasAttr("sweep send budget spent", "deferred_beats", strconv.Itoa(wantDeferred)) {
-		t.Fatalf("budget-cut line does not report the %d deferred beats (%d filler + the probe's history notice): %v",
-			wantDeferred, fillers-wantSent, rec.Records())
-	}
-	if got := w.beats[id].pendingMissing[0].late; got != LateUndelivered {
-		t.Errorf("late reason after the budget deferred an already-refused notice = %s, want %s: a deferral must never downgrade a delivery failure the webhook actually refused",
-			reasonName(got), reasonName(LateUndelivered))
 	}
 }
 

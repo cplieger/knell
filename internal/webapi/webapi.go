@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/cplieger/knell/internal/metrics"
@@ -47,6 +46,12 @@ const loggedPathCap = 128
 // (bearerPrefix + token), so acceptance is exactly one header value and knell
 // never parses the credential out of the header.
 const bearerPrefix = "Bearer "
+
+// beatRoutePattern is the ONE spelling of the recording route: it is what New
+// registers and what the failed-auth throttle compares the mux's own verdict
+// against, so "which requests are the beat endpoint" cannot be answered two
+// ways. Do not inline it at either site.
+const beatRoutePattern = "POST /beat/{id}"
 
 // Beater records pings. Implemented by watch.Watcher.
 type Beater interface {
@@ -124,7 +129,7 @@ func New(b Beater, deps Deps) http.Handler {
 	// neither can ever fall through to the recorder. Do not delete either as
 	// redundant boilerplate.
 	verifier := beatTokenVerifier(deps.BeatToken)
-	mux.HandleFunc("POST /beat/{id}", beatHandler(b, verifier))
+	mux.HandleFunc(beatRoutePattern, beatHandler(b, verifier))
 	mux.HandleFunc("GET /beat/{id}", writeMethodNotAllowed)
 	mux.HandleFunc("HEAD /beat/{id}", writeMethodNotAllowed)
 	// Every OTHER method (PUT, DELETE, PATCH, OPTIONS, an unknown verb) would
@@ -183,7 +188,7 @@ func New(b Beater, deps Deps) http.Handler {
 		// ping with a valid token never draws a token from the bucket, so
 		// knell's own senders can never throttle themselves. See
 		// beatAuthFailureLimiter.
-		beatAuthFailureLimiter(verifier),
+		beatAuthFailureLimiter(mux, verifier),
 		// /healthz and /metrics are machine probes, so they ride the
 		// fleet-standard ProbeLogLevel rather than a skip list: a HEALTHY
 		// probe logs at Debug (out of the shipped stream at the default
@@ -220,6 +225,21 @@ func New(b Beater, deps Deps) http.Handler {
 		webhttp.Logging(
 			webhttp.ProbeLogLevel("/healthz", "/metrics"),
 			webhttp.WithMaxLoggedPath(loggedPathCap),
+			// WithClientIP with NO trusted ranges, the spoof-proof default: it
+			// logs the immediate socket peer, which is the sender in every
+			// documented deployment (the compose example publishes the port
+			// directly and nothing terminates in front of it). Without it the
+			// 401 lines a token-guessing run writes name no source at all, so
+			// the one credential gating this endpoint can be attacked with no
+			// attributable trace and no address for an operator to block.
+			// Behind a reverse proxy the operator passes that proxy's CIDRs
+			// (webhttp.ParseCIDRs) so a trusted X-Forwarded-For resolves the
+			// real client; trusting a forwarded header with no proxy in front of
+			// it is how the field becomes spoofable, so it is deliberately not
+			// done speculatively. The attribute name is the fleet's client_ip,
+			// so a shared Loki query over every webhttp consumer's access lines
+			// includes knell.
+			webhttp.WithClientIP(),
 			webhttp.WithRecordRouteMetric(metrics.RecordHTTP),
 		),
 		webhttp.Recoverer(),
@@ -396,55 +416,34 @@ func presentsValidBeatToken(verifier webhttp.StaticTokenVerifier, r *http.Reques
 	return verifier.Verify(r.Header.Get("Authorization"))
 }
 
-// beatEndpointRequest reports whether r is addressed at the beat endpoint
-// itself: POST /beat/{id}, the one route whose handler runs the bearer gate.
-// Every other /beat spelling is refused before the gate on its own terms (405
-// for another method, 404 for a path naming no beat), so an absent credential
-// there is not a failed authentication and must not draw a throttle token.
-//
-// The path test is textual because the throttle runs OUTSIDE the mux, so
-// r.Pattern is not populated yet: one segment under /beat/, no deeper path.
-// That is exactly the shape the POST route matches, and a non-canonical
-// spelling of it is refused by canonicalBeatPath rather than gated.
-func beatEndpointRequest(r *http.Request) bool {
-	if r.Method != http.MethodPost {
-		return false
-	}
-	// Read the ESCAPED path and decode it the way ServeMux does — split the
-	// path into segments FIRST, then unescape each one — because neither raw
-	// view alone covers the class the gate answers. The mux matches patterns
-	// against the escaped path, so an encoded slash (/beat/a%2Fb) stays inside
-	// the {id} segment; and it unescapes each request segment before comparing
-	// it to a literal one, so an escaped letter in the literal segment
-	// (/%62eat/api) matches too. A request needing BOTH at once
-	// (/%62eat/a%2Fb) routes to POST /beat/{id} while satisfying neither raw
-	// view, which is exactly the exemption an unbounded guessing oracle and log
-	// flood would ride through. Over-inclusion is harmless (a spelling the mux
-	// 404s draws a token it would otherwise not); under-inclusion is a bypass.
-	return singleSegmentUnderBeat(r.URL.EscapedPath())
-}
-
-// singleSegmentUnderBeat reports whether the ESCAPED path p is exactly one
-// non-empty segment under /beat/, the shape the POST /beat/{id} route matches.
-// It decodes segment-wise like ServeMux: the literal segment is unescaped
-// before it is compared, while an escaped slash inside the id is not a
-// separator and keeps the id a single segment.
-func singleSegmentUnderBeat(p string) bool {
-	literal, id, found := strings.Cut(strings.TrimPrefix(p, "/"), "/")
-	if !found || id == "" || strings.Contains(id, "/") {
-		return false
-	}
-	decoded, unescapeErr := url.PathUnescape(literal)
-	return unescapeErr == nil && decoded == "beat"
-}
-
 // failedBeatAuth reports whether r is a FAILED authentication on the beat
 // endpoint: the exact class the throttle bounds. beatAuthFailureLimiter is its
 // only caller and gates BOTH the bucket and the 429 attribution on this one
 // verdict, so there is no second predicate that could disagree about which
 // requests the throttle can possibly refuse.
-func failedBeatAuth(verifier webhttp.StaticTokenVerifier, r *http.Request) bool {
-	return beatEndpointRequest(r) && !presentsValidBeatToken(verifier, r)
+//
+// The endpoint half of that verdict is the ROUTER's, not a model of it. Only
+// beatRoutePattern runs the bearer gate; every other /beat spelling is refused
+// before the gate on its own terms (405 for another method, 404 for a path
+// naming no beat), so an absent credential there is not a failed
+// authentication and must not draw a throttle token. The throttle is mounted
+// outside the mux (see New), so r.Pattern is not populated yet — but
+// ServeMux.Handler performs the full match, method included, and returns the
+// pattern that matched, which is the same decision the handler will make one
+// middleware later. So the route's spelling has one home (beatRoutePattern) and
+// no copy of net/http's segment-wise unescaping can drift from it: an encoded
+// slash inside the id (/beat/a%2Fb), an escaped literal segment (/%62eat/api)
+// and a request needing both at once are all answered by the matcher that
+// actually routes them.
+//
+// The deliberate over-inclusion survives: for a path ServeMux would rewrite,
+// Handler returns a redirect handler together with the pattern that would match
+// after cleaning, so a non-canonical spelling still draws a token (and is then
+// refused 404 by canonicalBeatPath). Over-inclusion is harmless;
+// under-inclusion is a bypass.
+func failedBeatAuth(mux *http.ServeMux, verifier webhttp.StaticTokenVerifier, r *http.Request) bool {
+	_, pattern := mux.Handler(r)
+	return pattern == beatRoutePattern && !presentsValidBeatToken(verifier, r)
 }
 
 // beatAuthFailureLimiter throttles FAILED authentication on the beat endpoint
@@ -477,7 +476,7 @@ func failedBeatAuth(verifier webhttp.StaticTokenVerifier, r *http.Request) bool 
 // and within that class the limiter is the one thing that can answer 429 (a
 // failed authentication that reaches the handler answers 401), so the status
 // test attributes the refusal exactly without duplicating the bucket's state.
-func beatAuthFailureLimiter(verifier webhttp.StaticTokenVerifier) webhttp.Middleware {
+func beatAuthFailureLimiter(mux *http.ServeMux, verifier webhttp.StaticTokenVerifier) webhttp.Middleware {
 	// A nil predicate, deliberately: the wrapper below hands the limiter ONLY
 	// predicate-matching requests, so the bucket already sees exactly the
 	// failed-auth class and a second copy of the predicate could only disagree
@@ -489,7 +488,7 @@ func beatAuthFailureLimiter(verifier webhttp.StaticTokenVerifier) webhttp.Middle
 	return func(next http.Handler) http.Handler {
 		limited := limit(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !failedBeatAuth(verifier, r) {
+			if !failedBeatAuth(mux, verifier, r) {
 				// Straight to next, never through the bucket: the limiter draws
 				// a token from every request it sees, so this class must not
 				// reach it.
