@@ -18,11 +18,12 @@ import (
 // The oracle is the transport, not this package's own constants:
 // TestBeatTokenFitsHeaderAgreesWithTheTransportForEveryByte proves
 // beatTokenFitsHeader agrees with the wire for the INTERIOR bytes of one fixed
-// shape, while the edge cutset (asciiWhitespace) and the empty, blank and
-// invisible-edge verdicts are asserted only against hand-picked values. Fuzzing
-// the whole validator against a header round trip covers the combinations no
-// table enumerates: mixed edges, multi-byte edges, interior padding beside an
-// invisible edge.
+// shape, while the edge cutset (asciiWhitespace) and the length bounds are
+// asserted only against hand-picked values. Fuzzing the whole validator against
+// a header round trip covers the combinations no table enumerates: mixed edges,
+// multi-byte edges, and interior padding beside an edge rune the operator
+// cannot see — every one of which knell now ACCEPTS, so the round trip is the
+// only thing proving the accepted value still reaches the verifier verbatim.
 func FuzzCheckBeatToken(f *testing.F) {
 	for _, seed := range []string{
 		"unit-test-beat-token",

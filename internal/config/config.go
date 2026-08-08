@@ -699,10 +699,12 @@ func loadBeatToken() (string, error) {
 		// disarms the switch silently — and a startup failure is the one signal
 		// that cannot be mistaken for a working observer.
 		//
-		// This is the ONLY empty-token refusal, and checkBeatToken deliberately
-		// carries none: envx.SecretWithSource returns a non-empty value on every
-		// success path (Require refuses an empty variable, and a blank secret file
-		// is ErrBlankSecretFile), so no empty token can reach it.
+		// This is the only branch that gives an explicitly empty BEAT_TOKEN its
+		// set-but-empty diagnosis. checkBeatToken's minimum-length floor also
+		// refuses an empty direct input, but envx.SecretWithSource returns a
+		// non-empty value on every success path (Require refuses an empty
+		// variable, and a blank secret file is ErrBlankSecretFile), so
+		// loadBeatToken never sends one there.
 		if v, ok := os.LookupEnv("BEAT_TOKEN"); ok && v == "" {
 			return "", fmt.Errorf("BEAT_TOKEN is set but empty: it is the only thing standing between a stranger who can reach this port and a forged ping, so there is no configuration in which knell serves /beat/{id} without it; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
 		}

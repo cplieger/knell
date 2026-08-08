@@ -1951,12 +1951,14 @@ func TestLoadDoesNotLeakACredentialPastedIntoASecretFileVariable(t *testing.T) {
 	}
 }
 
-// TestLoadRefusesAHeaderIllegalTokenWithoutCallingItArmed pins that a plain
-// BEAT_TOKEN of Unicode spaces around a control byte is REFUSED: it passes the
-// ASCII-edge refusal and reads blank to strings.TrimSpace, so only the
-// header-legality check stands between it and a gate armed with a value no
-// sender can present.
-func TestLoadRefusesAHeaderIllegalTokenWithoutCallingItArmed(t *testing.T) {
+// TestLoadRefusesAHeaderIllegalTokenBeforeTheLengthFloor pins the ORDER of
+// checkBeatToken's header-legality and minimum-length refusals. A plain
+// BEAT_TOKEN of Unicode spaces around a control byte passes the ASCII-edge
+// refusal and is BOTH header-illegal and under the 16-byte floor, so it is the
+// one fixture whose diagnosis reveals which check ran first: the operator has
+// to be told the token carries a byte HTTP forbids, not that it is too short,
+// because lengthening it would not make it presentable.
+func TestLoadRefusesAHeaderIllegalTokenBeforeTheLengthFloor(t *testing.T) {
 	// Serial (t.Setenv forbids t.Parallel).
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKEN", "\u00a0\n\u00a0")

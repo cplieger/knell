@@ -781,7 +781,13 @@ func TestTeardownAfterServeExitDrainsAcceptedHandlers(t *testing.T) {
 	if lnErr != nil {
 		t.Fatalf("listen: %v", lnErr)
 	}
-	go func() { _ = srv.Serve(ln) }()
+	// Serve's result is the ORDERING WITNESS: http.Server.Shutdown closes the
+	// listener before it waits for active handlers, so Serve returning
+	// ErrServerClosed proves the drain is under way. A fixed real-time wait
+	// would only prove a goroutine had time to be scheduled, and a teardown
+	// with Shutdown deleted passes that on a loaded runner.
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve(ln) }()
 	go func() {
 		resp, getErr := http.Get("http://" + ln.Addr().String() + "/")
 		if getErr == nil {
@@ -789,6 +795,20 @@ func TestTeardownAfterServeExitDrainsAcceptedHandlers(t *testing.T) {
 		}
 	}()
 	<-entered
+
+	released := false
+	releaseHandler := func() {
+		if !released {
+			released = true
+			close(release)
+		}
+	}
+	// On an early failure the handler is still parked on <-release and the
+	// listener is still open: free both, or a failing run hangs at exit.
+	t.Cleanup(func() {
+		releaseHandler()
+		_ = srv.Close()
+	})
 
 	watcherDone := make(chan struct{})
 	exitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -799,11 +819,21 @@ func TestTeardownAfterServeExitDrainsAcceptedHandlers(t *testing.T) {
 		close(returned)
 	}()
 	select {
+	case serveErr := <-serveDone:
+		if !errors.Is(serveErr, http.ErrServerClosed) {
+			t.Fatalf("Serve returned %v, want http.ErrServerClosed: teardown must shut the server down rather than leave the listener up", serveErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve never returned: teardownAfterServeExit did not shut the server down, so an accepted handler's own loss diagnostic (the only trace of a discarded outage record) would be cut off by process exit")
+	}
+	// Shutdown has closed the listener and is now waiting on the parked
+	// handler, so teardown MUST still be inside it.
+	select {
 	case <-returned:
 		t.Fatal("teardownAfterServeExit returned while an accepted handler was still in flight: srv.Shutdown must drain it, or a handler's own loss diagnostic (the only trace of a discarded outage record) is cut off by process exit")
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
-	close(release)
+	releaseHandler()
 	select {
 	case <-returned:
 	case <-time.After(5 * time.Second):

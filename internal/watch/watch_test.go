@@ -1657,6 +1657,12 @@ func TestEveryBeatCanQueueItsRecoveryWithoutADrop(t *testing.T) {
 	clock := newFakeClock()
 	n := &fakeNotifier{}
 	w := New(beats, n, clock.Now, clock.Now())
+	// Checked BEFORE any ping, because Beat PANICS on a full queue: a mis-sized
+	// channel would otherwise take the fleet-ping loop below down with a stack
+	// trace out of the beat handler instead of naming the sizing this test pins.
+	if got := cap(w.recoveries); got != total {
+		t.Fatalf("cap(w.recoveries) = %d, want one slot per configured beat (%d): New must size the recovered-transition queue from the beat count, or Beat's capacity assertion fires on a fleet-wide ping storm", got, total)
+	}
 
 	// Alert every beat, so every ping below queues a recovered transition.
 	clock.Advance(deadline + time.Minute)
@@ -1672,10 +1678,11 @@ func TestEveryBeatCanQueueItsRecoveryWithoutADrop(t *testing.T) {
 			t.Fatalf("Beat(%s) = false", b.ID)
 		}
 	}
-	// Every ping above found a slot, which is what the panic in Beat relies on: a
-	// queue one slot short would have taken the last ping down instead.
+	// Every alerted ping queued its recovery: the capacity is pinned above, so
+	// this is the per-ping half — a ping that cleared alerted must have put an
+	// event in the channel, not merely returned true.
 	if got := len(w.recoveries); got != total {
-		t.Errorf("queued recoveries = %d, want one per beat (%d): New must size w.recoveries from the beat count, or Beat's capacity assertion fires on a fleet-wide ping storm",
+		t.Errorf("queued recoveries = %d, want one per beat (%d): every ping that closed an alerted outage must enqueue its recovered transition",
 			got, total)
 	}
 
@@ -2497,6 +2504,11 @@ func TestByAttemptThenAgeOrdersAttemptThenAgeThenHistory(t *testing.T) {
 			a:    live(base.Add(-time.Hour), base),
 			b:    live(base, base),
 			want: -1,
+		},
+		"the newer outage sorts behind among equal attempt stamps": {
+			a:    live(base, base),
+			b:    live(base.Add(-time.Hour), base),
+			want: 1,
 		},
 		"history leads a live notice on a full key tie": {
 			a:    history(base, base),
