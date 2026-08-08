@@ -1722,12 +1722,13 @@ func TestLoadDoesNotWarnWhenOnlyThePlainVarsAreSet(t *testing.T) {
 
 // TestConfigLogValueNeverRendersASecret pins the redaction seam:
 // LogValue is the reason a call site can log a whole Config without leaking, so
-// DISCORD_WEBHOOK_URL is reported by its SOURCE and BEAT_TOKEN is not reported at
-// all — it is required, so its presence is a constant and an attr for it would
-// report no state while giving a future edit somewhere to render the value. The
-// webhook's source is state and its value is not: neither channel's name can
-// carry a byte of the credential, and the plain channel is the one worth naming
-// because that credential is then also in `docker inspect` output. The
+// DISCORD_WEBHOOK_URL and BEAT_TOKEN are both reported by their SOURCE and
+// neither by its value — and neither gets a presence attr, because both are
+// required, so presence reports no state while giving a future edit somewhere to
+// render the credential. Each source is state and each value is not: no
+// channel's name can carry a byte of the credential, and the plain channel is
+// the one worth naming because that credential is then also in `docker inspect`
+// output. The
 // receiver under test is a VALUE, not a pointer: Load returns
 // Config by value and that is the form a future slog call would hand a
 // logger, so a seam that only covers *Config would not cover the leak.
@@ -1739,13 +1740,14 @@ func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 		secretToken = "leak-me-if-you-can-token"
 	)
 	cfg := Config{
-		WebhookURL:    secretHook,
-		WebhookSource: envx.SourceEnv,
-		Node:          "node-a",
-		ListenAddr:    ":9190",
-		BeatToken:     secretToken,
-		Beats:         []Beat{{ID: "api", Deadline: time.Hour}},
-		LogLevel:      slog.LevelInfo,
+		WebhookURL:      secretHook,
+		WebhookSource:   envx.SourceEnv,
+		Node:            "node-a",
+		ListenAddr:      ":9190",
+		BeatToken:       secretToken,
+		BeatTokenSource: envx.SourceFile,
+		Beats:           []Beat{{ID: "api", Deadline: time.Hour}},
+		LogLevel:        slog.LevelInfo,
 	}
 
 	got := map[string]string{}
@@ -1760,8 +1762,11 @@ func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 	if got["webhook"] != string(envx.SourceEnv) {
 		t.Errorf("webhook = %q, want %q: the attr reports the channel that supplied the credential, never the credential", got["webhook"], envx.SourceEnv)
 	}
+	if got["beat_token"] != string(envx.SourceFile) {
+		t.Errorf("beat_token = %q, want %q: the attr reports the channel that supplied the token, never the token", got["beat_token"], envx.SourceFile)
+	}
 	if _, reported := got["beat_auth"]; reported {
-		t.Errorf("LogValue renders beat_auth = %q; the token is required, so the attr can only ever say \"required\" and reports no state", got["beat_auth"])
+		t.Errorf("LogValue renders beat_auth = %q; the token is required, so a presence attr can only ever say \"required\" and reports no state — its CHANNEL is the state, and beat_token publishes that", got["beat_auth"])
 	}
 }
 
@@ -1823,10 +1828,70 @@ func TestConfigLogValueReportsTheWebhookCredentialSource(t *testing.T) {
 	}
 }
 
+// TestConfigLogValueReportsTheBeatTokenSource mirrors the webhook's
+// source-flow test for the /beat/{id} credential, against Load, which is the
+// only producer of the field. The token carries the same exposure the webhook
+// does — envx.SourceEnv means it is also in the process environment and in
+// `docker inspect` output, the _FILE channel keeps it out — and
+// warnPlainVarIgnored speaks up only when BOTH variables are set, so for a
+// plain-only deployment this attr is the whole signal. Publishing the webhook's
+// channel and not the token's would tell an operator half of where their
+// secrets live, which is why the two are pinned the same way.
+func TestConfigLogValueReportsTheBeatTokenSource(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv.
+	const token = "source-probe-beat-token"
+
+	for name, tc := range map[string]struct {
+		file bool
+		want envx.SecretSource
+	}{
+		"the plain variable leaves the token in the environment": {want: envx.SourceEnv},
+		"the _FILE companion keeps it out of the environment":    {file: true, want: envx.SourceFile},
+	} {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			if tc.file {
+				path := filepath.Join(t.TempDir(), "beat-token")
+				if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
+					t.Fatalf("writing the beat token secret file: %v", err)
+				}
+				unsetEnv(t, "BEAT_TOKEN")
+				t.Setenv("BEAT_TOKEN_FILE", path)
+			} else {
+				t.Setenv("BEAT_TOKEN", token)
+				unsetEnv(t, "BEAT_TOKEN_FILE")
+			}
+
+			cfg, err := Load(maxNodeNameBytes)
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if cfg.BeatToken != token {
+				t.Fatalf("BeatToken = %q, want %q", cfg.BeatToken, token)
+			}
+			if cfg.BeatTokenSource != tc.want {
+				t.Errorf("BeatTokenSource = %q, want %q: Load must carry the channel through, or LogValue has nothing to report", cfg.BeatTokenSource, tc.want)
+			}
+			var rendered string
+			for _, attr := range cfg.LogValue().Group() {
+				if attr.Key == "beat_token" {
+					rendered = attr.Value.String()
+				}
+			}
+			if rendered != string(tc.want) {
+				t.Errorf("startup line reports beat_token = %q, want %q", rendered, tc.want)
+			}
+			if strings.Contains(rendered, token) {
+				t.Errorf("startup line reports beat_token = %q, which carries the credential itself", rendered)
+			}
+		})
+	}
+}
+
 // TestConfigLogValueReportsEveryNonSecretField pins the accuracy half of
 // LogValue's contract; TestConfigLogValueNeverRendersASecret
 // pins the hygiene half. LogValue exists so a call site can hand a whole
-// Config to slog, and those six attrs are then the entire rendering of a
+// Config to slog, and those seven attrs are then the entire rendering of a
 // configuration that is env-only, with no reload and no readback endpoint.
 // Every value below differs from any plausible default and from every sibling
 // field, so an attr rewired to a literal or to the wrong field fails here
@@ -1849,6 +1914,11 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		Node:          "observer-borgcube",
 		ListenAddr:    "127.0.0.1:19190",
 		BeatToken:     "unit-test-beat-token",
+		// The OTHER channel than the webhook's, deliberately: the two source
+		// attrs are the only pair in this fixture that share a value domain, so
+		// an attr wired to the wrong source field would otherwise render exactly
+		// what the right one does and pass.
+		BeatTokenSource: envx.SourceEnv,
 		Beats: []Beat{
 			{ID: "watchdog-mimir", Deadline: 20 * time.Minute},
 			{ID: "watchdog-loki", Deadline: 26 * time.Hour},
@@ -1868,7 +1938,12 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		// The rendered WORD, not string(envx.SourceFile): restating the constant
 		// would assert nothing about what an operator reads, and this attr's
 		// whole job is to name a channel legibly in the startup line.
-		"webhook":       "file",
+		"webhook": "file",
+		// The token's channel, reported symmetrically with the webhook's and from
+		// its own field: both credentials are exposed by the plain variable in the
+		// same way, so publishing one channel and not the other tells an operator
+		// half of where their secrets live.
+		"beat_token":    "env",
 		"allowed_hosts": "allowlist(2)",
 		"log_level":     "DEBUG",
 	}

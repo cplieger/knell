@@ -148,15 +148,27 @@ type Config struct {
 	Node          string
 	ListenAddr    string
 	BeatToken     string
-	Beats         []Beat
-	LogLevel      slog.Level
+	// BeatTokenSource is the channel BEAT_TOKEN arrived through, carried for the
+	// same reason WebhookSource is: it is the one non-secret FACT about the
+	// credential worth publishing at startup (see LogValue). A bearer token
+	// supplied through the plain variable sits in the process environment and in
+	// `docker inspect` output, where the _FILE channel keeps it out, and
+	// warnPlainVarIgnored reports the channel only when BOTH variables are set —
+	// so without this the plain-only case, which is the one with the
+	// consequence, is silent. Load is how consumers obtain a Config, and every
+	// successful Load assigns the source loadBeatToken returned, so this field
+	// is always populated on the Config the app logs.
+	BeatTokenSource envx.SecretSource
+	Beats           []Beat
+	LogLevel        slog.Level
 }
 
 // LogValue implements slog.LogValuer so a Config can never publish its own
 // secrets. DISCORD_WEBHOOK_URL's path IS the Discord credential and BeatToken
-// is the required /beat/{id} gate, so NEITHER is rendered: the webhook is
-// reported by its SOURCE only and the token is not reported at all (it is
-// required, so its presence is not state). Logging a Config (or a *Config,
+// is the required /beat/{id} gate, so NEITHER is rendered: each is reported by
+// its SOURCE only, never by its value, and neither gets a presence attr (the
+// webhook and the token are both required, so presence reports no state).
+// Logging a Config (or a *Config,
 // whose method set includes this value receiver) stays leak-free even from a
 // call site that logs the whole struct rather than the attributes this method
 // itself chooses -- which is what main.go's logConfig publishes today, by
@@ -168,14 +180,17 @@ type Config struct {
 //
 //nolint:gocritic // hugeParam: slog.LogValuer must sit on the value receiver so a bare Config redacts too; the copy happens at most once per config log line.
 func (c Config) LogValue() slog.Value {
-	// The webhook attr reports which CHANNEL supplied the credential, not
-	// whether one was supplied: DISCORD_WEBHOOK_URL is required and loadWebhook
-	// refuses every path that could yield an empty value, so a presence attr
-	// could only ever print one word and reported no state at all. The source is
-	// real state with a real consequence — envx.SourceEnv means the credential
-	// is in the process environment and therefore in `docker inspect` output,
-	// where the _FILE channel keeps it out — and warnPlainVarIgnored only fires
-	// when BOTH variables are set, so the plain-only case was silent everywhere.
+	// The webhook and beat_token attrs report which CHANNEL supplied each
+	// credential, not whether one was supplied: both variables are required and
+	// their loaders refuse every path that could yield an empty value, so a
+	// presence attr could only ever print one word and reported no state at all.
+	// The source is real state with a real consequence — envx.SourceEnv means the
+	// credential is in the process environment and therefore in `docker inspect`
+	// output, where the _FILE channel keeps it out — and warnPlainVarIgnored only
+	// fires when BOTH variables are set, so the plain-only case was silent
+	// everywhere. The two attrs are symmetric because the two credentials carry
+	// the same exposure: reporting one channel and not the other tells an
+	// operator half of where their secrets live.
 	//
 	// envx's own vocabulary is rendered verbatim ("env", "file") rather than
 	// translated, so the value names the same channel the package that resolved
@@ -201,6 +216,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("node", c.Node),
 		slog.String("listen_addr", c.ListenAddr),
 		slog.String("webhook", string(c.WebhookSource)),
+		slog.String("beat_token", string(c.BeatTokenSource)),
 		slog.String("allowed_hosts", allowedHosts),
 		slog.String("log_level", c.LogLevel.String()),
 	)
@@ -250,11 +266,12 @@ func Load(maxNodeNameBytes int) (Config, error) {
 	}
 	cfg.AllowedHosts = hosts
 
-	beatToken, err := loadBeatToken()
+	beatToken, beatTokenSource, err := loadBeatToken()
 	if err != nil {
 		return cfg, err
 	}
 	cfg.BeatToken = beatToken
+	cfg.BeatTokenSource = beatTokenSource
 
 	cfg.LogLevel = logLevel()
 
@@ -763,20 +780,25 @@ func checkBeatToken(token string) error {
 // newline, which envx still removes. BEAT_TOKEN_FILE points at a
 // mounted secret file instead (the same convention DISCORD_WEBHOOK_URL uses),
 // keeping the credential out of `docker inspect` output.
-func loadBeatToken() (string, error) {
+//
+// The SOURCE is not a secret and is returned for the startup summary to publish
+// (see Config.LogValue), exactly as loadWebhook returns the webhook's: which
+// channel supplied the credential decides whether it is also sitting in the
+// process environment.
+func loadBeatToken() (string, envx.SecretSource, error) {
 	token, src, err := resolveSecret("BEAT_TOKEN", errBeatTokenSetButEmpty, errBeatTokenRequired)
 	if err != nil {
-		return "", err
+		return "", src, err
 	}
 	// Validate BEFORE the ignored-plain-variable advisory: checkBeatToken can
 	// still fail startup (a control byte in a file-sourced token), and advising
 	// the operator to unset a variable in the same breath as exiting on the
 	// winning one is advice about a configuration that never ran.
 	if tokenErr := checkBeatToken(token); tokenErr != nil {
-		return "", tokenErr
+		return "", src, tokenErr
 	}
 	warnPlainVarIgnored("BEAT_TOKEN", "token", src)
-	return token, nil
+	return token, src, nil
 }
 
 // loadWebhook reads and shape-checks DISCORD_WEBHOOK_URL, returning the URL and
