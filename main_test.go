@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/envx"
 	"github.com/cplieger/health"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/notify"
@@ -176,10 +177,11 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global
 	// slog default to inspect the startup summary.
 	cfg := config.Config{
-		WebhookURL: testWebhookURL,
-		Node:       "node-1",
-		ListenAddr: ":9190",
-		Beats:      []config.Beat{{ID: "api", Deadline: 20 * time.Minute}},
+		WebhookURL:    testWebhookURL,
+		WebhookSource: envx.SourceEnv,
+		Node:          "node-1",
+		ListenAddr:    ":9190",
+		Beats:         []config.Beat{{ID: "api", Deadline: 20 * time.Minute}},
 	}
 
 	rec := capture.Default(t)
@@ -188,8 +190,11 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	if !rec.Contains("configuration loaded") {
 		t.Fatalf("messages = %v, want the startup summary", rec.Messages())
 	}
-	if !rec.HasAttr("configuration loaded", "webhook", "configured") {
-		t.Error(`webhook attr must render as the literal presence marker "configured"`)
+	// The channel that supplied the credential, never the credential: "env"
+	// means it is also in the process environment and in `docker inspect`
+	// output, which is the one thing about a required webhook worth publishing.
+	if !rec.HasAttr("configuration loaded", "webhook", "env") {
+		t.Error(`webhook attr must name the credential's source channel ("env" for the plain variable)`)
 	}
 	if rec.Contains(testWebhookSecret) || rec.AttrContains("", "", testWebhookSecret) {
 		t.Errorf("startup log leaks the webhook URL: %v", rec.Messages())

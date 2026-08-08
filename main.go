@@ -392,7 +392,8 @@ func awaitWatchLoop(teardownCtx context.Context, watcherDone <-chan struct{}) bo
 }
 
 // logConfig logs the active configuration at startup. The webhook URL is a
-// secret and never logged; only its presence is reported.
+// secret and never logged; only which channel supplied it is reported (the
+// plain variable, or its _FILE companion).
 func logConfig(cfg *config.Config) {
 	for _, b := range cfg.Beats {
 		slog.Info("watching beat", "beat", b.ID, "deadline", b.Deadline.String())

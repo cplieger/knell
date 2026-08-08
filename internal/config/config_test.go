@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/envx"
 	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/slogx/capture"
 	"github.com/cplieger/webhttp"
@@ -1666,9 +1667,12 @@ func TestLoadDoesNotWarnWhenOnlyThePlainVarsAreSet(t *testing.T) {
 
 // TestConfigLogValueNeverRendersASecret pins the redaction seam:
 // LogValue is the reason a call site can log a whole Config without leaking, so
-// DISCORD_WEBHOOK_URL is reported by presence and BEAT_TOKEN is not reported at
+// DISCORD_WEBHOOK_URL is reported by its SOURCE and BEAT_TOKEN is not reported at
 // all — it is required, so its presence is a constant and an attr for it would
 // report no state while giving a future edit somewhere to render the value. The
+// webhook's source is state and its value is not: neither channel's name can
+// carry a byte of the credential, and the plain channel is the one worth naming
+// because that credential is then also in `docker inspect` output. The
 // receiver under test is a VALUE, not a pointer: Load returns
 // Config by value and that is the form a future slog call would hand a
 // logger, so a seam that only covers *Config would not cover the leak.
@@ -1680,12 +1684,13 @@ func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 		secretToken = "leak-me-if-you-can-token"
 	)
 	cfg := Config{
-		WebhookURL: secretHook,
-		Node:       "node-a",
-		ListenAddr: ":9190",
-		BeatToken:  secretToken,
-		Beats:      []Beat{{ID: "api", Deadline: time.Hour}},
-		LogLevel:   slog.LevelInfo,
+		WebhookURL:    secretHook,
+		WebhookSource: envx.SourceEnv,
+		Node:          "node-a",
+		ListenAddr:    ":9190",
+		BeatToken:     secretToken,
+		Beats:         []Beat{{ID: "api", Deadline: time.Hour}},
+		LogLevel:      slog.LevelInfo,
 	}
 
 	got := map[string]string{}
@@ -1697,20 +1702,81 @@ func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 			t.Errorf("LogValue attr %s = %q carries a secret verbatim: logging a Config would publish the Discord credential and the /beat/{id} gate into the log store", key, value)
 		}
 	}
-	if got["webhook"] != "configured" {
-		t.Errorf("webhook = %q, want \"configured\": presence is the only thing this attr may report", got["webhook"])
+	if got["webhook"] != string(envx.SourceEnv) {
+		t.Errorf("webhook = %q, want %q: the attr reports the channel that supplied the credential, never the credential", got["webhook"], envx.SourceEnv)
 	}
 	if _, reported := got["beat_auth"]; reported {
 		t.Errorf("LogValue renders beat_auth = %q; the token is required, so the attr can only ever say \"required\" and reports no state", got["beat_auth"])
 	}
 
+	// A Config built without Load carries no source. It must render envx's own
+	// name for that rather than an empty attr, the same way a nil host policy
+	// renders "any" instead of panicking.
 	empty := Config{LogLevel: slog.LevelInfo}
 	got = map[string]string{}
 	for _, attr := range empty.LogValue().Group() {
 		got[attr.Key] = attr.Value.String()
 	}
-	if got["webhook"] != "unset" {
-		t.Errorf("unconfigured: webhook = %q, want \"unset\"", got["webhook"])
+	if got["webhook"] != string(envx.SourceNone) {
+		t.Errorf("unconfigured: webhook = %q, want %q", got["webhook"], envx.SourceNone)
+	}
+}
+
+// TestConfigLogValueReportsTheWebhookCredentialSource pins the attr's whole
+// value domain against Load, which is the only producer of it. The point of the
+// attr is that it reports STATE: the file channel keeps the credential out of
+// the process environment and out of `docker inspect`, the plain variable does
+// not, and warnPlainVarIgnored only speaks up when BOTH variables are set — so
+// this line is the only signal a plain-only deployment ever gets. A rendering
+// keyed off presence instead of source passes every assertion above and fails
+// here, because presence is identical in both cases.
+func TestConfigLogValueReportsTheWebhookCredentialSource(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv.
+	const url = "https://discord.example/api/webhooks/1/source-probe"
+
+	for name, tc := range map[string]struct {
+		file bool
+		want envx.SecretSource
+	}{
+		"the plain variable leaves the credential in the environment": {want: envx.SourceEnv},
+		"the _FILE companion keeps it out of the environment":         {file: true, want: envx.SourceFile},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("BEATS", "api:1h")
+			t.Setenv("BEAT_TOKEN", "source-probe-beat-token")
+			if tc.file {
+				path := filepath.Join(t.TempDir(), "webhook")
+				if err := os.WriteFile(path, []byte(url+"\n"), 0o600); err != nil {
+					t.Fatalf("writing the webhook secret file: %v", err)
+				}
+				t.Setenv("DISCORD_WEBHOOK_URL_FILE", path)
+			} else {
+				t.Setenv("DISCORD_WEBHOOK_URL", url)
+			}
+
+			cfg, err := Load(maxNodeNameBytes)
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if cfg.WebhookURL != url {
+				t.Fatalf("WebhookURL = %q, want %q", cfg.WebhookURL, url)
+			}
+			if cfg.WebhookSource != tc.want {
+				t.Errorf("WebhookSource = %q, want %q: Load must carry the channel through, or LogValue has nothing to report", cfg.WebhookSource, tc.want)
+			}
+			var rendered string
+			for _, attr := range cfg.LogValue().Group() {
+				if attr.Key == "webhook" {
+					rendered = attr.Value.String()
+				}
+			}
+			if rendered != string(tc.want) {
+				t.Errorf("startup line reports webhook = %q, want %q", rendered, tc.want)
+			}
+			if strings.Contains(rendered, url) {
+				t.Errorf("startup line reports webhook = %q, which carries the credential itself", rendered)
+			}
+		})
 	}
 }
 
@@ -1734,11 +1800,12 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 	}
 
 	cfg := Config{
-		AllowedHosts: policy,
-		WebhookURL:   "https://discord.example/hook",
-		Node:         "observer-borgcube",
-		ListenAddr:   "127.0.0.1:19190",
-		BeatToken:    "unit-test-beat-token",
+		AllowedHosts:  policy,
+		WebhookURL:    "https://discord.example/hook",
+		WebhookSource: envx.SourceFile,
+		Node:          "observer-borgcube",
+		ListenAddr:    "127.0.0.1:19190",
+		BeatToken:     "unit-test-beat-token",
 		Beats: []Beat{
 			{ID: "watchdog-mimir", Deadline: 20 * time.Minute},
 			{ID: "watchdog-loki", Deadline: 26 * time.Hour},
@@ -1752,10 +1819,13 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"beats":         "2",
-		"node":          "observer-borgcube",
-		"listen_addr":   "127.0.0.1:19190",
-		"webhook":       "configured",
+		"beats":       "2",
+		"node":        "observer-borgcube",
+		"listen_addr": "127.0.0.1:19190",
+		// The rendered WORD, not string(envx.SourceFile): restating the constant
+		// would assert nothing about what an operator reads, and this attr's
+		// whole job is to name a channel legibly in the startup line.
+		"webhook":       "file",
 		"allowed_hosts": "allowlist(2)",
 		"log_level":     "DEBUG",
 	}

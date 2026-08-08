@@ -133,17 +133,25 @@ type Config struct {
 	// inactive policy accepts every Host (the documented default).
 	AllowedHosts *webhttp.HostPolicy
 	WebhookURL   string
-	Node         string
-	ListenAddr   string
-	BeatToken    string
-	Beats        []Beat
-	LogLevel     slog.Level
+	// WebhookSource is the channel DISCORD_WEBHOOK_URL arrived through, as envx
+	// names it: SourceFile for the _FILE companion, SourceEnv for the plain
+	// variable. It is carried here because it is the one non-secret FACT about
+	// the credential worth publishing at startup (see LogValue) — a webhook
+	// supplied through the plain variable sits in the process environment and in
+	// `docker inspect` output. Load always sets it; a Config built any other way
+	// leaves it empty and LogValue reports SourceNone.
+	WebhookSource envx.SecretSource
+	Node          string
+	ListenAddr    string
+	BeatToken     string
+	Beats         []Beat
+	LogLevel      slog.Level
 }
 
 // LogValue implements slog.LogValuer so a Config can never publish its own
 // secrets. DISCORD_WEBHOOK_URL's path IS the Discord credential and BeatToken
 // is the required /beat/{id} gate, so NEITHER is rendered: the webhook is
-// reported by PRESENCE only and the token is not reported at all (it is
+// reported by its SOURCE only and the token is not reported at all (it is
 // required, so its presence is not state). Logging a Config (or a *Config,
 // whose method set includes this value receiver) stays leak-free even from a
 // call site that logs the whole struct rather than the attributes this method
@@ -156,9 +164,23 @@ type Config struct {
 //
 //nolint:gocritic // hugeParam: slog.LogValuer must sit on the value receiver so a bare Config redacts too; the copy happens at most once per config log line.
 func (c Config) LogValue() slog.Value {
-	webhook := "unset"
-	if c.WebhookURL != "" {
-		webhook = "configured"
+	// The webhook attr reports which CHANNEL supplied the credential, not
+	// whether one was supplied: DISCORD_WEBHOOK_URL is required and loadWebhook
+	// refuses every path that could yield an empty value, so a presence attr
+	// could only ever print one word and reported no state at all. The source is
+	// real state with a real consequence — envx.SourceEnv means the credential
+	// is in the process environment and therefore in `docker inspect` output,
+	// where the _FILE channel keeps it out — and warnPlainVarIgnored only fires
+	// when BOTH variables are set, so the plain-only case was silent everywhere.
+	//
+	// envx's own vocabulary is rendered verbatim ("env", "file") rather than
+	// translated, so the value names the same channel the package that resolved
+	// it does. A Config built without Load carries no source, which is exactly
+	// envx.SourceNone ("none"); the nil-safe fallback matches allowed_hosts
+	// below, so a zero Config renders rather than printing an empty attr.
+	webhook := string(c.WebhookSource)
+	if webhook == "" {
+		webhook = string(envx.SourceNone)
 	}
 	// The Host allowlist is knell's one OPTIONAL gate, and ABSENCE is the state
 	// that needs publishing: a present-but-blank ALLOWED_HOSTS warns at parse
@@ -208,11 +230,12 @@ func Load(maxNodeNameBytes int) (Config, error) {
 	}
 	cfg.Beats = beats
 
-	webhook, err := loadWebhook()
+	webhook, webhookSource, err := loadWebhook()
 	if err != nil {
 		return cfg, err
 	}
 	cfg.WebhookURL = webhook
+	cfg.WebhookSource = webhookSource
 
 	node, err := nodeName(maxNodeNameBytes)
 	if err != nil {
@@ -724,13 +747,17 @@ func loadBeatToken() (string, error) {
 	return token, nil
 }
 
-// loadWebhook reads and shape-checks DISCORD_WEBHOOK_URL. The URL is a
-// secret: errors never embed it, and only https is accepted — the URL's own
-// path carries the webhook credential, so a plain-http webhook would put the
-// secret on the wire in cleartext on every notification.
-func loadWebhook() (string, error) {
+// loadWebhook reads and shape-checks DISCORD_WEBHOOK_URL, returning the URL and
+// the channel it arrived through. The URL is a secret: errors never embed it,
+// and only https is accepted — the URL's own path carries the webhook
+// credential, so a plain-http webhook would put the secret on the wire in
+// cleartext on every notification. The SOURCE is not a secret and is returned
+// for the startup summary to publish (see Config.LogValue): which channel
+// supplied the credential decides whether it is also sitting in the process
+// environment.
+func loadWebhook() (string, envx.SecretSource, error) {
 	if err := rejectBlankFileVar("DISCORD_WEBHOOK_URL"); err != nil {
-		return "", err
+		return "", envx.SourceNone, err
 	}
 	webhook, src, err := envx.SecretWithSource("DISCORD_WEBHOOK_URL")
 	if err != nil {
@@ -743,9 +770,9 @@ func loadWebhook() (string, error) {
 			// BEAT_TOKEN, and the same diagnosis the value that trims to
 			// nothing visible below already gets.
 			if v, ok := os.LookupEnv("DISCORD_WEBHOOK_URL"); ok && v == "" {
-				return "", errWebhookSetButEmpty
+				return "", envx.SourceNone, errWebhookSetButEmpty
 			}
-			return "", fmt.Errorf("DISCORD_WEBHOOK_URL is required: %w", err)
+			return "", envx.SourceNone, fmt.Errorf("DISCORD_WEBHOOK_URL is required: %w", err)
 		}
 		// Provided via _FILE but unreadable/empty: not a missing-variable
 		// case, and never a fallback to the plain variable — a webhook the
@@ -753,7 +780,7 @@ func loadWebhook() (string, error) {
 		// envx error is sanitized, never wrapped: it embeds the
 		// DISCORD_WEBHOOK_URL_FILE value, which is the webhook credential
 		// itself whenever the operator pasted the URL into the file variable.
-		return "", secretFileError("DISCORD_WEBHOOK_URL", err)
+		return "", src, secretFileError("DISCORD_WEBHOOK_URL", err)
 	}
 
 	// Neither channel trims: envx returns the plain variable verbatim and the
@@ -780,17 +807,17 @@ func loadWebhook() (string, error) {
 		// broken secret pipeline, not a missing setting. Reported as such
 		// instead of falling through to the shape check, which would answer
 		// "scheme must be https" for a value that carries no scheme.
-		return "", errWebhookSetButEmpty
+		return "", src, errWebhookSetButEmpty
 	}
 	if _, err := parseWebhookURL(webhook); err != nil {
-		return "", fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
+		return "", src, fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err)
 	}
 	// The URL is now fully validated, so the winning-source advisory cannot be
 	// followed by a startup failure about the credential it just described --
 	// the position loadBeatToken already uses, and the one warnPlainVarIgnored's
 	// own contract requires.
 	warnPlainVarIgnored("DISCORD_WEBHOOK_URL", "webhook URL", src)
-	return webhook, nil
+	return webhook, src, nil
 }
 
 // parseBeats parses the BEATS spec list: comma-separated "id:deadline"

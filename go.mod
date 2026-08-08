@@ -8,7 +8,7 @@ require (
 	github.com/cplieger/httpx/v4 v4.2.1
 	github.com/cplieger/metrics/v3 v3.0.1
 	github.com/cplieger/slogx v1.6.0
-	github.com/cplieger/webhttp v1.21.0
+	github.com/cplieger/webhttp v1.22.0
 )
 
 require github.com/cplieger/pathinside v1.0.0 // indirect

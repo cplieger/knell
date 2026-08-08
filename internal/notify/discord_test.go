@@ -182,9 +182,9 @@ func TestBeatOutageHistoryReportsOneEndedOutageInThePastTense(t *testing.T) {
 	outages := []watch.Outage{{
 		Started:   recovered.Add(-12 * time.Minute),
 		Recovered: recovered,
-		// The case the history path was built for: a sweep raised the alert
-		// and the webhook was unreachable, so the notice arrives after the
-		// outage it reports.
+		// The case the history path was built for, and the one reason that may
+		// point at the webhook: a sweep raised the alert, the webhook refused
+		// it, and the notice arrives after the outage it reports.
 		LateReason: watch.LateUndelivered,
 	}}
 	if err := d.BeatOutageHistory(context.Background(), "api", outages); err != nil {
@@ -204,8 +204,14 @@ func TestBeatOutageHistoryReportsOneEndedOutageInThePastTense(t *testing.T) {
 		}
 	}
 	// The whole point of the history notice: an outage that is over must
-	// never read like the live alarm for a beat that is down right now.
-	for _, forbidden := range []string{"MISSING", "check the sender", "recovered: pings arriving again"} {
+	// never read like the live alarm for a beat that is down right now. The
+	// deferral clause is forbidden too: this outage's alert WAS attempted, so a
+	// notice saying nothing was tried would point away from the webhook that
+	// refused it.
+	for _, forbidden := range []string{
+		"MISSING", "check the sender", "recovered: pings arriving again",
+		"no delivery was attempted",
+	} {
 		if strings.Contains(content, forbidden) {
 			t.Errorf("content %q reports an ended outage with live-incident wording %q", content, forbidden)
 		}
@@ -242,25 +248,29 @@ func TestBeatOutageHistorySummarizesSeveralEndedOutages(t *testing.T) {
 		// Whole timestamp, date included: see the singular test.
 		"last recovered at 2026-07-23 14:07 UTC",
 		// Every entry above carries the zero LateReason (LateUndelivered),
-		// which is also what a producer that names no reason gets.
+		// which is also what a producer that names no reason gets: an unnamed
+		// reason blames delivery rather than vouching for it.
 		"Delivery was delayed for every outage", "check the webhook",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("content %q missing %q", content, want)
 		}
 	}
-	if strings.Contains(content, "MISSING") {
-		t.Errorf("content %q reports ended outages with the live-alarm wording", content)
+	for _, forbidden := range []string{"MISSING", "deferred to a later sweep", "ended before a sweep detected it"} {
+		if strings.Contains(content, forbidden) {
+			t.Errorf("content %q reports ended outages with wording that belongs to another reason: %q", content, forbidden)
+		}
 	}
 }
 
 // TestBeatOutageHistoryStatesTheTrueReasonForALateNotice pins the mapping from
 // watch.LateReason to the clause an operator acts on, for every shape of batch.
 // Each case asserts BOTH the wording that belongs to its reason and the wording
-// that belongs to the OTHER one: a want-only assertion still passes if the two
-// clauses are swapped (both mention the outage and a duration), and swapping
+// that belongs to the OTHER two: a want-only assertion still passes if the
+// clauses are swapped (they all mention the outage and a duration), and swapping
 // them is precisely the bug this fixes — telling an operator to inspect a
-// webhook that delivered this message on its first attempt.
+// webhook that delivered this message on its first attempt, or that was never
+// asked to deliver anything at all.
 func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 	t.Parallel()
 
@@ -280,9 +290,11 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 		delayedAll    = "Delivery was delayed for every outage"
 		selfResolved  = "ended before a sweep detected it"
 		deliveryFine  = "nothing was wrong with delivery"
-		// The sweep's send budget can defer a record before any send is
-		// started, so no notice may claim a delivery ATTEMPT happened.
-		noAttemptClaim = "attempt"
+		// The deferral clauses. Only the webhook-blaming reason may send an
+		// operator to the webhook, so these two must not contain webhookClause.
+		deferredOne = "this observer deferred the alert to a later sweep"
+		deferredAll = "Every alert was deferred to a later sweep"
+		noAttempt   = "no delivery was attempted"
 	)
 	cases := map[string]struct {
 		outages []watch.Outage
@@ -292,16 +304,19 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 		"one outage that ended before any sweep saw it": {
 			outages: []watch.Outage{outage(12*time.Minute, watch.LateEndedBeforeDetection)},
 			want:    []string{"was missing for 12m0s", selfResolved, deliveryFine},
-			forbid:  []string{webhookClause, delayedOne, "notifications were failing"},
+			forbid:  []string{webhookClause, delayedOne, deferredOne, noAttempt, "notifications were failing"},
 		},
-		"one outage whose alert the webhook never took": {
+		"one outage whose alert the webhook refused": {
 			outages: []watch.Outage{outage(12*time.Minute, watch.LateUndelivered)},
 			want:    []string{"was missing for 12m0s", delayedOne, webhookClause},
-			// LateUndelivered is also reached without any send having been
-			// tried (the sweep's send budget defers a record before its turn),
-			// so the clause must point at delivery without claiming an
-			// attempt was made.
-			forbid: []string{selfResolved, deliveryFine, noAttemptClaim},
+			forbid:  []string{selfResolved, deliveryFine, deferredOne, noAttempt},
+		},
+		// The reason the split exists: nothing was ever sent for this outage, so
+		// the notice must not spend the operator's evening on a healthy webhook.
+		"one outage this observer deferred before any send": {
+			outages: []watch.Outage{outage(12*time.Minute, watch.LateSchedulerDeferred)},
+			want:    []string{"was missing for 12m0s", deferredOne, noAttempt},
+			forbid:  []string{webhookClause, delayedOne, selfResolved, deliveryFine},
 		},
 		"a batch of outages that all ended before a sweep saw them": {
 			outages: []watch.Outage{
@@ -309,21 +324,29 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 				outage(47*time.Minute, watch.LateEndedBeforeDetection),
 			},
 			want:   []string{"had 2 outages", "longest 47m0s", selfResolved, deliveryFine},
-			forbid: []string{webhookClause, delayedAll},
+			forbid: []string{webhookClause, delayedAll, deferredAll, noAttempt},
 		},
-		"a batch of outages whose alerts were all undelivered": {
+		"a batch of outages whose alerts the webhook all refused": {
 			outages: []watch.Outage{
 				outage(12*time.Minute, watch.LateUndelivered),
 				outage(47*time.Minute, watch.LateUndelivered),
 			},
 			want:   []string{"had 2 outages", "longest 47m0s", delayedAll, webhookClause},
-			forbid: []string{selfResolved, deliveryFine, noAttemptClaim},
+			forbid: []string{selfResolved, deliveryFine, deferredAll, noAttempt},
+		},
+		"a batch of outages this observer deferred before any send": {
+			outages: []watch.Outage{
+				outage(12*time.Minute, watch.LateSchedulerDeferred),
+				outage(47*time.Minute, watch.LateSchedulerDeferred),
+			},
+			want:   []string{"had 2 outages", "longest 47m0s", deferredAll, noAttempt},
+			forbid: []string{webhookClause, delayedAll, selfResolved, deliveryFine},
 		},
 		// The batch a real webhook outage produces on a flapping beat: some
-		// alerts held back, some outages over before a sweep could see them.
+		// alerts refused, some outages over before a sweep could see them.
 		// Both counts must be stated; picking one reason for the batch says
 		// something false about the other outages.
-		"a batch that mixes both reasons": {
+		"a batch that mixes a refusal with a self-resolved outage": {
 			outages: []watch.Outage{
 				outage(12*time.Minute, watch.LateUndelivered),
 				outage(47*time.Minute, watch.LateUndelivered),
@@ -334,9 +357,27 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 				"Delivery was delayed for 2 (check the webhook)", "1 ended before a sweep detected it", webhookClause,
 			},
 			forbid: []string{
-				// Neither single-reason clause may stand in for a mixed batch.
-				delayedAll, "Each " + selfResolved, noAttemptClaim,
+				// No single-reason clause may stand in for a mixed batch.
+				delayedAll, "Each " + selfResolved, deferredAll,
 			},
+		},
+		// The shape a saturated sweep produces during a partial webhook outage,
+		// and the one a two-cause sentence cannot express: three causes, three
+		// counts, and only the first of them names the webhook.
+		"a batch that mixes all three reasons": {
+			outages: []watch.Outage{
+				outage(12*time.Minute, watch.LateUndelivered),
+				outage(47*time.Minute, watch.LateUndelivered),
+				outage(20*time.Minute, watch.LateSchedulerDeferred),
+				outage(9*time.Minute, watch.LateEndedBeforeDetection),
+			},
+			want: []string{
+				"had 4 outages", "longest 47m0s",
+				"Delivery was delayed for 2 (check the webhook)",
+				"1 deferred to a later sweep with nothing attempted",
+				"1 ended before a sweep detected it",
+			},
+			forbid: []string{delayedAll, deferredAll, "Each " + selfResolved},
 		},
 	}
 	for name, tc := range cases {
@@ -361,11 +402,11 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 			}
 			for _, forbidden := range tc.forbid {
 				if strings.Contains(content, forbidden) {
-					t.Errorf("content %q states %q, which belongs to the other late reason", content, forbidden)
+					t.Errorf("content %q states %q, which belongs to one of the other late reasons", content, forbidden)
 				}
 			}
-			// Past tense and the recovery point are the same for both reasons;
-			// only the explanation differs.
+			// Past tense and the recovery point are the same for all three
+			// reasons; only the explanation differs.
 			if !strings.Contains(content, "recovered at 2026-07-23 14:07 UTC") {
 				t.Errorf("content %q does not report the recovery point", content)
 			}

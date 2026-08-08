@@ -47,17 +47,25 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 	observed := started.Add(200 * 365 * 24 * time.Hour)
 	live := watch.Transition{Started: started, Observed: observed}
 
-	// The single-outage notice carries the longest of the two lateClause
+	// The single-outage notice carries the longest of the three lateClause
 	// branches; the batch carries the MIXED batchLateClause, the longest of the
-	// four late clauses, at watch's MaxHistoryBatch bound.
+	// six late clauses, at watch's MaxHistoryBatch bound. The mixed batch cycles
+	// through ALL THREE reasons, because the widest sentence names one count per
+	// reason: a two-reason batch measures a clause a real three-cause batch
+	// overruns.
 	single := []watch.Outage{{Started: started, Recovered: observed, LateReason: watch.LateEndedBeforeDetection}}
+	reasons := []watch.LateReason{
+		watch.LateUndelivered,
+		watch.LateSchedulerDeferred,
+		watch.LateEndedBeforeDetection,
+	}
 	mixed := make([]watch.Outage, 0, watch.MaxHistoryBatch)
 	for i := range watch.MaxHistoryBatch {
-		reason := watch.LateUndelivered
-		if i%2 == 0 {
-			reason = watch.LateEndedBeforeDetection
-		}
-		mixed = append(mixed, watch.Outage{Started: started, Recovered: observed, LateReason: reason})
+		mixed = append(mixed, watch.Outage{
+			Started:    started,
+			Recovered:  observed,
+			LateReason: reasons[i%len(reasons)],
+		})
 	}
 
 	cases := map[string]func() error{

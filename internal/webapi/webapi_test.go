@@ -45,6 +45,18 @@ func (f *fakeBeater) Beat(id string) watch.BeatOutcome {
 // itself presents this token and gets the endpoint's real behaviour.
 const testBeatToken = "unit-test-beat-token"
 
+// authFailBurst mirrors the burst of the failed-auth token bucket knell's
+// throttle rides — webhttp.FailedAuthRateLimit's preset, not knell's own tuning
+// any more (the library owns the numbers so the services guarding one static
+// bearer on one route cannot drift apart). It is unexported there, so the tests
+// that need to say HOW MANY attempts fit inside the burst carry this mirror.
+//
+// It is self-verifying rather than a second source of truth: the first subtest
+// of TestFailedAuthIsThrottledInAggregate demands exactly this many 401s and
+// then a 429, so a preset retuned upstream fails there loudly instead of
+// quietly weakening every assertion below.
+const authFailBurst = 10
+
 // newTestHandler assembles the routed handler around b with a healthy
 // liveness endpoint; token is the required beat credential, exactly as in
 // production. Beat acceptance is whatever b reports: a fakeBeater with
@@ -291,7 +303,7 @@ func TestNonCanonicalBeatPathsAnswerTheCodedNotFound(t *testing.T) {
 //
 // TestNonCanonicalBeatPathsAnswerTheCodedNotFound pins five NAMED spellings.
 // This target pins the CLASS for arbitrary bytes, which is what a rewrite of
-// sanitizedPath, inBeatNamespace, or the chain's ordering can break in a
+// canonicalBeatPath, inBeatNamespace, or the chain's ordering can break in a
 // spelling no table names (a repeated slash behind a long id, a non-UTF-8 byte,
 // a path that only ENTERS the namespace after cleaning). It drives the DECODED
 // path only: the harness assigns r.URL.Path and leaves RawPath empty, so
@@ -335,8 +347,11 @@ func FuzzBeatPathNeverRedirectsOrRecordsNonCanonically(f *testing.F) {
 
 		// Outside the beat namespace net/http keeps its own behavior, redirects
 		// included (an empty path is cleaned to "/" with a 307): the guard
-		// deliberately does not reach there.
-		if !inBeatNamespace(path) && !inBeatNamespace(sanitizedPath(path)) {
+		// deliberately does not reach there. The cleaned spelling comes from the
+		// same library function the guard itself judges with, so this exemption
+		// cannot drift from the guard's own namespace test.
+		clean, _ := webhttp.CanonicalRequestPath(path)
+		if !inBeatNamespace(path) && !inBeatNamespace(clean) {
 			return
 		}
 		switch rec.Code {

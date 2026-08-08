@@ -9,9 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"path"
 	"strings"
-	"time"
 
 	"github.com/cplieger/knell/internal/metrics"
 	"github.com/cplieger/knell/internal/watch"
@@ -49,24 +47,6 @@ const loggedPathCap = 128
 // (bearerPrefix + token), so acceptance is exactly one header value and knell
 // never parses the credential out of the header.
 const bearerPrefix = "Bearer "
-
-// authFailBurst and authFailRefill tune the AGGREGATE failed-auth throttle on
-// the beat endpoint: every request presenting an absent or invalid bearer draws
-// one token from a single process-wide bucket, and knell answers 429 once it is
-// empty. A valid ping never draws, so the numbers do not have to leave room for
-// knell's own senders however many there are.
-//
-// They are pg-autodump's numbers deliberately: the two apps guard the same
-// shape (one static bearer on one POST route), the bounded resource is the same
-// (a log line and the token digests an attempt costs, not the beat recording
-// itself), and one tuning across the fleet is one thing to reason about. Ten
-// back-to-back
-// attempts absorb an operator retrying a rotated token by hand; the 6s refill
-// turns a guessing run at wire speed into ten attempts per minute.
-const (
-	authFailBurst  = 10
-	authFailRefill = 6 * time.Second
-)
 
 // Beater records pings. Implemented by watch.Watcher.
 type Beater interface {
@@ -273,13 +253,20 @@ func New(b Beater, deps Deps) http.Handler {
 // deadline later, with nothing anywhere saying the URL was malformed — the
 // same failure the bare /beat route exists to prevent, one spelling class over.
 //
-// The comparison is against the sanitation net/http itself performs
-// (path.Clean, with a trailing slash preserved — see net/http's cleanPath), so
-// the guard covers every spelling ServeMux would rewrite. It is applied to the
-// DECODED r.URL.Path while ServeMux compares the ESCAPED one, so it is slightly
-// WIDER: an encoded dot segment (/beat/%2e%2e/ghost) draws no redirect from
-// net/http but is refused here, and that is accepted deliberately: the decoded
-// path is the one a sender believed it was pinging. EVERY refusal here lands
+// The verdict comes from webhttp.CanonicalRequestPath, which computes the
+// sanitation net/http itself performs (path.Clean, with a non-root trailing
+// slash put back — see net/http's cleanPath) and reports whether the request
+// already IS that spelling, so the guard covers every spelling ServeMux would
+// rewrite. The trailing slash it preserves is load-bearing rather than
+// cosmetic: ServeMux does NOT redirect a path that only ends in one when a
+// pattern matches it — /beat/ and /beat/{id}/ are served by this file's own
+// routes — so folding it away would make this guard swallow two refusals that
+// already answer correctly under their own patterns. knell passes the DECODED
+// r.URL.Path while ServeMux compares the ESCAPED one, which is the wider of the
+// two readings the library documents: an encoded dot segment
+// (/beat/%2e%2e/ghost) draws no redirect from net/http but is refused here, and
+// that is accepted deliberately: the decoded path is the one a sender believed
+// it was pinging. EVERY refusal here lands
 // before the mux routes, so none of them can inherit a route label — the whole
 // class shares the request counter's "unmatched" path label with scanner
 // traffic, and what tells the two apart is metrics.RecordPreRouteRefusal, the
@@ -294,8 +281,8 @@ func New(b Beater, deps Deps) http.Handler {
 func canonicalBeatPath(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw := r.URL.Path
-		if clean := sanitizedPath(raw); clean != raw &&
-			(inBeatNamespace(raw) || inBeatNamespace(clean)) {
+		clean, canonical := webhttp.CanonicalRequestPath(raw)
+		if !canonical && (inBeatNamespace(raw) || inBeatNamespace(clean)) {
 			// Count the class by REASON, since the route label the mux never
 			// assigned cannot say what this was: the request counter buckets it
 			// as unmatched, and this is what names it for an operator reading
@@ -308,28 +295,8 @@ func canonicalBeatPath(next http.Handler) http.Handler {
 	})
 }
 
-// sanitizedPath mirrors net/http's own cleanPath: path.Clean, with a trailing
-// slash preserved. The trailing slash is load-bearing here, because ServeMux
-// does NOT redirect a path that only ends in one when a pattern matches it —
-// /beat/ and /beat/{id}/ are served by this file's own routes — so folding it
-// away would make canonicalBeatPath swallow two refusals that already answer
-// correctly under their own patterns.
-func sanitizedPath(p string) string {
-	if p == "" {
-		return "/"
-	}
-	if p[0] != '/' {
-		p = "/" + p
-	}
-	clean := path.Clean(p)
-	if p[len(p)-1] == '/' && clean != "/" {
-		clean += "/"
-	}
-	return clean
-}
-
 // inBeatNamespace reports whether p is the bare /beat prefix or a path under
-// it. Both the raw and the sanitized spelling matter to canonicalBeatPath: a
+// it. Both the raw and the cleaned spelling matter to canonicalBeatPath: a
 // request can ENTER the namespace only after cleaning (//beat/api) or leave one
 // id for another (/beat/api/../ghost), and either way the sender believed it
 // was pinging a beat.
@@ -481,11 +448,19 @@ func failedBeatAuth(verifier webhttp.StaticTokenVerifier, r *http.Request) bool 
 }
 
 // beatAuthFailureLimiter throttles FAILED authentication on the beat endpoint
-// through one shared webhttp.RateLimiter bucket (the pg-autodump composition).
-// Only a request presenting an absent or invalid bearer to POST /beat/{id} draws
-// a token, so a valid ping is never throttled however large the sender fleet
-// grows or how badly a flood is running beside it; over-budget attempts are
-// answered 429 with a Retry-After hint.
+// through one shared webhttp.FailedAuthRateLimit bucket. Only a request
+// presenting an absent or invalid bearer to POST /beat/{id} draws a token, so a
+// valid ping is never throttled however large the sender fleet grows or how
+// badly a flood is running beside it; over-budget attempts are answered 429 with
+// a Retry-After hint.
+//
+// The tuning is the library preset's rather than knell's: burst 10 and one token
+// per 6 seconds, the numbers this app and pg-autodump had each written out for
+// the same shape (one static bearer on one POST route, bounding the log line and
+// the token digests an attempt costs rather than the recording itself). One home
+// for them is what keeps the services guarding that shape from drifting apart.
+// knell keeps the POLICY: which requests are failed authentications, the human
+// message naming the credential, and the attribution below.
 //
 // The bucket is deliberately AGGREGATE — no per-client identity, no config knob.
 // It caps the total failed-auth rate, which is what bounds both the guessing
@@ -503,16 +478,14 @@ func failedBeatAuth(verifier webhttp.StaticTokenVerifier, r *http.Request) bool 
 // failed authentication that reaches the handler answers 401), so the status
 // test attributes the refusal exactly without duplicating the bucket's state.
 func beatAuthFailureLimiter(verifier webhttp.StaticTokenVerifier) webhttp.Middleware {
-	// No WithRateLimitWhen: the wrapper below hands the limiter ONLY
+	// A nil predicate, deliberately: the wrapper below hands the limiter ONLY
 	// predicate-matching requests, so the bucket already sees exactly the
-	// failed-auth class and a second copy of the predicate could only
-	// disagree with the first. One predicate evaluation here rather than two,
-	// so a failed attempt costs two token digests (this wrapper's and
-	// beatHandler's own gate) instead of three.
-	limit := webhttp.RateLimiter(authFailBurst, authFailRefill,
-		webhttp.WithRateLimitError("too_many_auth_failures",
-			"too many failed beat token attempts"),
-	)
+	// failed-auth class and a second copy of the predicate could only disagree
+	// with the first. One predicate evaluation here rather than two, so a failed
+	// attempt costs two token digests (this wrapper's and beatHandler's own
+	// gate) instead of three. That is the second wiring FailedAuthRateLimit
+	// documents, and the tuning (burst 10, one token per 6s) is the library's.
+	limit := webhttp.FailedAuthRateLimit(nil, "too many failed beat token attempts")
 	return func(next http.Handler) http.Handler {
 		limited := limit(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
