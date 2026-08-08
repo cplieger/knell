@@ -61,7 +61,7 @@ func FuzzCheckBeatToken(f *testing.F) {
 			t.Fatalf("accepted a %d-byte token: the gate is /beat/{id}'s only defense, so a value under the %d-byte floor is guessable and must fail startup", len(token), minTokenLength)
 		}
 		if len(token) > maxTokenLength {
-			t.Fatalf("accepted a %d-byte token: knell reads at most %d bytes of request headers, so a value past the %d-byte maximum cannot travel and every ping would be answered 431 by an endpoint reporting itself gated", len(token), MaxRequestHeaderBytes, maxTokenLength)
+			t.Fatalf("accepted a %d-byte token: the %d-byte maximum is the token's share of the %d-byte header block knell reads, so a longer value eats the reserve held for the request line, Host and the \"Bearer \" prefix until the whole block crosses that cap and every ping is answered 431 by an endpoint reporting itself gated", len(token), maxTokenLength, MaxRequestHeaderBytes)
 		}
 		got, err := wireAuthorizationValue(t, token)
 		if err != nil {

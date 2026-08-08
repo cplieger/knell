@@ -2213,21 +2213,24 @@ func TestThrottledAuthFailureWritesNoAccessLine(t *testing.T) {
 }
 
 // TestFailedAuthDrawsATokenForEverySpellingTheGateAnswers pins the throttle
-// against the ROUTE rather than one spelling of it. The bucket exempts a
-// request whose path is not a single segment under /beat/, but ServeMux matches
-// patterns on the ESCAPED path, so an encoded slash keeps the request on
-// POST /beat/{id} and the bearer gate still answers it 401. Any spelling the
-// gate answers is a guessing attempt against the endpoint's only credential and
-// one access line per attempt, so it has to draw from the same bucket:
-// otherwise a caller who appends %2F to the id has an unbounded oracle and an
-// unbounded log flood, and every existing throttle test stays green.
+// against the ROUTE rather than one spelling of it. The bucket's endpoint half
+// is the mux's own verdict (failedBeatAuth compares mux.Handler's pattern to
+// beatRoutePattern), and ServeMux matches patterns on the ESCAPED path, so an
+// encoded slash keeps the request on POST /beat/{id} and the bearer gate still
+// answers it 401. Any spelling the gate answers is a guessing attempt against
+// the endpoint's only credential and one access line per attempt, so it has to
+// draw from the same bucket: otherwise a caller who appends %2F to the id has an
+// unbounded oracle and an unbounded log flood, and every existing throttle test
+// stays green.
 func TestFailedAuthDrawsATokenForEverySpellingTheGateAnswers(t *testing.T) {
 	// The families the mux reaches by different rules: an escaped character inside
 	// the {id} segment (matched on the ESCAPED path), an escaped character in the
 	// LITERAL segment (matched after unescaping it), and BOTH at once -- which
-	// routes to POST /beat/{id} while satisfying neither raw view on its own, so a
-	// gate reading only r.URL.EscapedPath() or only r.URL.Path exempts it from the
-	// throttle and hands out an unbounded guessing oracle.
+	// routes to POST /beat/{id} while satisfying neither raw view on its own. A
+	// predicate that MODELLED the router instead of asking it exempted that last
+	// family and handed out an unbounded guessing oracle; these cases now verify
+	// the router-verdict predicate, so they are the regression net for ever
+	// re-deriving the match textually.
 	for _, target := range []string{
 		"/beat/api", "/beat/%61pi", "/beat/a%2Fb", "/beat/ghost%2F",
 		"/%62eat/api", "/%62eat/%61pi",

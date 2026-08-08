@@ -47,13 +47,28 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 	observed := started.Add(200 * 365 * 24 * time.Hour)
 	live := watch.Transition{Started: started, Observed: observed}
 
-	// The single-outage notice carries the longest of the three lateClause
-	// branches; the batch carries the MIXED batchLateClause, the longest of the
-	// six late clauses, at watch's MaxHistoryBatch bound. The mixed batch cycles
-	// through ALL THREE reasons, because the widest sentence names one count per
-	// reason: a two-reason batch measures a clause a real three-cause batch
-	// overruns.
-	single := []watch.Outage{{Started: started, Recovered: observed, LateReason: watch.LateEndedBeforeDetection}}
+	// Both fixtures carry the LONGEST clause of their shape, measured rather than
+	// presumed: lateClause's LateSchedulerDeferred branch is 176 characters
+	// against 111 for LateEndedBeforeDetection and 69 for LateUndelivered, and
+	// batchLateClause's all-deferred whole-batch sentence is 141 against 135 for
+	// the mixed three-reason count at watch's MaxHistoryBatch bound, 72 for
+	// all-ended and 58 for all-undelivered. So the single record and every record
+	// of the widest batch name LateSchedulerDeferred. The mixed batch is kept as a
+	// second case because it is the only shape that renders COUNTS, whose digit
+	// width grows if MaxHistoryBatch ever passes 9 — a batch that names one reason
+	// keeps that reason's own sentence and never a count of itself.
+	single := []watch.Outage{{Started: started, Recovered: observed, LateReason: watch.LateSchedulerDeferred}}
+	deferred := make([]watch.Outage, 0, watch.MaxHistoryBatch)
+	for range watch.MaxHistoryBatch {
+		deferred = append(deferred, watch.Outage{
+			Started:    started,
+			Recovered:  observed,
+			LateReason: watch.LateSchedulerDeferred,
+		})
+	}
+	// The mixed batch cycles through ALL THREE reasons, because the count
+	// sentence names one count per reason: a two-reason batch measures a clause a
+	// real three-cause batch overruns.
 	reasons := []watch.LateReason{
 		watch.LateUndelivered,
 		watch.LateSchedulerDeferred,
@@ -69,10 +84,11 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 	}
 
 	cases := map[string]func() error{
-		"missing":         func() error { return d.BeatMissing(t.Context(), id, live) },
-		"recovered":       func() error { return d.BeatRecovered(t.Context(), id, live) },
-		"history one":     func() error { return d.BeatOutageHistory(t.Context(), id, single) },
-		"history several": func() error { return d.BeatOutageHistory(t.Context(), id, mixed) },
+		"missing":               func() error { return d.BeatMissing(t.Context(), id, live) },
+		"recovered":             func() error { return d.BeatRecovered(t.Context(), id, live) },
+		"history one":           func() error { return d.BeatOutageHistory(t.Context(), id, single) },
+		"history several":       func() error { return d.BeatOutageHistory(t.Context(), id, deferred) },
+		"history several mixed": func() error { return d.BeatOutageHistory(t.Context(), id, mixed) },
 	}
 	for name, send := range cases {
 		t.Run(name, func(t *testing.T) {

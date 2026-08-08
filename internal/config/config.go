@@ -678,9 +678,13 @@ var (
 // behind it.
 //
 // A token longer than maxTokenLength returns to the first reason at the other end
-// of the scale: MaxRequestHeaderBytes bounds the header block knell will read, so
-// a token past the maximum has no room to travel and the endpoint would 431 every
-// ping. The two length bounds are declared together with that budget, so neither
+// of the scale: MaxRequestHeaderBytes bounds the header block knell will read, and
+// maxTokenLength is the token's SHARE of that block, so an accepted token always
+// travels with headerOverheadAllowance bytes left over for the request line, Host
+// and the "Bearer " prefix. A token one byte past the maximum still travels; what
+// it eats is that reserve, and 431 arrives only once the WHOLE block exceeds
+// MaxRequestHeaderBytes — which is why the bound is a margin rather than the wire
+// limit. The two length bounds are declared together with that budget, so neither
 // can be moved without the other.
 func checkBeatToken(token string) error {
 	if strings.Trim(token, asciiWhitespace) != token {
@@ -715,17 +719,18 @@ func checkBeatToken(token string) error {
 		return fmt.Errorf("BEAT_TOKEN is shorter than the %d-byte minimum: it is the only gate on /beat/{id}, so a token short enough to guess lets a stranger who can reach this port keep every beat reading fresh while the thing it watches is dead; set a random token of at least %d bytes (e.g. `openssl rand -hex 16`)", minTokenLength, minTokenLength)
 	}
 	if len(token) > maxTokenLength {
-		// Presentable byte for byte, and still unsendable — this time because of
-		// its size rather than its content. knell caps the header block it reads
-		// at MaxRequestHeaderBytes, so a token past maxTokenLength cannot fit
-		// that budget alongside the request line, Host and the "Bearer " prefix,
-		// and POST /beat/{id} would answer 431 to every ping while reporting
-		// itself gated. That is the same fail-silent outcome the padding and
-		// control-byte refusals above prevent, so it is refused at startup for
-		// the same reason. What actually reaches here is a BEAT_TOKEN_FILE
-		// pointing at a bundle or an archive the mount picked up (envx reads a
-		// secret file of up to 1 MiB), which is why the remedy names the value
-		// and not the cap.
+		// Presentable byte for byte, and sendable as it stands — refused for
+		// what it would cost the header budget rather than for being unsendable
+		// now. maxTokenLength is the token's SHARE of MaxRequestHeaderBytes, so
+		// an accepted token always leaves headerOverheadAllowance bytes for the
+		// request line, Host and the "Bearer " prefix; a longer one eats that
+		// reserve, and once the WHOLE block crosses MaxRequestHeaderBytes POST
+		// /beat/{id} answers 431 to every ping while reporting itself gated.
+		// Refusing at startup keeps that fail-silent outcome unreachable, the
+		// same end the padding and control-byte refusals above serve by another
+		// route. What actually reaches here is a BEAT_TOKEN_FILE pointing at a
+		// bundle or an archive the mount picked up (envx reads a secret file of
+		// up to 1 MiB), which is why the remedy names the value and not the cap.
 		return fmt.Errorf("BEAT_TOKEN is longer than the %d-byte maximum: the maximum is the token's share of the %d-byte header block knell reads, so an accepted token always travels with %d bytes left over for the request line, the Host header and the \"Bearer \" prefix, and a longer one is refused at startup rather than left to eat that reserve until POST /beat/{id} answers 431 to every ping while reporting itself gated; a real credential is far shorter than the maximum, so set a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or check that BEAT_TOKEN_FILE names the secret file itself rather than a bundle the mount picked up", maxTokenLength, MaxRequestHeaderBytes, headerOverheadAllowance, minTokenLength)
 	}
 	return nil

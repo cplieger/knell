@@ -483,14 +483,17 @@ func digitRuns(s string) []string {
 
 // TestBeatTokenLengthCeiling pins both edges of the token maximum. The bound is
 // not about credential strength — a 512-byte token is absurd, not weak — but
-// about whether the credential can TRAVEL: MaxRequestHeaderBytes caps the header
-// block knell reads, so one byte past the maximum and POST /beat/{id} answers 431
-// to every ping while startup reported the endpoint gated, and one deadline later
-// every configured beat posts a false MISSING notice. Both edges are asserted
-// because either mistake is silent in production: a maximum that refused a token
-// the header budget can carry would stop deployments that work today, and one
-// that admitted an oversized token would restore the 431 the bound exists to
-// prevent.
+// about the header budget the credential TRAVELS in: maxTokenLength is the
+// token's share of MaxRequestHeaderBytes, so an accepted token always leaves
+// headerOverheadAllowance bytes for the request line, Host and the "Bearer "
+// prefix. One byte past the maximum still travels — 431 arrives only once the
+// WHOLE header block exceeds MaxRequestHeaderBytes — so what the bound protects
+// is that reserve. Both edges are asserted because either mistake is silent in
+// production: a maximum that refused a token the budget reserves room for would
+// stop deployments that work today, and one that admitted an unbounded token
+// would let a BEAT_TOKEN_FILE pointing at the wrong file eat the reserve until
+// every ping is answered 431 by an endpoint reporting itself gated and one
+// deadline later every configured beat posts a false MISSING notice.
 func TestBeatTokenLengthCeiling(t *testing.T) {
 	atMax := strings.Repeat("a", maxTokenLength)
 
@@ -515,7 +518,7 @@ func TestBeatTokenLengthCeiling(t *testing.T) {
 
 		_, err := Load(maxNodeNameBytes)
 		if err == nil {
-			t.Fatalf("Load() with a %d-byte BEAT_TOKEN = nil, want a startup refusal: it leaves no room inside the %d-byte header budget for the request line, Host and the \"Bearer \" prefix, so every ping would be answered 431 by an endpoint reporting itself gated", maxTokenLength+1, MaxRequestHeaderBytes)
+			t.Fatalf("Load() with a %d-byte BEAT_TOKEN = nil, want a startup refusal: the maximum is the token's share of the %d-byte header block knell reads, so anything past it eats the %d-byte reserve held for the request line, Host and the \"Bearer \" prefix", maxTokenLength+1, MaxRequestHeaderBytes, headerOverheadAllowance)
 		}
 		if !strings.Contains(err.Error(), strconv.Itoa(maxTokenLength)) {
 			t.Errorf("refusal = %q, want it to name the %d-byte maximum: it is the number the operator has to act on", err, maxTokenLength)
@@ -902,8 +905,12 @@ func TestLoadRejectsAnUnusableAllowedHostsEntry(t *testing.T) {
 	if !strings.Contains(err.Error(), "ALLOWED_HOSTS") {
 		t.Errorf("Load() error = %q, want ALLOWED_HOSTS named so the operator knows which variable to fix", err)
 	}
-	if !strings.Contains(err.Error(), "http://x/y") {
-		t.Errorf("Load() error = %q, want it to name the unusable entry: it is the only part of the value the operator can act on", err)
+	// %q, not %v: the entries are rendered quoted so an invisible rune pasted in
+	// with a hostname is escaped rather than printed invisibly. Asserting the
+	// QUOTES (not the bare entry, which both verbs print) is what fails if the
+	// rendering is reverted.
+	if !strings.Contains(err.Error(), `"http://x/y"`) {
+		t.Errorf("Load() error = %q, want the unusable entry named and QUOTED: it is the only part of the value the operator can act on, and %%v prints an invisible rune invisibly, so the refusal would name a hostname that looks correct", err)
 	}
 }
 
@@ -1127,9 +1134,12 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 // Nothing else in the package pins the ACCEPTING side of that scope.
 // checkBeatToken's refusals are pinned by value, FuzzCheckBeatToken asserts only
 // on tokens it ACCEPTS (a rejection returns early, so an over-strict validator
-// satisfies it vacuously), and the one interior-whitespace fixture in the
-// package ("alpha\tbeta", in the beatTokenFitsHeader tables) never reaches
-// checkBeatToken. So tightening the edge test to refuse SP/HTAB anywhere -- the
+// satisfies it vacuously), and every OTHER interior-whitespace fixture in the
+// package is too short to be ACCEPTED: "alpha\tbeta" and "alpha  beta" in the
+// beatTokenFitsHeader tables never reach checkBeatToken at all, and
+// "alpha\tbeta" is also a committed FuzzCheckBeatToken seed, where it does reach
+// it but the 16-byte floor refuses its 10 bytes before any acceptance assertion
+// runs. So tightening the edge test to refuse SP/HTAB anywhere -- the
 // shape a "harden the credential" edit reaches for -- leaves every existing test
 // green while a passphrase-style BEAT_TOKEN stops the observer from starting at
 // all, which for a dead-man switch is the one refusal nobody is watching for.

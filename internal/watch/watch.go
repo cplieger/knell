@@ -1266,10 +1266,17 @@ func (w *Watcher) collectDue() []dueNotice {
 // moment it produced the record.
 //
 // Same instrument and same shape as Beat's recovery-queue assertion, including
-// the unlock: the mutex is released before failing because a mutex left held
-// turns a loud bug report into a silently wedged watcher — every ping, the
-// freshness ticker and the shutdown tally all block on it forever. Callers hold
-// w.mu and must not hold it after this returns abnormally.
+// the unlock — but for a weaker reason, because the two panics land in different
+// goroutines. Beat's runs on an HTTP handler, where webhttp.Recoverer catches it
+// and the process continues, so releasing the mutex there is what keeps every
+// later ping, the freshness ticker and the shutdown tally from blocking on it
+// forever. This one runs on the Run loop, which nothing recovers, so the process
+// exits with the panic and the release buys no survivor: it is here so the two
+// assertions read the same way, and so a future caller that DOES recover finds
+// the mutex free. Do not add such a recover to gain that property: a recovered
+// producer bug is a watcher running on a queue this function refused to vouch
+// for, which is the silent failure the panic exists to avoid. Callers hold w.mu
+// and must not hold it after this returns abnormally.
 func (w *Watcher) assertSealedRun(id string, run []Outage) {
 	for i := range run {
 		var broken string
