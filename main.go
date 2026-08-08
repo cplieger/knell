@@ -36,20 +36,38 @@ import (
 // to finish and exit under its own power.
 const shutdownGrace = 8 * time.Second
 
-// requestTimeout bounds a whole request, read and write alike. No route
-// streams, so both bounds are safe: the read bound stops a slow-trickled
-// body from holding a handler goroutine forever (the 1 MiB drain cap bounds
-// bytes, not time), and the write bound stops a client that requests
+// The three request bounds. No route streams, so every phase is safe to
+// bound: the header bound is the slowloris guard, the read bound stops a
+// slow-trickled body from holding a handler goroutine (the 1 MiB drain cap
+// bounds bytes, not time), and the write bound stops a client that requests
 // /metrics and never reads the response from pinning the goroutine in Write.
 //
-// It is LARGER than shutdownGrace, and that pairing is load-bearing: webhttp
-// spends one grace budget across pre-drain, srv.Shutdown and the teardown,
-// and srv.Shutdown waits for in-flight requests -- so a single request still
-// inside this bound when the signal arrives can spend the whole grace, leave
-// awaitWatchLoop no budget, and turn an ordinary stop into the exit
-// classifyServeError names. Read the two constants together before changing
-// either.
-const requestTimeout = 30 * time.Second
+// The INVARIANT that picks these numbers, and the one to preserve when
+// changing any of them: an in-flight request must reach its own deadline
+// INSIDE shutdownGrace, with margin left over for the teardown. webhttp spends
+// ONE grace budget across pre-drain, srv.Shutdown and onShutdown, and
+// srv.Shutdown waits for in-flight requests -- so a request that arrived just
+// before the signal spends its full remaining bounds inside that budget. It is
+// therefore wrong for any of these to approach shutdownGrace, let alone exceed
+// it: /beat/{id} authenticates BEFORE it drains the caller-paced body, so a
+// token holder trickling bytes is an active request for the whole read bound,
+// and a read bound at or above the grace lets one such caller consume the
+// entire budget, leave awaitWatchLoop nothing, and turn a routine stop into
+// the exit classifyServeError names.
+//
+// The arithmetic: net/http arms the write deadline once the headers are read,
+// while the read bound runs from the same instant the header bound does, so
+// the worst-case active request is header + write = 2s + 3s = 5s (the 3s read
+// bound finishes earlier). At least 3s of the 8s grace therefore survives for
+// awaitWatchLoop to collect the watch loop and flush its abandoned-notice
+// WARN, still under Docker's 10s stop timeout. Read these together with
+// shutdownGrace before changing either side; TestNewServerBounds... pins the
+// margin so a later tweak cannot erase it silently.
+const (
+	requestHeaderTimeout = 2 * time.Second
+	requestReadTimeout   = 3 * time.Second
+	requestWriteTimeout  = 3 * time.Second
+)
 
 func main() {
 	// CLI liveness probe for the Docker healthcheck (scratch image: no
@@ -217,8 +235,12 @@ func run() error {
 // run() installs the handler before any of the wiring.
 func newServer(handler http.Handler) *http.Server {
 	return webhttp.NewServer(handler,
-		webhttp.WithReadTimeout(requestTimeout),
-		webhttp.WithWriteTimeout(requestTimeout),
+		// The header bound is set explicitly rather than left at webhttp's 10s
+		// default: a header ceiling ABOVE the whole-request bound below is a
+		// dead number, since the read deadline would fire first.
+		webhttp.WithReadHeaderTimeout(requestHeaderTimeout),
+		webhttp.WithReadTimeout(requestReadTimeout),
+		webhttp.WithWriteTimeout(requestWriteTimeout),
 		// The header ceiling is config's, not a number restated here:
 		// config derives it from the BEAT_TOKEN maximum it enforces at
 		// startup, so the bound a token is checked against and the bound the
