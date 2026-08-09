@@ -479,8 +479,11 @@ func allowedHosts(opts []webhttp.HostAllowlistOption) (*webhttp.HostPolicy, erro
 // when it is given no ranges at all: no forwarded header is honored and
 // client_ip is the socket peer.
 func trustedProxies() []*net.IPNet {
-	raw, present := os.LookupEnv("TRUSTED_PROXIES")
-	if !present || strings.TrimSpace(raw) == "" {
+	// Getenv, not LookupEnv: unlike the four siblings above, present-but-blank
+	// is deliberately NOT warned here (the 7-case Load table pins the silence),
+	// so the present bit decides nothing and blank and unset are one case.
+	raw := os.Getenv("TRUSTED_PROXIES")
+	if strings.TrimSpace(raw) == "" {
 		return nil
 	}
 	nets, invalid := webhttp.ParseCIDRs(strings.Split(raw, ","))

@@ -2306,8 +2306,14 @@ func TestLoadWarnsOnlyWhenLogLevelIsUnparseable(t *testing.T) {
 			if cfg.LogLevel.String() != tt.want {
 				t.Errorf("LogLevel = %v, want %v", cfg.LogLevel, tt.want)
 			}
-			if got := rec.Contains("invalid LOG_LEVEL"); got != tt.wantWarn {
-				t.Errorf("LOG_LEVEL=%q: warned = %v, want %v; the warning is the only signal that a typo was ignored, and a warning on a valid level trains the operator to ignore it: %v", tt.raw, got, tt.wantWarn, rec.Messages())
+			wantCount := 0
+			if tt.wantWarn {
+				wantCount = 1
+			}
+			gotAny := rec.Count("invalid LOG_LEVEL")
+			gotWarn := rec.CountLevel(slog.LevelWarn, "invalid LOG_LEVEL")
+			if gotAny != wantCount || gotWarn != wantCount {
+				t.Errorf("LOG_LEVEL=%q: matching records = %d, WARN records = %d, want %d; the warning is the only signal that a typo was ignored, it is invisible below WARN at the default level, and a warning on a valid level trains the operator to ignore it: %v", tt.raw, gotAny, gotWarn, wantCount, rec.Records())
 			}
 		})
 	}
@@ -2337,8 +2343,8 @@ func TestLoadWarnsWhenLogLevelIsPresentButBlank(t *testing.T) {
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %v, want INFO: a blank LOG_LEVEL must land on the documented default", cfg.LogLevel)
 	}
-	if !rec.Contains("LOG_LEVEL is set but blank") {
-		t.Errorf("no warning that a blank LOG_LEVEL was ignored; the operator set the variable and this process threw the value away, so the level they turned up to diagnose an outage silently never applies: %v", rec.Messages())
+	if got := rec.CountLevel(slog.LevelWarn, "LOG_LEVEL is set but blank"); got != 1 {
+		t.Errorf("the blank-LOG_LEVEL warning was logged at WARN %d times, want exactly 1; the operator set the variable and this process threw the value away, and below WARN the line is invisible at the very default level it silently fell back to: %v", got, rec.Records())
 	}
 }
 
