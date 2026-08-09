@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cplieger/httpx/v3"
+	"github.com/cplieger/httpx/v4"
 )
 
 // attemptTimeout bounds each delivery attempt when the caller's context
