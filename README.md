@@ -38,7 +38,7 @@ services:
     environment:
       BEATS: "cron-backup:26h,pipeline-watchdog:20m"
       DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/..."
-      BEAT_TOKEN: "replace-with-a-random-token"  # required, min 16 bytes: openssl rand -hex 16
+      BEAT_TOKEN: "CHANGEME"  # invalid placeholder; required, min 16 bytes: openssl rand -hex 16
       NODE_NAME: "server-1"
     ports:
       - "9190:9190"
@@ -86,7 +86,7 @@ A malformed `BEATS` or `DISCORD_WEBHOOK_URL` fails startup rather than falling b
 
 Request bodies on `/beat/{id}` are ignored, so webhook-shaped senders (an Alertmanager `webhook_configs` target, a CI notification hook) can point at it unchanged. Up to 1 MiB of the body is read and discarded so the connection stays reusable; a payload larger than that still records the ping and answers `{"ok":true}`, logs one `warn` line saying the body was not fully read, and closes that connection instead of draining the rest (so an oversized sender loses keep-alive, never its ping). A ping is never refused for its payload: the body is not what the switch is listening for.
 
-Headers are bounded the other way round, because they are the part knell has to parse before it knows anything about the caller: at most 8704 bytes of request headers are read (net/http's own default is 1 MiB, one megabyte per connection an unauthenticated caller can spend), and a request whose header block is larger is answered 431. That figure is the 512-byte `BEAT_TOKEN` maximum plus 8 KiB of room for the request line, `Host`, the `Bearer` prefix with its trailing space that the token travels behind, and whatever sits in front of knell adds — `X-Forwarded-*`, tracing headers, the cookies a browser sends to `/metrics` — which is the whole header block nginx and Apache allow by default. The two bounds are one decision: startup refuses a token that could not travel inside this ceiling, so no accepted configuration can produce a ping that is answered 431.
+Headers are bounded the other way round, because they are the part knell has to parse before it knows anything about the caller: at most 8704 bytes of request headers are read (net/http's own default is 1 MiB, one megabyte per connection an unauthenticated caller can spend), and a request whose header block is larger is answered 431. That figure is the 512-byte `BEAT_TOKEN` maximum plus 8 KiB for the request line, `Host`, the `Bearer` prefix, and whatever sits in front of knell adds. The 8 KiB matches what a default nginx or Apache allows in one header line; their whole-block limits are higher, so a proxy that piles on `X-Forwarded-*`, tracing and cookie headers can still deliver a block knell answers 431. If pings start failing that way, trim the headers the proxy adds.
 
 Only `POST` records. `GET` and `HEAD` are answered with 405 and never feed the switch, so nothing that merely fetches a URL — a chat client's link preview, a crawler, an uptime prober, an `<img>` on a page an operator opens — can keep a beat looking alive. Repeated pings that present no valid token are throttled together and answered 429 with a `Retry-After` hint once the shared budget is spent, which caps both guessing and the log flood a bad sender would otherwise write; a ping with the right token is never throttled, however many senders you run.
 
@@ -130,7 +130,7 @@ A live incident and one that is already over are reported differently: nothing a
 | `knell_outage_records_dropped_total{beat}` | counter | ended-outage records discarded per beat because the beat's queue was full. Counted per RECORD, not per message: the record was that outage's last trace, so no notice for it will ever arrive. Reconstruct the missed window from `knell_beat_last_seen_timestamp_seconds` |
 | `knell_notifications_sent_total{kind}` | counter | delivered webhook notifications (`missing`, `recovered`, `history`), one per delivered message: a `history` message covering several ended outages counts once |
 | `knell_notifications_failed_total{kind}` | counter | delivery attempts that failed after retries and will be retried, one per failed message. This counter means exactly that: something was sent, did not get through, and its record is still queued. In practice that is `missing` and `history`, which the next sweep tries again |
-| `knell_notifications_dropped_total{kind}` | counter | notification messages that will never be delivered, one per lost message. In practice that is `recovered`, the one fire-once kind: its transition was discarded by a full recovery queue, or its send failed with nothing left to retry from. Nothing retries a drop. A lost outage RECORD is counted on `knell_outage_records_dropped_total` instead, because a record is not a message |
+| `knell_notifications_dropped_total{kind}` | counter | notification messages that will never be delivered, one per lost message. In practice that is `recovered`, the one fire-once kind: its send failed with nothing left to retry from. Nothing retries a drop. A lost outage RECORD is counted on `knell_outage_records_dropped_total` instead, because a record is not a message |
 | `knell_pre_route_refusals_total{reason}` | counter | requests refused before any route ran, by cause: `non_canonical_beat_path` (a sender pinging a malformed `/beat` URL), `host_not_allowed` (a `Host` missing from `ALLOWED_HOSTS`, or a DNS-rebinding attempt), `auth_throttled` (failed authentication over the throttle's budget). A diagnostic, not an alert source — see below |
 | `knell_http_requests_total{method,path,status}` | counter | served requests, labelled by the matched route template (never the raw path) and a closed method set. The only view of a REFUSED ping: a 401, 404, 405 or 503 never reaches `knell_beats_received_total`. A refusal answered before routing has no template, so it lands under `path="unmatched"` and is named by cause on `knell_pre_route_refusals_total` |
 | `knell_http_request_duration_seconds` | histogram | served-request latency across the whole surface, deliberately unlabelled |
@@ -160,8 +160,8 @@ knell is itself the alert path for the things it watches, so alert rules about k
 #             unreachable) and its record is still queued, so it is retried
 #             every 15s sweep. The notice is late, not lost: wait for it.
 #   dropped = a MESSAGE that will never arrive, in practice a fire-once
-#             recovered notice whose send failed or whose transition was
-#             discarded by a full recovery queue.
+#             recovered notice whose send failed with nothing left to
+#             retry from.
 #   outage records dropped = an ended outage whose record was discarded by a
 #             full per-beat queue. Counted per record rather than per message,
 #             because one history message covers several records. Reconstruct
