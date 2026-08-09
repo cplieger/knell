@@ -482,11 +482,11 @@ func trustedProxies() []*net.IPNet {
 	// Getenv, not LookupEnv: present-but-blank is deliberately NOT warned here,
 	// unlike in nodeName, listenAddr, allowedHosts, and logLevel (the 7-case Load
 	// table pins the silence), so the present bit decides nothing and blank and
-	// unset are one case.
+	// unset are one case. No local blank test either, for the reason allowedHosts
+	// has none: ParseCIDRs trims every entry and skips the blank ones, so an unset,
+	// blank, whitespace-only or all-comma value yields no ranges and nothing to
+	// warn about — TestLoadTrustedProxiesDegradesRestrictively pins that silence.
 	raw := os.Getenv("TRUSTED_PROXIES")
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
 	nets, invalid := webhttp.ParseCIDRs(strings.Split(raw, ","))
 	if len(invalid) > 0 {
 		slog.Warn("TRUSTED_PROXIES entries ignored, X-Forwarded-For is not honored for them",
@@ -507,11 +507,14 @@ func logLevel() slog.Level {
 	// collapses present-but-blank with unset, and only the former is an
 	// accident worth a line.
 	raw, present := os.LookupEnv("LOG_LEVEL")
-	if present && strings.TrimSpace(raw) == "" {
-		slog.Warn("LOG_LEVEL is set but blank and was ignored; logging stays at the default level, so unset the variable to accept that on purpose, or set debug, info, warn or error", "log_level", slog.LevelInfo.String())
-		return slog.LevelInfo
-	}
+	// Resolved first, so the fallback level is named once in this function:
+	// slogx.ParseLevel TrimSpaces the value and reports ok for a blank one, so it
+	// settles the blank and the unset case alike and the arm below is the
+	// diagnostic a PRESENT blank earns, not a second way to reach the default.
 	level, ok := slogx.ParseLevel(raw, slog.LevelInfo)
+	if present && strings.TrimSpace(raw) == "" {
+		slog.Warn("LOG_LEVEL is set but blank and was ignored; logging stays at the default level, so unset the variable to accept that on purpose, or set debug, info, warn or error", "log_level", level.String())
+	}
 	if !ok {
 		// The value is NOT pre-quoted: slog's TextHandler, the handler
 		// slogx.Options{} installs, already applies strconv.Quote to any attr
