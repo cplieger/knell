@@ -1928,14 +1928,22 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 	if len(invalid) > 0 {
 		t.Fatalf("ParseHostList rejected %v; the fixture must be a valid allowlist", invalid)
 	}
+	proxies, invalidCIDRs := webhttp.ParseCIDRs([]string{"10.0.0.0/24", "192.168.1.5"})
+	if len(invalidCIDRs) > 0 {
+		t.Fatalf("ParseCIDRs rejected %v; the fixture must be a valid trusted-proxy set", invalidCIDRs)
+	}
 
 	cfg := Config{
-		AllowedHosts:  policy,
-		WebhookURL:    "https://discord.example/hook",
-		WebhookSource: envx.SourceFile,
-		Node:          "observer-borgcube",
-		ListenAddr:    "127.0.0.1:19190",
-		BeatToken:     "unit-test-beat-token",
+		AllowedHosts: policy,
+		// Two ranges rather than zero or one: the attr publishes a COUNT, so a
+		// zero fixture renders the same "0" an unset TRUSTED_PROXIES does and
+		// would assert nothing, and 1 cannot be told apart from a boolean.
+		TrustedProxies: proxies,
+		WebhookURL:     "https://discord.example/hook",
+		WebhookSource:  envx.SourceFile,
+		Node:           "observer-borgcube",
+		ListenAddr:     "127.0.0.1:19190",
+		BeatToken:      "unit-test-beat-token",
 		// The OTHER channel than the webhook's, deliberately: the two source
 		// attrs are the only pair in this fixture that share a value domain, so
 		// an attr wired to the wrong source field would otherwise render exactly
@@ -1967,7 +1975,11 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		// half of where their secrets live.
 		"beat_token":    "env",
 		"allowed_hosts": "allowlist(2)",
-		"log_level":     "DEBUG",
+		// A COUNT, for the reason allowed_hosts publishes one: a misspelled
+		// TRUSTED_PROXIES is indistinguishable from an unset one, so the number
+		// of ranges actually held is the state an operator checks this line for.
+		"trusted_proxies": "2",
+		"log_level":       "DEBUG",
 	}
 	if len(got) != len(want) {
 		t.Errorf("LogValue() rendered %d attrs %v, want exactly %d: an added attr has to be reviewed for secret content, and a dropped one silently removes a field from the only rendering of an env-only configuration", len(got), got, len(want))

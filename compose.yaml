@@ -13,5 +13,5 @@ services:
 
     ports:
       # /metrics is unauthenticated and enumerates beats; set ALLOWED_HOSTS
-      # and restrict exposure -- see README "Security".
+      # and restrict exposure -- see README "Configuration reference".
       - "9190:9190"

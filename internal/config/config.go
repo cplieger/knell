@@ -134,7 +134,11 @@ type Config struct {
 	// AllowedHosts is the exact-match Host allowlist webapi applies. A nil or
 	// inactive policy accepts every Host (the documented default).
 	AllowedHosts *webhttp.HostPolicy
-	WebhookURL   string
+	// TrustedProxies is the reverse-proxy CIDR set X-Forwarded-For is honored
+	// for. Empty (the default) keeps webhttp's spoof-proof behaviour: the
+	// access line's client_ip is the socket peer.
+	TrustedProxies []*net.IPNet
+	WebhookURL     string
 	// WebhookSource is the channel DISCORD_WEBHOOK_URL arrived through, as envx
 	// names it: SourceFile for the _FILE companion, SourceEnv for the plain
 	// variable. It is carried here because it is the one non-secret FACT about
@@ -217,6 +221,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("webhook", string(c.WebhookSource)),
 		slog.String("beat_token", string(c.BeatTokenSource)),
 		slog.String("allowed_hosts", allowedHosts),
+		slog.Int("trusted_proxies", len(c.TrustedProxies)),
 		slog.String("log_level", c.LogLevel.String()),
 	)
 }
@@ -272,6 +277,8 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...webhttp.HostAllowlistOption) (
 		return cfg, err
 	}
 	cfg.AllowedHosts = hosts
+
+	cfg.TrustedProxies = trustedProxies()
 
 	beatToken, beatTokenSource, err := loadBeatToken()
 	if err != nil {
@@ -459,6 +466,29 @@ func allowedHosts(opts []webhttp.HostAllowlistOption) (*webhttp.HostPolicy, erro
 			"hint", "unset the variable to accept every Host on purpose, or list the hostnames knell is reached by, e.g. knell.internal,10.0.0.5")
 	}
 	return policy, nil
+}
+
+// trustedProxies parses TRUSTED_PROXIES into the CIDR set the access line
+// resolves client_ip against. Entries degrade RESTRICTIVELY: a malformed entry
+// is warned about and dropped, because dropping one NARROWS whose
+// X-Forwarded-For is believed (env-validation.md, "Restriction LISTS").
+// Contrast ALLOWED_HOSTS, where a dropped entry would refuse a caller the
+// operator meant to admit, so that list fails startup instead.
+//
+// Unset or blank returns nil, which is exactly what webhttp.WithClientIP takes
+// when it is given no ranges at all: no forwarded header is honored and
+// client_ip is the socket peer.
+func trustedProxies() []*net.IPNet {
+	raw, present := os.LookupEnv("TRUSTED_PROXIES")
+	if !present || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	nets, invalid := webhttp.ParseCIDRs(strings.Split(raw, ","))
+	if len(invalid) > 0 {
+		slog.Warn("TRUSTED_PROXIES entries ignored, X-Forwarded-For is not honored for them",
+			"ignored", invalid, "trusted", len(nets))
+	}
+	return nets
 }
 
 // logLevel resolves the log level: LOG_LEVEL when it parses, else info. A

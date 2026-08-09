@@ -157,9 +157,10 @@ func run() error {
 	// the HTTP drain begins. So the endpoint holds no lifecycle state and no
 	// context of its own.
 	handler := webapi.New(watcher, webapi.Deps{
-		Healthz:   health.Handler(marker),
-		BeatToken: cfg.BeatToken,
-		Hosts:     cfg.AllowedHosts,
+		Healthz:        health.Handler(marker),
+		BeatToken:      cfg.BeatToken,
+		Hosts:          cfg.AllowedHosts,
+		TrustedProxies: cfg.TrustedProxies,
 	})
 	srv := newServer(handler)
 

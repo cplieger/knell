@@ -28,8 +28,13 @@
 //     [A-Za-z0-9][A-Za-z0-9_-]{0,63} and caps a fleet at 64 beats;
 //   - internal/watch passes only ids from that configured set (New's beat map
 //     is the whole domain of every call it makes);
-//   - internal/webapi answers 404 for an unknown id, so an arbitrary request
-//     path never reaches watch.Beat at all.
+//   - internal/webapi does NOT filter the id: it hands the raw /beat/{id}
+//     path segment straight to watch.Beat and answers 404 from the
+//     BeatUnknown outcome that call returns. So the w.beats[id] lookup
+//     inside watch.Beat is the boundary an attacker-chosen path segment
+//     stops at, and nothing upstream of watch inspects the id at all
+//     (internal/watch/watch_metrics_test.go pins that an unconfigured id
+//     mints no series).
 //
 // The only PRODUCTION caller of the five id-taking functions is
 // internal/watch; test code in this module may also call them, with fixed
@@ -49,8 +54,10 @@
 // contract instead, and the same reasoning drives it — its method and path
 // labels must be bounded by the ROUTE TABLE and a closed method set, never by
 // the request line, because /beat/{id} is served to unauthenticated callers
-// (webhttp.Logging is the outermost middleware, so its metric hook fires before
-// the BEAT_TOKEN gate runs). The derivation lives in webhttp
+// (webhttp.Logging wraps the whole mux, so its metric hook fires before
+// beatHandler's BEAT_TOKEN gate; only SecurityHeaders, NoStore and the
+// failed-auth throttle sit outside it, which is why the throttle's 429 reaches
+// this counter not at all — see preRouteRefusals). The derivation lives in webhttp
 // (RouteMetricLabels): internal/webapi.New passes this function straight to
 // webhttp.WithRecordRouteMetric, so the library computes the pair and knell has
 // none of its own to get wrong.
@@ -385,8 +392,8 @@ var httpRequests = metricslib.NewLabeledCounter(
 // is deliberately unlabelled: a labelled histogram would multiply bucket
 // series per route for no operator question on a three-route surface, and
 // the aggregate still surfaces the one signal that matters here (a slow
-// request — e.g. a body drain riding out the 30s read timeout — lands past
-// the 1.0s top default bucket). httpRequests carries the per-route
+// request — e.g. a body drain riding out main.go's requestReadTimeout — lands
+// past the 1.0s top default bucket). httpRequests carries the per-route
 // request/status split; per-route LATENCY is deliberately not derivable from
 // this pair, and a route label should be added here if that question ever
 // becomes real.

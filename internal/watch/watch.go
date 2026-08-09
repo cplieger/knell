@@ -1384,7 +1384,7 @@ func collectBeatDue(id string, st *beatState, now time.Time) (live *overdueBeat,
 // the record again (gocritic hugeParam).
 //
 // A real failure also blames delivery for the record it left queued
-// (markMissingUndelivered): the alert for this outage was attempted and
+// (markUndelivered): the alert for this outage was attempted and
 // refused, so if a ping ends the outage before the retry lands, the past-tense
 // notice must point at the webhook instead of at this observer's scheduling.
 // Cancellation is exempt, exactly as it is in sendHistory: a shutdown is not a
@@ -1398,7 +1398,7 @@ func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 			return true
 		}
 		metrics.RecordNotificationFailed(metrics.KindMissing)
-		w.markMissingUndelivered(beat.id)
+		w.markUndelivered(beat.id, 1)
 		slog.Error("missing notification failed, will retry next sweep",
 			"beat", beat.id, "silence", beat.silence.DownFor().String(), "error", err,
 			"retryable", true)
@@ -1423,7 +1423,7 @@ func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 // already moved once per outage at detection.
 //
 // A real failure also rewrites the late reason of the records it left queued
-// (markHistoryUndelivered): they are now late because this notice's own
+// (markUndelivered): they are now late because this notice's own
 // delivery failed, so the retry must not still claim nothing was wrong with
 // delivery. Cancellation is exempt from that as well as from the counter: a
 // shutdown is not a delivery failure, so the queued records keep their
@@ -1436,7 +1436,7 @@ func (w *Watcher) sendHistory(ctx context.Context, past beatOutages) bool {
 			return true
 		}
 		metrics.RecordNotificationFailed(metrics.KindHistory)
-		w.markHistoryUndelivered(past.id, len(past.outages))
+		w.markUndelivered(past.id, len(past.outages))
 		slog.Error("outage history notification failed, will retry next sweep",
 			"beat", past.id, "outages", len(past.outages), "error", err,
 			"retryable", true)
@@ -1460,29 +1460,21 @@ func (w *Watcher) dropDelivered(id string, n int) {
 	w.beats[id].dropMissing(n)
 }
 
-// markHistoryUndelivered blames delivery for the n head records a FAILED
-// history notice left queued, so the retry reports the true reason it is late
-// (see beatState.blameDelivery). The n records it rewrites are exactly the ones
-// the failed notice covered, for the reason dropDelivered gives. A record
-// queued after the failed send keeps its own reason — this notice never tried
-// to deliver it.
-func (w *Watcher) markHistoryUndelivered(id string, n int) {
+// markUndelivered blames delivery for the n head records whose own notice was
+// just attempted and refused, so the retry reports the true reason it is late
+// (see beatState.blameDelivery). n is exactly the records that notice covered:
+// 1 for a live missing notice — the head, which is still the record the sweep
+// copied, because only the sender pops and a concurrent ping can only seal that
+// record or append behind it — and len(outages) for a history notice, for the
+// reason dropDelivered gives. A record queued after the failed send keeps its
+// own reason: that notice never tried to deliver it. Without this, an outage
+// whose alert the webhook refused and which a ping then ended would be reported
+// as merely deferred, telling the operator nothing was attempted for a notice
+// this very webhook had already turned down.
+func (w *Watcher) markUndelivered(id string, n int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.beats[id].blameDelivery(n)
-}
-
-// markMissingUndelivered blames delivery for the ONE queued record whose live
-// missing notice was just attempted and refused: the head, which is still the
-// record the sweep copied because only the sender pops and a concurrent ping can
-// only seal that record or append behind it. Without this, an outage whose live
-// alert the webhook refused and which a ping then ended would be reported as
-// merely deferred — telling the operator nothing was attempted for a notice this
-// very webhook had already turned down.
-func (w *Watcher) markMissingUndelivered(id string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.beats[id].blameDelivery(1)
 }
 
 // markDelivered records the outcome of a delivered missing send for id. It

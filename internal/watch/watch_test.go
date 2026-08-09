@@ -510,7 +510,7 @@ func TestFailedMissingStillDeliversAfterBeatRecovers(t *testing.T) {
 	checkSpans(t, outages, 11*time.Minute)
 	// A sweep raised this outage and the send FAILED, which is the one reason
 	// that may point an operator at the webhook: sendMissing blames delivery for
-	// the record it left queued (markMissingUndelivered), so the past-tense
+	// the record it left queued (markUndelivered), so the past-tense
 	// notice reports a refused delivery rather than this observer's scheduling.
 	checkLateReasons(t, outages, LateUndelivered)
 }

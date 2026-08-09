@@ -353,6 +353,42 @@ func TestRecordHTTPRecordsBothTheCounterAndTheDuration(t *testing.T) {
 	}
 }
 
+// TestRecordBeatPublishesLastSeenInWholeUnixSeconds pins the UNIT of the
+// per-beat last-seen sample. The series is named _timestamp_seconds and two
+// documented operator computations read it as Unix seconds: adding
+// beat_deadline_seconds to it to learn when an overdue beat fires, and
+// reconstructing the window of an outage whose record a full queue discarded.
+// A RecordBeat that published milliseconds, nanoseconds or a fractional second
+// leaves both of those silently wrong while every existing assertion stays
+// green: internal/watch's ping test only checks the sample MOVED off the boot
+// baseline, internal/webapi's asserts a refused ping left it UNCHANGED, and the
+// exact-value assertions in this file cover InitBeat's baseline rather than
+// RecordBeat's ping.
+func TestRecordBeatPublishesLastSeenInWholeUnixSeconds(t *testing.T) {
+	const id = "record-beat-unit-probe"
+	// The registry is a package-level singleton that outlives one iteration, so
+	// the probe series must not survive into the next `go test -count=2` run.
+	t.Cleanup(func() {
+		beatLastSeen.Delete(id)
+		beatsReceived.Delete(id)
+	})
+	if got, ok := beatSeriesValue(t, "knell_beat_last_seen_timestamp_seconds", id); ok {
+		t.Fatalf("knell_beat_last_seen_timestamp_seconds{beat=%q} = %s before RecordBeat: the probe id is not unique to this test, so it cannot pin the published sample", id, got)
+	}
+
+	// A ping with a sub-second component, so the assertion also fails for a
+	// fractional-seconds rendering, not only for a wrong-magnitude unit.
+	RecordBeat(id, time.Unix(1700000123, 456000000))
+
+	got, ok := beatSeriesValue(t, "knell_beat_last_seen_timestamp_seconds", id)
+	if !ok {
+		t.Fatal("knell_beat_last_seen_timestamp_seconds is absent after an accepted ping: the operator has no window to reconstruct after a dropped notice, and no way to compute when the beat fires")
+	}
+	if got != "1700000123" {
+		t.Errorf("knell_beat_last_seen_timestamp_seconds{beat=%q} = %s, want 1700000123: the series is named _seconds and the operator adds beat_deadline_seconds to it to learn when an overdue beat fires, so a sample in any other unit leaves that computation and the dropped-record reconstruction wrong with nothing failing", id, got)
+	}
+}
+
 // rawSeriesValue returns the rendered value of the first exposition line
 // starting with prefix, and whether one was present. It is the general form:
 // beatSeriesValue is this function with a beat-label prefix, and the unlabelled

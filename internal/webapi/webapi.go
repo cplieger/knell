@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 
@@ -64,8 +65,9 @@ type Beater interface {
 
 // Deps carries what the composition root supplies and webapi cannot reach on
 // its own: the liveness handler (built over main's health.Marker), the Host
-// allowlist, and the beat credential. They are named rather than positional
-// because the three are otherwise indistinguishable at a call site. The
+// allowlist, the beat credential, and the trusted-proxy set client_ip is
+// resolved against. They are named rather than positional because the four are
+// otherwise indistinguishable at a call site. The
 // Prometheus exposition is deliberately absent: webapi already imports
 // internal/metrics for the route-metric hook, so it serves metrics.Handler()
 // itself rather than having the same dependency injected a second way.
@@ -92,10 +94,18 @@ type Deps struct {
 	// BeatToken is the REQUIRED bearer credential for POST /beat/{id} and the
 	// endpoint's only gate (internal/config refuses to start without it). An
 	// empty value is a wiring bug rather than a mode: the gate then fails
-	// CLOSED and every ping is refused. Last because a string's length word is
-	// not a pointer, which keeps the struct's pointer-scanned prefix at 32
-	// bytes (govet fieldalignment).
+	// CLOSED and every ping is refused.
 	BeatToken string
+	// TrustedProxies is the reverse-proxy CIDR set client_ip is resolved
+	// against (TRUSTED_PROXIES). Empty means no X-Forwarded-For is honored,
+	// which is the spoof-proof default and correct for a directly published
+	// port; behind the TLS proxy the README requires, an empty set makes every
+	// access line name the proxy instead of the sender.
+	//
+	// Last because a slice's length and capacity words are not pointers, which
+	// keeps the struct's pointer-scanned prefix at 48 bytes (govet
+	// fieldalignment); it is the widest non-pointer tail of the four fields.
+	TrustedProxies []*net.IPNet
 }
 
 // New assembles the routed and middleware-wrapped root handler.
@@ -225,21 +235,22 @@ func New(b Beater, deps Deps) http.Handler {
 		webhttp.Logging(
 			webhttp.ProbeLogLevel("/healthz", "/metrics"),
 			webhttp.WithMaxLoggedPath(loggedPathCap),
-			// WithClientIP with NO trusted ranges, the spoof-proof default: it
-			// logs the immediate socket peer, which is the sender in every
-			// documented deployment (the compose example publishes the port
-			// directly and nothing terminates in front of it). Without it the
+			// WithClientIP with the operator's trusted ranges, EMPTY unless
+			// TRUSTED_PROXIES is set: with none it logs the immediate socket
+			// peer, the spoof-proof default and the sender in a deployment that
+			// publishes the port directly (as the compose example does, with
+			// nothing terminating in front of it). Without it the
 			// 401 lines a token-guessing run writes name no source at all, so
 			// the one credential gating this endpoint can be attacked with no
 			// attributable trace and no address for an operator to block.
-			// Behind a reverse proxy the operator passes that proxy's CIDRs
-			// (webhttp.ParseCIDRs) so a trusted X-Forwarded-For resolves the
-			// real client; trusting a forwarded header with no proxy in front of
+			// Behind a reverse proxy the operator sets TRUSTED_PROXIES to that
+			// proxy's CIDRs so a trusted X-Forwarded-For resolves the real
+			// client; trusting a forwarded header with no proxy in front of
 			// it is how the field becomes spoofable, so it is deliberately not
 			// done speculatively. The attribute name is the fleet's client_ip,
 			// so a shared Loki query over every webhttp consumer's access lines
 			// includes knell.
-			webhttp.WithClientIP(),
+			webhttp.WithClientIP(deps.TrustedProxies...),
 			webhttp.WithRecordRouteMetric(metrics.RecordHTTP),
 		),
 		webhttp.Recoverer(),
