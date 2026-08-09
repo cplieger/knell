@@ -1,0 +1,34 @@
+# punused findings adjudicated as false positives. One literal substring per
+# line, matched against punused's output line; full-line `#` comments carry the
+# reason. Invalid-by-construction classes: `.kiro/steering/tools.md`.
+#
+# Both error types are constructed in non-test code in internal/notify/discord.go
+# -- transportError by safeTransportError on every client.Do failure, and
+# webhookCredentialError on the 401/403 branch of deliveryError -- and both flow
+# out as `error` through post -> httpx.Do -> watch. So every use is interface
+# dispatch or a stdlib errors.* traversal, which punused cannot see
+# (bep/punused#3).
+#
+# Error() satisfies the builtin error interface; the text surfaces through
+# httpx.Do's per-attempt logging and watch's failure lines.
+method (transportError).Error
+method (*webhookCredentialError).Error
+#
+# transportError.Unwrap is decision-changing, not decorative: watch's
+# sendMissing/sendHistory/sendRecovered test errors.Is(err, context.Canceled),
+# and Error() renders only the phrase, so the cause is reachable ONLY through
+# Unwrap. Without it a shutdown-abandoned send is misread as a delivery failure,
+# moving the notification counters and logging an error on every shutdown.
+# httpx's retry classifier also reads the chain for net.Error / ECONNRESET /
+# ECONNREFUSED / DNSError, so dropping Unwrap would silently disable per-attempt
+# retry of transport failures.
+method (transportError).Unwrap
+#
+# webhookCredentialError.Unwrap is invoked by non-test code (httpx.IsTransient's
+# errors.As, LogSafeError's errors.As, watch's errors.Is) and upholds the
+# documented chain contract, though no non-test consumer's verdict currently
+# depends on what it exposes: CheckHTTPStatus already returns *AuthError for
+# 401/403 and IsTransient answers false either way. Kept because a wrapper that
+# hides its cause is a latent correctness bug, and the fuzz oracle
+# assertTypedStatusError pins the chain.
+method (*webhookCredentialError).Unwrap

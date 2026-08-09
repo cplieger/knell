@@ -7,8 +7,11 @@ services:
 
     environment:
       BEATS: "cron-backup:26h,pipeline-watchdog:20m"  # id:deadline list, see README
-      DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/..."  # where the bell rings
+      DISCORD_WEBHOOK_URL: "https://discord.com/"  # invalid placeholder; replace with the full Discord webhook URL
+      BEAT_TOKEN: "CHANGEME"  # invalid placeholder; replace with: openssl rand -hex 16
       NODE_NAME: "server-1"  # names this observer in notifications
 
     ports:
+      # /metrics is unauthenticated and enumerates beats; set ALLOWED_HOSTS
+      # and restrict exposure -- see README "Configuration reference".
       - "9190:9190"

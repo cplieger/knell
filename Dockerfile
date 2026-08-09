@@ -12,9 +12,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /knell .
 
-# Directory skeleton for the scratch stage: /tmp for the health marker
-# (world-writable + sticky so any runtime uid works).
-RUN mkdir -p /outfs/tmp && chmod 1777 /outfs/tmp
+# Directory skeleton for the scratch stage: /tmp for the health marker. The
+# mode is deliberately NOT set here: COPY recreates the destination directory
+# and takes its mode from --chmod below, never from this source dir.
+RUN mkdir -p /outfs/tmp
 
 FROM scratch
 
@@ -25,7 +26,7 @@ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifi
 # (observed on Docker 24 / DSM) then make /tmp unwritable for the nonroot
 # user even when the compose tmpfs says mode=1777. Bake the 1777.
 COPY --from=builder --chmod=1777 /outfs/tmp /tmp
-COPY --chmod=755 --from=builder /knell /knell
+COPY --from=builder --chmod=755 /knell /knell
 
 # Non-root numeric uid:gid (scratch has no /etc/passwd). knell binds a high
 # port and writes only its /tmp health marker, so it never needs root.
