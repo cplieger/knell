@@ -988,9 +988,9 @@ func TestFailedAuthIsThrottledInAggregate(t *testing.T) {
 // TRUE for every rejected method. The method-agnostic /beat/{id} route is the
 // reason they all share one response: it catches GET, HEAD and every other
 // non-POST verb and answers this file's coded 405 with Allow: POST. Without it
-// they would fall to net/http's built-in 405, whose plain-text body carries no
-// code a sender can parse and whose Allow is assembled from the registered
-// patterns. A GET or HEAD that recorded a ping would keep the switch armed with
+// net/http answers instead, with whatever it synthesizes from the remaining
+// patterns, and none of those shapes carries a code a sender can parse. A GET
+// or HEAD that recorded a ping would keep the switch armed with
 // no heartbeat behind it, so a prober reading Allow must never be steered at
 // them.
 func TestEveryRejectedMethodAnswersTheSameRefusal(t *testing.T) {
@@ -1002,8 +1002,8 @@ func TestEveryRejectedMethodAnswersTheSameRefusal(t *testing.T) {
 		// r.URL.Host, so it reaches the method-agnostic route without the
 		// cleaning pass. It must still answer the same coded 405 with a
 		// truthful Allow — a CONNECT routed to the POST pattern would
-		// RECORD a ping, and net/http's built-in 405 would answer an
-		// uncoded plain-text body.
+		// RECORD a ping, and with no method-agnostic route the answer
+		// would come from net/http, uncoded.
 		http.MethodConnect, "WHATEVER",
 	} {
 		t.Run(method, func(t *testing.T) {

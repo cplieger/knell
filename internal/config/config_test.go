@@ -915,6 +915,9 @@ func TestLoadTrustedProxiesDegradesRestrictively(t *testing.T) {
 				}
 				return
 			}
+			if got := rec.CountLevel(slog.LevelWarn, "TRUSTED_PROXIES entries ignored"); got != 1 {
+				t.Errorf("the dropped-entry line was logged at WARN %d times, want 1 (records %v); at DEBUG it is out of the log at knell's default LOG_LEVEL, so the operator never learns which proxy stopped being trusted", got, rec.Records())
+			}
 			if !rec.AttrContains("TRUSTED_PROXIES", "ignored", tt.wantDropped) {
 				t.Errorf("warning %v never names the dropped entry %q; the startup line reports only a COUNT, so this warning is the only place an operator learns WHICH proxy is not trusted", rec.Records(), tt.wantDropped)
 			}

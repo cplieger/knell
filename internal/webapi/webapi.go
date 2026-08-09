@@ -142,9 +142,10 @@ func New(b Beater, deps Deps) http.Handler {
 	mux.HandleFunc(beatRoutePattern, beatHandler(b, verifier))
 	// Every OTHER method -- GET and HEAD included, along with PUT, DELETE,
 	// PATCH, OPTIONS and an unknown verb -- is refused HERE, by this one
-	// method-agnostic pattern. Without it they would fall to net/http's
-	// built-in 405, which writes a plain-text body instead of this file's coded
-	// envelope and assembles Allow from the registered patterns. The pattern is
+	// method-agnostic pattern: it is the ONLY registration that answers them,
+	// so this file's coded envelope and its truthful Allow: POST reach them
+	// only as long as it exists. Delete it and net/http answers instead,
+	// with whatever it synthesizes from the remaining patterns. The pattern is
 	// less specific than the method-bearing POST one, so a real ping still
 	// routes above.
 	mux.HandleFunc("/beat/{id}", writeMethodNotAllowed)
