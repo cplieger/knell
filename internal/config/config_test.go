@@ -849,8 +849,10 @@ func TestAllowedHostsGate(t *testing.T) {
 				}
 				return
 			}
-			if !rec.Contains(tt.wantWarn) {
-				t.Errorf("log output %v never says %q; an allowlist knell could not use is invisible otherwise - every non-loopback ping 403s and one deadline later every beat posts a false MISSING notice", rec.Messages(), tt.wantWarn)
+			gotAny := rec.Count(tt.wantWarn)
+			gotWarn := rec.CountLevel(slog.LevelWarn, tt.wantWarn)
+			if gotAny != 1 || gotWarn != 1 {
+				t.Errorf("log output %v: records saying %q = %d, WARN records = %d, want exactly 1 of each; below WARN the line is out of the log at the default LOG_LEVEL, so an allowlist knell could not use is invisible - every non-loopback ping 403s and one deadline later every beat posts a false MISSING notice", rec.Records(), tt.wantWarn, gotAny, gotWarn)
 			}
 		})
 	}
