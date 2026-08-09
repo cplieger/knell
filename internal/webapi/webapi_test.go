@@ -985,13 +985,14 @@ func TestFailedAuthIsThrottledInAggregate(t *testing.T) {
 }
 
 // TestEveryRejectedMethodAnswersTheSameRefusal pins that the Allow header is
-// TRUE for every rejected method. Without the method-agnostic /beat/{id} route,
-// PUT/DELETE/PATCH/OPTIONS fall to net/http's built-in 405, which assembles
-// Allow from the registered patterns and so answers "GET, HEAD, POST" —
-// advertising as permitted the two methods this file registers routes for in
-// order to REFUSE (a GET or HEAD that recorded a ping would keep the switch
-// armed with no heartbeat behind it). A prober that discovers methods from Allow
-// would be steered straight at them.
+// TRUE for every rejected method. The method-agnostic /beat/{id} route is the
+// reason they all share one response: it catches GET, HEAD and every other
+// non-POST verb and answers this file's coded 405 with Allow: POST. Without it
+// they would fall to net/http's built-in 405, whose plain-text body carries no
+// code a sender can parse and whose Allow is assembled from the registered
+// patterns. A GET or HEAD that recorded a ping would keep the switch armed with
+// no heartbeat behind it, so a prober reading Allow must never be steered at
+// them.
 func TestEveryRejectedMethodAnswersTheSameRefusal(t *testing.T) {
 	for _, method := range []string{
 		http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete,
@@ -1001,7 +1002,8 @@ func TestEveryRejectedMethodAnswersTheSameRefusal(t *testing.T) {
 		// r.URL.Host, so it reaches the method-agnostic route without the
 		// cleaning pass. It must still answer the same coded 405 with a
 		// truthful Allow — a CONNECT routed to the POST pattern would
-		// RECORD a ping, and net/http's built-in 405 would advertise GET.
+		// RECORD a ping, and net/http's built-in 405 would answer an
+		// uncoded plain-text body.
 		http.MethodConnect, "WHATEVER",
 	} {
 		t.Run(method, func(t *testing.T) {

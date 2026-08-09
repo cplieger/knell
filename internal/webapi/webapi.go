@@ -130,25 +130,23 @@ type Deps struct {
 // included (see Deps.Hosts).
 func New(b Beater, deps Deps) http.Handler {
 	mux := http.NewServeMux()
-	// POST is the ONLY method that records. GET and HEAD are registered
-	// explicitly to REFUSE, for the same reason: a recording GET is reachable
-	// from anything that fetches a URL without being asked to — a chat client's
-	// link preview, a crawler, an <img> on a page an operator opens — and such a
-	// fetch would re-arm the switch with no heartbeat behind it. Registering
-	// them also overrides net/http's rule that a GET pattern matches HEAD, so
-	// neither can ever fall through to the recorder. Do not delete either as
-	// redundant boilerplate.
+	// POST is the ONLY method that records, and beatRoutePattern is the ONLY
+	// method-bearing /beat/{id} pattern registered. That matters because a
+	// recording GET is reachable from anything that fetches a URL without being
+	// asked to — a chat client's link preview, a crawler, an <img> on a page an
+	// operator opens — and such a fetch would re-arm the switch with no
+	// heartbeat behind it. net/http's rule that a GET pattern also matches HEAD
+	// has no GET pattern to apply to here, and it cannot route either method to
+	// a POST pattern, so neither can reach the recorder.
 	verifier := beatTokenVerifier(deps.BeatToken)
 	mux.HandleFunc(beatRoutePattern, beatHandler(b, verifier))
-	mux.HandleFunc("GET /beat/{id}", writeMethodNotAllowed)
-	mux.HandleFunc("HEAD /beat/{id}", writeMethodNotAllowed)
-	// Every OTHER method (PUT, DELETE, PATCH, OPTIONS, an unknown verb) would
-	// otherwise fall to net/http's built-in 405, which assembles Allow from the
-	// registered patterns and so answers "GET, HEAD, POST" -- advertising as
-	// permitted the two methods the routes above exist to refuse -- with a
-	// plain-text body instead of this file's coded envelope. The
-	// method-agnostic pattern is less specific than the three method-bearing
-	// ones, so GET, POST and HEAD still route above.
+	// Every OTHER method -- GET and HEAD included, along with PUT, DELETE,
+	// PATCH, OPTIONS and an unknown verb -- is refused HERE, by this one
+	// method-agnostic pattern. Without it they would fall to net/http's
+	// built-in 405, which writes a plain-text body instead of this file's coded
+	// envelope and assembles Allow from the registered patterns. The pattern is
+	// less specific than the method-bearing POST one, so a real ping still
+	// routes above.
 	mux.HandleFunc("/beat/{id}", writeMethodNotAllowed)
 	// A /beat path that names no configured beat answers this file's coded 404
 	// rather than net/http's plain-text one. /beat is the bare prefix a sender
@@ -161,7 +159,7 @@ func New(b Beater, deps Deps) http.Handler {
 	// the one refusal class that means "this beat is never being pinged" cannot
 	// be told apart from a port scan. Three patterns rather than one /beat/
 	// subtree so the path label still says WHICH shape arrived. All three are
-	// less specific than the four /beat/{id} patterns above, so a real ping
+	// less specific than the two /beat/{id} patterns above, so a real ping
 	// still routes there.
 	//
 	// The bare /beat carries a reason of its own. Without an exact pattern for
@@ -342,12 +340,12 @@ func inBeatNamespace(p string) bool {
 //
 // webhttp.SetAllow renders the Allow field, and knell keeps its own message and
 // its own writer rather than webhttp.RequireMethod: RequireMethod guards ONE
-// handler from inside, while this refusal is the handler four routes are
-// registered to, and webhttp.MethodNotAllowed would write the library's generic
-// "method not allowed" body where this one names the method a sender should use
-// instead. GET and HEAD are deliberately absent from the Allow set even though
-// ServeMux would serve them -- New registers both to refuse them, so
-// advertising either would contradict the refusal.
+// handler from inside, while this refusal is what New's method-agnostic
+// /beat/{id} route is registered to, and webhttp.MethodNotAllowed would write
+// the library's generic "method not allowed" body where this one names the
+// method a sender should use instead. GET and HEAD are deliberately absent from
+// the Allow set: neither records a beat, and that route sends both here to be
+// refused, so advertising either would contradict the refusal.
 func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 	webhttp.SetAllow(w, http.MethodPost)
 	webhttp.WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed",
@@ -365,16 +363,6 @@ func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 // produces.
 func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
 	webhttp.WriteError(w, r, http.StatusNotFound, "unknown_beat", "unknown beat id")
-}
-
-// writeShuttingDown refuses a beat because admission is closed: 503 in this
-// file's standard coded envelope. It names no beat id — not even an unknown one
-// — so the refusal leaks as little as the 404 path does about which ids are
-// configured. One caller, the watcher's authoritative BeatClosed outcome, since
-// admission has one owner (see New).
-func writeShuttingDown(w http.ResponseWriter, r *http.Request) {
-	webhttp.WriteError(w, r, http.StatusServiceUnavailable, "shutting_down",
-		"knell is shutting down and is no longer accepting beats")
 }
 
 // drainBeatBody drains the deliberately ignored ping payload so keep-alive
@@ -607,8 +595,11 @@ func beatRecorder(b Beater) http.HandlerFunc {
 		switch b.Beat(id) {
 		case watch.BeatClosed:
 			// The watcher closed admission: nothing was recorded, so the
-			// sender must not be told 200.
-			writeShuttingDown(w, r)
+			// sender must not be told 200. The refusal names no beat id — not
+			// even an unknown one — so it leaks as little as the 404 path does
+			// about which ids are configured.
+			webhttp.WriteError(w, r, http.StatusServiceUnavailable, "shutting_down",
+				"knell is shutting down and is no longer accepting beats")
 		case watch.BeatUnknown:
 			writeUnknownBeat(w, r)
 		case watch.BeatRecorded:
