@@ -438,8 +438,9 @@ func presentsValidBeatToken(verifier webhttp.StaticTokenVerifier, r *http.Reques
 //
 // The deliberate over-inclusion survives: for a path ServeMux would rewrite,
 // Handler returns a redirect handler together with the pattern that would match
-// after cleaning, so a non-canonical spelling still draws a token (and is then
-// refused 404 by canonicalBeatPath). Over-inclusion is harmless;
+// after cleaning, so a non-canonical spelling still draws a token -- and is
+// then refused 404 by canonicalBeatPath, or 429 here when the bucket is already
+// empty, since the throttle is mounted outside it. Over-inclusion is harmless;
 // under-inclusion is a bypass.
 func failedBeatAuth(mux *http.ServeMux, verifier webhttp.StaticTokenVerifier, r *http.Request) bool {
 	_, pattern := mux.Handler(r)
