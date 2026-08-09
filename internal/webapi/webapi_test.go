@@ -1933,6 +1933,64 @@ func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 	}
 }
 
+// TestAccessLogClientIPResolvesOnlyThroughTrustedProxies pins the wiring of
+// Deps.TrustedProxies into webhttp.WithClientIP. internal/config pins
+// TRUSTED_PROXIES parsing and webhttp pins ClientIP's spoof model, so neither can
+// catch a Deps field that never reaches the option: an operator's TRUSTED_PROXIES
+// would then be parsed, reported as trusted_proxies=1 at startup, and silently
+// ignored, leaving every access line — including the 401s a token-guessing run
+// writes past the throttle — naming the proxy instead of an address an operator
+// can block. Losing the variadic expansion (or the field on the composition
+// root's Deps literal) is a one-character edit that nothing else in the module
+// fails on.
+//
+// Both halves matter: the trusted half proves the set REACHES the option, the
+// empty half pins the spoof-proof default an unset TRUSTED_PROXIES has to keep.
+// Deliberately at the webapi level rather than in main_lifecycle_test.go, where
+// the other Deps fields are pinned: their oracles are HTTP-observable (200/401/
+// 403), while client_ip is observable only in the access line, and run() calls
+// slogx.Setup, which replaces the capture a lifecycle test installs.
+func TestAccessLogClientIPResolvesOnlyThroughTrustedProxies(t *testing.T) {
+	// Serial (no t.Parallel): capture.Default swaps the process-global slog
+	// default, and must be installed BEFORE New, because webhttp.Logging
+	// resolves slog.Default() when the chain is built.
+	logs := capture.Default(t)
+
+	trusted, invalid := webhttp.ParseCIDRs([]string{"192.0.2.0/24"})
+	if len(invalid) > 0 {
+		t.Fatalf("ParseCIDRs rejected %v; the fixture must be a valid trusted-proxy set", invalid)
+	}
+	b := &fakeBeater{known: map[string]bool{"api": true}}
+	h := New(b, Deps{Healthz: staticHealthz(http.StatusOK), BeatToken: testBeatToken, TrustedProxies: trusted})
+
+	// httptest.NewRequest's RemoteAddr is 192.0.2.1:1234, inside the set above,
+	// so the forwarded header is a trusted proxy's own report of the sender.
+	req := newBeatRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	proxied := httptest.NewRecorder()
+	h.ServeHTTP(proxied, req)
+	if proxied.Code != http.StatusOK {
+		t.Fatalf("proxied ping = %d, want 200: the fixture must reach the access log through a recorded beat (body %s)", proxied.Code, proxied.Body.String())
+	}
+	if !logs.HasAttr("http", "client_ip", "203.0.113.7") {
+		t.Errorf("access line does not resolve client_ip through the trusted proxy's X-Forwarded-For: an unwired Deps.TrustedProxies leaves every proxied access line naming the proxy; records = %v", logs.Records())
+	}
+
+	// The same request with NO trusted set must report the socket peer.
+	bare := capture.Default(t)
+	plain := New(b, Deps{Healthz: staticHealthz(http.StatusOK), BeatToken: testBeatToken})
+	spoofed := newBeatRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
+	spoofed.Header.Set("X-Forwarded-For", "203.0.113.7")
+	plain.ServeHTTP(httptest.NewRecorder(), spoofed)
+
+	if !bare.HasAttr("http", "client_ip", "192.0.2.1") {
+		t.Errorf("access line with no trusted set does not report the socket peer; records = %v", bare.Records())
+	}
+	if bare.HasAttr("http", "client_ip", "203.0.113.7") {
+		t.Errorf("access line honors X-Forwarded-For with no trusted proxies: any caller can then choose the address knell attributes its 401s to; records = %v", bare.Records())
+	}
+}
+
 // The label and marker vocabulary webhttp produces, restated here because these
 // tests assert on the exposition and the access line an operator reads. The
 // library exports the derivation (RouteMetricLabels), not the strings, so if a

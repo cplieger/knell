@@ -44,6 +44,7 @@ func TestMain(m *testing.M) {
 		"LISTEN_ADDR",
 		"LOG_LEVEL",
 		"NODE_NAME",
+		"TRUSTED_PROXIES",
 	} {
 		if err := os.Unsetenv(key); err != nil {
 			panic(err)
@@ -850,6 +851,72 @@ func TestAllowedHostsGate(t *testing.T) {
 			}
 			if !rec.Contains(tt.wantWarn) {
 				t.Errorf("log output %v never says %q; an allowlist knell could not use is invisible otherwise - every non-loopback ping 403s and one deadline later every beat posts a false MISSING notice", rec.Messages(), tt.wantWarn)
+			}
+		})
+	}
+}
+
+// TestLoadTrustedProxiesDegradesRestrictively pins the TRUSTED_PROXIES contract,
+// and pins it through Load rather than through trustedProxies directly so the
+// assignment in Load is covered by the same table: a table over the parser alone
+// stays green if Load stops assigning the field, and the only other oracle on it
+// (TestConfigLogValueReportsEveryNonSecretField) builds Config by hand and never
+// runs the loader.
+//
+// The SAFE-DEFAULT half: unset, blank and all-entries-invalid must each yield an
+// EMPTY set, because that is what makes webapi's
+// webhttp.WithClientIP(cfg.TrustedProxies...) expand to the zero-argument call it
+// made before the variable existed — no forwarded header honored, client_ip on
+// the socket peer. The DIRECTION half: a malformed entry is warned about and
+// DROPPED rather than failing startup, which is legal only because dropping one
+// NARROWS whose X-Forwarded-For is believed (env-validation.md, "Restriction
+// LISTS"); a fallback that trusted everything when the value did not parse would
+// make client_ip spoofable with nothing failing. Contrast TestAllowedHostsGate,
+// where a dropped entry would refuse a caller the operator meant to admit, so
+// that list refuses startup instead.
+func TestLoadTrustedProxiesDegradesRestrictively(t *testing.T) {
+	tests := map[string]struct {
+		raw         string
+		set         bool
+		wantCount   int
+		wantDropped string
+	}{
+		"unset honors no forwarded header":    {},
+		"blank honors no forwarded header":    {set: true},
+		"padded blank honors none":            {set: true, raw: "   "},
+		"a CIDR and a bare IP both parse":     {set: true, raw: "10.0.0.0/24,192.168.1.5", wantCount: 2},
+		"spaces around entries are tolerated": {set: true, raw: " 10.0.0.0/24 , 192.168.1.5 ", wantCount: 2},
+		"one malformed entry is dropped":      {set: true, raw: "10.0.0.0/24,not-an-ip", wantCount: 1, wantDropped: "not-an-ip"},
+		"all malformed leaves the set empty":  {set: true, raw: "not-an-ip", wantDropped: "not-an-ip"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Serial (no t.Parallel): capture.Default swaps the process-global
+			// slog default, and t.Setenv forbids parallel tests anyway.
+			setValidLoadEnv(t)
+			if tt.set {
+				t.Setenv("TRUSTED_PROXIES", tt.raw)
+			} else {
+				unsetEnv(t, "TRUSTED_PROXIES")
+			}
+
+			rec := capture.Default(t)
+
+			cfg, err := Load(maxNodeNameBytes)
+			if err != nil {
+				t.Fatalf("Load() with TRUSTED_PROXIES=%q error = %v, want nil: a malformed restriction list degrades, it does not refuse startup", tt.raw, err)
+			}
+			if len(cfg.TrustedProxies) != tt.wantCount {
+				t.Errorf("cfg.TrustedProxies holds %d ranges %v, want %d: webapi spreads this field into webhttp.WithClientIP, so a range lost here is a proxy whose X-Forwarded-For stops being believed, and one gained is a caller that can choose the client_ip knell attributes its 401s to", len(cfg.TrustedProxies), cfg.TrustedProxies, tt.wantCount)
+			}
+			if tt.wantDropped == "" {
+				if rec.Contains("TRUSTED_PROXIES") {
+					t.Errorf("log output %v warns about TRUSTED_PROXIES for a usable configuration; a warning on the documented default trains operators to ignore the ones that matter", rec.Messages())
+				}
+				return
+			}
+			if !rec.AttrContains("TRUSTED_PROXIES", "ignored", tt.wantDropped) {
+				t.Errorf("warning %v never names the dropped entry %q; the startup line reports only a COUNT, so this warning is the only place an operator learns WHICH proxy is not trusted", rec.Records(), tt.wantDropped)
 			}
 		})
 	}
@@ -1913,7 +1980,7 @@ func TestConfigLogValueReportsTheBeatTokenSource(t *testing.T) {
 // TestConfigLogValueReportsEveryNonSecretField pins the accuracy half of
 // LogValue's contract; TestConfigLogValueNeverRendersASecret
 // pins the hygiene half. LogValue exists so a call site can hand a whole
-// Config to slog, and those seven attrs are then the entire rendering of a
+// Config to slog, and those attrs are then the entire rendering of a
 // configuration that is env-only, with no reload and no readback endpoint.
 // Every value below differs from any plausible default and from every sibling
 // field, so an attr rewired to a literal or to the wrong field fails here

@@ -28,11 +28,11 @@
 //     [A-Za-z0-9][A-Za-z0-9_-]{0,63} and caps a fleet at 64 beats;
 //   - internal/watch passes only ids from that configured set (New's beat map
 //     is the whole domain of every call it makes);
-//   - internal/webapi does NOT filter the id: it hands the raw /beat/{id}
-//     path segment straight to watch.Beat and answers 404 from the
-//     BeatUnknown outcome that call returns. So the w.beats[id] lookup
-//     inside watch.Beat is the boundary an attacker-chosen path segment
-//     stops at, and nothing upstream of watch inspects the id at all
+//   - internal/webapi does not constrain the id's CONTENT: it hands the raw
+//     /beat/{id} path segment straight to watch.Beat and answers 404 from the
+//     BeatUnknown outcome that call returns. So the w.beats[id] lookup inside
+//     watch.Beat is the only check on the id itself, and a segment reaches it
+//     only from a caller that passed beatHandler's BEAT_TOKEN gate
 //     (internal/watch/watch_metrics_test.go pins that an unconfigured id
 //     mints no series).
 //

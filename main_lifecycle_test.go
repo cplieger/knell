@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -554,6 +556,138 @@ func TestRunAppliesConfiguredHostAllowlist(t *testing.T) {
 		t.Fatalf("signalling self: %v", err)
 	}
 	r.waitForReturn(t, 10*time.Second, "after a shutdown signal")
+}
+
+// TestRunResolvesClientIPThroughConfiguredTrustedProxies pins the last of main's
+// four Deps fields, for the reason its three siblings above are pinned: the
+// config suite pins env-to-CIDR parsing and the webapi suite receives the set as
+// an argument, so neither can catch a composition root that drops the field.
+// Dropped, an operator's TRUSTED_PROXIES is still parsed and still reported as
+// trusted_proxies=1 in the startup line, while every access line — including the
+// 401s a token-guessing run writes past the throttle — keeps naming the proxy
+// instead of an address an operator can block.
+//
+// It reads the access LINE rather than an HTTP status because client_ip has no
+// other observable: unlike the allowlist's 403 and the token gate's 401, nothing
+// in a response carries it. The capture prepareLifecycleRun installs cannot serve
+// here either, since run() calls slogx.Setup and replaces it — hence
+// captureRunLog, which redirects the writer slogx.Setup resolves instead of the
+// handler it installs.
+func TestRunResolvesClientIPThroughConfiguredTrustedProxies(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, a process-global slog default and
+	// os.Stderr, a process-wide signal, and the shared health-marker path.
+	//
+	// A beat id no other test in this package pings, since the metrics registry
+	// is a package-level singleton shared by the whole test binary.
+	const beat = "client-ip"
+	addr := prepareLifecycleRun(t, beat)
+	// Loopback, because that is what the socket peer of the request below is:
+	// the trusted set has to contain the PEER for a forwarded header to be
+	// consulted at all. Every other lifecycle boot leaves the variable unset.
+	t.Setenv("TRUSTED_PROXIES", "127.0.0.0/8")
+	// Installed before the boot: slogx.Setup resolves its output writer when
+	// run() calls it, so a later swap would not be seen.
+	logs := captureRunLog(t)
+
+	r := startLifecycleRun(t)
+	waitForMarkerWithin(t, true, 10*time.Second)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+addr+"/beat/"+beat, nil)
+	if err != nil {
+		t.Fatalf("building beat request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testBeatToken)
+	req.Header.Set("X-Forwarded-For", forwardedSender)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("ping %s: %v", req.URL, err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close beat response body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ping = %d, want 200: the access line under test is the one a RECORDED beat writes", resp.StatusCode)
+	}
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("signalling self: %v", err)
+	}
+	r.waitForReturn(t, 10*time.Second, "after a shutdown signal")
+
+	// Poll: run() has returned, so the line is written, but the goroutine
+	// draining the pipe still has to be scheduled.
+	want := "client_ip=" + forwardedSender
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(logs.String(), want) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Errorf("no access line reports %s; an unwired Deps.TrustedProxies leaves client_ip on the trusted proxy itself, so a token-guessing run past the throttle is attributed to the proxy and no source address is left to block. Log:\n%s", want, logs.String())
+}
+
+// forwardedSender is the address the trusted proxy claims the request came
+// from, chosen from the RFC 5737 documentation range and distinct from the
+// loopback socket peer so the two possible client_ip values cannot be confused.
+const forwardedSender = "203.0.113.7"
+
+// runLog collects what run() logs. Writes come from run()'s own goroutines
+// while the test body reads, so the buffer is mutex-guarded.
+type runLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *runLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *runLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// captureRunLog redirects os.Stderr to a pipe for the duration of the test and
+// returns what is written to it. It is the only way to read a line run() logs:
+// run() calls slogx.Setup, which installs its own handler over the capture
+// prepareLifecycleRun set up, and that handler resolves its destination from
+// os.Stderr when NewHandler runs. Nothing in production changes — this swaps a
+// process variable the stdlib exports, not a seam knell owns.
+//
+// The pipe is drained continuously rather than read at the end: its buffer is
+// 64 KiB, and a full one would block run() inside a log write and hang the
+// shutdown the test is waiting for.
+func captureRunLog(t *testing.T) *runLog {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("opening a pipe for run's log output: %v", err)
+	}
+	original := os.Stderr
+	os.Stderr = w
+	out := &runLog{}
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		_, _ = io.Copy(out, r)
+	}()
+	t.Cleanup(func() {
+		os.Stderr = original
+		// Close the write end first: io.Copy returns on EOF, which cannot
+		// arrive while this process still holds the writer open.
+		if err := w.Close(); err != nil {
+			t.Errorf("closing the log pipe writer: %v", err)
+		}
+		<-drained
+		if err := r.Close(); err != nil {
+			t.Errorf("closing the log pipe reader: %v", err)
+		}
+	})
+	return out
 }
 
 // beatResponse is one /beat answer: the status and the body a failure message
