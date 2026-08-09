@@ -99,9 +99,9 @@ func authEchoServer(t *testing.T) *httptest.Server {
 
 // echoAuthHeader sends "Bearer "+token to srv and reports the Authorization
 // value the server actually read, or the error the client refused to send it
-// with. One definition of "what the transport carries" for both
-// beatTokenFitsHeader oracles, so the byte sweep and the hand-picked table
-// cannot come to measure different things.
+// with. One definition of "what the transport carries" for every test that uses
+// the wire itself as its oracle, so they cannot come to measure different
+// things.
 func echoAuthHeader(t *testing.T, srv *httptest.Server, token string) (string, error) {
 	t.Helper()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
@@ -1191,14 +1191,15 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 // checkBeatToken's refusals are pinned by value, FuzzCheckBeatToken asserts only
 // on tokens it ACCEPTS (a rejection returns early, so an over-strict validator
 // satisfies it vacuously), and every OTHER interior-whitespace fixture in the
-// package is too short to be ACCEPTED: "alpha\tbeta" and "alpha  beta" in the
-// beatTokenFitsHeader tables never reach checkBeatToken at all, and
-// "alpha\tbeta" is also a committed FuzzCheckBeatToken seed, where it does reach
-// it but the 16-byte floor refuses its 10 bytes before any acceptance assertion
-// runs. So tightening the edge test to refuse SP/HTAB anywhere -- the
-// shape a "harden the credential" edit reaches for -- leaves every existing test
-// green while a passphrase-style BEAT_TOKEN stops the observer from starting at
-// all, which for a dead-man switch is the one refusal nobody is watching for.
+// package is too short to be ACCEPTED: the 10-byte "alpha<byte>beta" fixtures
+// that sweep the interior byte range call beatTokenFitsHeader directly and never
+// reach checkBeatToken at all, and "alpha\tbeta" is also a committed
+// FuzzCheckBeatToken seed, where it does reach it but the 16-byte floor refuses
+// its 10 bytes before any acceptance assertion runs. So tightening the edge test
+// to refuse SP/HTAB anywhere -- the shape a "harden the credential" edit reaches
+// for -- leaves every existing test green while a passphrase-style BEAT_TOKEN
+// stops the observer from starting at all, which for a dead-man switch is the one
+// refusal nobody is watching for.
 func TestLoadKeepsABeatTokenWithInteriorASCIIWhitespaceArmed(t *testing.T) {
 	// Serial (t.Setenv forbids t.Parallel). A space AND a tab, both interior,
 	// and 20 bytes so the value clears the minTokenLength floor on its own.
@@ -1228,7 +1229,8 @@ func TestLoadKeepsABeatTokenWithInteriorASCIIWhitespaceArmed(t *testing.T) {
 }
 
 func TestLoadRejectsABeatTokenHTTPCannotCarry(t *testing.T) {
-	// Distinct from the whitespace-only refusal: these values are non-empty
+	// Distinct from a token made only of ASCII whitespace (refused by the
+	// padding cutset like any other edge run): these values are non-empty
 	// after an ASCII trim, so trimming cannot rescue them, yet HTTP forbids
 	// the byte they carry in a field value. Go's client refuses to write the
 	// header and Go's server rejects a handcrafted one before beatHandler, so
