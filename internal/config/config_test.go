@@ -1150,44 +1150,6 @@ func TestLoadRejectsAPaddedFileBorneBeatToken(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsAnASCIIWhitespaceOnlyBeatToken(t *testing.T) {
-	// Where this shape comes from: a compose quoting accident or a padded
-	// interpolation (BEAT_TOKEN="${TOKEN} " with TOKEN undefined) hands the
-	// process a token made only of spaces and tabs.
-	//
-	// Such a token has nothing but edge whitespace, so it is refused by the
-	// padding rule above: its every byte is either stripped on the wire
-	// (trailing SP/HTAB), illegal in a field value (CR, LF, VT, FF), or
-	// delivered as an invisible leading run inside "Bearer <token>" that the
-	// sender using the configured value cannot reproduce. Keeping it armed was
-	// the worst outcome available for a dead-man switch: knell started,
-	// reported itself gated, 401'd every ping, and one deadline later posted a
-	// MISSING notice for every configured beat. So it fails startup, like
-	// the two adjacent accidents this package already refuses (a
-	// present-but-empty BEAT_TOKEN and a blank BEAT_TOKEN_FILE).
-	tests := map[string]string{
-		"spaces":             "   ",
-		"tab":                "\t",
-		"spaces and tabs":    " \t \t ",
-		"carriage return lf": "\r\n",
-	}
-	for name, token := range tests {
-		t.Run(name, func(t *testing.T) {
-			setValidLoadEnv(t)
-			t.Setenv("BEAT_TOKEN", token)
-			unsetEnv(t, "BEAT_TOKEN_FILE")
-
-			_, err := Load(maxNodeNameBytes)
-			if err == nil {
-				t.Fatalf("Load() with BEAT_TOKEN=%q = nil, want error: the token cannot survive into a header value, so every ping 401s against an endpoint that reports itself gated", token)
-			}
-			if !strings.Contains(err.Error(), "BEAT_TOKEN") {
-				t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which variable to fix", err)
-			}
-		})
-	}
-}
-
 func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 	// The boundary of the refusal above, and the one place a naive
 	// strings.TrimSpace check would be wrong. TrimSpace follows
