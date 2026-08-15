@@ -1,7 +1,6 @@
 package notify
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -249,7 +248,7 @@ func attemptAgainstStub(t *testing.T, rawURL string, status int, body string) (r
 			Request:    r,
 		}, nil
 	})
-	_, err = d.postAttempt(context.Background(), []byte(`{"content":"fuzz"}`))
+	_, err = d.postAttempt(t.Context(), []byte(`{"content":"fuzz"}`))
 	return requested, err
 }
 
@@ -415,6 +414,6 @@ func attemptAgainstRedirectStub(t *testing.T, rawURL string, status int, locatio
 			Request:    r,
 		}, nil
 	})
-	_, err := d.postAttempt(context.Background(), []byte(`{"content":"fuzz"}`))
+	_, err := d.postAttempt(t.Context(), []byte(`{"content":"fuzz"}`))
 	return err
 }
