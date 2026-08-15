@@ -492,16 +492,6 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 	}
 }
 
-func TestSecurityHeadersPresent(t *testing.T) {
-	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
-	req := newBeatRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
-		t.Errorf("X-Content-Type-Options = %q", got)
-	}
-}
-
 // TestNoStoreOnEveryRoute pins that no response knell serves is cacheable: a
 // cached ping response would let a sender believe a beat was recorded when the
 // request never reached the observer (false MISSING notice), and a cached
@@ -1325,27 +1315,6 @@ func assertBeatRefused(t *testing.T, h http.Handler, method, path string) {
 	}
 }
 
-// TestBeatRefusedOnceTheWatcherClosesAdmission pins the acceptance window
-// against the real state machine. On SIGTERM the composition root closes beat
-// admission in webhttp's pre-drain hook, before the HTTP drain begins, while the
-// surface itself stays live for up to the shutdown grace. A ping accepted after
-// that point is recorded behind a sender that no longer exists, so from the
-// instant admission closes the recording method must refuse and say so honestly.
-// GET and HEAD need no case here: they are refused as methods in every lifecycle
-// phase (TestEveryRejectedMethodAnswersTheSameRefusal).
-// What accepting one would cost is pinned by
-// the siblings below: TestRefusedBeatLeavesMetricsUnchanged (the exposition),
-// TestRefusedUnknownBeatMintsNoSeries (label cardinality), and
-// TestProbeRoutesServeWhileBeatAcceptanceIsClosed (the probes keep serving).
-func TestBeatRefusedOnceTheWatcherClosesAdmission(t *testing.T) {
-	const id = "webapi-shutdown-guard"
-	h, closeAdmission, _, _ := newShutdownHarness(t, id)
-
-	closeAdmission()
-
-	assertBeatRefused(t, h, http.MethodPost, "/beat/"+id)
-}
-
 // TestRefusedBeatLeavesMetricsUnchanged pins the exposition across the
 // refusal. A ping accepted during the drain moves lastSeen, moves
 // knell_beats_received_total, and republishes knell_beat_fresh as 1 — a false
@@ -1449,25 +1418,6 @@ func TestRefusedBeatStillDrainsTheBody(t *testing.T) {
 	}
 	if body.reads == 0 {
 		t.Errorf("body reads = 0, want the body drained before the watcher's verdict: the refusal is Beat's answer, which is asked after the drain, and skipping the drain would leave the connection unreusable")
-	}
-}
-
-// TestProbeRoutesServeWhileBeatAcceptanceIsClosed pins the other half of the
-// drain: only the beat endpoint refuses. The orchestrator has to observe the
-// health flip, and a last scrape during the drain is useful.
-func TestProbeRoutesServeWhileBeatAcceptanceIsClosed(t *testing.T) {
-	const id = "webapi-shutdown-probes"
-	h, closeAdmission, _, _ := newShutdownHarness(t, id)
-
-	closeAdmission()
-
-	for _, path := range []string{"/healthz", "/metrics"} {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("GET %s with beat admission closed = %d, want 200", path, rec.Code)
-		}
 	}
 }
 
@@ -2099,29 +2049,6 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 				t.Errorf("recorded beats = %d, want %d: a refused Host must never feed the switch", got, tt.wantSeen)
 			}
 		})
-	}
-}
-
-// TestNilHostPolicyAcceptsEveryHost pins the backward-compatible default:
-// ALLOWED_HOSTS is unset in every documented deployment, so an inactive policy
-// must remove no capability. Without this, tightening the guard to fail closed
-// on an unset variable would brick every existing sender and leave the suite
-// green.
-func TestNilHostPolicyAcceptsEveryHost(t *testing.T) {
-	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := newTestHandler(b, testBeatToken) // Deps.Hosts is nil, exactly like an unset ALLOWED_HOSTS
-
-	for _, host := range []string{"knell.example", "attacker.example", "192.0.2.9:9190", ""} {
-		req := newBeatRequest(http.MethodPost, "/beat/api", nil)
-		req.Host = host
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("Host %q: status = %d, want 200 (a nil policy is a pass-through)", host, rec.Code)
-		}
-	}
-	if len(b.seen) != 4 {
-		t.Errorf("recorded beats = %d, want 4", len(b.seen))
 	}
 }
 

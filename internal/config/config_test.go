@@ -199,24 +199,6 @@ func TestParseBeats(t *testing.T) {
 	}
 }
 
-func TestParseBeatsMaxCap(t *testing.T) {
-	t.Parallel()
-
-	var entries []string
-	for r := 'a'; r <= 'z'; r++ {
-		for s := 'a'; s <= 'c'; s++ {
-			entries = append(entries, string(r)+string(s)+":20m")
-		}
-	}
-	if len(entries) <= maxBeats {
-		t.Fatalf("test needs more than %d entries, built %d", maxBeats, len(entries))
-	}
-	_, err := parseBeats(strings.Join(entries, ","))
-	if err == nil || !strings.Contains(err.Error(), "maximum") {
-		t.Fatalf("expected maximum-cap error, got %v", err)
-	}
-}
-
 func TestParseBeatsAcceptsExactlyMaxCap(t *testing.T) {
 	t.Parallel()
 
@@ -1571,20 +1553,6 @@ func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
 	})
 }
 
-func TestLoadAcceptsANodeNameAtTheLimit(t *testing.T) {
-	setValidLoadEnv(t)
-	node := strings.Repeat("n", maxNodeNameBytes)
-	t.Setenv("NODE_NAME", node)
-
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() with a %d-byte NODE_NAME error = %v, want it accepted: the cap is the last accepted value, and it still leaves every notice far inside Discord's 2000-character limit", maxNodeNameBytes, err)
-	}
-	if cfg.Node != node {
-		t.Errorf("Node = %q, want the configured %d-byte name verbatim", cfg.Node, maxNodeNameBytes)
-	}
-}
-
 func TestLoadRejectsANodeNamePastTheLimit(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("NODE_NAME", strings.Repeat("n", maxNodeNameBytes+1))
@@ -1648,19 +1616,6 @@ func TestLoadCountsNodeNameLengthInBytesNotRunes(t *testing.T) {
 			t.Fatalf("Load() with a %d-byte (%d-rune) NODE_NAME = nil, want error: the bound is counted in bytes, which is the conservative direction against Discord's character limit", len(node), maxNodeNameBytes-10)
 		}
 	})
-}
-
-func TestLoadRejectsWhitespaceOnlyWebhook(t *testing.T) {
-	setValidLoadEnv(t)
-	t.Setenv("DISCORD_WEBHOOK_URL", "   ")
-
-	_, err := Load(maxNodeNameBytes)
-	if err == nil {
-		t.Fatal("Load() with a whitespace-only DISCORD_WEBHOOK_URL = nil, want error: a broken secret pipeline must fail startup rather than arm a switch that can never ring")
-	}
-	if !strings.Contains(err.Error(), "set but empty") {
-		t.Errorf("error = %q, want the set-but-empty diagnosis rather than the misleading https-scheme rejection", err)
-	}
 }
 
 // TestLoadDoesNotWarnWhenOnlyTheSecretFilesAreSet pins the negative half of

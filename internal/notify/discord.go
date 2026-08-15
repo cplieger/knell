@@ -1,13 +1,11 @@
 // Package notify delivers knell's transition notifications to a Discord
-// webhook. It is the app's only outbound-network package and retries
-// transient delivery failures via httpx.
+// webhook. It is the app's only outbound-network package and retries transient
+// delivery failures via httpx.
 //
 // Wording lives here, not in the state machine: internal/watch decides WHICH
-// transition happened and hands over its own types (watch.Transition for a
-// live incident, watch.Outage for one that is already over), and this package
-// decides how an operator reads it. Every duration a notice reports comes from
-// those types' DownFor, so the live and past-tense notices cannot measure the
-// same span differently.
+// transition happened and hands over its own types, and this package decides how
+// an operator reads it. Every duration a notice reports comes from those types'
+// DownFor, so the live and past-tense notices cannot measure a span differently.
 package notify
 
 import (
@@ -32,52 +30,38 @@ import (
 
 // attemptTimeout bounds each delivery attempt. httpx.WithAttemptTimeout
 // installs it inside the retry loop, so its expiry is retryable and the
-// caller's own budget is never extended (a nearer caller deadline still
-// governs).
+// caller's own budget is never extended.
 const attemptTimeout = 10 * time.Second
 
-// MaxNodeNameBytes is the maximum UTF-8 byte length of NODE_NAME.
-// internal/config enforces this cap so every rendered notification remains
-// within Discord's content limit.
-//
-// The node name is interpolated into EVERY notice (missing, recovered,
-// history), so an unbounded value makes Discord reject all of them: knell would
-// start, accept beats and detect outages while no notice is ever delivered — a
-// dead-man switch that delivers nothing. Counting BYTES is conservative against
-// Discord's character limit: UTF-8 bytes are always >= the character count and
-// >= the UTF-16 code-unit count. TestEveryNoticeStaysInsideDiscordsContentLimit
-// owns the derivation: it renders every notice shape at its worst case and
-// fails when a wording change eats the budget.
+// MaxNodeNameBytes is the maximum UTF-8 byte length of NODE_NAME, enforced by
+// internal/config. The node name is interpolated into EVERY notice, so an
+// unbounded value makes Discord reject all of them: knell would start, accept
+// beats and detect outages while no notice is ever delivered. Counting BYTES is
+// conservative, UTF-8 bytes always being >= the character count.
 const MaxNodeNameBytes = 256
 
 // maxAttempts is the total delivery attempts per notification (httpx
 // semantics: total, including the first).
 const maxAttempts = 3
 
-// rateLimitMaxWait caps how long ONE rate-limited attempt may park the
-// sweep's single sender goroutine. httpx waits min(Retry-After, this ceiling)
-// before a 429 retry, so this number — never Discord's hint — bounds the delay
-// every OTHER beat's notice inherits from one rate-limited beat.
+// rateLimitMaxWait caps how long ONE rate-limited attempt may park the sweep's
+// single sender goroutine. httpx waits min(Retry-After, this ceiling) before a
+// 429 retry, so this number -- never Discord's hint -- bounds the delay every
+// OTHER beat's notice inherits from one rate-limited beat.
 const rateLimitMaxWait = 30 * time.Second
 
 // maxErrorBodyBytes caps how much of a rejected response's body is READ, and
 // nothing about it is ever printed. Discord names the cause in that body as a
-// numeric code (a deleted webhook vs a rejected payload), and knell reports
-// the code plus its own wording for it — never the body's own text, which is
-// authored by the other end and can echo the webhook URL that IS the
-// credential. The cap bounds the JSON parse; a body past it is not Discord's
-// error object at all (that object is a few hundred bytes), so the size is
-// reported as the fact it is and the detail is dropped.
+// numeric code, and knell reports the code plus its own wording for it -- never
+// the body's own text, which is authored by the other end and can echo the
+// webhook URL that IS the credential.
 const maxErrorBodyBytes = 512
 
 // userAgent identifies this client to Discord's edge. Go sends
-// "Go-http-client/1.1" when the header is unset, which an edge or WAF in
-// front of a webhook commonly refuses; that refusal would arrive as a
-// non-transient 4xx the sweep re-posts forever. Discord's DiscordBot
-// ($url, $version) form is the bot-API rule and is deliberately not
-// followed here: webhook execution accepts any identifying agent, and
-// knell has no version symbol to render (nothing sets one, and
-// debug.ReadBuildInfo plumbing would buy no delivery guarantee).
+// "Go-http-client/1.1" when the header is unset, which an edge or WAF in front
+// of a webhook commonly refuses; that refusal would arrive as a non-transient
+// 4xx the sweep re-posts forever. Discord's DiscordBot form is the bot-API rule
+// and does not apply: webhook execution accepts any identifying agent.
 const userAgent = "knell (https://github.com/cplieger/knell)"
 
 // Discord posts plain-content messages to one Discord-compatible webhook.
@@ -85,24 +69,17 @@ type Discord struct {
 	client *http.Client
 	url    string
 	// node is the observer name ALREADY escaped for Discord markdown: New escapes
-	// it once because it is constant for the process, unlike the per-notice beat
-	// id. Every notice interpolates this field directly; escaping it a second
-	// time at a render site publishes the backslashes instead of the name.
+	// it once because it is constant for the process. Escaping it again at a
+	// render site publishes the backslashes instead of the name.
 	node string
-	// attemptTimeout bounds one delivery attempt. It is a field rather than
-	// a direct use of the constant only so a test can shorten it on its own
-	// notifier; New always sets it to attemptTimeout.
-	attemptTimeout time.Duration
-	// rateLimitMaxWait caps one rate-limit retry wait, a field for the same
-	// reason as attemptTimeout: a test shortens it on its own notifier so the
-	// ceiling is observable without waiting the production one. New always
-	// sets it to rateLimitMaxWait.
+	// attemptTimeout bounds one delivery attempt, rateLimitMaxWait one rate-limit
+	// retry wait. Fields only so a test can shorten them on its own notifier.
+	attemptTimeout   time.Duration
 	rateLimitMaxWait time.Duration
 }
 
-// Discord implements the transition contract the state machine consumes;
-// the assertion keeps a signature drift a notify-local compile error
-// instead of one that first appears in main's wiring.
+// Discord implements the transition contract the state machine consumes; the
+// assertion keeps a signature drift a notify-local compile error.
 var _ watch.Notifier = (*Discord)(nil)
 
 // New builds a Discord notifier for the given webhook URL. node names this
@@ -112,25 +89,11 @@ func New(webhookURL, node string) *Discord {
 	// Client timeout above the per-attempt context timeout so the
 	// context is the effective per-attempt bound.
 	client := httpx.NewClient(attemptTimeout + 5*time.Second)
-	// Redirect policy, declaratively: follow only a same-host hop (the
-	// configured webhook URL is the only trusted delivery target; a
-	// cross-host hop would post the notice to an origin the operator never
-	// named, and Go forwards custom headers across hops), never an
-	// https->http downgrade (refused by default, and it matters here
-	// because the URL's own path is the credential), and never a hop
-	// net/http would rewrite to another method — the webhook POST must not
-	// be replayed as a bodyless GET. WithPreserveMethod refuses such a hop
-	// by surfacing its 3xx response, which postAttempt then reports as
-	// non-delivery; TestMethodChangingRedirectIsNotDelivery pins that, and
-	// is also the only test pinning that a policy is installed at all.
-	//
-	// The Referer deletion is a second, separate reason: net/http writes the
-	// PREVIOUS request's full URL into that header, and for a webhook the URL's
-	// path IS the credential, so even an ordinary same-host hop (a relay that
-	// 307s /hooks/<token> to /api/v2/hooks) would hand the credential to the
-	// target path's access log and to anything that ships it. CheckRedirect runs
-	// after net/http sets the header and before the request goes out, so deleting
-	// it here removes it from the wire; the policy then decides the hop.
+	// Redirect policy: follow only a same-host hop, and never one net/http would
+	// rewrite to another method -- the webhook POST must not be replayed as a
+	// bodyless GET. The Referer deletion is separate: net/http writes the
+	// PREVIOUS request's full URL there, and for a webhook the path IS the
+	// credential.
 	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		req.Header.Del("Referer")
@@ -150,15 +113,12 @@ func (d *Discord) Close() {
 	d.client.CloseIdleConnections()
 }
 
-// BeatMissing announces that a beat's deadline of silence has passed.
-//
-// The wording names what to check without presuming the beat ever pinged: a
-// beat configured in BEATS but never wired to a sender (a typo, a wrong id)
-// fires this very notice one deadline after start, and notify cannot tell that
-// case from a sender that pinged for weeks and stopped — watch.Transition
-// carries only Started and Observed, and Started deliberately collapses "last
-// accepted ping" and the process-start baseline into one field. So the sentence
-// must fit both, and "never pinged at all" is one of the causes it names.
+// BeatMissing announces that a beat's deadline of silence has passed. The
+// wording names what to check without presuming the beat ever pinged: a beat
+// configured in BEATS but never wired to a sender fires this notice one deadline
+// after start, and notify cannot tell that from a sender that pinged for weeks
+// and stopped, watch.Transition's Started collapsing "last accepted ping" and
+// the process-start baseline into one field.
 func (d *Discord) BeatMissing(ctx context.Context, id string, live watch.Transition) error {
 	msg := fmt.Sprintf(
 		"🚨 [knell %s] beat **%s** MISSING: silent for %s. Nothing has pinged it in time: check the sender, its path to this observer, and that anything is pinging this beat id at all.",
@@ -179,42 +139,27 @@ func (d *Discord) BeatRecovered(ctx context.Context, id string, live watch.Trans
 // historyTimeFormat includes the date because queued history notices may arrive
 // days after recovery, and the zone because readers may be outside the
 // observer's timezone. The instant is always converted to UTC before
-// formatting, so the zone renders as "UTC" whatever TZ the process runs
-// under: the README's notice examples state UTC, and the recovery point is
-// what an operator correlates against knell's own log lines (slogx normalizes
-// those to UTC) and knell_beat_last_seen_timestamp_seconds.
+// formatting, so the recovery point correlates with knell's own log lines and
+// knell_beat_last_seen_timestamp_seconds.
 const historyTimeFormat = "2006-01-02 15:04 MST"
 
 // BeatOutageHistory announces outages that were already over by the time this
 // observer could send anything about them, in one past-tense message so a
-// resolved incident never reads as a new live failure. One outage is reported
-// on its own; several are summarized, because the point of the message is
-// that they are over, not to replay each of them.
-//
-// The batch's shape is the caller's contract: watch builds a history notice only
-// from a non-empty run (collectDue collapses one only under `len(run) > 0`, and
-// assertSealedRun iterates the run, so it would pass an empty one vacuously) and
-// asserts the rest record by record before calling (every record ended, every
-// record has a start, recovery points ascend), so nothing here re-checks it: a
-// refusal returns to watch's sendHistory as an ordinary delivery error, which
-// keeps the records queued and re-offered every sweep and holds the beat's live
-// notices behind them, so a producer bug would present as a webhook problem
-// forever.
+// resolved incident never reads as a new live failure. One outage is reported on
+// its own; several are summarized. The batch's shape is the caller's contract:
+// watch asserts every record ended, has a start, and ascends by recovery point,
+// so a refusal here would keep the records queued forever and present a producer
+// bug as a webhook one.
 func (d *Discord) BeatOutageHistory(ctx context.Context, id string, outages []watch.Outage) error {
 	return d.post(ctx, "history "+id, d.historyMessage(id, outages))
 }
 
-// historyMessage renders the history notice for id. outages is non-empty
-// (BeatOutageHistory), and every entry has a measurable span and ascends by
-// recovery point (asserted by watch where the run is built), so the last entry
-// is the most recent recovery.
-//
-// Every notice is two parts: WHAT happened, then why it is being read after
-// the fact. The second part comes from watch's LateReason and is never guessed
-// here, because the three reasons send an operator to three different places:
-// one is a webhook to fix, one is this observer's own scheduling with nothing to
-// fix at all, and one is a beat that came back faster than the sweep could see
-// it — and on two of the three a webhook check finds nothing wrong.
+// historyMessage renders the history notice for id. outages is non-empty and
+// ascends by recovery point (both asserted by watch), so the last entry is the
+// most recent recovery. Every notice is two parts: WHAT happened, then why it is
+// being read after the fact. The second part comes from watch's LateReason and is
+// never guessed here, because on two of its three reasons a webhook check finds
+// nothing wrong.
 func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 	last := outages[len(outages)-1]
 	recovered := last.Recovered.UTC().Format(historyTimeFormat)
@@ -234,26 +179,15 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 
 // markdownEscaper neutralizes the markup Discord's renderer consumes, in two
 // ways. Every ESCAPED entry is a Discord formatting character, which matters:
-// Discord strips a backslash only in front of one of its own markup
-// characters, so escaping anything else (a "-", a "#") would publish the
-// backslash itself. Line breaks are COLLAPSED instead, for that same reason:
-// they enable line-anchored markup a backslash cannot suppress. The
-// masked-link delimiters "[" and "]" are in the set for the same reason as the
-// rest: NODE_NAME is only trimmed and byte-capped, so a name like
-// "a[b](https://example)c" would otherwise be consumed as a link and displayed
-// as "abc" — the operator could not read the configured observer identity off
-// the alert.
+// Discord strips a backslash only in front of one of its own markup characters,
+// so escaping anything else would publish the backslash. Line breaks are
+// COLLAPSED for that same reason. The masked-link delimiters are in the set
+// because NODE_NAME is only trimmed and byte-capped.
 var markdownEscaper = strings.NewReplacer(
-	// Line breaks first, and collapsed rather than escaped: Discord's
-	// heading, blockquote and list markup is LINE-ANCHORED, so a backslash
-	// cannot suppress it (and would be published, per the note above) - only
-	// removing the break can. NODE_NAME is the one value that can carry one:
-	// config trims surrounding whitespace and caps bytes, so an interior
-	// "\r\n" survives and would render the single-line notice as several.
-	// A space is never wider than the break it replaces (identical for a lone
-	// "\r" or "\n", one byte shorter for "\r\n"), so MaxNodeNameBytes's
-	// derivation still bounds the rendered notice. CRLF precedes its halves
-	// because strings.Replacer matches patterns in argument order.
+	// Line breaks first, and collapsed rather than escaped: Discord's heading,
+	// blockquote and list markup is LINE-ANCHORED, so only removing the break can
+	// suppress it, and NODE_NAME is the one value that can carry one. A space is
+	// never wider than the break it replaces, so MaxNodeNameBytes still holds.
 	"\r\n", " ",
 	"\r", " ",
 	"\n", " ",
@@ -267,42 +201,22 @@ var markdownEscaper = strings.NewReplacer(
 	"]", `\]`,
 )
 
-// escapeMarkdown renders s literally in a Discord message. It is applied to
-// the two values a notice interpolates that knell did not write itself — the
-// beat id and the node name — because Discord's markdown EATS characters
-// rather than merely styling them: a pair of underscores anywhere in a word
-// italicizes what sits between them and removes both, so a beat id the
-// operator configured as "db_backup_nightly" arrives as "dbbackupnightly",
-// matching nothing in BEATS and nothing on /beat/{id}. The notice's whole job
-// is to name the beat to act on, so the id has to survive rendering. A
-// backslash is Discord's own escape and is stripped before display, so an id
-// with no markup character (every hyphenated id, and every example in the
-// README) renders exactly as it does today. One class is not preserved but
-// replaced: an interior line break (only NODE_NAME can carry one) becomes a
-// space, because Discord's heading, blockquote and list markup is
-// line-anchored and no escape reaches it.
+// escapeMarkdown renders s literally in a Discord message. It is applied to the
+// two values a notice interpolates that knell did not write itself, because
+// Discord's markdown EATS characters rather than merely styling them: a pair of
+// underscores italicizes what sits between them and removes both, so an id
+// configured as "db_backup_nightly" arrives as "dbbackupnightly", matching
+// nothing in BEATS and nothing on /beat/{id}.
 func escapeMarkdown(s string) string {
 	return markdownEscaper.Replace(s)
 }
 
-// lateClause explains why ONE ended outage is reported after the fact, and
-// what the operator should do about it. Each of watch's three reasons gets its
-// own sentence, because each sends the operator somewhere different and two of
-// the three must actively steer them AWAY from the webhook: a notice that says
-// "check the webhook" about a message the webhook accepted on its first attempt
-// costs an evening.
-//
-//   - LateUndelivered is the only reason that names the webhook, and it means a
-//     send for this outage was ATTEMPTED and refused, so delivery really is
-//     behind.
-//   - LateSchedulerDeferred means this observer never got to the send before the
-//     beat came back. Nothing was attempted, so there is no failed delivery to
-//     find.
-//   - LateEndedBeforeDetection means no alert was ever due at all.
-//
-// An unrecognized reason falls to the LateUndelivered sentence, which matches
-// watch's zero value: a notice that cannot tell would rather send an operator
-// to look at a healthy webhook than vouch for a broken one.
+// lateClause explains why ONE ended outage is reported after the fact. Each of
+// watch's three reasons gets its own sentence, because two of them must steer
+// the operator AWAY from the webhook: only LateUndelivered means a send was
+// ATTEMPTED and refused. An unrecognized reason falls to that sentence, matching
+// watch's zero value: a notice that cannot tell would rather point at a healthy
+// webhook than vouch for it.
 func lateClause(reason watch.LateReason) string {
 	switch reason {
 	case watch.LateEndedBeforeDetection:
@@ -315,15 +229,11 @@ func lateClause(reason watch.LateReason) string {
 }
 
 // batchLateClause explains why a whole run of ended outages is reported after
-// the fact. A batch can MIX all three of watch's reasons — a webhook outage
-// holds alerts back while a saturated sweep defers others and short outages keep
-// ending between sweeps, which is how a flapping beat behaves during a Discord
-// outage — so a mixed batch reports EVERY non-zero count instead of picking the
-// majority reason and stating something false about the rest. It keeps the
-// webhook pointer where it belongs: one refused delivery is reason enough to
-// look, while the other two counts stop that number from reading as that many
-// webhook failures. A batch that names ONE reason keeps that reason's own
-// whole-batch sentence, which is shorter than a count of itself.
+// the fact. A batch can MIX all three of watch's reasons -- how a flapping beat
+// behaves during a Discord outage -- so a mixed batch reports EVERY non-zero
+// count instead of picking a majority and stating something false about the rest.
+// One refused delivery is reason enough to look at the webhook; the other counts
+// stop that number from reading as that many webhook failures.
 func batchLateClause(outages []watch.Outage) string {
 	var undelivered, deferred, ended int
 	for _, o := range outages {
@@ -334,8 +244,7 @@ func batchLateClause(outages []watch.Outage) string {
 			deferred++
 		default:
 			// The zero reason counts as undelivered, like watch.LateUndelivered
-			// being the zero value: a batch whose records name no reason blames
-			// delivery rather than vouching for it.
+			// being the zero value: a batch naming no reason blames delivery.
 			undelivered++
 		}
 	}
@@ -350,8 +259,7 @@ func batchLateClause(outages []watch.Outage) string {
 		return "Each ended before a sweep detected it - nothing was wrong with delivery."
 	}
 	// Mixed, so every non-zero count is named. Delivery leads because it is the
-	// only actionable one and is therefore the only clause that opens the
-	// sentence, which is what keeps the rest starting with their own digit.
+	// only actionable one, which keeps the rest starting with their own digit.
 	clauses := make([]string, 0, 3)
 	if undelivered > 0 {
 		clauses = append(clauses, fmt.Sprintf("Delivery was delayed for %d (check the webhook)", undelivered))
@@ -365,22 +273,16 @@ func batchLateClause(outages []watch.Outage) string {
 	return strings.Join(clauses, "; ") + "."
 }
 
-// post delivers one message, retrying transient failures. The webhook URL
-// cannot appear in returned errors or logs, because no text the OTHER end
-// authored is ever printed: every message this package publishes is written
-// here (none of them interpolates d.url), and the two places remote text
-// could enter are reduced structurally instead of filtered — a transport
-// error through safeTransportError (the *url.Error that embeds the URL is
-// unwrapped and the cause underneath is classified, never rendered) and a
-// rejected response through statusDetail (Discord's numeric error code and
-// knell's own wording for it, never the body's text).
+// post delivers one message, retrying transient failures. The webhook URL cannot
+// appear in returned errors or logs, because no text the OTHER end authored is
+// ever printed: the two places remote text could enter are reduced structurally
+// instead of filtered -- a transport error through safeTransportError and a
+// rejected response through statusDetail.
 func (d *Discord) post(ctx context.Context, label, content string) error {
 	// allowed_mentions with an EMPTY parse list is the only structural way to
-	// keep a notice from pinging anyone: the two values a notice interpolates
-	// (NODE_NAME and the beat id) are not filtered for mention tokens, and
-	// escapeMarkdown cannot be - a backslash before "@" is not one of Discord's
-	// escapes and would be published verbatim. So the payload states it instead
-	// of the text defending it, exactly like the rest of this package.
+	// keep a notice from pinging anyone: the interpolated values are not filtered
+	// for mention tokens, and escapeMarkdown cannot be -- a backslash before "@"
+	// is not one of Discord's escapes.
 	body, err := json.Marshal(map[string]any{
 		"content":          content,
 		"allowed_mentions": map[string][]string{"parse": {}},
@@ -391,21 +293,14 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 	_, err = httpx.Do(ctx, func(ctx context.Context) (struct{}, error) {
 		return d.postAttempt(ctx, body)
 	}, httpx.WithLabel("discord webhook "+label), httpx.WithMaxAttempts(maxAttempts),
-		// Bound EACH attempt and make that bound's expiry retryable. httpx
-		// classifies a bare context deadline as terminal (it cannot tell the
-		// caller's budget from a per-attempt bound), so the bound has to be
-		// installed by the loop that owns the retries: WithAttemptTimeout
-		// derives the attempt context itself, marks only an expiry that fired
-		// while the caller's context was still live, and keeps the deadline
-		// visible to errors.Is — which is what makes the timeout classifiable
-		// by httpx AND transparent to knell's own callers.
+		// Bound EACH attempt and make that bound's expiry retryable: httpx
+		// classifies a bare context deadline as terminal, unable to tell the
+		// caller's budget from a per-attempt bound.
 		httpx.WithAttemptTimeout(d.attemptTimeout),
 		httpx.WithRateLimitRetry(d.rateLimitMaxWait),
-		// watch publishes the terminal verdict for every failed delivery
-		// (sendMissing/sendHistory/sendRecovered log at Error with the beat,
-		// the silence and the retry plan), so httpx's own exhaustion WARN is a
-		// second, thinner line for one event. Debug keeps it for diagnosis
-		// without the alarm, which is what WithExhaustedLevel is for.
+		// watch publishes the terminal verdict for every failed delivery, so
+		// httpx's own exhaustion WARN is a second, thinner line for one event.
+		// Debug keeps it for diagnosis without the alarm.
 		httpx.WithExhaustedLevel(slog.LevelDebug))
 	if err != nil {
 		return fmt.Errorf("delivering %s notification: %w", label, httpx.LogSafeError(err))
@@ -413,52 +308,19 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 	return nil
 }
 
-// safeTransportError reports a failed transport call in knell's own words.
-// It is what postAttempt returns for every error client.Do produces, and it
-// exists because httpx.LogSafeError alone is not enough there: stripping the
-// *url.Error wrapper leaves the cause's own TEXT, and two of net/http's causes
-// are written from the response's Location header — a malformed one is rendered
-// as `failed to parse Location header "<remote bytes>"`, and a refused hop as
-// httpx's `refusing redirect to <remote host>`. Both are remote-authored, and
-// an endpoint that answers with a redirect echoing the request URI would put
-// the webhook path (which IS the credential) into httpx.Do's per-attempt logs
-// and into the returned error.
-//
-// So the cause is CLASSIFIED, never rendered: transportPhrase maps it to one
-// of knell's fixed phrases and the cause itself is reachable only through
-// Unwrap. That keeps every consumer of the chain intact — watch's
-// context.Canceled exemption and httpx's transient classification both use
-// errors.Is/As, which traverse Unwrap without ever formatting the error.
-//
-// The reduction this and post share is httpx.LogSafeError, and it is purely
-// STRUCTURAL: it unwraps the *url.Error net/http builds around a transport
-// failure (the one error shape that embeds the full request URL) and returns
-// everything else untouched, so errors.Is/As keep working. A *url.Error
-// carrying NO cause reduces to httpx's own contentless stand-in rather than to
-// nil (v4.2.0 fixed that at the source), so a real failure can never be
-// reduced to a success signal and the loop below can rely on "reduce, never
-// nil". There is deliberately no string search-and-replace backstop:
-// text-matching redaction can only defend text knell chose to publish, and
-// this package publishes none (see post for that invariant). httpx.RedactSecret
-// cannot stand in for it — it returns a bare errors.New and would break both
-// classifications.
+// safeTransportError reports a failed transport call in knell's own words,
+// because httpx.LogSafeError alone is not enough: stripping the *url.Error
+// wrapper leaves the cause's own TEXT, and two of net/http's causes are written
+// from the response's Location header, so an endpoint answering with a redirect
+// that echoes the request URI would put the webhook path (the credential) into
+// the logs. The cause is CLASSIFIED, never rendered, and reachable only through
+// Unwrap, which keeps every errors.Is/As consumer intact.
 func safeTransportError(err error) error {
-	// Reduce until no *url.Error is left ANYWHERE in the chain, not just at
-	// the top. httpx.LogSafeError searches the chain with errors.As and
-	// RETURNS what it finds, so a url.Error still nested under the cause would
-	// let it unwrap past this wrapper and render that error's cause instead of
-	// the phrase below — in httpx.Do's attempt lines and in post's own
-	// reduction. The loop terminates: each pass either strips a url.Error or
-	// (for one with a nil Err) substitutes httpx's contentless stand-in, which
-	// is not a url.Error.
-	// maxURLErrorDepth bounds the reduction. Real chains are one or two
-	// levels deep (net/http wraps at most a redirect error inside a
-	// transport error), and httpx.LogSafeError reduces strictly, so the
-	// cap is never reached. It is here because the loop's termination
-	// would otherwise rest entirely on the library's behavior: a value
-	// that reduces to itself would spin this bare loop forever inside the
-	// delivery attempt, which no context can interrupt, and knell's only
-	// sender goroutine would stop notifying with /healthz still green.
+	// Reduce until no *url.Error is left ANYWHERE in the chain: LogSafeError
+	// searches with errors.As and RETURNS what it finds, so a nested one would let
+	// it unwrap past this wrapper. maxURLErrorDepth bounds the loop because a
+	// value that reduced to itself would spin forever inside the attempt,
+	// uninterruptible, with knell's only sender silent and /healthz still green.
 	const maxURLErrorDepth = 8
 	cause := httpx.LogSafeError(err)
 	for range maxURLErrorDepth {
@@ -470,23 +332,11 @@ func safeTransportError(err error) error {
 	}
 	var unreduced *url.Error
 	if errors.As(cause, &unreduced) {
-		// The cap was reached with a *url.Error still in the chain, so the
-		// full webhook URL is still reachable through it -- and post's own
-		// httpx.LogSafeError SEARCHES the chain with errors.As and RETURNS what
-		// it finds, so it would discard this wrapper and render that error's
-		// cause (net/http writes two of those from the Location header).
-		// Fail closed like every other reduction here: publish the phrase
-		// with no cause at all. The cost is the classification httpx and
-		// watch read off the chain, so the attempt is terminal and the 15s
-		// sweep retries the delivery -- affordable where a published
-		// credential is not.
-		//
-		// Say so. The phrase published below is the SAME one transportPhrase
-		// returns for an unrecognized cause with no net.OpError stage, so
-		// without this line the fail-closed path is indistinguishable from
-		// routine unclassified noise -- and the dropped cause is what httpx's
-		// transient check and watch's context.Canceled exemption read. No
-		// remote text and no URL are logged, only knell's own words and the cap.
+		// The cap was reached with a *url.Error still in the chain, so the URL is
+		// still reachable. Fail closed: publish the phrase with no cause, at the
+		// cost of the classification httpx and watch read off the chain, so the
+		// attempt is terminal and the sweep retries. Logged because that phrase
+		// is also transportPhrase's unrecognized-cause phrase.
 		slog.Warn("webhook transport error still carried a URL after the reduction cap, "+
 			"diagnosis dropped to protect the credential and this attempt is terminal",
 			"reductions", maxURLErrorDepth)
@@ -508,11 +358,9 @@ func (e transportError) Error() string { return e.phrase }
 func (e transportError) Unwrap() error { return e.cause }
 
 // transportPhrase names why an attempt produced no response, choosing from a
-// finite set of knell's own sentences. err is matched STRUCTURALLY (errors.Is
-// against sentinel values, errors.As against types) and its text is never
-// read, because a transport cause can be written from a response header — see
-// safeTransportError. An unrecognized cause reports only that the transport
-// failed; the stage suffix carries what is still knowable about it.
+// finite set of knell's own sentences. err is matched STRUCTURALLY and its text
+// is never read, because a transport cause can be written from a response header.
+// An unrecognized cause reports only that the transport failed.
 func transportPhrase(err error) string {
 	var (
 		dnsErr  *net.DNSError
@@ -533,9 +381,8 @@ func transportPhrase(err error) string {
 	case errors.Is(err, syscall.ECONNRESET):
 		return "the connection to the webhook was reset"
 	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
-		// No route, not a refusal: the packet never left this host's
-		// network. Named separately because the operator action is the
-		// node's egress (routing, firewall, a missing IPv6 route), not
+		// No route, not a refusal: the packet never left this host's network.
+		// Named separately because the operator action is the node's egress, not
 		// Discord and not DNS.
 		return "no network route to the webhook host"
 	case errors.As(err, &certErr):
@@ -548,19 +395,13 @@ func transportPhrase(err error) string {
 	return "webhook transport failed" + transportStage(err)
 }
 
-// transportStage names WHICH stage of the attempt failed, from net.OpError's
-// Op field. That field is one of net's own fixed verbs ("dial", "read",
-// "write", or "proxyconnect" for a proxied attempt), so it is safe to print
+// transportStage names WHICH stage of the attempt failed, from net.OpError's Op
+// field. That field is one of net's own fixed verbs, so it is safe to print
 // where the surrounding error text is not, and it carries the distinction that
-// matters most during an outage: a stalled dial points at egress or DNS, while a
-// stalled read means the webhook host accepted the connection and then went
-// quiet.
-//
-// "proxyconnect" reaches here even though transportPhrase has a branch for it:
-// a proxy dial that TIMES OUT (rather than being refused) matches the deadline
-// branch first, which appends this suffix, so that failure reads "a deadline
-// expired during proxyconnect" — the stage still names the proxy, which is why
-// the order is left alone.
+// matters during an outage: a stalled dial points at egress or DNS, a stalled
+// read means the host accepted the connection and went quiet. "proxyconnect"
+// reaches here despite transportPhrase's own branch, a proxy dial that TIMES OUT
+// matching the deadline branch first.
 func transportStage(err error) string {
 	var opErr *net.OpError
 	if errors.As(err, &opErr) && opErr.Op != "" {
@@ -570,17 +411,11 @@ func transportStage(err error) string {
 }
 
 // isProxyConnectError reports whether the failure happened while reaching the
-// egress proxy rather than the webhook host. knell keeps
-// http.DefaultTransport, which honors HTTPS_PROXY/HTTP_PROXY, and net/http
-// wraps a proxy dial failure as *net.OpError{Op: "proxyconnect"} (a fixed
-// literal of net/http, safe to match). The errno underneath (ECONNREFUSED, a
-// DNS failure) would otherwise satisfy the webhook-host branches in
-// transportPhrase and name the wrong endpoint — a confident wrong diagnosis
-// sends the operator to Discord while their own proxy is what is down. The
-// proxy's HOSTNAME is operator-supplied text and is NOT named, only net's own
-// verb for the stage. errors.As finds the OUTERMOST *net.OpError, which for a
-// proxied attempt is the proxyconnect wrapper, so an unproxied failure (whose
-// first OpError is a "dial"/"read"/"write") is unaffected.
+// egress proxy rather than the webhook host. net/http wraps a proxy dial failure
+// as *net.OpError{Op: "proxyconnect"}, and the errno underneath would otherwise
+// satisfy transportPhrase's webhook-host branches -- a confident wrong diagnosis
+// sending the operator to Discord while their own proxy is down. errors.As finds
+// the OUTERMOST *net.OpError, so an unproxied failure is unaffected.
 func isProxyConnectError(err error) bool {
 	var opErr *net.OpError
 	return errors.As(err, &opErr) && opErr.Op == "proxyconnect"
@@ -588,15 +423,10 @@ func isProxyConnectError(err error) bool {
 
 // postAttempt performs one delivery attempt of an already-encoded payload:
 // request construction, transport call, and response cleanup, leaving the
-// verdict on the response to deliveryError. It is the retry callback post
-// hands to httpx.Do, which owns the retry policy, the per-attempt deadline
-// (WithAttemptTimeout, so ctx already carries it) and terminal wrapping.
-// Every error it returns is URL-free by CONSTRUCTION rather than by
-// filtering: a transport error is reduced and classified by
-// safeTransportError, and a rejected response contributes only statusDetail's
-// numbers and knell's own wording for them. The reduction happens here rather
-// than in post's own httpx.LogSafeError call because httpx.Do logs each
-// attempt's error before post ever sees it.
+// verdict to deliveryError. It is the retry callback post hands to httpx.Do,
+// which owns the retry policy and the per-attempt deadline. Every error it
+// returns is URL-free by CONSTRUCTION, and the reduction happens here rather
+// than in post because httpx.Do logs each attempt's error first.
 func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error) {
 	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, d.url, bytes.NewReader(body))
 	if reqErr != nil {
@@ -609,86 +439,46 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 	if doErr != nil {
 		// *url.Error embeds the full webhook URL and its cause can be written
 		// from a response's Location header; report knell's own phrase for it.
-		// The chain survives Unwrap, which is what both classifications read:
-		// httpx's transient check, and its own per-attempt-deadline mark (the
-		// expiry of the bound WithAttemptTimeout installed is retried, while
-		// the caller's own expired budget stays terminal).
+		// The chain survives Unwrap, which is what both classifications read.
 		return struct{}{}, safeTransportError(doErr)
 	}
-	// Drain up to 64 KiB and close, so the connection can be reused. The
-	// library helper is safe to use directly as of httpx v4.2.1: its drain
-	// logs a bare Debug line and no longer passes the body-read error VALUE
-	// to it. That error's text is remote-authored (net/http renders a
-	// malformed chunked trailer as `malformed MIME header: missing colon:
-	// "<remote bytes>"`, and a webhook edge echoing the request URI puts the
-	// path that IS the credential in those bytes).
-	// TestSuccessfulDeliveryDrainsTheBodyWithoutLoggingItsReadError keeps
-	// asserting it here, because a regression in httpx would reopen the leak
-	// in knell's own log stream.
+	// Drain up to 64 KiB and close, so the connection can be reused. The library
+	// helper is safe to use directly as of httpx v4.2.1: its drain no longer
+	// passes the body-read error VALUE to the log, and that text is
+	// remote-authored -- an edge echoing the request URI puts the credential in it.
 	defer httpx.DrainClose(resp.Body)
 	return struct{}{}, deliveryError(resp)
 }
 
-// deliveryError reports what a response says about delivery: nil for a
-// success, otherwise CheckHTTPStatus's typed error carrying whatever knell can
-// safely add to it.
-//
-// Success is exactly 2xx: CheckHTTPStatus rejects every other status, an
-// unfollowed redirect's 3xx included (pinned by
-// TestUnfollowedRedirectIsNotDelivery), so the sweep keeps retrying a
-// non-delivery. Its error is typed, and every return here keeps that type in
-// the chain (%w), which is what lets httpx.Do classify 502/503/504 as
-// transient and find *RateLimitError for the 429 wait.
-//
-// Nothing the other end authored is added. The detail is built HERE rather
-// than by post's own reduction because httpx.Do logs each attempt's error
-// through the type-based LogSafeError only, which passes a wrapped status error
-// through unchanged — so anything the body's own text contributed would reach
-// the retry and exhausted log lines, and for a webhook whose edge echoes the
-// request URI that text IS the credential. statusDetail therefore publishes
-// numbers and knell's words only, and an empty body adds nothing.
+// deliveryError reports what a response says about delivery: nil for a success,
+// otherwise CheckHTTPStatus's typed error carrying whatever knell can safely add.
+// Success is exactly 2xx, an unfollowed redirect's 3xx included, so the sweep
+// keeps retrying a non-delivery. Every return keeps its typed error in the chain
+// (%w), which lets httpx.Do classify 502/503/504 as transient and find
+// *RateLimitError for the 429 wait. The detail is built HERE because httpx.Do
+// logs each attempt's error through the type-based LogSafeError only.
 func deliveryError(resp *http.Response) error {
 	statusErr := httpx.CheckHTTPStatus(resp)
 	if statusErr == nil {
 		return nil
 	}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		// A 3xx reaches a caller only because the hop was NOT followed:
-		// New's policy hands back the 3xx for a method-changing hop
-		// (http.ErrUseLastResponse), and net/http does not follow a 3xx
-		// with no usable Location (a cross-host refusal never reaches
-		// here — CheckRedirect's error surfaces on the doErr path in
-		// postAttempt). "HTTP 302" alone reads like a webhook-side
-		// rejection, so say that nothing was delivered and what to point the
-		// URL at; the specific reason the hop was not followed is not knowable
-		// here, so the text does not claim one. The response body of an
-		// unfollowed redirect is not diagnostic, and neither the Location nor
-		// the request URL is included: for a webhook the path IS the
-		// credential.
+		// A 3xx reaches a caller only because the hop was NOT followed. "HTTP 302"
+		// alone reads like a webhook-side rejection, so say that nothing was
+		// delivered and what to point the URL at. Neither the Location nor the
+		// request URL is included: for a webhook the path IS the credential.
 		return fmt.Errorf(
 			"%w: redirect or other 3xx response was not followed, nothing was delivered (point DISCORD_WEBHOOK_URL at an endpoint that accepts the POST with a 2xx response)",
 			statusErr)
 	}
 	// The code alone cannot tell a deleted webhook from a rejected payload;
-	// Discord names that difference in the body as a numeric code, and
-	// statusDetail reports the code plus knell's own wording for it.
+	// Discord names that difference in the body as a numeric code.
 	detail := statusDetail(resp.Body)
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		// CheckHTTPStatus renders these two as "invalid API key (401)" and
-		// "access denied (403)" — wording for a keyed API. knell sends no API
-		// key: DISCORD_WEBHOOK_URL's own path and token ARE the credential,
-		// which is why config refuses a non-https URL. Discord answers a
-		// rotated webhook token with 401 + code 50027, but that code reaches
-		// the operator only when the body arrives whole and under
-		// maxErrorBodyBytes, so name the credential knell actually has and
-		// the verdict stands on its own when the body contributes nothing.
-		//
-		// %w cannot be used here: it would carry CheckHTTPStatus's own
-		// "invalid API key (401)" / "access denied (403)" text into the
-		// message this correction exists to replace, so the operator would
-		// read both diagnoses at once. webhookCredentialError writes the
-		// whole message itself and keeps the typed cause reachable through
-		// Unwrap, so errors.As still classifies it.
+		// CheckHTTPStatus renders these two as wording for a keyed API. knell
+		// sends no API key: DISCORD_WEBHOOK_URL's own path and token ARE the
+		// credential. %w cannot be used, since it would carry that text into the
+		// message this correction exists to replace.
 		return &webhookCredentialError{cause: statusErr, detail: detail, status: resp.StatusCode}
 	}
 	if detail != "" {
@@ -716,37 +506,23 @@ func (e *webhookCredentialError) Error() string {
 
 func (e *webhookCredentialError) Unwrap() error { return e.cause }
 
-// statusDetail renders what a rejected response adds to its status code,
-// using only numbers this package measured and words this package wrote.
-//
-// Discord answers a rejected webhook POST with a JSON error object whose
-// numeric "code" field names the cause, and that number is the body's whole
-// diagnostic value: a number cannot carry a credential. The object's own
-// "message" string and nested "errors" object are authored by the other end
-// and are never published, in any form — a webhook edge that echoes the
-// request URI would otherwise put the credential (for a webhook the URL path
-// IS the credential) into this error and into httpx.Do's log lines.
-//
-// Everything else about the body is reported as a fact ABOUT the body and
-// never as its content: a body that is not Discord's error object, one past
-// maxErrorBodyBytes, and one that did not arrive whole all report the byte
-// count and that the detail was dropped. The empty string means the status is
-// the whole verdict (an empty body), which the caller reports as the bare
-// typed error.
+// statusDetail renders what a rejected response adds to its status code, using
+// only numbers this package measured and words this package wrote. Discord
+// answers a rejected POST with a JSON error object whose numeric "code" field
+// names the cause, and that number is the body's whole diagnostic value: a
+// number cannot carry a credential. The object's text fields are authored by the
+// other end and never published; everything else is reported as a fact ABOUT the
+// body. The empty string means the status is the whole verdict.
 func statusDetail(body io.Reader) string {
 	// One byte past the cap, so an over-cap body is DETECTABLE instead of
 	// silently truncated into a partial (and then unattributable) fragment.
 	detail, readErr := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes+1))
 	switch {
 	case readErr != nil:
-		// A body that did not arrive whole is worth saying out loud: a bare
-		// status reads as "the webhook explained nothing", while a response
-		// that broke mid-body points at the path between here and Discord
-		// rather than at Discord's verdict, and the status cannot tell them
-		// apart. The partial bytes are dropped, and so is the read error's
-		// own text — net/textproto renders a malformed trailer as "malformed
-		// MIME header line: <remote bytes>", which is remote-authored like
-		// any body. readFailure classifies it structurally instead.
+		// A body that did not arrive whole is worth saying out loud: a bare status
+		// reads as "the webhook explained nothing", while a response that broke
+		// mid-body points at the path between here and Discord. The read error's
+		// own text is remote-authored, so readFailure classifies it instead.
 		return fmt.Sprintf(" (response body unreadable after %d bytes, detail dropped: %s)",
 			len(detail), readFailure(readErr))
 	case len(detail) > maxErrorBodyBytes:
@@ -767,12 +543,11 @@ func statusDetail(body io.Reader) string {
 	return fmt.Sprintf(": Discord error code %d", code)
 }
 
-// discordErrorCode reports the numeric error code of a rejected response
-// body. Exactly one field is decoded: the surrounding object's text fields
-// are remote-authored, so they are never bound to a variable this package
-// formats. A body that is not a JSON object, or whose "code" is missing or
-// not a number, reports no code, and the decode error is discarded rather
-// than reported — encoding/json's message describes the input.
+// discordErrorCode reports the numeric error code of a rejected response body.
+// Exactly one field is decoded: the surrounding object's text fields are
+// remote-authored, so they are never bound to a variable this package formats. A
+// body that is not a JSON object, or whose "code" is missing, reports no code,
+// and the decode error is discarded: encoding/json's message describes the input.
 func discordErrorCode(body []byte) (int, bool) {
 	var parsed struct {
 		Code *int `json:"code"`
@@ -785,16 +560,11 @@ func discordErrorCode(body []byte) (int, bool) {
 
 // discordCodeMeaning is knell's own wording for the Discord error codes an
 // operator can act on; the empty string means knell knows no meaning for the
-// code and reports the bare number. The mapped codes split by what the
-// operator can do about them: 10015 and 50027 mean the webhook this knell
-// posts to no longer accepts it, which only an operator can fix; 50006 and
-// 50035 mean Discord refused the payload knell built, which no configuration
-// change helps — so both are reported as knell bugs, and neither names a
-// setting for the operator to re-check: config validates every operator-set
-// value at startup, so a rejected payload is knell's own doing and pointing
-// at an input startup already accepted would only send the operator to
-// inspect the wrong thing. Values are phrased as that verdict rather than as
-// a translation of Discord's message, which is never read.
+// code and reports the bare number. The mapped codes split by what the operator
+// can do: 10015 and 50027 mean the webhook no longer accepts this knell, which
+// only an operator can fix, while 50006 and 50035 mean Discord refused the
+// payload knell built, so both are reported as knell bugs and neither names a
+// setting to re-check.
 func discordCodeMeaning(code int) string {
 	switch code {
 	case 10015:
@@ -810,21 +580,16 @@ func discordCodeMeaning(code int) string {
 }
 
 // readFailure names why reading a rejected response's body failed, in knell's
-// own words. The read error is classified structurally (errors.Is against a
-// fixed set) and never rendered: io.ReadAll surfaces net/textproto's
-// "malformed MIME header line: <remote bytes>" verbatim, so its text is
-// remote-authored input, not a diagnosis. An unrecognized failure reports
-// only that the read failed; the caller's byte count carries the rest.
+// own words. The read error is classified structurally and never rendered:
+// io.ReadAll surfaces net/textproto's "malformed MIME header line: <remote
+// bytes>" verbatim, so its text is remote-authored input, not a diagnosis.
 func readFailure(err error) string {
 	switch {
 	case errors.Is(err, io.ErrUnexpectedEOF):
 		return "the connection closed before the body was complete"
 	case errors.Is(err, context.Canceled):
-		// Shutdown, not a fault on the path to Discord: the sweep's context
-		// was canceled while the rejected response's body was being read.
-		// It reaches here by the same mechanism as the deadline below (the
-		// attempt context governs the body read too), and transportPhrase
-		// names the same cause for the pre-response half of an attempt.
+		// Shutdown, not a fault on the path to Discord: the sweep's context was
+		// canceled while the rejected response's body was being read.
 		return "delivery was canceled before the body was complete"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "the attempt deadline expired mid-body"

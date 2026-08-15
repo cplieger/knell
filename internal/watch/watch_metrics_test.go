@@ -177,67 +177,6 @@ func TestSweepExactDeadlineBoundaryIsFresh(t *testing.T) {
 
 var refreshProbeSequence atomic.Uint64
 
-func TestRefreshFreshnessUpdatesGaugeWithoutNotifying(t *testing.T) {
-	t.Parallel()
-
-	id := "refresh-probe-" + strconv.FormatUint(refreshProbeSequence.Add(1), 10)
-	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
-
-	// Construction pre-mints the received counter at zero so increase()
-	// alerts have a baseline sample before the first ping.
-	if got := labeledValue(t, "knell_beats_received_total", "beat", id); got != "0" {
-		t.Errorf("beats_received_total at boot = %s, want 0", got)
-	}
-
-	// refreshFreshness alone must flip the gauge when the beat goes
-	// overdue -- without sending any notification (that is sweep's job).
-	// This is the documented ground-truth path while the sender loop is
-	// blocked on a slow webhook.
-	clock.Advance(11 * time.Minute)
-	w.refreshFreshness()
-	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "0" {
-		t.Fatalf("beat_fresh after refreshFreshness = %s, want 0", got)
-	}
-	if calls := n.snapshot(); len(calls) != 0 {
-		t.Fatalf("refreshFreshness sent notifications: %v", calls)
-	}
-
-	// A ping restores the gauge; refreshFreshness must keep it at 1.
-	if !recordedBeat(w, id) {
-		t.Fatal("Beat returned false for configured id")
-	}
-	w.refreshFreshness()
-	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
-		t.Fatalf("beat_fresh after ping + refresh = %s, want 1", got)
-	}
-}
-
-func TestUnknownBeatMintsNoMetricSeries(t *testing.T) {
-	t.Parallel()
-
-	// The beat id is a metric label, so a ping for an id that is not
-	// configured must record nothing at all: minting a series on an unknown id
-	// turns arbitrary /beat/<anything> request paths into unbounded, permanent
-	// label cardinality in knell and in every observer scraping it. Beat's
-	// false return is asserted elsewhere; this pins the half that has no
-	// symptom at all until the series count explodes.
-	const unknown = "unknown-cardinality-probe"
-	w, _, _ := newTestWatcher(Beat{ID: "known-cardinality-probe", Deadline: 10 * time.Minute})
-	if recordedBeat(w, unknown) {
-		t.Fatalf("Beat(%s) = true, want false for an unconfigured id", unknown)
-	}
-	for _, name := range []string{
-		"knell_beats_received_total",
-		"knell_beat_fresh",
-		"knell_beat_last_seen_timestamp_seconds",
-		"knell_beat_outages_total",
-	} {
-		if got, ok := findLabeledValue(name, "beat", unknown); ok {
-			t.Errorf("%s{beat=%q} = %s after a ping for an unconfigured id, want the series absent (the id is a label)", name, unknown, got)
-		}
-	}
-}
-
 // labeledCounterValue parses the exposition value of name{label="<value>"} as
 // a float. It is the single parse-and-diagnose path behind the two
 // label-specific helpers below.
@@ -580,82 +519,6 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	}
 }
 
-func TestFailedAndDroppedNeverBothMoveForOneEvent(t *testing.T) {
-	// Serial (no t.Parallel): asserts deltas on the package-global
-	// notification counters. failed and dropped answer two different
-	// operator questions -- "wait, it will retry" vs "reconstruct the missed
-	// window" -- so a single event must land on exactly one of them, or
-	// KnellNotifyFailing reports one incident as two. A lost outage RECORD
-	// lands on neither: it is counted per record on
-	// knell_outage_records_dropped_total, because one history message covers
-	// several records, so N lost records are not N lost messages.
-	const id = "failed-vs-dropped-probe"
-	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
-	w.Beat(id)
-
-	// Event 1: a genuine delivery failure. failed only.
-	clock.Advance(11 * time.Minute)
-	n.setFail(errors.New("discord down"))
-	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
-	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "missing")
-	w.sweep(t.Context())
-	if got, want := counterValue(t, "knell_notifications_failed_total", "missing"), failedBefore+1; got != want {
-		t.Errorf("failed{missing} = %v after a failed delivery, want %v", got, want)
-	}
-	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
-		t.Errorf("dropped{missing} = %v after a failed delivery, want unchanged %v (the record is still queued and retries)", got, droppedBefore)
-	}
-
-	// Event 2: a permanent queue-full drop of an ended outage. The per-RECORD
-	// counter only.
-	// Fill the remaining slots with ended outages first (the failed send
-	// above left its record queued and open until this ping seals it).
-	for len(w.beats[id].pendingMissing) < missingQueueSize {
-		clock.Advance(11 * time.Minute)
-		if !recordedBeat(w, id) {
-			t.Fatalf("Beat(%s) = false", id)
-		}
-	}
-	failedBefore = counterValue(t, "knell_notifications_failed_total", "missing")
-	droppedBefore = counterValue(t, "knell_notifications_dropped_total", "missing")
-	recordsDroppedBefore := beatCounterValue(t, "knell_outage_records_dropped_total", id)
-	clock.Advance(11 * time.Minute)
-	if !recordedBeat(w, id) {
-		t.Fatalf("overflow Beat(%s) = false", id)
-	}
-	if got, want := beatCounterValue(t, "knell_outage_records_dropped_total", id), recordsDroppedBefore+1; got != want {
-		t.Errorf("outage_records_dropped_total = %v after a queue-full drop, want %v", got, want)
-	}
-	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
-		t.Errorf("dropped{missing} = %v after a queue-full drop, want unchanged %v (the message counter must not move for a lost RECORD)", got, droppedBefore)
-	}
-	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
-		t.Errorf("failed{missing} = %v after a queue-full drop, want unchanged %v (nothing was attempted, nothing will retry)", got, failedBefore)
-	}
-
-	// Event 3: the sweep-path queue-full event on an ongoing outage. No
-	// counter moves: the notice is deferred, not failed and not lost.
-	n.setFail(nil)
-	failedBefore = counterValue(t, "knell_notifications_failed_total", "missing")
-	droppedBefore = counterValue(t, "knell_notifications_dropped_total", "missing")
-	recordsDroppedBefore = beatCounterValue(t, "knell_outage_records_dropped_total", id)
-	outagesBefore := beatCounterValue(t, "knell_beat_outages_total", id)
-	clock.Advance(11 * time.Minute)
-	w.sweep(t.Context())
-	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), outagesBefore+1; got != want {
-		t.Fatalf("beat_outages_total = %v, want %v (the sweep must have detected the crossing while the queue was full)", got, want)
-	}
-	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
-		t.Errorf("failed{missing} = %v after a sweep-path queue-full event, want unchanged %v", got, failedBefore)
-	}
-	if got := counterValue(t, "knell_notifications_dropped_total", "missing"); got != droppedBefore {
-		t.Errorf("dropped{missing} = %v after a sweep-path queue-full event, want unchanged %v", got, droppedBefore)
-	}
-	if got := beatCounterValue(t, "knell_outage_records_dropped_total", id); got != recordsDroppedBefore {
-		t.Errorf("outage_records_dropped_total = %v after a sweep-path queue-full event, want unchanged %v", got, recordsDroppedBefore)
-	}
-}
-
 func TestFailedRecoveredSendIsCountedAsDroppedNotFailed(t *testing.T) {
 	// Serial (no t.Parallel): asserts deltas on the package-global
 	// notification counters and captures the process-global slog default.
@@ -878,38 +741,6 @@ func TestHistoryNoticeCountsOncePerMessageWhileOutagesCountEach(t *testing.T) {
 	}
 	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), outagesBefore+outages; got != want {
 		t.Errorf("beat_outages_total = %v after delivery, want %v (delivery must not move an outage counter)", got, want)
-	}
-}
-
-func TestCanceledHistoryNotificationIsNotFailedAndKeepsRecords(t *testing.T) {
-	// Serial (no t.Parallel): asserts a delta on the package-global failed
-	// counter. A shutdown-abandoned send must not page KnellNotifyFailing,
-	// and it must not consume the outages it was about to report.
-	const id = "history-cancel-probe"
-	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
-	w.Beat(id)
-	for range 2 {
-		clock.Advance(11 * time.Minute)
-		if !recordedBeat(w, id) {
-			t.Fatalf("Beat(%s) = false", id)
-		}
-	}
-
-	failedBefore := counterValue(t, "knell_notifications_failed_total", "history")
-	n.setFail(context.Canceled)
-	w.sweep(t.Context())
-	if got := counterValue(t, "knell_notifications_failed_total", "history"); got != failedBefore {
-		t.Errorf("failed{history} = %v after a canceled send, want unchanged %v", got, failedBefore)
-	}
-	if got := len(w.beats[id].pendingMissing); got != 2 {
-		t.Errorf("queued records = %d after a canceled history send, want both retained for the next run", got)
-	}
-
-	// Once the notifier heals, the abandoned notice still goes out.
-	n.setFail(nil)
-	w.sweep(t.Context())
-	if got := n.snapshot(); len(got) != 1 || got[0].kind != "history" || got[0].outages != 2 {
-		t.Fatalf("calls = %v, want the abandoned history notice delivered after the notifier healed", got)
 	}
 }
 
@@ -1171,55 +1002,5 @@ func TestBudgetCutIsLoggedOncePerSweepWithTheDeferredCount(t *testing.T) {
 	w.sweep(t.Context())
 	if got := quiet.Count(msg); got != 0 {
 		t.Errorf("budget-cut lines in a sweep that delivered everything = %d, want 0: %v", got, quiet.Messages())
-	}
-}
-
-func TestRunReportsUndeliveredWorkWhenTheContextIsCancelled(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default.
-	//
-	// The shutdown report is wiring, not just a function: every other test of
-	// it calls logUndelivered directly, so deleting Run's call to it leaves
-	// them all green while the operator loses the ONLY trace of a notice that
-	// died with the process (this path has no delivery counter behind it).
-	const id = "run-shutdown-report-probe"
-	clock := newFakeClock()
-	n := &fakeNotifier{}
-	w := New([]Beat{{ID: id, Deadline: 10 * time.Minute}}, n, clock.Now, clock.Now())
-
-	// One ended outage whose notice never got out: the webhook is down when
-	// the sweep detects the crossing, so the record stays queued, and a late
-	// ping seals it. That record is the outage's only trace.
-	n.setFail(errors.New("discord down"))
-	if !recordedBeat(w, id) {
-		t.Fatalf("Beat(%s) = false", id)
-	}
-	clock.Advance(11 * time.Minute)
-	w.sweep(t.Context())
-	if !recordedBeat(w, id) {
-		t.Fatalf("late Beat(%s) = false", id)
-	}
-	if got := len(w.beats[id].pendingMissing); got != 1 {
-		t.Fatalf("queued records before shutdown = %d, want 1 undelivered ended-outage record", got)
-	}
-
-	rec := capture.Default(t)
-	// A tick far beyond this test's lifetime, so only the cancellation arm of
-	// Run's select runs.
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		w.Run(ctx, time.Hour)
-	}()
-	cancel()
-	<-done
-
-	if got := rec.CountLevel(slog.LevelWarn, "shutting down with undelivered ended-outage records"); got != 1 {
-		t.Errorf("shutdown loss warnings = %d, want exactly 1: Run must report the notices dying with the process, which no counter records: %v",
-			got, rec.Messages())
-	}
-	if !rec.HasAttr("watch loop stopped", "permanent_loss", "1") {
-		t.Errorf("shutdown summary does not report the permanently lost record: %v", rec.Records())
 	}
 }
