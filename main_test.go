@@ -327,7 +327,7 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 
 	bindFailure := errors.New("listen tcp :9190: bind: address already in use")
 
-	got := classifyBindError(context.Background(), ":9190", bindFailure)
+	got := classifyBindError(t.Context(), ":9190", bindFailure)
 	if got == nil {
 		t.Fatal("classifyBindError(live ctx) = nil, want the bind failure surfaced so the boot fails instead of running as a switch nothing can reach")
 	}

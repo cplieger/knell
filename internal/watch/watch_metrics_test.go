@@ -56,7 +56,7 @@ func TestBeatFreshGaugeTracksOverdueAndRecovery(t *testing.T) {
 	bootSeen := labeledValue(t, "knell_beat_last_seen_timestamp_seconds", "beat", id)
 
 	clock.Advance(11 * time.Minute)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "0" {
 		t.Fatalf("beat_fresh when overdue = %s, want 0", got)
 	}
@@ -114,7 +114,7 @@ func TestCanceledNotificationsAreNotCountedAsFailed(t *testing.T) {
 	failedBefore := labeledValue(t, "knell_notifications_failed_total", "kind", "missing")
 	droppedBefore := labeledValue(t, "knell_notifications_dropped_total", "kind", "missing")
 	n.setFail(context.Canceled)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := labeledValue(t, "knell_notifications_failed_total", "kind", "missing"); got != failedBefore {
 		t.Errorf("failed{missing} = %s after canceled send, want unchanged %s (a shutdown must not page KnellNotifyFailing)", got, failedBefore)
 	}
@@ -125,7 +125,7 @@ func TestCanceledNotificationsAreNotCountedAsFailed(t *testing.T) {
 	// The abandoned send did not mark the beat alerted: once the notifier
 	// heals, the outage is still reported.
 	n.setFail(nil)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	got := n.snapshot()
 	if len(got) != 1 || got[0].kind != "missing" {
 		t.Fatalf("calls = %v, want the missing notice retried after a shutdown-abandoned send", got)
@@ -156,7 +156,7 @@ func TestSweepExactDeadlineBoundaryIsFresh(t *testing.T) {
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 
 	clock.Advance(10 * time.Minute)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
 		t.Fatalf("beat_fresh at silence == deadline = %s, want 1 (inclusive boundary)", got)
 	}
@@ -165,7 +165,7 @@ func TestSweepExactDeadlineBoundaryIsFresh(t *testing.T) {
 	}
 
 	clock.Advance(time.Nanosecond)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "0" {
 		t.Fatalf("beat_fresh just past deadline = %s, want 0", got)
 	}
@@ -272,7 +272,7 @@ func TestDeliveredNotificationsIncrementSentCounters(t *testing.T) {
 	clock.Advance(11 * time.Minute)
 
 	missingBefore := counterValue(t, "knell_notifications_sent_total", "missing")
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := counterValue(t, "knell_notifications_sent_total", "missing"); got != missingBefore+1 {
 		t.Errorf("sent{missing} = %v after delivered send, want %v (the sent counter is the delivery ground truth dashboards read)", got, missingBefore+1)
 	}
@@ -301,7 +301,7 @@ func TestFailedMissingNotificationIncrementsFailedCounter(t *testing.T) {
 	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "missing")
 	sentBefore := counterValue(t, "knell_notifications_sent_total", "missing")
 	n.setFail(errors.New("discord down"))
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore+1 {
 		t.Errorf("failed{missing} = %v after failed send, want %v (KnellNotifyFailing increases() over this counter)", got, failedBefore+1)
 	}
@@ -315,7 +315,7 @@ func TestFailedMissingNotificationIncrementsFailedCounter(t *testing.T) {
 	// The record survived, which is what makes failed (not dropped) the right
 	// counter: the very next sweep delivers the same notice.
 	n.setFail(nil)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" {
 		t.Fatalf("calls = %v, want the missing notice retried on the next sweep", got)
 	}
@@ -387,7 +387,7 @@ func TestQueueFullLogsAreEmittedWithTheWatcherMutexReleased(t *testing.T) {
 	// announces the back-pressure at Debug.
 	n.setFail(errors.New("discord down"))
 	clock.Advance(11 * time.Minute)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	// The ping path: the queue is still full, so this ping's already-ended
 	// outage loses its record and Beat announces the permanent loss at Warn.
 	clock.Advance(47 * time.Minute)
@@ -495,7 +495,7 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	rec := capture.Default(t)
 	const sweeps = 3
 	for range sweeps {
-		w.sweep(context.Background())
+		w.sweep(t.Context())
 	}
 	// Nothing was lost and nothing was attempted for the ongoing outage, so
 	// neither the failed nor the dropped counter may move for it. The queue
@@ -565,7 +565,7 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	outagesBefore = beatCounterValue(t, "knell_beat_outages_total", id)
 	fresh := capture.Default(t)
 	clock.Advance(11 * time.Minute)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), outagesBefore+1; got != want {
 		t.Errorf("beat_outages_total = %v after a new outage, want %v", got, want)
 	}
@@ -598,7 +598,7 @@ func TestFailedAndDroppedNeverBothMoveForOneEvent(t *testing.T) {
 	n.setFail(errors.New("discord down"))
 	failedBefore := counterValue(t, "knell_notifications_failed_total", "missing")
 	droppedBefore := counterValue(t, "knell_notifications_dropped_total", "missing")
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got, want := counterValue(t, "knell_notifications_failed_total", "missing"), failedBefore+1; got != want {
 		t.Errorf("failed{missing} = %v after a failed delivery, want %v", got, want)
 	}
@@ -641,7 +641,7 @@ func TestFailedAndDroppedNeverBothMoveForOneEvent(t *testing.T) {
 	recordsDroppedBefore = beatCounterValue(t, "knell_outage_records_dropped_total", id)
 	outagesBefore := beatCounterValue(t, "knell_beat_outages_total", id)
 	clock.Advance(11 * time.Minute)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got, want := beatCounterValue(t, "knell_beat_outages_total", id), outagesBefore+1; got != want {
 		t.Fatalf("beat_outages_total = %v, want %v (the sweep must have detected the crossing while the queue was full)", got, want)
 	}
@@ -674,7 +674,7 @@ func TestFailedRecoveredSendIsCountedAsDroppedNotFailed(t *testing.T) {
 	// Deliver the missing notice so the beat is alerted and the next ping
 	// queues a real recovered transition.
 	clock.Advance(11 * time.Minute)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" {
 		t.Fatalf("calls = %v, want the missing notice delivered before the recovery", got)
 	}
@@ -719,7 +719,7 @@ func TestFailedRecoveredSendIsCountedAsDroppedNotFailed(t *testing.T) {
 	// once the notifier heals. If a retry existed, failed would be right.
 	n.setFail(nil)
 	drainRecoveries(w)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" {
 		t.Fatalf("calls = %v, want only the original missing: a dropped recovery must never be retried", got)
 	}
@@ -746,7 +746,7 @@ func TestUndeliveredNoticeLogsCarryTheirRetryability(t *testing.T) {
 	clock.Advance(11 * time.Minute)
 	n.setFail(errors.New("discord down"))
 	missing := capture.Default(t)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := missing.CountLevel(slog.LevelError, "missing notification failed"); got != 1 {
 		t.Fatalf("missing-failure error lines = %d, want exactly 1: %v", got, missing.Messages())
 	}
@@ -760,7 +760,7 @@ func TestUndeliveredNoticeLogsCarryTheirRetryability(t *testing.T) {
 		t.Fatalf("closing Beat(%s) = false", id)
 	}
 	history := capture.Default(t)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := history.CountLevel(slog.LevelError, "outage history notification failed"); got != 1 {
 		t.Fatalf("history-failure error lines = %d, want exactly 1: %v", got, history.Messages())
 	}
@@ -773,11 +773,11 @@ func TestUndeliveredNoticeLogsCarryTheirRetryability(t *testing.T) {
 	// arrive -- and this site moves no counter, which makes the log line its
 	// only trace and the field its only loss signal.
 	n.setFail(nil)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	// One more outage, this time delivered, so the beat is alerted and the next
 	// ping queues a real recovered transition.
 	clock.Advance(11 * time.Minute)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if !recordedBeat(w, id) {
 		t.Fatalf("recovering Beat(%s) = false", id)
 	}
@@ -804,7 +804,7 @@ func TestUndeliveredNoticeLogsCarryTheirRetryability(t *testing.T) {
 	cmClock.Advance(11 * time.Minute)
 	cmNotifier.setFail(context.Canceled)
 	canceledMissing := capture.Default(t)
-	cm.sweep(context.Background())
+	cm.sweep(t.Context())
 	if got := canceledMissing.CountLevel(slog.LevelInfo, "missing notification abandoned"); got != 1 {
 		t.Fatalf("abandoned-missing info lines = %d, want exactly 1: %v", got, canceledMissing.Messages())
 	}
@@ -821,7 +821,7 @@ func TestUndeliveredNoticeLogsCarryTheirRetryability(t *testing.T) {
 	}
 	chNotifier.setFail(context.Canceled)
 	canceledHistory := capture.Default(t)
-	ch.sweep(context.Background())
+	ch.sweep(t.Context())
 	if got := canceledHistory.CountLevel(slog.LevelInfo, "outage history notification abandoned"); got != 1 {
 		t.Fatalf("abandoned-history info lines = %d, want exactly 1: %v", got, canceledHistory.Messages())
 	}
@@ -863,7 +863,7 @@ func TestHistoryNoticeCountsOncePerMessageWhileOutagesCountEach(t *testing.T) {
 	sentBefore := counterValue(t, "knell_notifications_sent_total", "history")
 	missingBefore := counterValue(t, "knell_notifications_sent_total", "missing")
 	recoveredBefore := counterValue(t, "knell_notifications_sent_total", "recovered")
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := n.snapshot(); len(got) != 1 || got[0].outages != outages {
 		t.Fatalf("calls = %v, want one history notice covering %d outages", got, outages)
 	}
@@ -897,7 +897,7 @@ func TestCanceledHistoryNotificationIsNotFailedAndKeepsRecords(t *testing.T) {
 
 	failedBefore := counterValue(t, "knell_notifications_failed_total", "history")
 	n.setFail(context.Canceled)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := counterValue(t, "knell_notifications_failed_total", "history"); got != failedBefore {
 		t.Errorf("failed{history} = %v after a canceled send, want unchanged %v", got, failedBefore)
 	}
@@ -907,7 +907,7 @@ func TestCanceledHistoryNotificationIsNotFailedAndKeepsRecords(t *testing.T) {
 
 	// Once the notifier heals, the abandoned notice still goes out.
 	n.setFail(nil)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := n.snapshot(); len(got) != 1 || got[0].kind != "history" || got[0].outages != 2 {
 		t.Fatalf("calls = %v, want the abandoned history notice delivered after the notifier healed", got)
 	}
@@ -1020,7 +1020,7 @@ func TestShutdownWarnsAboutQueuedRecoveredNotifications(t *testing.T) {
 	// Alert the beat, then ping it: the recovered transition is queued and
 	// never drained, exactly as it sits when cancellation arrives.
 	clock.Advance(11 * time.Minute)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if !recordedBeat(w, id) {
 		t.Fatalf("Beat(%s) = false", id)
 	}
@@ -1089,7 +1089,7 @@ func TestLogUndeliveredCountsAnUnqueuedOngoingOutage(t *testing.T) {
 	// abandoned outage is then the ONLY undelivered work, and a
 	// slice-derived snapshot would skip the beat entirely.
 	n.setFail(nil)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := len(w.beats[id].pendingMissing); got != 0 {
 		t.Fatalf("queued records after the history drain = %d, want 0", got)
 	}
@@ -1139,7 +1139,7 @@ func TestBudgetCutIsLoggedOncePerSweepWithTheDeferredCount(t *testing.T) {
 	slowSends(n, clock, perSend)
 
 	rec := capture.Default(t)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 
 	const msg = "sweep send budget spent"
 	if got := rec.CountLevel(slog.LevelDebug, msg); got != 1 {
@@ -1168,7 +1168,7 @@ func TestBudgetCutIsLoggedOncePerSweepWithTheDeferredCount(t *testing.T) {
 	// enough to finish the remaining beats, the sweep must stay silent.
 	n.onMissing = nil
 	quiet := capture.Default(t)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if got := quiet.Count(msg); got != 0 {
 		t.Errorf("budget-cut lines in a sweep that delivered everything = %d, want 0: %v", got, quiet.Messages())
 	}
@@ -1195,7 +1195,7 @@ func TestRunReportsUndeliveredWorkWhenTheContextIsCancelled(t *testing.T) {
 		t.Fatalf("Beat(%s) = false", id)
 	}
 	clock.Advance(11 * time.Minute)
-	w.sweep(context.Background())
+	w.sweep(t.Context())
 	if !recordedBeat(w, id) {
 		t.Fatalf("late Beat(%s) = false", id)
 	}
@@ -1206,7 +1206,7 @@ func TestRunReportsUndeliveredWorkWhenTheContextIsCancelled(t *testing.T) {
 	rec := capture.Default(t)
 	// A tick far beyond this test's lifetime, so only the cancellation arm of
 	// Run's select runs.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

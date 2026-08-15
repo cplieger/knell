@@ -852,7 +852,7 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 		t.Skip("cannot plant a health marker in the test temp dir")
 	}
 
-	exitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	exitCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	watcherDone := make(chan struct{})
 	admissionClosed := 0
@@ -948,7 +948,7 @@ func TestTeardownAfterServeExitDrainsAcceptedHandlers(t *testing.T) {
 	})
 
 	watcherDone := make(chan struct{})
-	exitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	exitCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	returned := make(chan struct{})
 	go func() {
@@ -1041,7 +1041,7 @@ func TestTeardownAfterServeExitWarnsWhenTheDrainOutlivesTheGrace(t *testing.T) {
 	// An already-expired grace: Shutdown still closes the listener, cannot
 	// drain the parked handler, and returns the deadline error -- the branch
 	// under test, unreachable while a drain succeeds.
-	exitCtx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	exitCtx, cancel := context.WithTimeout(t.Context(), time.Millisecond)
 	defer cancel()
 	<-exitCtx.Done()
 

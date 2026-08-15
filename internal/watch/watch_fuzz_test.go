@@ -1,7 +1,6 @@
 package watch
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -186,7 +185,7 @@ func FuzzMissingQueue(f *testing.F) {
 			case 'a': // a partial deadline of silence
 				clock.Advance(deadline / 3)
 			case 's': // a watch sweep
-				w.sweep(context.Background())
+				w.sweep(t.Context())
 				checkSwitchStaysArmed(t, w, id, clock.Now(), ops)
 			case 'r': // the Run loop draining queued recoveries
 				drainRecoveries(w)

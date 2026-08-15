@@ -82,6 +82,8 @@ func runMain(t *testing.T, env []string, args ...string) (int, string) {
 	// error, a rejected boot). If a regression makes it boot instead, the
 	// child would otherwise hold CombinedOutput open until the package-wide
 	// test timeout panics; the kill turns that into this test's failure.
+	// Background, not t.Context(): cancel is registered as a Cleanup, and
+	// t.Context() is already cancelled by the time Cleanups run.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	cmd := exec.CommandContext(ctx, os.Args[0], args...)
@@ -121,6 +123,9 @@ type servingKnell struct {
 // missing contract.
 func startServingKnell(t *testing.T, env []string) *servingKnell {
 	t.Helper()
+	// Background, not t.Context(): this child must outlive the test body so the
+	// caller can signal it and drain its shutdown lines, and its teardown is
+	// registered as a Cleanup, by which point t.Context() is already cancelled.
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)
 	cmd := exec.CommandContext(ctx, os.Args[0])
