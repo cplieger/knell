@@ -85,8 +85,8 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 				t.Fatalf("sending the %s notice: %v", name, err)
 			}
 			content := <-rec.contents
-			if runes := len([]rune(content)); runes >= discordContentLimit {
-				t.Errorf("the %s notice renders %d characters at the worst case, want under Discord's %d-character content limit: either shorten the template or lower MaxNodeNameBytes, because Discord answers 400 for an over-limit content and the notice is never delivered",
+			if runes := len([]rune(content)); runes > discordContentLimit {
+				t.Errorf("the %s notice renders %d characters at the worst case, want at most Discord's %d-character content limit: either shorten the template or lower MaxNodeNameBytes, because Discord answers 400 for an over-limit content and the notice is never delivered",
 					name, runes, discordContentLimit)
 			}
 		})

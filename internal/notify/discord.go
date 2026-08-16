@@ -42,10 +42,22 @@ const MaxNodeNameBytes = 256
 // semantics: total, including the first).
 const maxAttempts = 3
 
-// rateLimitMaxWait caps how long ONE rate-limited attempt may park the sweep's
-// single sender goroutine. httpx waits min(Retry-After, this ceiling) before a
-// 429 retry, so this number -- never Discord's hint -- bounds the delay every
-// OTHER beat's notice inherits from one rate-limited beat.
+// sendBudget is the TOTAL wall time one delivery may spend, and therefore the
+// longest a notice can park watch's single sender goroutine. Derived from the
+// per-attempt knobs rather than chosen, so changing either cannot leave it
+// stale. Its expiry CUTS the retry loop: two full-ceiling rate-limit parks (the
+// header-less regime below) spend it before the third attempt runs, which for a
+// missing or history notice is watch's 15s sweep re-posting the cut send, and
+// for the fire-once recovered notice is one permanently dropped message.
+const sendBudget = maxAttempts*attemptTimeout + rateLimitMaxWait
+
+// rateLimitMaxWait caps ONE rate-limited attempt's wait, and IS that wait
+// whenever the 429 carries no positive Retry-After HEADER: httpx waits
+// min(hint, this ceiling) only when it parses one. Discord answers its own 429
+// with an integer header, so the full-ceiling park belongs to the header-less
+// refusals in front of it -- an edge, a proxy, a ban page. httpx sleeps before
+// each of the maxAttempts-1 retries, so sendBudget, not this constant, bounds
+// the delay every OTHER beat's notice inherits from one rate-limited beat.
 const rateLimitMaxWait = 30 * time.Second
 
 // maxErrorBodyBytes caps how much of a rejected response's body is READ, and
@@ -71,9 +83,10 @@ type Discord struct {
 	// render site publishes the backslashes instead of the name.
 	node string
 	// attemptTimeout bounds one delivery attempt, rateLimitMaxWait one rate-limit
-	// retry wait. Fields only so a test can shorten them on its own notifier.
+	// retry wait, sendBudget the whole delivery. Fields only so a test can shorten them.
 	attemptTimeout   time.Duration
 	rateLimitMaxWait time.Duration
+	sendBudget       time.Duration
 }
 
 // Discord implements the transition contract the state machine consumes; the
@@ -103,6 +116,7 @@ func New(webhookURL, node string) *Discord {
 		node:             escapeMarkdown(node),
 		attemptTimeout:   attemptTimeout,
 		rateLimitMaxWait: rateLimitMaxWait,
+		sendBudget:       sendBudget,
 	}
 }
 
@@ -145,18 +159,18 @@ const historyTimeFormat = "2006-01-02 15:04 MST"
 // observer could send anything about them, in one past-tense message so a
 // resolved incident never reads as a new live failure. One outage is reported on
 // its own; several are summarized. The batch's shape is the caller's contract:
-// watch asserts every record ended, has a start, and ascends by recovery point,
-// so a refusal here would keep the records queued forever and present a producer
-// bug as a webhook one.
+// watch guarantees by construction that every record ended, has a start, and
+// ascends by recovery point, so a refusal here would keep the records queued
+// forever and present a producer bug as a webhook one.
 func (d *Discord) BeatOutageHistory(ctx context.Context, id string, outages []watch.Outage) error {
 	return d.post(ctx, "history "+id, d.historyMessage(id, outages))
 }
 
 // historyMessage renders the history notice for id. outages is non-empty and
-// ascends by recovery point (both asserted by watch), so the last entry is the
+// ascends by recovery point (both guaranteed by watch), so the last entry is the
 // most recent recovery. Every notice is two parts: WHAT happened, then why it is
 // being read after the fact. The second part comes from watch's delivery blame and is
-// never guessed here, because on two of its three reasons a webhook check finds
+// never guessed here, because an unattempted outage means a webhook check finds
 // nothing wrong.
 func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 	last := outages[len(outages)-1]
@@ -255,15 +269,14 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 	// allowed_mentions with an EMPTY parse list is the only structural way to
 	// keep a notice from pinging anyone: the interpolated values are not filtered
 	// for mention tokens, and escapeMarkdown cannot be -- a backslash before "@"
-	// is not one of Discord's escapes.
-	body, err := json.Marshal(map[string]any{
+	// is not one of Discord's escapes. A string and this map cannot fail to encode.
+	body, _ := json.Marshal(map[string]any{
 		"content":          content,
 		"allowed_mentions": map[string][]string{"parse": {}},
 	})
-	if err != nil {
-		return fmt.Errorf("encoding webhook payload: %w", err)
-	}
-	_, err = httpx.Do(ctx, func(ctx context.Context) (struct{}, error) {
+	ctx, cancel := httpx.ContextWithDefaultTimeout(ctx, d.sendBudget)
+	defer cancel()
+	_, err := httpx.Do(ctx, func(ctx context.Context) (struct{}, error) {
 		return d.postAttempt(ctx, body)
 	}, httpx.WithLabel("discord webhook "+label), httpx.WithMaxAttempts(maxAttempts),
 		// Bound EACH attempt and make that bound's expiry retryable: httpx
@@ -276,7 +289,7 @@ func (d *Discord) post(ctx context.Context, label, content string) error {
 		// Debug keeps it for diagnosis without the alarm.
 		httpx.WithExhaustedLevel(slog.LevelDebug))
 	if err != nil {
-		return fmt.Errorf("delivering %s notification: %w", label, httpx.LogSafeError(err))
+		return fmt.Errorf("delivering %s notification: %w", label, err)
 	}
 	return nil
 }

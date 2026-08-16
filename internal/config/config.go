@@ -197,6 +197,12 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...webhttp.HostAllowlistOption) (
 
 	cfg.LogLevel = logLevel()
 
+	// Both advisories run here rather than inside the loaders: each names a
+	// variable to unset, so every refusal above has to be behind them or the
+	// advice describes a configuration that never ran.
+	warnPlainVarIgnored("DISCORD_WEBHOOK_URL", "webhook URL", cfg.WebhookSource)
+	warnPlainVarIgnored("BEAT_TOKEN", "token", cfg.BeatTokenSource)
+
 	return cfg, nil
 }
 
@@ -208,11 +214,8 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...webhttp.HostAllowlistOption) (
 // hostname fallback is not length-checked because the kernel bounds it far below
 // the cap, which holds only while maxNodeNameBytes stays at or above 255.
 func nodeName(maxNodeNameBytes int) (string, error) {
-	// Trimmed with this package's own predicate for "the operator cannot see it"
-	// rather than TrimSpace, whose blank is Unicode SPACES only: a name built from
-	// invisible runes names nothing, and a padded one prefixes every notice with a
-	// character the operator cannot see. Safe here where BEAT_TOKEN is REFUSED,
-	// because nothing reproduces the node name byte for byte.
+	// Trimmed, not refused as BEAT_TOKEN is: knell is the only reader of the
+	// node name, so nothing has to reproduce it byte for byte.
 	node := strings.TrimFunc(os.Getenv("NODE_NAME"), invisibleInURL)
 	if node == "" {
 		return hostnameNode(), nil
@@ -275,8 +278,9 @@ func allowedHosts(opts []webhttp.HostAllowlistOption) (*webhttp.HostPolicy, erro
 	policy, invalid := webhttp.ParseHostList(strings.Split(raw, ","), opts...)
 	if len(invalid) > 0 {
 		// %q, not %v: the one mistake an operator cannot SEE is an invisible
-		// rune pasted in with the hostname, and %q escapes it.
-		return nil, fmt.Errorf("%s has entries no Host can ever match, so the allowlist knell would serve is not the one configured: %q; use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,10.0.0.5,knell.example.com — a lone port like :9190 belongs in LISTEN_ADDR", key, invalid)
+		// rune pasted in with the hostname, and %q escapes it. Count plus bounded
+		// sample: a 1 MiB value rejects ~95k entries, and the record is knell's.
+		return nil, fmt.Errorf("%s has %d entries no Host can ever match, so the allowlist knell would serve is not the one configured: %.64q; use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,10.0.0.5,knell.example.com — a lone port like :9190 belongs in LISTEN_ADDR", key, len(invalid), invalid[:min(len(invalid), 4)])
 	}
 	return policy, nil
 }
@@ -295,7 +299,8 @@ func trustedProxies() []*net.IPNet {
 	nets, invalid := webhttp.ParseCIDRs(strings.Split(raw, ","))
 	if len(invalid) > 0 {
 		slog.Warn("TRUSTED_PROXIES entries ignored, X-Forwarded-For is not honored for them",
-			"ignored", invalid, "trusted", len(nets))
+			"ignored", fmt.Sprintf("%.64q", invalid[:min(len(invalid), 4)]),
+			"ignored_count", len(invalid), "trusted", len(nets))
 	}
 	return nets
 }
@@ -307,7 +312,7 @@ func logLevel() slog.Level {
 	if !ok {
 		// NOT pre-quoted: TextHandler already quotes an attr value that needs it,
 		// and an invisible rune does, so quoting here would quote the quotes.
-		slog.Warn("invalid LOG_LEVEL, using info", "value", raw)
+		slog.Warn("invalid LOG_LEVEL, using info", "value", fmt.Sprintf("%.64s", raw))
 	}
 	return level
 }
@@ -505,13 +510,9 @@ func loadBeatToken() (string, envx.SecretSource, error) {
 	if err != nil {
 		return "", src, err
 	}
-	// Validate BEFORE the ignored-plain-variable advisory: checkBeatToken can
-	// still fail startup, and advising the operator to unset a variable while
-	// exiting on the winning one describes a configuration that never ran.
 	if tokenErr := checkBeatToken(token); tokenErr != nil {
 		return "", src, fileSourcedValueError("BEAT_TOKEN", src, tokenErr)
 	}
-	warnPlainVarIgnored("BEAT_TOKEN", "token", src)
 	return token, src, nil
 }
 
@@ -526,10 +527,8 @@ func loadWebhook() (string, envx.SecretSource, error) {
 		return "", src, err
 	}
 
-	// Neither channel trims, so a value copied from a deployment file can carry
-	// padding through either, and a trailing space survives url.Parse and is
-	// escaped as %20 on every POST -- Discord answers 404 forever. Trimmed where
-	// BEAT_TOKEN is refused because knell is this URL's only sender.
+	// Neither channel trims, so padding copied out of a deployment file reaches
+	// here through either one; trimmed because knell is this URL's only sender.
 	webhook = strings.TrimFunc(webhook, invisibleInURL)
 	if webhook == "" {
 		// Nothing visible at all: the variable WAS provided, so this is a broken
@@ -541,9 +540,6 @@ func loadWebhook() (string, envx.SecretSource, error) {
 		return "", src, fileSourcedValueError("DISCORD_WEBHOOK_URL",
 			src, fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err))
 	}
-	// The URL is now fully validated, so the winning-source advisory cannot be
-	// followed by a startup failure about the credential it just described.
-	warnPlainVarIgnored("DISCORD_WEBHOOK_URL", "webhook URL", src)
 	return webhook, src, nil
 }
 
@@ -552,10 +548,10 @@ func loadWebhook() (string, envx.SecretSource, error) {
 // [A-Za-z0-9][A-Za-z0-9_-]{0,63} and be unique; deadlines are Go durations
 // of at least minDeadline.
 func parseBeats(raw string) ([]Beat, error) {
-	// Count first, allocate second, and never materialize the split: BEATS is
-	// unbounded, so sizing from its ENTRY count keeps its LENGTH from deciding
-	// the footprint. 1 MiB of separators allocated ~93 MiB, which a
-	// memory-limited container OOM-kills before either refusal can name a cause.
+	// Count first, allocate second, and never materialize the split: sizing from
+	// the ENTRY count keeps BEATS' LENGTH out of the footprint. execve caps one
+	// env value at 32*PAGE_SIZE (128 KiB at 4 KiB pages, 512 KiB at 16 KiB), so
+	// the split this avoids is single-digit MiB of headers, not an unbounded one.
 	configured := 0
 	for entry := range strings.SplitSeq(raw, ",") {
 		if strings.TrimSpace(entry) != "" {
@@ -590,27 +586,27 @@ func parseBeats(raw string) ([]Beat, error) {
 func parseBeatEntry(entry string, seen map[string]struct{}) (Beat, error) {
 	id, rawDeadline, found := strings.Cut(entry, ":")
 	if !found {
-		return Beat{}, fmt.Errorf("entry %q: expected \"id:deadline\"", entry)
+		return Beat{}, fmt.Errorf("entry %.64q: expected \"id:deadline\"", entry)
 	}
 	id = strings.TrimSpace(id)
 	if !beatIDPattern.MatchString(id) {
-		return Beat{}, fmt.Errorf("entry %q: id must match %s", entry, beatIDPattern)
+		return Beat{}, fmt.Errorf("entry %.64q: id must match %s", entry, beatIDPattern)
 	}
 	if _, dup := seen[id]; dup {
-		return Beat{}, fmt.Errorf("entry %q: duplicate id %q", entry, id)
+		return Beat{}, fmt.Errorf("entry %.64q: duplicate id %.64q", entry, id)
 	}
-	deadline, err := time.ParseDuration(strings.TrimSpace(rawDeadline))
+	rawDeadline = strings.TrimSpace(rawDeadline)
+	deadline, err := time.ParseDuration(rawDeadline)
 	if err != nil {
-		// The stdlib message names the offending text but not the remedy, and
-		// this is the first refusal a new operator meets: a unit-less "api:30"
-		// and a day-unit "cron-backup:1d" are the two shapes a first BEATS
-		// carries.
-		return Beat{}, fmt.Errorf("entry %q: invalid deadline: %w: use a Go duration "+
+		// The operand is stated here rather than through the stdlib message,
+		// which quotes it a second time unbounded: a unit-less "api:30" and a
+		// day-unit "cron-backup:1d" are the two shapes a first BEATS carries.
+		return Beat{}, fmt.Errorf("entry %.64q: invalid deadline %.64q: use a Go duration "+
 			"with an explicit unit (s, m, h), e.g. 30s, 20m or 26h; there is no day "+
-			"unit, so a daily job is 26h", entry, err)
+			"unit, so a daily job is 26h", entry, rawDeadline)
 	}
 	if deadline < minDeadline {
-		return Beat{}, fmt.Errorf("entry %q: deadline below minimum %s", entry, minDeadline)
+		return Beat{}, fmt.Errorf("entry %.64q: deadline below minimum %s", entry, minDeadline)
 	}
 	seen[id] = struct{}{}
 	return Beat{ID: id, Deadline: deadline}, nil
@@ -618,8 +614,8 @@ func parseBeatEntry(entry string, seen map[string]struct{}) (Beat, error) {
 
 // invisibleInURL reports whether r is a rune an operator cannot see inside a
 // configured webhook URL: the ASCII space, and every rune outside Unicode's
-// printable set. url.Parse accepts all of them and percent-encodes each one on
-// every request, so the host and path that reach the other end are not the
+// printable set. Runes in this set that survive url.Parse are percent-encoded
+// on every request, so the host and path that reach the other end are not the
 // configured ones and no notification can ever be delivered -- while startup
 // succeeds and /healthz reports ready. Printable runes are excluded on purpose:
 // refusing them would reject a working non-Discord relay URL.
@@ -670,11 +666,9 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		return nil, errors.New("missing path (the webhook URL's own path carries the credential, so a host-only URL cannot deliver a notification)")
 	}
 	if !utf8.ValidString(raw) || strings.IndexFunc(raw, invisibleInURL) >= 0 {
-		// An interior invisible rune survives url.Parse and is percent-encoded on
-		// every POST, in the host as well as the path. Visible runes are NOT
-		// refused: that would reject a working non-Discord relay URL.
-		// utf8.ValidString carries the rule to the BYTE level, which the rune
-		// predicate cannot: an invalid byte decodes to U+FFFD, which IsPrint accepts.
+		// Visible runes are NOT refused: that would reject a working non-Discord
+		// relay URL. utf8.ValidString carries the rule to the BYTE level, which the
+		// rune predicate cannot: an invalid byte decodes to U+FFFD, which IsPrint accepts.
 		return nil, errors.New("contains a space or an invisible character (it is percent-encoded on every request, so the webhook host and path that reach the other end are not the configured ones; remove it, or percent-encode it yourself if it really belongs to the credential)")
 	}
 	return u, nil

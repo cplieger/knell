@@ -110,7 +110,7 @@ A live incident and one that is already over are reported differently: nothing a
 
 | Metric | Type | Notes |
 | ----- | ------- | ----- |
-| `knell_beat_fresh{beat}` | gauge | 1 = last ping within deadline, 0 = overdue. The aggregation input for multi-observer quorum rules |
+| `knell_beat_fresh{beat}` | gauge | 1 = observed silence within deadline, 0 = overdue; silence runs from process start until the first ping, so a beat nothing has pinged reads 1 for its first deadline. The aggregation input for multi-observer quorum rules |
 | `knell_beat_last_seen_timestamp_seconds{beat}` | gauge | Unix time of the last accepted ping (process start until the first ping) |
 | `knell_beat_deadline_seconds{beat}` | gauge | the beat's configured silence deadline. Add it to the last-seen gauge to get when an overdue beat fires, and compare it across observers to catch a `BEATS` skew before one node alerts alone |
 | `knell_beats_received_total{beat}` | counter | accepted pings; unknown ids are rejected, not counted |

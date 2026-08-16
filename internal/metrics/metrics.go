@@ -122,11 +122,13 @@ func mintRefusalReasons() {
 // Handler is its only exported view.
 var registry = metricslib.NewRegistry("knell")
 
-// beatFresh reports per beat whether the last ping is within its deadline.
-// This is the aggregation input for multi-observer quorum rules.
+// beatFresh reports per beat whether its observed silence is within its
+// deadline; until a first ping arrives that silence runs from process start
+// (the boot-armed clock), so a beat nothing has pinged reads 1 for its first
+// deadline. This is the aggregation input for multi-observer quorum rules.
 var beatFresh = metricslib.NewLabeledGauge(
 	"beat_fresh",
-	"Whether the beat's last ping is within its deadline (1 = fresh, 0 = overdue).",
+	"Whether the beat's observed silence is within its deadline (1 = fresh, 0 = overdue; silence runs from process start until the first ping).",
 	[]string{beatLabel},
 )
 

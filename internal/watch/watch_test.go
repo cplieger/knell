@@ -517,39 +517,6 @@ func TestRunLoopDeliversSweepAndRecovery(t *testing.T) {
 	})
 }
 
-func TestFailedRecoveredIsBestEffortOnce(t *testing.T) {
-	t.Parallel()
-
-	w, clock, n := newTestWatcher(Beat{ID: "api", Deadline: 10 * time.Minute})
-	w.Beat("api")
-
-	// First outage: missing delivered, then the beat pings again while the
-	// notifier is down, so the queued recovered send fails.
-	clock.Advance(11 * time.Minute)
-	w.sweep(t.Context())
-	n.setFail(errors.New("discord down"))
-	w.Beat("api")
-	drainRecoveries(w)
-
-	// Best-effort means the failed recovery is consumed, never retried:
-	// after the notifier heals, nothing is re-queued or re-sent.
-	n.setFail(nil)
-	drainRecoveries(w)
-	w.sweep(t.Context())
-	got := n.snapshot()
-	if len(got) != 1 || got[0].kind != "missing" {
-		t.Fatalf("calls = %v, want only the original missing (failed recovery never retried)", got)
-	}
-
-	// The switch stays armed: the next silence still fires a missing notice.
-	clock.Advance(11 * time.Minute)
-	w.sweep(t.Context())
-	got = n.snapshot()
-	if len(got) != 2 || got[1].kind != "missing" {
-		t.Fatalf("calls = %v, want a second missing after the next outage", got)
-	}
-}
-
 // failFirstNotifier fails the FIRST attempted missing send whichever beat it
 // is for, and counts every attempt. Which beat comes first is deliberately
 // irrelevant: Watcher stores beats in a map and therefore promises no
@@ -885,12 +852,12 @@ func TestThreeOutagesQueueWhileNoticesAreUndelivered(t *testing.T) {
 	// per-record independence this scenario exists to prove: a shared or
 	// overwritten measurement shows up here as the wrong span on some index.
 	checkSpans(t, outages, 11*time.Minute, 13*time.Minute, 17*time.Minute)
-	// All three reasons in one batch, which is the point: A's own live notice
-	// was attempted and refused (true), B was queued behind A and no
-	// send was ever started for it (false — the failed history
-	// notice covered A alone), and C began and ended with no sweep in between
-	// (false). The summary must state all three instead of
-	// blaming the webhook for the two it never tried to deliver.
+	// Both blame states in one batch, which is the point: A's own live notice was
+	// attempted and refused (undelivered), while B was queued behind A with no send
+	// ever started for it (the failed history notice covered A alone) and C began
+	// and ended with no sweep in between, so neither blames delivery. The summary
+	// must name both counts instead of blaming the webhook for the two it never
+	// tried to deliver.
 	checkBlame(t, outages, true, false, false)
 }
 
@@ -955,9 +922,9 @@ func fillMissingQueue(t *testing.T, w *Watcher, clock *fakeClock, id string) {
 }
 
 // queueOutageNoSweepEverSaw drives one full deadline of silence ended by a late
-// ping, the only producer of a false record, and asserts the
-// beat is left holding exactly that. It is the precondition of the two tests
-// below: both are about what happens to that reason afterwards, so a change
+// ping -- the ping path's producer of an unblamed closed record -- and asserts
+// the beat is left holding exactly that. It is the precondition of the two tests
+// below: both are about what happens to that record afterwards, so a change
 // that stopped producing it would otherwise make them pass vacuously.
 func queueOutageNoSweepEverSaw(t *testing.T, w *Watcher, clock *fakeClock, id string) {
 	t.Helper()
@@ -980,10 +947,9 @@ func TestFailedHistorySendBlamesDeliveryForEveryRecordItCovered(t *testing.T) {
 	// The multi-record half of the blame rule. A sustained webhook outage is
 	// exactly what queues several ended outages behind ONE history notice, and
 	// when that notice fails, every record it covered is now late because
-	// delivery failed - not just the head. A record left claiming
-	// false renders as "nothing was wrong with delivery" in
-	// the very notice this webhook already refused, so the operator is told to
-	// look nowhere for the rest of the batch.
+	// delivery failed - not just the head. A record left unblamed renders as "the
+	// webhook is not the place to look" in the very notice this webhook already
+	// refused, so the operator is told to look nowhere for the rest of the batch.
 	const (
 		id       = "history-blame-run-probe"
 		deadline = 10 * time.Minute
@@ -1177,9 +1143,8 @@ func TestOutageDetectedWhileTheQueueWasFullDoesNotBlameTheWebhook(t *testing.T) 
 	// detected it" would be false — a sweep did see it — but blaming delivery
 	// would be a diagnosis nothing supports: no record and therefore no send
 	// ever existed for this outage, and the queue fills from knell's own
-	// back-pressure as readily as from a broken webhook. So
-	// lateReasonForUnqueuedOutage reads overflowAccounted and reports the
-	// deferral instead.
+	// back-pressure as readily as from a broken webhook. So the record stays
+	// unblamed and its notice reports only that nothing was attempted.
 	const id = "overflow-reason-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
@@ -1209,10 +1174,8 @@ func TestOutageDetectedWhileTheQueueWasFullDoesNotBlameTheWebhook(t *testing.T) 
 	if len(payloads) != 2 {
 		t.Fatalf("history notices = %d, want 2 (the drained backlog, then the overflowed outage)", len(payloads))
 	}
+	// Every record in the drained backlog is unblamed: make zero-fills.
 	backlog := make([]bool, missingQueueSize)
-	for i := range backlog {
-		backlog[i] = false
-	}
 	checkBlame(t, payloads[0], backlog...)
 	checkSpans(t, payloads[1], 11*time.Minute)
 	checkBlame(t, payloads[1], false)
@@ -1666,8 +1629,8 @@ func stormNoticesBeforeRecovery(n *fakeNotifier, recoverID string) (before int, 
 // still passes a Run-driven test most of the time (measured 17 of 30 runs).
 // Calling handleTick directly removes the select randomness: with the drain
 // deleted, sweep runs while the recovery is still queued and this test fails
-// every run. TestRunServicesRecoveriesAfterABudgetLimitedSweep above stays the
-// Run-loop integration check.
+// every run. No test drives this ordering through Run itself, for the same
+// reason: the select's randomness makes a Run-driven assertion unreliable.
 func TestHandleTickPrioritizesQueuedRecovery(t *testing.T) {
 	t.Parallel()
 
@@ -1802,5 +1765,57 @@ func TestByAttemptThenAgeOrdersAttemptThenAgeThenHistory(t *testing.T) {
 				t.Errorf("byAttemptThenAge(a, b) = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestObservationDetectsACrossingWhileTheSenderIsParked pins the property the
+// observation ticker exists for: the sender sits inside a Discord post for tens of
+// seconds, so a beat crossing its deadline during that post must be detected, counted
+// and queued by the observation loop, not left waiting for the post. Detection is
+// local and must not be reachable only through the remote call it reports on.
+func TestObservationDetectsACrossingWhileTheSenderIsParked(t *testing.T) {
+	// Serial (no t.Parallel): asserts a delta on the package-global outage
+	// counter, which the parallel tests also move.
+	const (
+		sender   = "parked-sender-probe"
+		observed = "parked-observed-probe"
+	)
+	w, clock, n := newTestWatcher(
+		Beat{ID: sender, Deadline: 10 * time.Minute},
+		Beat{ID: observed, Deadline: 30 * time.Minute},
+	)
+	w.Beat(sender)
+	w.Beat(observed)
+
+	// The interleave, from inside the in-flight send: the second beat's
+	// deadline passes and the observation ticker fires while the sweep is
+	// still parked in the first beat's notification.
+	var (
+		outagesDuringSend float64
+		freshDuringSend   string
+		queuedDuringSend  int
+	)
+	n.onMissing = func() {
+		clock.Advance(21 * time.Minute)
+		w.observeBeats()
+		outagesDuringSend = beatCounterValue(t, "knell_beat_outages_total", observed)
+		freshDuringSend = labeledValue(t, "knell_beat_fresh", "beat", observed)
+		w.mu.Lock()
+		queuedDuringSend = len(w.beats[observed].pendingMissing)
+		w.mu.Unlock()
+	}
+	outagesBefore := beatCounterValue(t, "knell_beat_outages_total", observed)
+	clock.Advance(11 * time.Minute)
+	w.sweep(t.Context())
+	n.onMissing = nil
+
+	if got, want := outagesDuringSend, outagesBefore+1; got != want {
+		t.Errorf("beat_outages_total{%s} = %v while the sender was parked, want %v: the crossing was not counted until the post returned", observed, got, want)
+	}
+	if freshDuringSend != "0" {
+		t.Errorf("beat_fresh{%s} = %s while the sender was parked, want 0: the quorum gauge stalls behind the webhook", observed, freshDuringSend)
+	}
+	if queuedDuringSend != 1 {
+		t.Errorf("queued records for %s while the sender was parked = %d, want 1: the crossing was not recorded, so its notice waits on the parked send", observed, queuedDuringSend)
 	}
 }

@@ -110,8 +110,10 @@ func TestSecretFileErrorNamesEveryFailureClass(t *testing.T) {
 }
 
 // TestLoadRejectsAnOversizedSecretFile is the end-to-end half of the class
-// mapping above, and the only test that pins WHICH sentinel envx returns for a
-// real file: the table asserts knell's wording per class, but a dependency bump
+// mapping above for the SIZE class — the one sentinel with no other
+// real-file pin (the unreadable and blank classes get theirs from
+// TestLoadRejectsUnreadableBeatTokenFile and TestLoadRejectsEmptyBeatTokenFile):
+// the table asserts knell's wording per class, but a dependency bump
 // that reclassified an oversized file would leave every row green while the
 // operator got the catch-all message and was sent to check the path instead of
 // the mount. It is also the one size class the filesystem can produce, and the

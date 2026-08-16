@@ -226,7 +226,8 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 // about the credential. BEAT_TOKEN is required, so a presence attr could only
 // ever read "required" and would report no state at all — and the summary is the
 // one line that renders a whole Config, so it is where a rendering of the value
-// itself would surface. Neither the token nor an attr naming it may appear.
+// itself would surface. The token value and a redundant beat_auth presence attr
+// must not appear; the beat_token attr reports only its source channel.
 func TestLogConfigNeverPublishesTheBeatToken(t *testing.T) {
 	// Serial (no t.Parallel): swaps the process-global slog default.
 	cfg := config.Config{

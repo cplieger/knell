@@ -310,10 +310,10 @@ func withQuotedForms(needles []string) []string {
 // redirect to <host>`), so an endpoint answering a webhook POST with a
 // redirect that echoes the request URI would put the credential into the
 // returned error and into httpx.Do's attempt lines without ever sending a
-// body. TestRedirectDerivedTransportErrorsCarryNoRemoteText pins two
-// hand-picked shapes; this target explores the whole header space and the
-// whole 3xx band, so the seed corpus committed here is the durable coverage of
-// the class (the weekly run's generated corpus is discarded).
+// body. This target is the class's only pin: it explores the whole header
+// space and the whole 3xx band, so the seed corpus committed here is the
+// durable coverage of the class (the weekly run's generated corpus is
+// discarded).
 func FuzzRedirectResponsesNeverCarryLocationText(f *testing.F) {
 	// Seed Locations cover the shapes that reach a different cause: an
 	// unparseable header, a cross-host method-preserving hop (refused by

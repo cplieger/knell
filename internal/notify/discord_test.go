@@ -114,6 +114,47 @@ func TestBeatMissingDelivers(t *testing.T) {
 	}
 }
 
+// TestEveryNoticeSuppressesMentions pins the payload field that is the only
+// mention control: escapeMarkdown deliberately leaves "@" alone (a backslash
+// before it is not a Discord escape), so without allowed_mentions.parse = []
+// a NODE_NAME carrying "@everyone" pings the channel on every notice.
+// Discord ignores unknown JSON fields, so a typoed key fails no request and
+// only this decode can catch it. One notice suffices: post is the single
+// funnel every shape passes through.
+func TestEveryNoticeSuppressesMentions(t *testing.T) {
+	t.Parallel()
+
+	bodies := make(chan []byte, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		bodies <- body
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := New(srv.URL, "@everyone")
+	t.Cleanup(d.Close)
+
+	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
+		t.Fatalf("BeatMissing: %v", err)
+	}
+	var payload struct {
+		Content         string `json:"content"`
+		AllowedMentions *struct {
+			Parse *[]string `json:"parse"`
+		} `json:"allowed_mentions"`
+	}
+	if err := json.Unmarshal(<-bodies, &payload); err != nil {
+		t.Fatalf("payload not JSON: %v", err)
+	}
+	if payload.AllowedMentions == nil || payload.AllowedMentions.Parse == nil || len(*payload.AllowedMentions.Parse) != 0 {
+		t.Errorf("payload allowed_mentions = %+v, want parse present and empty: it is the only mention control", payload.AllowedMentions)
+	}
+	if !strings.Contains(payload.Content, "@everyone") {
+		t.Errorf("content = %q, want the raw node name: suppression is the payload's job, not the escaper's", payload.Content)
+	}
+}
+
 func TestMissingNoticeDoesNotPresumeTheBeatEverPinged(t *testing.T) {
 	t.Parallel()
 
@@ -377,9 +418,8 @@ func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 	const secret = "verysecretchaintoken"
 	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
 
-	// Both shapes occur: postAttempt hands back client.Do's bare *url.Error,
-	// and post reduces what httpx.Do returns a second time, where the same
-	// error arrives wrapped in the retry plumbing's own text.
+	// Both POSITIONS, not both call sites: LogSafeError searches with errors.As
+	// rather than matching the top, which is what safeTransportError's loop rests on.
 	for name, in := range map[string]error{
 		"bare url error":    &url.Error{Op: "Post", URL: rawURL, Err: context.Canceled},
 		"wrapped url error": fmt.Errorf("attempt 3 failed: %w", &url.Error{Op: "Post", URL: rawURL, Err: context.Canceled}),
@@ -451,13 +491,11 @@ func TestNestedURLErrorsAreFullyReducedBeforeClassification(t *testing.T) {
 	if got.Error() != "webhook transport failed" {
 		t.Errorf("safeTransportError(nested *url.Error).Error() = %q, want knell's own phrase", got.Error())
 	}
-	// The two surfaces the reduction has to hold for: the error itself, and the
-	// reduction both httpx.Do's attempt lines and post's own terminal wrap put
-	// it through (one function, httpx.LogSafeError, since the app-local alias
-	// was removed). They fail independently.
+	// Two surfaces, failing independently: the error itself, and the reduction
+	// httpx.Do's own attempt lines put it through.
 	for surface, rendered := range map[string]error{
-		"transport error":                        got,
-		"reduced error as httpx and post log it": httpx.LogSafeError(got),
+		"transport error":                got,
+		"reduced error as httpx logs it": httpx.LogSafeError(got),
 	} {
 		if rendered == nil {
 			t.Errorf("%s = nil, want an error (a nil reports an undelivered notification as delivered)", surface)
@@ -498,8 +536,8 @@ func TestLogSafeNeverReducesAFailureToNil(t *testing.T) {
 	if strings.Contains(got.Error(), secret) {
 		t.Errorf("the reduced error leaks the webhook credential: %v", got)
 	}
-	// The nil-in/nil-out half of the contract: post and postAttempt reduce
-	// only on a real failure, so a nil must not become an error.
+	// The nil-in/nil-out half of the contract: postAttempt reduces only on a
+	// real failure, so a nil must not become an error.
 	if got := httpx.LogSafeError(nil); got != nil {
 		t.Errorf("httpx.LogSafeError(nil) = %v, want nil", got)
 	}
@@ -508,13 +546,11 @@ func TestLogSafeNeverReducesAFailureToNil(t *testing.T) {
 func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 	// Deliberately NOT t.Parallel: slog.Default() is process-global.
 	//
-	// The returned-error assertions cannot cover the LOG surface. post
-	// reduces whatever httpx.Do returns a SECOND time, so an
-	// attempt-level error that embeds the URL is reduced in the error every
-	// other test reads, while httpx.Do's per-attempt retry and exhausted
-	// lines (both Debug here, via WithExhaustedLevel) log the RAW attempt
-	// error through the type-based LogSafeError only. This pins that surface
-	// end to end.
+	// The returned-error assertions cannot cover the LOG surface: postAttempt
+	// constructs the returned error URL-free, while httpx.Do's per-attempt retry
+	// and exhausted lines (both Debug here, via WithExhaustedLevel) log the RAW
+	// attempt error through the type-based LogSafeError only. This pins that
+	// surface end to end.
 	const secret = "verysecretlogtoken"
 
 	rec := captureDeliveryLogs(t)
@@ -853,7 +889,7 @@ func TestAttemptTimeoutReportsSafeDiagnostic(t *testing.T) {
 	// "webhook transport failed" is safeTransportError's phrase for the cause;
 	// the cause's own text is never rendered, because a transport cause can be
 	// written from a response header (see
-	// TestRedirectDerivedTransportErrorsCarryNoRemoteText).
+	// FuzzRedirectResponsesNeverCarryLocationText).
 	if !strings.Contains(err.Error(), "webhook transport failed") {
 		t.Errorf("timeout error = %q, want it to contain knell's own phrase", err)
 	}
@@ -878,27 +914,30 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 	t.Parallel()
 
 	// A 429's Retry-After is the OTHER end's number, and honoring it verbatim
-	// parks the sweep's single sender goroutine for as long as it says: no
-	// beat's notice is delivered during that window while /healthz stays
-	// green. httpx waits min(Retry-After, ceiling), so the ceiling knell hands
-	// WithRateLimitRetry is the whole bound. Nothing else pins it:
-	// TestRateLimitRetriesAfterRetryAfter asserts a >= 1s LOWER bound against
-	// a Retry-After of 1, which a ceiling of 30s, of 30 minutes, or of 0
-	// (httpx's own 60s fallback) all satisfy identically.
+	// parks the sweep's single sender: no beat's notice is delivered during that
+	// window while /healthz stays green. Two bounds, and only both together
+	// bound the park: this ceiling caps ONE wait (and IS the wait when no
+	// Retry-After header parses), and sendBudget caps the delivery. Nothing else
+	// in the package pins either -- every other assertion here is satisfied by a
+	// ceiling of 30s, of 30 minutes, or of 0 (httpx's own 60s fallback)
+	// identically.
 	var attempts atomic.Int64
 	d := New("https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
 	t.Cleanup(d.Close)
 	// The seam is a test affordance, not the policy, so pin the production
-	// wiring BEFORE shortening it: a New that drops the assignment leaves the
-	// field zero and httpx falls back to its own 60s cap, and a ceiling raised
-	// past two sweep ticks parks the single sender across sweeps. Neither
-	// shows up in the timing assertions below, which run against this
-	// notifier's shortened ceiling.
+	// wiring BEFORE shortening it: a New that drops either assignment leaves the
+	// field zero, which is httpx's option-absent path -- its own 60s cap for the
+	// ceiling, and no budget at all for the delivery. Neither shows up in the
+	// timing assertions below, which run against this notifier's shortened
+	// values.
 	if d.rateLimitMaxWait != rateLimitMaxWait {
 		t.Fatalf("New() rateLimitMaxWait = %s, want %s: httpx falls back to its own 60s cap for a non-positive ceiling", d.rateLimitMaxWait, rateLimitMaxWait)
 	}
-	if rateLimitMaxWait <= 0 || rateLimitMaxWait > 2*watch.DefaultTick {
-		t.Errorf("rateLimitMaxWait = %s, want a positive ceiling within two %s sweep ticks: the sweep is the single sender, so a longer wait holds every other beat's notice", rateLimitMaxWait, watch.DefaultTick)
+	if d.sendBudget != sendBudget {
+		t.Fatalf("New() sendBudget = %s, want %s: a non-positive budget is ContextWithDefaultTimeout's pass-through path, so the delivery keeps whatever the caller brought -- for watch's ctx, no deadline at all", d.sendBudget, sendBudget)
+	}
+	if rateLimitMaxWait <= 0 || sendBudget > 4*watch.DefaultTick {
+		t.Errorf("rateLimitMaxWait = %s gives sendBudget = %s, want a positive ceiling whose delivery budget stays within four %s sweep ticks: the sweep is the single sender, so the budget is what holds every other beat's notice", rateLimitMaxWait, sendBudget, watch.DefaultTick)
 	}
 	// Shorten only this notifier's ceiling: the branch under test cares that
 	// knell's own ceiling bounds the wait, not how long the production one is.
@@ -925,7 +964,8 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 	// The caller's budget is bounded so an UNCAPPED wait fails this test in
 	// seconds instead of hanging the package for the hour the response asked
 	// for: httpx observes the dead context before its next retry, so the
-	// attempt count below is what reports the regression.
+	// attempt count below is what reports the regression. That deadline is also
+	// what the door defers to, so this half measures the ceiling alone.
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
@@ -941,6 +981,21 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 	// reduced to zero would spend the attempts with no back-pressure at all.
 	if elapsed < 2*ceiling {
 		t.Errorf("delivery took %s, want at least %s (one ceiling-long wait before each of the %d retries)", elapsed, 2*ceiling, maxAttempts-1)
+	}
+	// The budget, not the sum of the waits, is what the sender pays. The same
+	// permanent 429 under a budget shorter than two waits, on a ctx carrying no
+	// deadline of its own -- watch's shape, and the only one the door bounds:
+	// the loop is cut mid-park, so the last attempt never runs. For a missing or
+	// history notice the sweep re-posts it; for the fire-once recovered notice
+	// that cut attempt is a permanently dropped message.
+	d.sendBudget = ceiling + ceiling/2
+	attempts.Store(0)
+	err = d.post(t.Context(), "missing probe", "body")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("post() against a permanent 429 under a %s budget = %v, want the budget's own expiry", d.sendBudget, err)
+	}
+	if got := attempts.Load(); got >= int64(maxAttempts) {
+		t.Errorf("delivery attempts = %d, want fewer than %d: the budget bounds the whole delivery, so it cuts the retry loop instead of waiting out every ceiling", got, maxAttempts)
 	}
 }
 
@@ -1110,7 +1165,7 @@ func TestCanceledDeliveryErrorIsCanceled(t *testing.T) {
 	// as failed (KnellNotifyFailing would page on every shutdown). That
 	// contract crosses post's whole wrap chain (client error -> safeTransportError,
 	// whose Error() renders only knell's phrase and whose Unwrap is the only thing
-	// carrying the cause -> httpx.LogSafeError -> %w wrap), so pin it against the real
+	// carrying the cause -> %w wrap), so pin it against the real
 	// notifier: dropping transportError.Unwrap fails here, not in watch.
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})

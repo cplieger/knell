@@ -80,7 +80,7 @@ func TestBeatFreshGaugeAtConstructionMeasuresTheBootSilence(t *testing.T) {
 	// reach New after a short deadline has already passed. A gauge that reports
 	// fresh in that window feeds a false vote into the quorum sum
 	// knell_beat_fresh exists to carry, and stays wrong until the first
-	// refreshFreshness one tick after Run starts. Every other construction in
+	// observeBeats one tick after Run starts. Every other construction in
 	// this package passes start == now, where a measured reading and a
 	// hardcoded 0 are indistinguishable.
 	//
@@ -301,7 +301,7 @@ func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
 // queue-full lines are written, which the level and attribute assertions above
 // cannot see. slogx installs a synchronous stderr handler, so a record emitted
 // while w.mu is held blocks every other holder of that mutex — ping admission
-// (Beat), the freshness gauge the quorum rule reads (refreshFreshness) and the
+// (Beat), the freshness gauge the quorum rule reads (observeBeats) and the
 // pre-drain StopAccepting — for as long as a stalled container log driver holds
 // the write, while /healthz keeps passing off its marker file. Both lines were
 // emitted under the lock until this was fixed, and the content assertions above
@@ -354,7 +354,7 @@ func (h *mutexProbeHandler) Handle(_ context.Context, r slog.Record) error {
 	}
 	h.seen++
 	if !h.w.mu.TryLock() {
-		h.t.Errorf("%q was written while w.mu was held: a synchronous handler here blocks Beat, refreshFreshness and StopAccepting for the duration of the write", r.Message)
+		h.t.Errorf("%q was written while w.mu was held: a synchronous handler here blocks Beat, observeBeats and StopAccepting for the duration of the write", r.Message)
 		return nil
 	}
 	h.w.mu.Unlock()
@@ -582,6 +582,15 @@ func TestFailedRecoveredSendIsCountedAsDroppedNotFailed(t *testing.T) {
 	w.sweep(t.Context())
 	if got := n.snapshot(); len(got) != 1 || got[0].kind != "missing" {
 		t.Fatalf("calls = %v, want only the original missing: a dropped recovery must never be retried", got)
+	}
+
+	// A dropped recovery must not disarm the switch: the next silence still
+	// emits a missing notice.
+	clock.Advance(11 * time.Minute)
+	w.sweep(t.Context())
+	got := n.snapshot()
+	if len(got) != 2 || got[1].kind != "missing" {
+		t.Fatalf("calls = %v, want a second missing after the next outage", got)
 	}
 }
 

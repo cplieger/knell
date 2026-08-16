@@ -30,10 +30,10 @@ import (
 
 // Notifier delivers the transition notifications. Implementations are expected
 // to retry transient failures internally and return the final outcome. Every
-// returned error is logged VERBATIM by this package, so an implementation must
-// return only log-safe errors: the webhook endpoint carries its credential in its
-// own URL path. The first two methods report a LIVE incident; the third reports
-// outages already over, so it must be rendered in the past tense.
+// non-cancellation returned error is logged VERBATIM by this package, so an
+// implementation must return only log-safe errors: the webhook endpoint carries its
+// credential in its own URL path. The first two methods report a LIVE incident; the
+// third reports outages already over, so it must be rendered in the past tense.
 type Notifier interface {
 	// BeatMissing reports that id has been silent since live.Started and was
 	// still silent when the sweep observed it at live.Observed, so the outage
@@ -157,8 +157,8 @@ const missingQueueSize = MaxHistoryBatch
 // captured as the silence interval it was measured over. While the outage remains
 // open, collectBeatDue refreshes silence.Observed on each sweep so a retried live
 // notice reports current silence. recoveredAt freezes the first ping that ends the
-// outage (zero while ongoing), so the ended outage's span survives the wait. late
-// says WHY that past-tense notice is late.
+// outage (zero while ongoing), so the ended outage's span survives the wait.
+// undelivered says whether that notice's delivery was attempted and refused.
 type overdueBeat struct {
 	silence     Transition
 	recoveredAt time.Time
@@ -267,7 +267,7 @@ func (st *beatState) blameDelivery(n int) {
 // history: one collapsed past-tense notice covers all of them. The loop stops at
 // the first open record, so the run cannot silently depend on only the tail being
 // open. This is the site that SEALS a run into the shape BeatOutageHistory is
-// handed, so its caller asserts that shape once, here.
+// handed, and records append in outage order, so the shape holds by construction.
 func (st *beatState) closedRun() []Outage {
 	var run []Outage
 	for i := range st.pendingMissing {
@@ -354,8 +354,8 @@ func (st *beatState) recordOngoingOutage(rec *overdueBeat) bool {
 }
 
 // logOngoingOutageDeferred announces the back-pressure of a full queue, emitted
-// by collectDue outside w.mu for the reason logEndedOutageDropped gives. Debug,
-// not Warn: nothing was lost.
+// by observeBeat's caller outside w.mu for the reason logEndedOutageDropped
+// gives. Debug, not Warn: nothing was lost.
 func logOngoingOutageDeferred(rec *overdueBeat) {
 	// A time.Time value, for the reason logEndedOutageDropped's log gives.
 	slog.Debug("pending missing queue full, ongoing outage stays detected and is queued once a slot frees",
@@ -533,19 +533,19 @@ func (w *Watcher) StopAccepting() {
 // immediate delivery of queued recovered transitions. It is the only
 // goroutine that calls the notifier.
 func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
-	// Freshness gauges refresh on their own ticker: one overdue send can
-	// block the sender loop for tens of seconds (3x10s attempts + backoff,
-	// or 30s rate-limit waits), and the fresh gauge is the documented
-	// ground truth precisely when the webhook path is down.
+	// Observation runs on its own ticker: one overdue send can block the
+	// sender loop for tens of seconds (3x10s attempts + backoff, or 30s
+	// rate-limit waits), and neither the fresh gauge nor a deadline crossing
+	// may wait on the very path whose failure is what parked the sender.
 	go func() {
-		gauges := time.NewTicker(tick)
-		defer gauges.Stop()
+		observations := time.NewTicker(tick)
+		defer observations.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-gauges.C:
-				w.refreshFreshness()
+			case <-observations.C:
+				w.observeBeats()
 			}
 		}
 	}()
@@ -585,15 +585,23 @@ func (w *Watcher) handleTick(ctx context.Context) {
 	}
 }
 
-// refreshFreshness updates the per-beat freshness gauges without touching
-// notification state, so the metric ground truth stays current even while
-// the sender loop is blocked on a slow or unreachable webhook.
-func (w *Watcher) refreshFreshness() {
+// observeBeats observes every beat without sending anything, the observation
+// ticker's whole work: the freshness gauge and a newly detected deadline
+// crossing both stay current while the sender loop sits inside a slow or
+// unreachable webhook, which is exactly when they carry the switch.
+func (w *Watcher) observeBeats() {
+	var deferredOverflow []overdueBeat
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	now := w.now()
 	for id, st := range w.beats {
-		publishFreshness(id, now.Sub(st.lastSeen), st.deadline)
+		if overflow := observeBeat(id, st, now); overflow != nil {
+			deferredOverflow = append(deferredOverflow, *overflow)
+		}
+	}
+	w.mu.Unlock()
+	// Emitted outside the lock, for the reason collectDue's own loop gives.
+	for i := range deferredOverflow {
+		logOngoingOutageDeferred(&deferredOverflow[i])
 	}
 }
 
@@ -706,10 +714,10 @@ func overdue(silence, deadline time.Duration) bool {
 
 // publishFreshness publishes the freshness gauge for id given its observed
 // silence and deadline, reporting whether the beat is still fresh. It is the
-// ONLY writer of that gauge (New, Beat, refreshFreshness and collectBeatDue
-// all publish through it), and it reads the boundary from overdue, so the
-// quorum ground truth cannot drift between the paths that publish it. Callers
-// hold w.mu, except New, which publishes before the Watcher is shared.
+// ONLY writer of that gauge (New, Beat and observeBeat all publish through it),
+// and it reads the boundary from overdue, so the quorum ground truth cannot
+// drift between the paths that publish it. Callers hold w.mu, except New, which
+// publishes before the Watcher is shared.
 func publishFreshness(id string, silence, deadline time.Duration) bool {
 	fresh := !overdue(silence, deadline)
 	metrics.SetBeatFresh(id, fresh)
@@ -873,26 +881,25 @@ func (w *Watcher) collectDue() []dueNotice {
 	w.mu.Unlock()
 	// Ordered outside the lock: every key was copied out above, so the sort
 	// touches no shared state and must not hold the mutex Beat,
-	// refreshFreshness and StopAccepting all take.
+	// observeBeats and StopAccepting all take.
 	slices.SortFunc(due, byAttemptThenAge)
 	// Emitted outside the lock: a synchronous stderr write must not hold the
-	// mutex Beat, refreshFreshness and StopAccepting all take.
+	// mutex Beat, observeBeats and StopAccepting all take.
 	for i := range deferredOverflow {
 		logOngoingOutageDeferred(&deferredOverflow[i])
 	}
 	return due
 }
 
-// collectBeatDue is collectDue's per-beat state transition: it publishes the
-// beat's freshness gauge, records a newly detected crossing, refreshes an open
-// record's reading, and reports what this sweep owes the beat -- a live missing
-// notice, a run of ended outages, or neither. The caller holds w.mu; the returned
-// record is a COPY, so no pointer into pendingMissing escapes. The third result
-// is a record whose overflow the CALLER must log outside w.mu.
-func collectBeatDue(id string, st *beatState, now time.Time) (live *overdueBeat, history []Outage, deferredOverflow *overdueBeat) {
-	// This sweep's reading of the beat's silence, as the two instants that
-	// bound it: the last accepted ping and this sweep. The freshness gauge,
-	// a queued record and the live notice all read their span from it.
+// observeBeat is one beat's observation, run by BOTH the observation ticker and
+// every sweep: it publishes the freshness gauge and records a deadline crossing
+// the queue has not seen yet, returning a record whose overflow the CALLER must
+// log outside w.mu. Idempotent by that record's own guard, so the two callers
+// cannot count one outage twice. Callers hold w.mu.
+func observeBeat(id string, st *beatState, now time.Time) *overdueBeat {
+	// This observation's reading of the beat's silence, as the two instants
+	// that bound it: the last accepted ping and now. The freshness gauge, a
+	// queued record and the live notice all read their span from it.
 	silence := Transition{Started: st.lastSeen, Observed: now}
 	fresh := publishFreshness(id, silence.DownFor(), st.deadline)
 	// An overdue beat whose current outage is not on the queue yet is a fresh
@@ -902,9 +909,20 @@ func collectBeatDue(id string, st *beatState, now time.Time) (live *overdueBeat,
 	if !fresh && !st.alerted && st.openMissing() == nil {
 		pending := overdueBeat{id: id, silence: silence}
 		if st.recordOngoingOutage(&pending) {
-			deferredOverflow = &pending
+			return &pending
 		}
 	}
+	return nil
+}
+
+// collectBeatDue is collectDue's per-beat state transition: it observes the beat
+// through observeBeat, refreshes an open record's reading, and reports what this
+// sweep owes the beat -- a live missing notice, a run of ended outages, or
+// neither. The caller holds w.mu; the returned record is a COPY, so no pointer
+// into pendingMissing escapes. The third result is a record whose overflow the
+// CALLER must log outside w.mu.
+func collectBeatDue(id string, st *beatState, now time.Time) (live *overdueBeat, history []Outage, deferredOverflow *overdueBeat) {
+	deferredOverflow = observeBeat(id, st, now)
 	head := st.headMissing()
 	if head == nil {
 		return nil, nil, deferredOverflow
@@ -967,7 +985,7 @@ func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 // reports whether shutdown cancellation should stop the sweep. The records stay
 // queued until the notice is delivered, so a failure retries the whole run next
 // sweep, and the notice states the outages are over, so no recovered notification
-// follows. A real failure also rewrites the queued records' late reason.
+// follows. A real failure also marks the queued records it covered undelivered.
 func (w *Watcher) sendHistory(ctx context.Context, past beatOutages) bool {
 	if err := w.notifier.BeatOutageHistory(ctx, past.id, past.outages); err != nil {
 		if errors.Is(err, context.Canceled) {
