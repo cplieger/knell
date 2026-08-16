@@ -767,14 +767,13 @@ func TestAllowedHostsGate(t *testing.T) {
 		set        bool
 		wantActive bool
 		wantSize   int
-		wantWarn   string
 		wantErr    string
 	}{
-		"unset accepts every host":      {wantActive: false},
-		"one hostname engages the gate": {set: true, raw: "knell.internal", wantActive: true, wantSize: 1},
-		"blank entries are skipped":     {set: true, raw: "knell.internal, ,10.0.0.5", wantActive: true, wantSize: 2},
-		"present but blank is reported": {set: true, raw: "", wantActive: false, wantWarn: "is set but blank"},
-		"one unusable entry refuses":    {set: true, raw: "knell.internal,http://x/y", wantErr: "http://x/y"},
+		"unset accepts every host":        {wantActive: false},
+		"one hostname engages the gate":   {set: true, raw: "knell.internal", wantActive: true, wantSize: 1},
+		"blank entries are skipped":       {set: true, raw: "knell.internal, ,10.0.0.5", wantActive: true, wantSize: 2},
+		"present but blank never engages": {set: true, raw: "", wantActive: false},
+		"one unusable entry refuses":      {set: true, raw: "knell.internal,http://x/y", wantErr: "http://x/y"},
 		// Formerly pinned as active-size-zero, warned about and STARTED: the
 		// oracle is unchanged (this configuration rejects every non-loopback
 		// sender, so no beat can be recorded), and the verdict is now the
@@ -787,22 +786,19 @@ func TestAllowedHostsGate(t *testing.T) {
 		// non-blank unusable entry and startup would refuse instead of accepting
 		// every Host. Pinned so a webhttp bump has to fail here rather than in
 		// production.
-		"padded blank never engages": {set: true, raw: "   ", wantActive: false, wantWarn: "is set but blank"},
+		"padded blank never engages": {set: true, raw: "   ", wantActive: false},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			// Serial (no t.Parallel): capture.Default swaps the process-global
-			// slog default, and t.Setenv forbids parallel tests anyway.
+			// Serial (no t.Parallel): t.Setenv forbids parallel tests.
 			if tt.set {
 				t.Setenv("ALLOWED_HOSTS", tt.raw)
 			} else {
 				unsetEnv(t, "ALLOWED_HOSTS")
 			}
 
-			rec := capture.Default(t)
-
 			// nil options: this table asserts the env-to-policy mapping only
-			// (active, size, the blank warning, the startup refusal), none of
+			// (active, size, the startup refusal), none of
 			// which the serving-side options affect — webapi's tests cover the
 			// shipped envelope and the loopback exemption through
 			// webapi.HostPolicyOptions.
@@ -824,17 +820,6 @@ func TestAllowedHostsGate(t *testing.T) {
 			}
 			if policy.Size() != tt.wantSize {
 				t.Errorf("Size() = %d, want %d: every entry silently dropped is a hostname senders and browsers can no longer reach knell by", policy.Size(), tt.wantSize)
-			}
-			if tt.wantWarn == "" {
-				if rec.Contains("ALLOWED_HOSTS") {
-					t.Errorf("log output %v warns about ALLOWED_HOSTS for a usable configuration; a warning on the documented default trains operators to ignore the ones that matter", rec.Messages())
-				}
-				return
-			}
-			gotAny := rec.Count(tt.wantWarn)
-			gotWarn := rec.CountLevel(slog.LevelWarn, tt.wantWarn)
-			if gotAny != 1 || gotWarn != 1 {
-				t.Errorf("log output %v: records saying %q = %d, WARN records = %d, want exactly 1 of each; below WARN the line is out of the log at the default LOG_LEVEL, so an allowlist knell could not use is invisible - every non-loopback ping 403s and one deadline later every beat posts a false MISSING notice", rec.Records(), tt.wantWarn, gotAny, gotWarn)
 			}
 		})
 	}
@@ -1391,75 +1376,6 @@ func TestLoadTrimsPaddedListenAddr(t *testing.T) {
 	}
 }
 
-// TestLoadWarnsWhenListenAddrAsksForAnEphemeralPort pins the port-0
-// diagnostic, the one LISTEN_ADDR signal nothing else in this package
-// asserts. Port 0 BINDS, so net.Listen never refuses it and startup reports
-// itself healthy while the kernel hands out a fresh random port on every
-// boot: no sender's POST /beat/{id} URL and no scrape target can name it, so
-// every configured beat goes missing one deadline after start while the
-// observer looks up. Both directions are pinned because both are silent - a
-// dropped or inverted zero check loses the only signal that says so, and a
-// warning on a usable address trains the operator to ignore the ones that
-// matter.
-func TestLoadWarnsWhenListenAddrAsksForAnEphemeralPort(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
-	tests := map[string]struct {
-		addr     string
-		wantWarn bool
-	}{
-		"port zero on every interface": {addr: ":0", wantWarn: true},
-		"port zero on one interface":   {addr: "127.0.0.1:0", wantWarn: true},
-		"an explicit port stays quiet": {addr: "127.0.0.1:9999", wantWarn: false},
-		// A service NAME is resolved by net.Listen and is never zero, and a
-		// value that is not a host:port at all is refused at bind time and
-		// named by main's classifyBindError, so neither is this warning's job.
-		"a service name stays quiet": {addr: "127.0.0.1:http", wantWarn: false},
-		"a value net.Listen refuses": {addr: "9190", wantWarn: false},
-	}
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			setValidLoadEnv(t)
-			t.Setenv("LISTEN_ADDR", tt.addr)
-
-			rec := capture.Default(t)
-
-			cfg, err := Load(maxNodeNameBytes)
-			if err != nil {
-				t.Fatalf("Load() error: %v", err)
-			}
-			if cfg.ListenAddr != tt.addr {
-				t.Errorf("ListenAddr = %q, want %q kept verbatim: the address is handed to net.Listen as configured, so a rewrite here binds a port nobody scrapes", cfg.ListenAddr, tt.addr)
-			}
-			// Counted per LEVEL, not merely present: capture.Default records
-			// every level, so a Contains check stays green if the diagnostic
-			// is demoted to Debug or Info — and a demoted line is invisible at
-			// the WARN-and-above level a deployment runs at, which is the whole
-			// signal. The exact count also closes the other direction: a
-			// spurious second record at any level is a warning the operator
-			// learns to ignore.
-			wantCount := 0
-			if tt.wantWarn {
-				wantCount = 1
-			}
-			gotAny := rec.Count("asks for port 0")
-			gotWarn := rec.CountLevel(slog.LevelWarn, "asks for port 0")
-			if gotAny != wantCount || gotWarn != wantCount {
-				t.Errorf("LISTEN_ADDR=%q: matching records = %d, WARN records = %d, want %d; the diagnostic is the only signal that the listener moves to a fresh random port on every boot, so it must be absent or emitted exactly once at WARN: %v",
-					tt.addr, gotAny, gotWarn, wantCount, rec.Records())
-			}
-			if !tt.wantWarn {
-				return
-			}
-			// The hint carries the way out. Without it the operator reads that
-			// the port is random with nothing telling them what to set instead.
-			if !rec.HasAttr("asks for port 0", "hint", "set an explicit port, e.g. "+defaultListenAddr) {
-				t.Errorf("the port-0 warning does not carry the %q hint: %v", defaultListenAddr, rec.Records())
-			}
-		})
-	}
-}
-
 func TestLoadTrimsPaddedNodeName(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("NODE_NAME", "  node-1  ")
@@ -1487,8 +1403,7 @@ func TestLoadTrimsPaddedNodeName(t *testing.T) {
 // operator cannot see, and a padded DISCORD_WEBHOOK_URL goes back to refusing
 // startup through parseWebhookURL over a rune nobody can see in the value.
 func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
-	// Serial (no t.Parallel): t.Setenv, and the last subtest swaps the
-	// process-global slog default via capture.Default.
+	// Serial (no t.Parallel): t.Setenv.
 	const (
 		zeroWidthSpace = "\u200b"
 		softHyphen     = "\u00ad"
@@ -1538,17 +1453,12 @@ func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
 		setValidLoadEnv(t)
 		t.Setenv("LISTEN_ADDR", zeroWidthSpace+byteOrderMark)
 
-		rec := capture.Default(t)
-
 		cfg, err := Load(maxNodeNameBytes)
 		if err != nil {
 			t.Fatalf("Load() error: %v", err)
 		}
 		if cfg.ListenAddr != defaultListenAddr {
 			t.Errorf("ListenAddr = %q, want the default %q: a value with nothing visible in it reaches the documented blank path, not a bind failure", cfg.ListenAddr, defaultListenAddr)
-		}
-		if !rec.Contains("LISTEN_ADDR is set but blank") {
-			t.Errorf("no blank-LISTEN_ADDR warning for a value that is entirely invisible: the operator set a value this process threw away and nothing says so: %v", rec.Messages())
 		}
 	})
 }
@@ -2196,167 +2106,4 @@ func TestLoadWarnsOnlyWhenLogLevelIsUnparseable(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestLoadWarnsWhenLogLevelIsPresentButBlank pins the OTHER half of the
-// LOG_LEVEL diagnostic, the one TestLoadWarnsOnlyWhenLogLevelIsUnparseable
-// deliberately does not cover: slogx.ParseLevel returns ok=true for a blank
-// value, so without this line a LOG_LEVEL that resolved empty (compose
-// interpolation of an undefined variable produces exactly that shape) falls
-// back to info in total silence — on the one knob an operator turns while
-// diagnosing a live outage. The message is distinct from the typo warning on
-// purpose, so the sibling test's "present but blank does not warn" case keeps
-// pinning the typo-vs-accident distinction.
-func TestLoadWarnsWhenLogLevelIsPresentButBlank(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
-	setValidLoadEnv(t)
-	t.Setenv("LOG_LEVEL", "   ")
-
-	rec := capture.Default(t)
-
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.LogLevel != slog.LevelInfo {
-		t.Errorf("LogLevel = %v, want INFO: a blank LOG_LEVEL must land on the documented default", cfg.LogLevel)
-	}
-	if got := rec.CountLevel(slog.LevelWarn, "LOG_LEVEL is set but blank"); got != 1 {
-		t.Errorf("the blank-LOG_LEVEL warning was logged at WARN %d times, want exactly 1; the operator set the variable and this process threw the value away, and below WARN the line is invisible at the very default level it silently fell back to: %v", got, rec.Records())
-	}
-}
-
-// TestLoadRejectsAFileBorneBeatTokenHTTPCannotCarry pins that the
-// control-byte refusal covers the _FILE channel too, the same way
-// TestLoadRejectsPlainHTTPWebhookFromFile pins the https gate for the webhook's
-// file channel. envx removes at most one trailing line ending, so a two-line
-// secret file (a stray second line, a copy-pasted pair of lines) hands
-// loadBeatToken a token with an INTERIOR newline that no trim can rescue and no
-// sender can present.
-// TestLoadRejectsABeatTokenHTTPCannotCarry covers the plain variable only, so
-// scoping the check to the plain channel — the shape the cycle-8 normalization
-// work moved code toward — leaves the mounted-secret path arming a gate that
-// 401s every ping while every existing test stays green.
-func TestLoadRejectsAFileBorneBeatTokenHTTPCannotCarry(t *testing.T) {
-	tokenFile := filepath.Join(t.TempDir(), "beat-token")
-	if err := os.WriteFile(tokenFile, []byte("alpha\nbeta\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	setValidLoadEnv(t)
-	unsetEnv(t, "BEAT_TOKEN")
-	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
-
-	_, err := Load(maxNodeNameBytes)
-	if err == nil {
-		t.Fatal("Load() with a two-line BEAT_TOKEN_FILE = nil, want error: the interior newline is illegal in a header value, so the gate would be armed with a token no sender can present and every configured beat goes falsely missing one deadline later")
-	}
-	// The byte rule's own diagnosis, not merely "some error": the fixture is
-	// under the minTokenLength floor, so an err != nil oracle is answered by the
-	// length refusal and stays green when the header-legality check stops running
-	// on this channel — the regression this test exists to catch.
-	if !strings.Contains(err.Error(), "control character") {
-		t.Errorf("error = %q, want the control-character diagnosis: any other refusal means the _FILE channel was rejected by a different rule and the header-legality check no longer covers it", err)
-	}
-	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
-		t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which secret to fix", err)
-	}
-	if strings.Contains(err.Error(), "alpha") || strings.Contains(err.Error(), "beta") {
-		t.Errorf("error = %q embeds the token value; the startup error is shipped to Loki, so it must describe the shape and never echo the credential", err)
-	}
-}
-
-// TestLoadWarnsOnlyWhenAnOptionalVariableIsPresentButBlank pins the
-// present-versus-unset distinction on the two optional variables that fall
-// back silently: NODE_NAME and LISTEN_ADDR. Both warn ONLY when the operator
-// set the variable and this process threw the value away; an unset variable is
-// the documented default and must stay silent. Neither half is asserted
-// anywhere else - TestLoadFallsBackToTheHostnameWhenNodeNameIsUnset pins the
-// hostname fallback and captures no log, and the :9190 fallback VALUE is also
-// pinned by TestLoadDefaultsAndFailures while the warning that NAMES it is
-// asserted only by this test's own 'names the default' subtest - so
-// dropping the `if present` guard makes every default deployment log two
-// warnings about variables nobody set, and dropping the warning lets a value
-// the operator set be discarded with no signal at all, on the two settings
-// that decide which observer a Discord notice names and whether /metrics
-// answers at the scraped address.
-func TestLoadWarnsOnlyWhenAnOptionalVariableIsPresentButBlank(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
-	tests := map[string]struct {
-		key      string
-		value    string
-		unset    bool
-		warnSub  string
-		wantWarn bool
-	}{
-		"node name blank warns": {key: "NODE_NAME", value: "  ", warnSub: "NODE_NAME is set but blank", wantWarn: true},
-		// TrimSpace does not see these: an all-invisible NODE_NAME (zero-width
-		// space, BOM) is blank to the operator reading it, so it takes the same
-		// warn-and-fall-back-to-hostname path. Without this row nothing pins that,
-		// and the notices silently go back to reading "[knell ]".
-		"node name invisible warns":   {key: "NODE_NAME", value: "\u200b\ufeff", warnSub: "NODE_NAME is set but blank", wantWarn: true},
-		"node name unset stays quiet": {key: "NODE_NAME", unset: true, warnSub: "NODE_NAME is set but blank", wantWarn: false},
-		"node name set stays quiet":   {key: "NODE_NAME", value: "observer-1", warnSub: "NODE_NAME is set but blank", wantWarn: false},
-		"listen addr blank warns":     {key: "LISTEN_ADDR", value: "   ", warnSub: "LISTEN_ADDR is set but blank", wantWarn: true},
-		"listen addr unset is quiet":  {key: "LISTEN_ADDR", unset: true, warnSub: "LISTEN_ADDR is set but blank", wantWarn: false},
-		"listen addr set is quiet":    {key: "LISTEN_ADDR", value: "127.0.0.1:9999", warnSub: "LISTEN_ADDR is set but blank", wantWarn: false},
-	}
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			setValidLoadEnv(t)
-			if tt.unset {
-				unsetEnv(t, tt.key)
-			} else {
-				t.Setenv(tt.key, tt.value)
-			}
-
-			rec := capture.Default(t)
-
-			if _, err := Load(maxNodeNameBytes); err != nil {
-				t.Fatalf("Load() error: %v", err)
-			}
-			if got := rec.Contains(tt.warnSub); got != tt.wantWarn {
-				t.Errorf("%s=%q (unset=%v): warned = %v, want %v; the warning is the only signal that a value the operator set was discarded, and a warning for an unset variable trains the operator to ignore it: %v",
-					tt.key, tt.value, tt.unset, got, tt.wantWarn, rec.Messages())
-			}
-		})
-	}
-
-	// The blank-LISTEN_ADDR warning must name the address the listener falls
-	// back to: without it the operator reads "ignored" with no way to tell which
-	// port the scrape should target.
-	t.Run("blank listen addr warning names the default", func(t *testing.T) {
-		setValidLoadEnv(t)
-		t.Setenv("LISTEN_ADDR", " ")
-
-		rec := capture.Default(t)
-
-		cfg, err := Load(maxNodeNameBytes)
-		if err != nil {
-			t.Fatalf("Load() error: %v", err)
-		}
-		if cfg.ListenAddr != defaultListenAddr {
-			t.Fatalf("ListenAddr = %q, want %q", cfg.ListenAddr, defaultListenAddr)
-		}
-		if !rec.HasAttr("LISTEN_ADDR is set but blank", "listen_addr", defaultListenAddr) {
-			t.Errorf("blank-LISTEN_ADDR warning does not report the fallback address %q: %v", defaultListenAddr, rec.Records())
-		}
-	})
-
-	// The blank-NODE_NAME warning has to name the way out, because the operator
-	// who set the variable is the one reading it.
-	t.Run("blank node name warning tells the operator both options", func(t *testing.T) {
-		setValidLoadEnv(t)
-		t.Setenv("NODE_NAME", "\t")
-
-		rec := capture.Default(t)
-
-		if _, err := Load(maxNodeNameBytes); err != nil {
-			t.Fatalf("Load() error: %v", err)
-		}
-		if !strings.Contains(strings.Join(rec.Messages(), "\n"), "unset the variable") {
-			t.Errorf("blank-NODE_NAME warning does not name the unset-for-hostname option: %v", rec.Messages())
-		}
-	})
 }

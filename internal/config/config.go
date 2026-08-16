@@ -201,27 +201,20 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...webhttp.HostAllowlistOption) (
 }
 
 // nodeName resolves the observer name: NODE_NAME when set to a non-blank value
-// (a blank one is warned about and ignored), else the hostname, else "unknown".
+// (a blank one is ignored), else the hostname, else "unknown".
 // A NODE_NAME past maxNodeNameBytes fails startup like any other malformed
 // required value: the cap is what guarantees no name can push a notification
 // past Discord's content limit, where the switch would arm and never ring. The
 // hostname fallback is not length-checked because the kernel bounds it far below
 // the cap, which holds only while maxNodeNameBytes stays at or above 255.
 func nodeName(maxNodeNameBytes int) (string, error) {
-	raw, present := os.LookupEnv("NODE_NAME")
 	// Trimmed with this package's own predicate for "the operator cannot see it"
 	// rather than TrimSpace, whose blank is Unicode SPACES only: a name built from
 	// invisible runes names nothing, and a padded one prefixes every notice with a
 	// character the operator cannot see. Safe here where BEAT_TOKEN is REFUSED,
 	// because nothing reproduces the node name byte for byte.
-	node := strings.TrimFunc(raw, invisibleInURL)
+	node := strings.TrimFunc(os.Getenv("NODE_NAME"), invisibleInURL)
 	if node == "" {
-		if present {
-			// Same rule as listenAddr: an unset NODE_NAME is the documented
-			// hostname default, while a blank one is a value the operator set
-			// and this process threw away.
-			slog.Warn("NODE_NAME is set but blank and was ignored; the node name prefixes every Discord notice, so set it to name this observer, or unset the variable to use the hostname")
-		}
 		return hostnameNode(), nil
 	}
 	if len(node) > maxNodeNameBytes {
@@ -253,49 +246,20 @@ func hostnameNode() string {
 }
 
 // listenAddr resolves the listener address: LISTEN_ADDR when set to a non-blank
-// value (a blank one is warned about and ignored), else defaultListenAddr.
+// value (a blank one is ignored), else defaultListenAddr.
 // Padding is trimmed rather than refused because net.Listen resolves " :9190" as
 // a hostname lookup and fails with the padding invisible in the crash-loop log
 // line; unlike a credential, an address has no verifier on the other side that a
 // trim could disagree with. An entirely blank value falls back to the default
 // rather than to "", which would bind an ephemeral port.
 func listenAddr() string {
-	// LookupEnv, not envx.String: only the PRESENT-but-blank case is an
-	// accident worth a line (compose interpolation of an undefined variable
-	// produces exactly it), and envx.String collapses that with "unset".
-	raw, present := os.LookupEnv("LISTEN_ADDR")
 	// TrimFunc with invisibleInURL, not TrimSpace: a pasted value carries
 	// invisible runes TrimSpace keeps and net.Listen then fails to resolve, in a
 	// crash loop whose cause is invisible in the log line.
-	if addr := strings.TrimFunc(raw, invisibleInURL); addr != "" {
-		warnEphemeralListenPort(addr)
+	if addr := strings.TrimFunc(os.Getenv("LISTEN_ADDR"), invisibleInURL); addr != "" {
 		return addr
 	}
-	if present {
-		slog.Warn("LISTEN_ADDR is set but blank and was ignored; the listener binds every interface at the default address, so unset the variable to accept that on purpose, or set a host:port to narrow it", "listen_addr", defaultListenAddr)
-	}
 	return defaultListenAddr
-}
-
-// warnEphemeralListenPort reports a LISTEN_ADDR that asks the kernel for an
-// ephemeral port. Port 0 binds successfully and startup reports itself healthy,
-// but the address changes on every boot, so no sender's URL and no scrape target
-// can name it and every configured beat goes missing one deadline after start
-// while the observer looks up. Warned rather than refused: the value is a
-// working bind, so only the diagnostic is missing.
-func warnEphemeralListenPort(addr string) {
-	_, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		// Not a host:port at all. net.Listen refuses it at bind time and main's
-		// classifyBindError names it.
-		return
-	}
-	// A service NAME ("http") is resolved by net.Listen, never zero.
-	if n, convErr := strconv.Atoi(port); convErr != nil || n != 0 {
-		return
-	}
-	slog.Warn("LISTEN_ADDR asks for port 0, so the kernel picks a fresh random port on every start; no sender can reach POST /beat/{id} and no scrape can reach /metrics at a port that changes each boot, so every configured beat goes missing one deadline after start",
-		"hint", "set an explicit port, e.g. "+defaultListenAddr)
 }
 
 // allowedHosts parses the ALLOWED_HOSTS exact-match Host allowlist. Unset (the
@@ -307,19 +271,12 @@ func warnEphemeralListenPort(addr string) {
 // unlisted pings surface as missing-beat alerts for healthy services.
 func allowedHosts(opts []webhttp.HostAllowlistOption) (*webhttp.HostPolicy, error) {
 	const key = "ALLOWED_HOSTS"
-	// LookupEnv, not Getenv: a PRESENT-but-blank value leaves the rebinding
-	// guard OFF while the operator believes the allowlist is armed. Unset is the
-	// documented default and must stay silent.
-	raw, present := os.LookupEnv(key)
+	raw := os.Getenv(key)
 	policy, invalid := webhttp.ParseHostList(strings.Split(raw, ","), opts...)
 	if len(invalid) > 0 {
 		// %q, not %v: the one mistake an operator cannot SEE is an invisible
 		// rune pasted in with the hostname, and %q escapes it.
 		return nil, fmt.Errorf("%s has entries no Host can ever match, so the allowlist knell would serve is not the one configured: %q; use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,10.0.0.5,knell.example.com — a lone port like :9190 belongs in LISTEN_ADDR", key, invalid)
-	}
-	if present && !policy.Active() {
-		slog.Warn(key+" is set but blank and was ignored; every Host is accepted, so the DNS-rebinding guard is off",
-			"hint", "unset the variable to accept every Host on purpose, or list the hostnames knell is reached by, e.g. knell.internal,10.0.0.5")
 	}
 	return policy, nil
 }
@@ -332,9 +289,8 @@ func allowedHosts(opts []webhttp.HostAllowlistOption) (*webhttp.HostPolicy, erro
 // operator meant to admit. Unset or blank returns nil, which is what
 // webhttp.WithClientIP takes when given no ranges: client_ip is the socket peer.
 func trustedProxies() []*net.IPNet {
-	// Getenv, not LookupEnv: present-but-blank is deliberately NOT warned here,
-	// unlike in nodeName, listenAddr, allowedHosts and logLevel, and ParseCIDRs
-	// trims and skips blank entries, so there is nothing local to test.
+	// Getenv: ParseCIDRs trims and skips blank entries, so a present-but-blank
+	// value needs nothing local.
 	raw := os.Getenv("TRUSTED_PROXIES")
 	nets, invalid := webhttp.ParseCIDRs(strings.Split(raw, ","))
 	if len(invalid) > 0 {
@@ -344,22 +300,10 @@ func trustedProxies() []*net.IPNet {
 	return nets
 }
 
-// logLevel resolves the log level: LOG_LEVEL when it parses, else info. A
-// present-but-blank value is warned about and ignored, which matters most on
-// this variable: slogx.ParseLevel returns ok=true for a blank value, so the one
-// knob an operator turns while diagnosing a live outage is also the one whose
-// silent fallback hides the diagnosis.
+// logLevel resolves the log level: LOG_LEVEL when it parses, else info.
 func logLevel() slog.Level {
-	// LookupEnv, not envx.String, for the reason listenAddr gives: only
-	// present-but-blank is an accident worth a line.
-	raw, present := os.LookupEnv("LOG_LEVEL")
-	// Resolved first, so the fallback level is named once: ParseLevel reports ok
-	// for a blank value, so it settles the blank and unset cases alike and the
-	// arm below is the diagnostic a PRESENT blank earns.
+	raw := os.Getenv("LOG_LEVEL")
 	level, ok := slogx.ParseLevel(raw, slog.LevelInfo)
-	if present && strings.TrimSpace(raw) == "" {
-		slog.Warn("LOG_LEVEL is set but blank and was ignored; logging stays at the default level, so unset the variable to accept that on purpose, or set debug, info, warn or error", "log_level", level.String())
-	}
 	if !ok {
 		// NOT pre-quoted: TextHandler already quotes an attr value that needs it,
 		// and an invisible rune does, so quoting here would quote the quotes.

@@ -11,7 +11,6 @@ package notify
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +20,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/cplieger/httpx/v4"
@@ -330,7 +328,16 @@ func safeTransportError(err error) error {
 		}
 		cause = httpx.LogSafeError(cause)
 	}
-	return transportError{phrase: transportPhrase(cause), cause: cause}
+	// net.OpError's Op is one of net's own fixed verbs, so it is safe to print
+	// where the surrounding error text is not, and it carries the distinction
+	// that matters during an outage: a stalled dial points at egress or DNS, a
+	// stalled read means the host accepted the connection and went quiet.
+	phrase := "webhook transport failed"
+	var opErr *net.OpError
+	if errors.As(cause, &opErr) && opErr.Op != "" {
+		phrase += " during " + opErr.Op
+	}
+	return transportError{phrase: phrase, cause: cause}
 }
 
 // transportError is a transport failure whose message is knell's alone.
@@ -344,70 +351,6 @@ type transportError struct {
 
 func (e transportError) Error() string { return e.phrase }
 func (e transportError) Unwrap() error { return e.cause }
-
-// transportPhrase names why an attempt produced no response, choosing from a
-// finite set of knell's own sentences. err is matched STRUCTURALLY and its text
-// is never read, because a transport cause can be written from a response header.
-// An unrecognized cause reports only that the transport failed.
-func transportPhrase(err error) string {
-	var (
-		dnsErr  *net.DNSError
-		certErr *tls.CertificateVerificationError
-		netErr  net.Error
-	)
-	switch {
-	case errors.Is(err, context.Canceled):
-		return "webhook delivery was canceled"
-	case errors.Is(err, context.DeadlineExceeded):
-		return "a deadline expired" + transportStage(err)
-	case isProxyConnectError(err):
-		return "the egress proxy could not be reached"
-	case errors.As(err, &dnsErr):
-		return "the webhook host could not be resolved"
-	case errors.Is(err, syscall.ECONNREFUSED):
-		return "the webhook host refused the connection"
-	case errors.Is(err, syscall.ECONNRESET):
-		return "the connection to the webhook was reset"
-	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
-		// No route, not a refusal: the packet never left this host's network.
-		// Named separately because the operator action is the node's egress, not
-		// Discord and not DNS.
-		return "no network route to the webhook host"
-	case errors.As(err, &certErr):
-		return "the webhook's TLS certificate could not be verified"
-	case errors.As(err, &netErr) && netErr.Timeout():
-		return "the webhook did not answer in time" + transportStage(err)
-	case errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF):
-		return "the connection closed before the webhook answered"
-	}
-	return "webhook transport failed" + transportStage(err)
-}
-
-// transportStage names WHICH stage of the attempt failed, from net.OpError's Op
-// field. That field is one of net's own fixed verbs, so it is safe to print
-// where the surrounding error text is not, and it carries the distinction that
-// matters during an outage: a stalled dial points at egress or DNS, a stalled
-// read means the host accepted the connection and went quiet. "proxyconnect"
-// reaches here despite transportPhrase's own branch, a proxy dial that TIMES OUT
-// matching the deadline branch first.
-func transportStage(err error) string {
-	var opErr *net.OpError
-	if errors.As(err, &opErr) && opErr.Op != "" {
-		return " during " + opErr.Op
-	}
-	return ""
-}
-
-// isProxyConnectError reports whether the failure happened while reaching the
-// egress proxy rather than the webhook host. net/http wraps a proxy dial failure
-// as *net.OpError{Op: "proxyconnect"}, and the errno underneath would otherwise
-// satisfy transportPhrase's webhook-host branches -- a confident wrong diagnosis
-// sending the operator to Discord while their own proxy is down. errors.As finds
-// the OUTERMOST *net.OpError, so an unproxied failure is unaffected.
-func isProxyConnectError(err error) bool {
-	var opErr *net.OpError
-	return errors.As(err, &opErr) && opErr.Op == "proxyconnect"
-}
 
 // postAttempt performs one delivery attempt of an already-encoded payload:
 // request construction, transport call, and response cleanup, leaving the
@@ -462,72 +405,32 @@ func deliveryError(resp *http.Response) error {
 	// The code alone cannot tell a deleted webhook from a rejected payload;
 	// Discord names that difference in the body as a numeric code.
 	detail := statusDetail(resp.Body)
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		// CheckHTTPStatus renders these two as wording for a keyed API. knell
-		// sends no API key: DISCORD_WEBHOOK_URL's own path and token ARE the
-		// credential. %w cannot be used, since it would carry that text into the
-		// message this correction exists to replace.
-		return &webhookCredentialError{cause: statusErr, detail: detail, status: resp.StatusCode}
-	}
 	if detail != "" {
 		return fmt.Errorf("%w%s", statusErr, detail)
 	}
 	return statusErr
 }
 
-// webhookCredentialError reports a 401/403 in knell's own words while keeping
-// httpx's typed status error reachable for errors.As. Its Error text is
-// entirely knell-owned on purpose: the httpx wording it replaces describes a
-// keyed API, and knell sends no API key — DISCORD_WEBHOOK_URL's own path and
-// token are the credential.
-type webhookCredentialError struct {
-	cause  error
-	detail string
-	status int
-}
-
-func (e *webhookCredentialError) Error() string {
-	return fmt.Sprintf(
-		"HTTP %d: DISCORD_WEBHOOK_URL's path/token credential was rejected%s (knell sends no API key: recreate the webhook and update the config)",
-		e.status, e.detail)
-}
-
-func (e *webhookCredentialError) Unwrap() error { return e.cause }
-
 // statusDetail renders what a rejected response adds to its status code, using
 // only numbers this package measured and words this package wrote. Discord
 // answers a rejected POST with a JSON error object whose numeric "code" field
 // names the cause, and that number is the body's whole diagnostic value: a
 // number cannot carry a credential. The object's text fields are authored by the
-// other end and never published; everything else is reported as a fact ABOUT the
-// body. The empty string means the status is the whole verdict.
+// other end and never published. The empty string means the status is the whole
+// verdict.
 func statusDetail(body io.Reader) string {
-	// One byte past the cap, so an over-cap body is DETECTABLE instead of
-	// silently truncated into a partial (and then unattributable) fragment.
+	// One byte past the cap, so an over-cap body is DETECTABLE and dropped
+	// instead of being decoded as a whole one.
 	detail, readErr := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes+1))
-	switch {
-	case readErr != nil:
-		// A body that did not arrive whole is worth saying out loud: a bare status
-		// reads as "the webhook explained nothing", while a response that broke
-		// mid-body points at the path between here and Discord. The read error's
-		// own text is remote-authored, so readFailure classifies it instead.
-		return fmt.Sprintf(" (response body unreadable after %d bytes, detail dropped: %s)",
-			len(detail), readFailure(readErr))
-	case len(detail) > maxErrorBodyBytes:
-		return fmt.Sprintf(" (response body over %d bytes, detail dropped)", maxErrorBodyBytes)
-	case len(detail) == 0:
+	if readErr != nil || len(detail) > maxErrorBodyBytes {
 		return ""
 	}
 	code, ok := discordErrorCode(detail)
 	if !ok {
-		return fmt.Sprintf(" (response body of %d bytes carried no Discord error code, detail dropped)", len(detail))
+		return ""
 	}
-	if meaning := discordCodeMeaning(code); meaning != "" {
-		return fmt.Sprintf(": Discord error code %d (%s)", code, meaning)
-	}
-	// An unmapped code is still the one fact worth having — the operator can
-	// look it up in Discord's error reference — and knell claims no meaning
-	// it does not know.
+	// The code is the one fact worth having — the operator can look it up in
+	// Discord's error reference — and knell claims no meaning it does not know.
 	return fmt.Sprintf(": Discord error code %d", code)
 }
 
@@ -544,45 +447,4 @@ func discordErrorCode(body []byte) (int, bool) {
 		return 0, false
 	}
 	return *parsed.Code, true
-}
-
-// discordCodeMeaning is knell's own wording for the Discord error codes an
-// operator can act on; the empty string means knell knows no meaning for the
-// code and reports the bare number. The mapped codes split by what the operator
-// can do: 10015 and 50027 mean the webhook no longer accepts this knell, which
-// only an operator can fix, while 50006 and 50035 mean Discord refused the
-// payload knell built, so both are reported as knell bugs and neither names a
-// setting to re-check.
-func discordCodeMeaning(code int) string {
-	switch code {
-	case 10015:
-		return "unknown webhook: it was deleted, or DISCORD_WEBHOOK_URL points at one that never existed - recreate the webhook and update the config"
-	case 50027:
-		return "invalid webhook token: DISCORD_WEBHOOK_URL's token does not match the webhook - recreate the webhook and update the config"
-	case 50006:
-		return "cannot send an empty message: knell built a payload with no content, which is a knell bug, not an operator problem"
-	case 50035:
-		return "invalid request body: Discord rejected the payload knell built, which no configuration change helps, so this is a knell bug worth reporting"
-	}
-	return ""
-}
-
-// readFailure names why reading a rejected response's body failed, in knell's
-// own words. The read error is classified structurally and never rendered:
-// io.ReadAll surfaces net/textproto's "malformed MIME header line: <remote
-// bytes>" verbatim, so its text is remote-authored input, not a diagnosis.
-func readFailure(err error) string {
-	switch {
-	case errors.Is(err, io.ErrUnexpectedEOF):
-		return "the connection closed before the body was complete"
-	case errors.Is(err, context.Canceled):
-		// Shutdown, not a fault on the path to Discord: the sweep's context was
-		// canceled while the rejected response's body was being read.
-		return "delivery was canceled before the body was complete"
-	case errors.Is(err, context.DeadlineExceeded):
-		return "the attempt deadline expired mid-body"
-	case errors.Is(err, syscall.ECONNRESET):
-		return "the connection was reset"
-	}
-	return "the read failed"
 }

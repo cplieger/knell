@@ -2,17 +2,14 @@
 # line, matched against punused's output line; full-line `#` comments carry the
 # reason. Invalid-by-construction classes: `.kiro/steering/tools.md`.
 #
-# Both error types are constructed in non-test code in internal/notify/discord.go
-# -- transportError by safeTransportError on every client.Do failure, and
-# webhookCredentialError on the 401/403 branch of deliveryError -- and both flow
-# out as `error` through post -> httpx.Do -> watch. So every use is interface
-# dispatch or a stdlib errors.* traversal, which punused cannot see
-# (bep/punused#3).
+# transportError is constructed in non-test code in internal/notify/discord.go --
+# by safeTransportError on every client.Do failure -- and flows out as `error`
+# through post -> httpx.Do -> watch. So every use is interface dispatch or a
+# stdlib errors.* traversal, which punused cannot see (bep/punused#3).
 #
 # Error() satisfies the builtin error interface; the text surfaces through
 # httpx.Do's per-attempt logging and watch's failure lines.
 method (transportError).Error
-method (*webhookCredentialError).Error
 #
 # transportError.Unwrap is decision-changing, not decorative: watch's
 # sendMissing/sendHistory/sendRecovered test errors.Is(err, context.Canceled),
@@ -23,12 +20,3 @@ method (*webhookCredentialError).Error
 # ECONNREFUSED / DNSError, so dropping Unwrap would silently disable per-attempt
 # retry of transport failures.
 method (transportError).Unwrap
-#
-# webhookCredentialError.Unwrap is invoked by non-test code (httpx.IsTransient's
-# errors.As, LogSafeError's errors.As, watch's errors.Is) and upholds the
-# documented chain contract, though no non-test consumer's verdict currently
-# depends on what it exposes: CheckHTTPStatus already returns *AuthError for
-# 401/403 and IsTransient answers false either way. Kept because a wrapper that
-# hides its cause is a latent correctness bug, and the fuzz oracle
-# assertTypedStatusError pins the chain.
-method (*webhookCredentialError).Unwrap

@@ -76,8 +76,8 @@ func FuzzDeliveryErrorNeverCarriesWebhookURL(f *testing.F) {
 //
 // A needle that also appears in the error built for a DIFFERENT (control)
 // webhook URL is skipped: that text came from knell's own message template, so
-// a fuzz tail that happens to contain a phrase like "detail dropped" cannot
-// masquerade as a leak. Everything else is a leak by definition — nothing in
+// a fuzz tail that happens to contain a phrase like "Discord error code"
+// cannot masquerade as a leak. Everything else is a leak by definition — nothing in
 // the delivery path is supposed to depend on the URL at all.
 func assertDeliveryErrorHidesWebhookURL(t *testing.T, rawURL string, status int, body string) {
 	t.Helper()
@@ -203,8 +203,8 @@ func assertNoNeedleLeaked(t *testing.T, gotErr, controlErr error, needles []stri
 
 // assertTypedStatusError checks the other half of the contract the status
 // branch must keep: every non-2xx keeps CheckHTTPStatus's typed error
-// reachable in its chain -- by %w, or by webhookCredentialError's own Unwrap
-// on the 401/403 path -- which is what lets httpx.Do classify 502/503/504 as transient
+// reachable in its chain by %w, which is what lets httpx.Do classify
+// 502/503/504 as transient
 // and find the 429's *RateLimitError. A run where the request was never made
 // (an unusable fuzzed URL) reaches no status at all, and a 2xx is a delivery.
 //
