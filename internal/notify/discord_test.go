@@ -167,120 +167,85 @@ func TestBeatRecoveredDelivers(t *testing.T) {
 }
 
 // TestBeatOutageHistoryStatesTheTrueReasonForALateNotice pins the mapping from
-// watch.LateReason to the clause an operator acts on, for every shape of batch.
-// Each case asserts BOTH the wording that belongs to its reason and the wording
-// that belongs to the OTHER two: a want-only assertion still passes if the
-// clauses are swapped (they all mention the outage and a duration), and swapping
-// them is precisely the bug this fixes — telling an operator to inspect a
-// webhook that delivered this message on its first attempt, or that was never
-// asked to deliver anything at all.
+// a record's delivery blame to the clause an operator acts on, for every shape of
+// batch. Each case asserts BOTH the wording that belongs to its case and the
+// wording that belongs to the OTHER one: a want-only assertion still passes if
+// the clauses are swapped (they all mention the outage and a duration), and
+// swapping them is precisely the bug this prevents — telling an operator to
+// inspect a webhook that delivered this message on its first attempt, or
+// vouching for one that had just refused it.
 func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 	t.Parallel()
 
 	recovered := time.Date(2026, 7, 23, 14, 7, 0, 0, time.UTC)
-	// outage builds one ended outage of span with the given late reason; the
-	// spans differ per entry only so the summary's "longest" is unambiguous.
-	outage := func(span time.Duration, reason watch.LateReason) watch.Outage {
+	// outage builds one ended outage of span, blaming delivery or not; the spans
+	// differ per entry only so the summary's "longest" is unambiguous.
+	outage := func(span time.Duration, undelivered bool) watch.Outage {
 		return watch.Outage{
-			Started:    recovered.Add(-span),
-			Recovered:  recovered,
-			LateReason: reason,
+			Started:     recovered.Add(-span),
+			Recovered:   recovered,
+			Undelivered: undelivered,
 		}
 	}
 	const (
 		webhookClause = "check the webhook"
 		delayedOne    = "This notice is late because delivery was delayed"
 		delayedAll    = "Delivery was delayed for every outage"
-		selfResolved  = "ended before a sweep detected it"
-		deliveryFine  = "nothing was wrong with delivery"
-		// The deferral clauses. Only the webhook-blaming reason may send an
-		// operator to the webhook, so these two must not contain webhookClause.
-		deferredOne = "this observer deferred the alert to a later sweep"
-		deferredAll = "Every alert was deferred to a later sweep"
-		noAttempt   = "no delivery was attempted"
+		// The nothing-attempted clauses. Only a refused delivery may send an
+		// operator to the webhook, so these must not contain webhookClause.
+		noAttemptOne = "no delivery was ever attempted for it"
+		noAttemptAll = "No delivery was ever attempted for any of them"
+		notThePlace  = "the webhook is not the place to look"
 	)
 	cases := map[string]struct {
 		outages []watch.Outage
 		want    []string
 		forbid  []string
 	}{
-		"one outage that ended before any sweep saw it": {
-			outages: []watch.Outage{outage(12*time.Minute, watch.LateEndedBeforeDetection)},
-			want:    []string{"was missing for 12m0s", selfResolved, deliveryFine},
-			forbid:  []string{webhookClause, delayedOne, deferredOne, noAttempt, "notifications were failing"},
-		},
-		"one outage whose alert the webhook refused": {
-			outages: []watch.Outage{outage(12*time.Minute, watch.LateUndelivered)},
-			want:    []string{"was missing for 12m0s", delayedOne, webhookClause},
-			forbid:  []string{selfResolved, deliveryFine, deferredOne, noAttempt},
-		},
 		// The reason the split exists: nothing was ever sent for this outage, so
 		// the notice must not spend the operator's evening on a healthy webhook.
-		"one outage this observer deferred before any send": {
-			outages: []watch.Outage{outage(12*time.Minute, watch.LateSchedulerDeferred)},
-			want:    []string{"was missing for 12m0s", deferredOne, noAttempt},
-			forbid:  []string{webhookClause, delayedOne, selfResolved, deliveryFine},
+		"one outage nothing was attempted for": {
+			outages: []watch.Outage{outage(12*time.Minute, false)},
+			want:    []string{"was missing for 12m0s", noAttemptOne, notThePlace},
+			forbid:  []string{webhookClause, delayedOne, "notifications were failing"},
 		},
-		"a batch of outages that all ended before a sweep saw them": {
+		"one outage whose alert the webhook refused": {
+			outages: []watch.Outage{outage(12*time.Minute, true)},
+			want:    []string{"was missing for 12m0s", delayedOne, webhookClause},
+			forbid:  []string{noAttemptOne, notThePlace},
+		},
+		"a batch of outages nothing was attempted for": {
 			outages: []watch.Outage{
-				outage(12*time.Minute, watch.LateEndedBeforeDetection),
-				outage(47*time.Minute, watch.LateEndedBeforeDetection),
+				outage(12*time.Minute, false),
+				outage(47*time.Minute, false),
 			},
-			want:   []string{"had 2 outages", "longest 47m0s", selfResolved, deliveryFine},
-			forbid: []string{webhookClause, delayedAll, deferredAll, noAttempt},
+			want:   []string{"had 2 outages", "longest 47m0s", noAttemptAll, notThePlace},
+			forbid: []string{webhookClause, delayedAll},
 		},
 		"a batch of outages whose alerts the webhook all refused": {
 			outages: []watch.Outage{
-				outage(12*time.Minute, watch.LateUndelivered),
-				outage(47*time.Minute, watch.LateUndelivered),
+				outage(12*time.Minute, true),
+				outage(47*time.Minute, true),
 			},
 			want:   []string{"had 2 outages", "longest 47m0s", delayedAll, webhookClause},
-			forbid: []string{selfResolved, deliveryFine, deferredAll, noAttempt},
-		},
-		"a batch of outages this observer deferred before any send": {
-			outages: []watch.Outage{
-				outage(12*time.Minute, watch.LateSchedulerDeferred),
-				outage(47*time.Minute, watch.LateSchedulerDeferred),
-			},
-			want:   []string{"had 2 outages", "longest 47m0s", deferredAll, noAttempt},
-			forbid: []string{webhookClause, delayedAll, selfResolved, deliveryFine},
+			forbid: []string{noAttemptAll, notThePlace},
 		},
 		// The batch a real webhook outage produces on a flapping beat: some
-		// alerts refused, some outages over before a sweep could see them.
-		// Both counts must be stated; picking one reason for the batch says
-		// something false about the other outages.
-		"a batch that mixes a refusal with a self-resolved outage": {
+		// alerts refused, some outages over before a sweep could see them. Both
+		// counts must be stated; picking one for the batch says something false
+		// about the other outages.
+		"a batch that mixes a refusal with an unattempted outage": {
 			outages: []watch.Outage{
-				outage(12*time.Minute, watch.LateUndelivered),
-				outage(47*time.Minute, watch.LateUndelivered),
-				outage(9*time.Minute, watch.LateEndedBeforeDetection),
+				outage(12*time.Minute, true),
+				outage(47*time.Minute, true),
+				outage(9*time.Minute, false),
 			},
 			want: []string{
 				"had 3 outages", "longest 47m0s",
-				"Delivery was delayed for 2 (check the webhook)", "1 ended before a sweep detected it", webhookClause,
+				"Delivery was delayed for 2 (check the webhook)", "1 had nothing attempted", webhookClause,
 			},
-			forbid: []string{
-				// No single-reason clause may stand in for a mixed batch.
-				delayedAll, "Each " + selfResolved, deferredAll,
-			},
-		},
-		// The shape a saturated sweep produces during a partial webhook outage,
-		// and the one a two-cause sentence cannot express: three causes, three
-		// counts, and only the first of them names the webhook.
-		"a batch that mixes all three reasons": {
-			outages: []watch.Outage{
-				outage(12*time.Minute, watch.LateUndelivered),
-				outage(47*time.Minute, watch.LateUndelivered),
-				outage(20*time.Minute, watch.LateSchedulerDeferred),
-				outage(9*time.Minute, watch.LateEndedBeforeDetection),
-			},
-			want: []string{
-				"had 4 outages", "longest 47m0s",
-				"Delivery was delayed for 2 (check the webhook)",
-				"1 deferred to a later sweep with nothing attempted",
-				"1 ended before a sweep detected it",
-			},
-			forbid: []string{delayedAll, deferredAll, "Each " + selfResolved},
+			// No single-case clause may stand in for a mixed batch.
+			forbid: []string{delayedAll, noAttemptAll},
 		},
 	}
 	for name, tc := range cases {
@@ -305,11 +270,11 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 			}
 			for _, forbidden := range tc.forbid {
 				if strings.Contains(content, forbidden) {
-					t.Errorf("content %q states %q, which belongs to one of the other late reasons", content, forbidden)
+					t.Errorf("content %q states %q, which belongs to the other case", content, forbidden)
 				}
 			}
-			// Past tense and the recovery point are the same for all three
-			// reasons; only the explanation differs.
+			// Past tense and the recovery point are the same either way;
+			// only the explanation differs.
 			if !strings.Contains(content, "recovered at 2026-07-23 14:07 UTC") {
 				t.Errorf("content %q does not report the recovery point", content)
 			}
@@ -998,9 +963,9 @@ func TestNoticesEscapeDiscordMarkdownInConfiguredValues(t *testing.T) {
 		wantNode = `obs\*1\[x\](https://example)`
 	)
 	outage := watch.Outage{
-		Started:    time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC),
-		Recovered:  time.Date(2026, 7, 23, 12, 30, 0, 0, time.UTC),
-		LateReason: watch.LateUndelivered,
+		Started:     time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC),
+		Recovered:   time.Date(2026, 7, 23, 12, 30, 0, 0, time.UTC),
+		Undelivered: true,
 	}
 	sends := map[string]func(*Discord) error{
 		"missing":   func(d *Discord) error { return d.BeatMissing(t.Context(), id, liveSilence(time.Hour)) },
@@ -1520,14 +1485,14 @@ func TestNoticesReportWholeSecondDurations(t *testing.T) {
 
 	const ragged = 21*time.Minute + 30*time.Second + 123456789*time.Nanosecond
 	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
-	short := watch.Outage{Started: started, Recovered: started.Add(ragged), LateReason: watch.LateUndelivered}
+	short := watch.Outage{Started: started, Recovered: started.Add(ragged), Undelivered: true}
 	// A ragged span that is also the batch's longest: the summary truncates
 	// watch.LongestOutage's result, a fourth call site no singular notice
 	// reaches.
 	long := watch.Outage{
-		Started:    started,
-		Recovered:  started.Add(47*time.Minute + 987654321*time.Nanosecond),
-		LateReason: watch.LateUndelivered,
+		Started:     started,
+		Recovered:   started.Add(47*time.Minute + 987654321*time.Nanosecond),
+		Undelivered: true,
 	}
 	cases := map[string]struct {
 		send func(*Discord) error

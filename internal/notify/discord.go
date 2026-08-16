@@ -155,7 +155,7 @@ func (d *Discord) BeatOutageHistory(ctx context.Context, id string, outages []wa
 // historyMessage renders the history notice for id. outages is non-empty and
 // ascends by recovery point (both asserted by watch), so the last entry is the
 // most recent recovery. Every notice is two parts: WHAT happened, then why it is
-// being read after the fact. The second part comes from watch's LateReason and is
+// being read after the fact. The second part comes from watch's delivery blame and is
 // never guessed here, because on two of its three reasons a webhook check finds
 // nothing wrong.
 func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
@@ -165,7 +165,7 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 	if len(outages) == 1 {
 		return fmt.Sprintf(
 			"🕓 [knell %s] beat **%s** was missing for %s, recovered at %s. %s",
-			d.node, name, last.DownFor().Truncate(time.Second), recovered, lateClause(last.LateReason),
+			d.node, name, last.DownFor().Truncate(time.Second), recovered, lateClause(last.Undelivered),
 		)
 	}
 	return fmt.Sprintf(
@@ -209,66 +209,41 @@ func escapeMarkdown(s string) string {
 	return markdownEscaper.Replace(s)
 }
 
-// lateClause explains why ONE ended outage is reported after the fact. Each of
-// watch's three reasons gets its own sentence, because two of them must steer
-// the operator AWAY from the webhook: only LateUndelivered means a send was
-// ATTEMPTED and refused. An unrecognized reason falls to that sentence, matching
-// watch's zero value: a notice that cannot tell would rather point at a healthy
-// webhook than vouch for it.
-func lateClause(reason watch.LateReason) string {
-	switch reason {
-	case watch.LateEndedBeforeDetection:
-		return "This notice is late only because the outage ended before a sweep detected it - nothing was wrong with delivery."
-	case watch.LateSchedulerDeferred:
-		return "This notice is late because this observer deferred the alert to a later sweep and the beat came back first - no delivery was attempted, so the webhook is not the place to look."
-	default:
+// lateClause explains why ONE ended outage is reported after the fact. There are
+// two sentences because the reader has two next steps: an attempted-and-refused
+// delivery points at the webhook, and anything else must steer them away from a
+// webhook that was working the whole time.
+func lateClause(undelivered bool) string {
+	if undelivered {
 		return "This notice is late because delivery was delayed - check the webhook."
 	}
+	return "This notice is late because no delivery was ever attempted for it - the webhook is not the place to look."
 }
 
-// batchLateClause explains why a whole run of ended outages is reported after
-// the fact. A batch can MIX all three of watch's reasons -- how a flapping beat
-// behaves during a Discord outage -- so a mixed batch reports EVERY non-zero
-// count instead of picking a majority and stating something false about the rest.
-// One refused delivery is reason enough to look at the webhook; the other counts
-// stop that number from reading as that many webhook failures.
+// batchLateClause explains why a whole run of ended outages is reported after the
+// fact. A batch can MIX both cases -- how a flapping beat behaves during a Discord
+// outage -- so a mixed batch names BOTH counts instead of picking a majority and
+// stating something false about the rest. One refused delivery is reason enough to
+// look at the webhook; the other count stops that number from reading as that many
+// webhook failures.
 func batchLateClause(outages []watch.Outage) string {
-	var undelivered, deferred, ended int
+	var undelivered int
 	for _, o := range outages {
-		switch o.LateReason {
-		case watch.LateEndedBeforeDetection:
-			ended++
-		case watch.LateSchedulerDeferred:
-			deferred++
-		default:
-			// The zero reason counts as undelivered, like watch.LateUndelivered
-			// being the zero value: a batch naming no reason blames delivery.
+		if o.Undelivered {
 			undelivered++
 		}
 	}
-	// A batch that names ONE reason reads better as a statement about the whole
-	// batch than as a count of itself.
-	switch total := len(outages); {
-	case undelivered == total:
+	switch total := len(outages); undelivered {
+	case total:
 		return "Delivery was delayed for every outage - check the webhook."
-	case deferred == total:
-		return "Every alert was deferred to a later sweep and each beat came back first - no delivery was attempted, so the webhook is not the place to look."
-	case ended == total:
-		return "Each ended before a sweep detected it - nothing was wrong with delivery."
+	case 0:
+		return "No delivery was ever attempted for any of them - the webhook is not the place to look."
+	default:
+		return fmt.Sprintf(
+			"Delivery was delayed for %d (check the webhook); %d had nothing attempted.",
+			undelivered, total-undelivered,
+		)
 	}
-	// Mixed, so every non-zero count is named. Delivery leads because it is the
-	// only actionable one, which keeps the rest starting with their own digit.
-	clauses := make([]string, 0, 3)
-	if undelivered > 0 {
-		clauses = append(clauses, fmt.Sprintf("Delivery was delayed for %d (check the webhook)", undelivered))
-	}
-	if deferred > 0 {
-		clauses = append(clauses, fmt.Sprintf("%d deferred to a later sweep with nothing attempted", deferred))
-	}
-	if ended > 0 {
-		clauses = append(clauses, fmt.Sprintf("%d ended before a sweep detected it", ended))
-	}
-	return strings.Join(clauses, "; ") + "."
 }
 
 // post delivers one message, retrying transient failures. The webhook URL cannot

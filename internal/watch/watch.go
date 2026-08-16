@@ -9,7 +9,7 @@
 //
 // Notifications are split by whether the incident is still open: a live outage
 // gets the present-tense notices, while outages already over are reported once as
-// history, each carrying WHY it is late (LateReason). Every log line reporting a
+// history, each carrying whether its own delivery was refused. Every log line reporting a
 // delivery failure or an abandoned notice carries a retryable attribute -- the
 // LEVEL is deliberately not that signal -- so a log rule can tell "wait for it"
 // from "reconstruct the window".
@@ -45,7 +45,7 @@ type Notifier interface {
 	// BeatOutageHistory reports outages of id that were already over by the
 	// time anything about them could be sent, collapsed into a single
 	// past-tense notice. outages is chronological and never empty, and every
-	// entry carries its own recovery point, start and LateReason, which the
+	// entry carries its own recovery point, start and delivery blame, which the
 	// implementation must report rather than assume. Those guarantees are the
 	// CALLER's, so an implementation must not re-check them: every error it
 	// returns is read as a delivery failure.
@@ -76,35 +76,6 @@ func (t Transition) DownFor() time.Duration {
 	return t.Observed.Sub(t.Started)
 }
 
-// LateReason names WHY an outage was already over by the time anything about it
-// could be sent. All three values route identically and render in the past tense;
-// they differ in what the operator should DO. They form a one-way ORDER, weakest
-// claim about delivery first: LateEndedBeforeDetection, LateSchedulerDeferred,
-// LateUndelivered. A record's reason only moves ALONG it, because a notice that
-// blames delivery must have an attempt to point at; blameDelivery is the ONLY
-// writer after the record is queued. The NUMERIC values are NOT that order.
-type LateReason uint8
-
-const (
-	// LateUndelivered means a delivery ATTEMPT for this outage was made and
-	// FAILED, so delivery is demonstrably behind and the notice points the
-	// operator at the webhook. It is the strongest claim in the order above,
-	// and the zero value deliberately: a producer that queues a record without
-	// naming a reason points at delivery instead of vouching for it.
-	LateUndelivered LateReason = iota
-	// LateEndedBeforeDetection means no sweep ever saw this outage: it crossed
-	// its deadline and was ended by a ping between two sweeps, so no live notice
-	// was ever due. Reporting it as a delivery problem would send an operator
-	// hunting through a webhook that was working.
-	LateEndedBeforeDetection
-	// LateSchedulerDeferred means this observer never STARTED sending anything
-	// for this outage before the beat came back: the notice was deferred by
-	// knell's own scheduling, not refused by the webhook (a budget cut, a hold
-	// behind a queued recovery, or a full pending queue). Every record
-	// collectBeatDue queues starts here.
-	LateSchedulerDeferred
-)
-
 // Outage is one already-ended outage as the state machine observed it, the unit
 // BeatOutageHistory reports. It is this package's own output type, so the
 // notifier renders the outage without the state machine depending on how it is
@@ -117,10 +88,15 @@ type Outage struct {
 	// Recovered is the first accepted ping after the outage: the instant it
 	// ended. Always after Started.
 	Recovered time.Time
-	// LateReason says why this outage is reported after the fact instead of
-	// as a live incident. The renderer must not guess it: the three reasons
-	// lead an operator to different next steps.
-	LateReason LateReason
+	// Undelivered reports that a delivery attempt for this outage was made and
+	// REFUSED, so the notice points the operator at the webhook. False means
+	// nothing was ever attempted for it — no sweep saw the outage, or a sweep
+	// saw it and deferred it — and the notice must say so instead of sending
+	// the reader hunting through a webhook that was working. Those are the only
+	// two next steps a reader has, so they are the only two the record carries.
+	// It is false at every producer and only blameDelivery ever sets it, which
+	// is what keeps a notice from vouching for a webhook that just refused it.
+	Undelivered bool
 }
 
 // DownFor is the outage's full span: from the last ping before it to the first
@@ -187,7 +163,7 @@ type overdueBeat struct {
 	silence     Transition
 	recoveredAt time.Time
 	id          string
-	late        LateReason
+	undelivered bool
 }
 
 // beatState is the per-beat tracking record.
@@ -274,15 +250,15 @@ func (st *beatState) dropMissing(n int) {
 	st.pendingMissing = st.pendingMissing[n:]
 }
 
-// blameDelivery sets the late reason of the first n queued records to
-// LateUndelivered: the records whose own notice was ATTEMPTED and refused and
-// which stay queued for the next sweep. Once that has happened they ARE late
-// because of delivery -- a record still claiming LateEndedBeforeDetection would
-// tell the operator "nothing was wrong with delivery" in a message delivery had
-// just refused. n can never exceed the queue length, so a larger n panics.
+// blameDelivery marks the first n queued records undelivered: the records whose
+// own notice was ATTEMPTED and refused and which stay queued for the next sweep.
+// Once that has happened they ARE late because of delivery -- a record still
+// reporting that nothing was attempted would tell the operator "the webhook is
+// not the place to look" in a message delivery had just refused. n can never
+// exceed the queue length, so a larger n panics.
 func (st *beatState) blameDelivery(n int) {
 	for i := range n {
-		st.pendingMissing[i].late = LateUndelivered
+		st.pendingMissing[i].undelivered = true
 	}
 }
 
@@ -300,9 +276,9 @@ func (st *beatState) closedRun() []Outage {
 			break
 		}
 		run = append(run, Outage{
-			Started:    rec.silence.Started,
-			Recovered:  rec.recoveredAt,
-			LateReason: rec.late,
+			Started:     rec.silence.Started,
+			Recovered:   rec.recoveredAt,
+			Undelivered: rec.undelivered,
 		})
 	}
 	return run
@@ -385,20 +361,6 @@ func logOngoingOutageDeferred(rec *overdueBeat) {
 	slog.Debug("pending missing queue full, ongoing outage stays detected and is queued once a slot frees",
 		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.DownFor().String(),
 		"since", rec.silence.Started.UTC())
-}
-
-// lateReasonForUnqueuedOutage names why the notice for an outage with NO queued
-// record of its own will be late, for the ping about to record the whole closed
-// outage. Normally no sweep ran while it was open, so no live notice was ever due
-// (LateEndedBeforeDetection). The exception is overflowAccounted: a sweep DID
-// detect this outage and could not queue it, so nothing was ever attempted, which
-// is LateSchedulerDeferred -- the queue bound is knell's own back-pressure.
-// Callers hold w.mu.
-func (st *beatState) lateReasonForUnqueuedOutage() LateReason {
-	if st.overflowAccounted {
-		return LateSchedulerDeferred
-	}
-	return LateEndedBeforeDetection
 }
 
 // recoveryEvent is a queued recovered transition: the silence the arriving
@@ -507,11 +469,12 @@ func (w *Watcher) Beat(id string) BeatOutcome {
 	if open := st.openMissing(); open != nil {
 		open.recoveredAt = now
 	} else if !wasAlerted && overdue(silence.DownFor(), st.deadline) {
+		// undelivered stays false: no notice for this outage was ever
+		// attempted, whether or not a sweep saw it before the queue filled.
 		ended := overdueBeat{
 			id:          id,
 			silence:     silence,
 			recoveredAt: now,
-			late:        st.lateReasonForUnqueuedOutage(),
 		}
 		if st.recordEndedOutage(&ended) {
 			droppedEnded = &ended
@@ -934,10 +897,10 @@ func collectBeatDue(id string, st *beatState, now time.Time) (live *overdueBeat,
 	fresh := publishFreshness(id, silence.DownFor(), st.deadline)
 	// An overdue beat whose current outage is not on the queue yet is a fresh
 	// crossing to record, which is what keeps a second outage alive while an
-	// earlier notice is undelivered. The record is OPEN, so it starts at
-	// LateSchedulerDeferred: nothing has been attempted for it yet.
+	// earlier notice is undelivered. The record is OPEN, so undelivered stays
+	// false: nothing has been attempted for it yet.
 	if !fresh && !st.alerted && st.openMissing() == nil {
-		pending := overdueBeat{id: id, silence: silence, late: LateSchedulerDeferred}
+		pending := overdueBeat{id: id, silence: silence}
 		if st.recordOngoingOutage(&pending) {
 			deferredOverflow = &pending
 		}
@@ -954,8 +917,8 @@ func collectBeatDue(id string, st *beatState, now time.Time) (live *overdueBeat,
 		head.silence.Observed = now
 	}
 	// Held while an earlier recovery is queued or in flight, so transitions reach
-	// Discord in chronological order. No reason rewrite is owed: a record this
-	// hold defers was queued as LateSchedulerDeferred already.
+	// Discord in chronological order. No rewrite is owed: a record this hold
+	// defers has had nothing attempted for it either way.
 	if st.recovering {
 		return nil, nil, deferredOverflow
 	}
@@ -1040,10 +1003,10 @@ func (w *Watcher) dropDelivered(id string, n int) {
 // markUndelivered blames delivery for the n head records whose own notice was
 // just attempted and refused, so the retry reports the true reason it is late. n
 // is exactly the records that notice covered: 1 for a live missing notice and
-// len(outages) for a history notice. A record queued after the failed send keeps
-// its own reason: that notice never tried to deliver it. Without this, an outage
-// whose alert the webhook refused and which a ping then ended would be reported
-// as merely deferred.
+// len(outages) for a history notice. A record queued after the failed send stays
+// unblamed: that notice never tried to deliver it. Without this, an outage whose
+// alert the webhook refused and which a ping then ended would report that
+// nothing was attempted, vouching for the webhook that had just refused it.
 func (w *Watcher) markUndelivered(id string, n int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

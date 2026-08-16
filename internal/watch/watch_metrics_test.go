@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -174,8 +173,6 @@ func TestSweepExactDeadlineBoundaryIsFresh(t *testing.T) {
 		t.Fatalf("calls just past deadline = %v, want one missing", calls)
 	}
 }
-
-var refreshProbeSequence atomic.Uint64
 
 // labeledCounterValue parses the exposition value of name{label="<value>"} as
 // a float. It is the single parse-and-diagnose path behind the two
