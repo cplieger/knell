@@ -18,7 +18,6 @@ package watch
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"slices"
 	"sync"
@@ -129,14 +128,6 @@ type Outage struct {
 // measurement -- so every renderer measures it the same way.
 func (o Outage) DownFor() time.Duration {
 	return Transition{Started: o.Started, Observed: o.Recovered}.DownFor()
-}
-
-// Ended reports whether the outage carries a usable recovery point: one that is
-// set and no earlier than Started. It is the executable form of the invariant
-// the Recovered field documents, and it lives next to the type so the assertion
-// that ENFORCES it and the field that states it cannot come to disagree.
-func (o Outage) Ended() bool {
-	return !o.Recovered.IsZero() && !o.Recovered.Before(o.Started)
 }
 
 // LongestOutage returns the longest span among outages, or zero for an empty
@@ -903,9 +894,6 @@ func (w *Watcher) collectDue() []dueNotice {
 		}
 		switch {
 		case len(run) > 0:
-			// The one site that hands a sealed run out, so the one site that
-			// asserts its shape (assertSealedRun releases w.mu before failing).
-			w.assertSealedRun(id, run)
 			due = append(due, dueNotice{
 				started:     run[0].Started,
 				lastAttempt: st.lastAttempt,
@@ -930,38 +918,6 @@ func (w *Watcher) collectDue() []dueNotice {
 		logOngoingOutageDeferred(&deferredOverflow[i])
 	}
 	return due
-}
-
-// assertSealedRun fails loudly when a run of ended outages breaks the contract
-// BeatOutageHistory is handed: every record already ended, every record has a
-// start its silence can be measured from, and the run ascends by recovery point.
-// All three hold by construction, so a violation is a bug in THIS package's own
-// bookkeeping. It is asserted at the one site that builds a run rather than by the
-// notifier, whose every error is read as a delivery failure -- a refusal there
-// would re-offer the records every sweep with /healthz reporting healthy.
-func (w *Watcher) assertSealedRun(id string, run []Outage) {
-	// The ordering check compares against a CARRIED instant rather than
-	// run[i-1]: the same comparison, but the record ahead of this one is
-	// something the loop already held, so neither a reader nor a bounds
-	// analysis has to re-derive it from the i > 0 guard.
-	var prevRecovered time.Time
-	for i := range run {
-		var broken string
-		switch {
-		case !run[i].Ended():
-			broken = "has no recovery point at or after its start"
-		case run[i].Started.IsZero():
-			broken = "has no start, so its silence cannot be measured"
-		case i > 0 && run[i].Recovered.Before(prevRecovered):
-			broken = "recovered before the record ahead of it, so the notice cannot report the most recent recovery"
-		}
-		if broken != "" {
-			w.mu.Unlock()
-			panic(fmt.Sprintf("watch: beat %s history record %d of %d %s: records are appended in outage order and sealed only at the tail, under one mutex, so this is unreachable unless that invariant was broken",
-				id, i+1, len(run), broken))
-		}
-		prevRecovered = run[i].Recovered
-	}
 }
 
 // collectBeatDue is collectDue's per-beat state transition: it publishes the

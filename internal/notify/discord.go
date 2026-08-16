@@ -330,18 +330,6 @@ func safeTransportError(err error) error {
 		}
 		cause = httpx.LogSafeError(cause)
 	}
-	var unreduced *url.Error
-	if errors.As(cause, &unreduced) {
-		// The cap was reached with a *url.Error still in the chain, so the URL is
-		// still reachable. Fail closed: publish the phrase with no cause, at the
-		// cost of the classification httpx and watch read off the chain, so the
-		// attempt is terminal and the sweep retries. Logged because that phrase
-		// is also transportPhrase's unrecognized-cause phrase.
-		slog.Warn("webhook transport error still carried a URL after the reduction cap, "+
-			"diagnosis dropped to protect the credential and this attempt is terminal",
-			"reductions", maxURLErrorDepth)
-		return transportError{phrase: "webhook transport failed", cause: nil}
-	}
 	return transportError{phrase: transportPhrase(cause), cause: cause}
 }
 
