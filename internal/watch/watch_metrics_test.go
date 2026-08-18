@@ -45,30 +45,44 @@ func TestBeatFreshGaugeTracksOverdueAndRecovery(t *testing.T) {
 
 	// Unique beat id: the metric registry is package-global, so a label
 	// value no other test uses keeps this test's series isolated even
-	// under t.Parallel.
+	// under t.Parallel. The subtests are ordered and none of them takes
+	// t.Parallel, so they can share that id while each builds its own
+	// watcher and clock -- which is what makes a single case selectable with
+	// -run and keeps a failing stage from hiding the ones behind it.
 	const id = "metrics-quorum-probe"
-	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 
-	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
-		t.Fatalf("beat_fresh at boot = %s, want 1", got)
-	}
-	bootSeen := labeledValue(t, "knell_beat_last_seen_timestamp_seconds", "beat", id)
+	t.Run("fresh at boot", func(t *testing.T) {
+		newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+		if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
+			t.Errorf("beat_fresh = %s, want 1", got)
+		}
+	})
 
-	clock.Advance(11 * time.Minute)
-	w.sweep(t.Context())
-	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "0" {
-		t.Fatalf("beat_fresh when overdue = %s, want 0", got)
-	}
+	t.Run("overdue past the deadline", func(t *testing.T) {
+		w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+		clock.Advance(11 * time.Minute)
+		w.sweep(t.Context())
+		if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "0" {
+			t.Errorf("beat_fresh = %s, want 0", got)
+		}
+	})
 
-	if !recordedBeat(w, id) {
-		t.Fatal("Beat returned false for configured id")
-	}
-	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
-		t.Fatalf("beat_fresh after ping = %s, want 1", got)
-	}
-	if got := labeledValue(t, "knell_beat_last_seen_timestamp_seconds", "beat", id); got == bootSeen {
-		t.Errorf("beat_last_seen after ping = %s, still the boot baseline", got)
-	}
+	t.Run("fresh again after a ping", func(t *testing.T) {
+		w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+		bootSeen := labeledValue(t, "knell_beat_last_seen_timestamp_seconds", "beat", id)
+
+		clock.Advance(11 * time.Minute)
+		w.sweep(t.Context())
+		if !recordedBeat(w, id) {
+			t.Fatal("Beat returned false for configured id")
+		}
+		if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
+			t.Errorf("beat_fresh = %s, want 1", got)
+		}
+		if got := labeledValue(t, "knell_beat_last_seen_timestamp_seconds", "beat", id); got == bootSeen {
+			t.Errorf("beat_last_seen = %s, still the boot baseline", got)
+		}
+	})
 }
 
 func TestBeatFreshGaugeAtConstructionMeasuresTheBootSilence(t *testing.T) {
@@ -152,26 +166,40 @@ func TestSweepExactDeadlineBoundaryIsFresh(t *testing.T) {
 	// silence == deadline is still fresh ("within its deadline" is
 	// inclusive); only silence strictly past the deadline is overdue.
 	const id = "boundary-probe"
-	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 
-	clock.Advance(10 * time.Minute)
-	w.sweep(t.Context())
-	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
-		t.Fatalf("beat_fresh at silence == deadline = %s, want 1 (inclusive boundary)", got)
-	}
-	if calls := n.snapshot(); len(calls) != 0 {
-		t.Fatalf("exact-deadline sweep notified: %v", calls)
-	}
+	// Ordered, non-parallel subtests over one shared beat id, each with its
+	// own watcher, clock and notifier: the notifier's call count is then a
+	// fact about that case alone, so either case can be selected with -run
+	// and neither hides the other.
+	t.Run("at silence == deadline", func(t *testing.T) {
+		w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 
-	clock.Advance(time.Nanosecond)
-	w.sweep(t.Context())
-	if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "0" {
-		t.Fatalf("beat_fresh just past deadline = %s, want 0", got)
-	}
-	calls := n.snapshot()
-	if len(calls) != 1 || calls[0].kind != "missing" {
-		t.Fatalf("calls just past deadline = %v, want one missing", calls)
-	}
+		clock.Advance(10 * time.Minute)
+		w.sweep(t.Context())
+		if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "1" {
+			t.Errorf("beat_fresh = %s, want 1 (inclusive boundary)", got)
+		}
+		if calls := n.snapshot(); len(calls) != 0 {
+			t.Errorf("sweep notified: %v", calls)
+		}
+	})
+
+	t.Run("one nanosecond past the deadline", func(t *testing.T) {
+		w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+
+		// The inclusive sweep first, so this case pins the CROSSING rather
+		// than a cold sweep that happens to start overdue.
+		clock.Advance(10 * time.Minute)
+		w.sweep(t.Context())
+		clock.Advance(time.Nanosecond)
+		w.sweep(t.Context())
+		if got := labeledValue(t, "knell_beat_fresh", "beat", id); got != "0" {
+			t.Errorf("beat_fresh = %s, want 0", got)
+		}
+		if calls := n.snapshot(); len(calls) != 1 || calls[0].kind != "missing" {
+			t.Errorf("calls = %v, want one missing", calls)
+		}
+	})
 }
 
 // labeledCounterValue parses the exposition value of name{label="<value>"} as
@@ -607,96 +635,121 @@ func TestUndeliveredNoticeLogsCarryTheirRetryability(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, which every other test writes through.
 	const id = "retryability-log-probe"
-	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
-	w.Beat(id)
 
-	// A failed missing send: its record stays queued and the next sweep sends
-	// it again, so the failure is retryable.
-	clock.Advance(11 * time.Minute)
-	n.setFail(errors.New("discord down"))
-	missing := capture.Default(t)
-	w.sweep(t.Context())
-	if got := missing.CountLevel(slog.LevelError, "missing notification failed"); got != 1 {
-		t.Fatalf("missing-failure error lines = %d, want exactly 1: %v", got, missing.Messages())
-	}
-	if !missing.HasAttr("missing notification failed", "retryable", "true") {
-		t.Errorf("missing-failure log does not report retryable=true, so a log rule reads a late notice as a lost one: %v", missing.Records())
-	}
+	// Five scenarios, one subtest each and none of them parallel: capture.Default
+	// swaps the process-global slog default, so it is taken inside the subtest
+	// that reads it and restored when that subtest ends. Every case builds its
+	// own watcher -- so one is selectable with -run and none inherits the queue
+	// another left behind -- while the count check stays a Fatal inside its
+	// subtest, because the attribute assertion behind it has no record to read
+	// when the line is missing.
 
-	// A failed history send: same shape, its whole run stays queued.
-	clock.Advance(time.Minute)
-	if !recordedBeat(w, id) {
-		t.Fatalf("closing Beat(%s) = false", id)
-	}
-	history := capture.Default(t)
-	w.sweep(t.Context())
-	if got := history.CountLevel(slog.LevelError, "outage history notification failed"); got != 1 {
-		t.Fatalf("history-failure error lines = %d, want exactly 1: %v", got, history.Messages())
-	}
-	if !history.HasAttr("outage history notification failed", "retryable", "true") {
-		t.Errorf("history-failure log does not report retryable=true: %v", history.Records())
-	}
+	t.Run("a failed missing send is retryable", func(t *testing.T) {
+		// Its record stays queued and the next sweep sends it again.
+		w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+		w.Beat(id)
+		clock.Advance(11 * time.Minute)
+		n.setFail(errors.New("discord down"))
+		missing := capture.Default(t)
+		w.sweep(t.Context())
+		if got := missing.CountLevel(slog.LevelError, "missing notification failed"); got != 1 {
+			t.Fatalf("error lines = %d, want exactly 1: %v", got, missing.Messages())
+		}
+		if !missing.HasAttr("missing notification failed", "retryable", "true") {
+			t.Errorf("log does not report retryable=true, so a log rule reads a late notice as a lost one: %v", missing.Records())
+		}
+	})
 
-	// A recovered notice abandoned by a shutdown: recovered is fire-once and
-	// the event was already dequeued, so no notice for that recovery will ever
-	// arrive -- and this site moves no counter, which makes the log line its
-	// only trace and the field its only loss signal.
-	n.setFail(nil)
-	w.sweep(t.Context())
-	// One more outage, this time delivered, so the beat is alerted and the next
-	// ping queues a real recovered transition.
-	clock.Advance(11 * time.Minute)
-	w.sweep(t.Context())
-	if !recordedBeat(w, id) {
-		t.Fatalf("recovering Beat(%s) = false", id)
-	}
-	if got := len(w.recoveries); got != 1 {
-		t.Fatalf("queued recoveries = %d, want 1 (the test's own precondition)", got)
-	}
-	n.setFail(context.Canceled)
-	abandoned := capture.Default(t)
-	drainRecoveries(w)
-	if got := abandoned.CountLevel(slog.LevelInfo, "recovered notification abandoned"); got != 1 {
-		t.Fatalf("abandoned-recovery info lines = %d, want exactly 1: %v", got, abandoned.Messages())
-	}
-	if !abandoned.HasAttr("recovered notification abandoned", "retryable", "false") {
-		t.Errorf("abandoned-recovery log does not report retryable=false, and no counter moves for this loss at all: %v", abandoned.Records())
-	}
+	t.Run("a failed history send is retryable", func(t *testing.T) {
+		// Same shape as the missing failure: its whole run stays queued. The
+		// undelivered missing notice is the setup, so the capture starts after
+		// it and holds only the history attempt.
+		w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+		w.Beat(id)
+		clock.Advance(11 * time.Minute)
+		n.setFail(errors.New("discord down"))
+		w.sweep(t.Context())
+		clock.Advance(time.Minute)
+		if !recordedBeat(w, id) {
+			t.Fatalf("closing Beat(%s) = false", id)
+		}
+		history := capture.Default(t)
+		w.sweep(t.Context())
+		if got := history.CountLevel(slog.LevelError, "outage history notification failed"); got != 1 {
+			t.Fatalf("error lines = %d, want exactly 1: %v", got, history.Messages())
+		}
+		if !history.HasAttr("outage history notification failed", "retryable", "true") {
+			t.Errorf("log does not report retryable=true: %v", history.Records())
+		}
+	})
+
+	t.Run("a shutdown-abandoned recovered notice is not retryable", func(t *testing.T) {
+		// Recovered is fire-once and the event was already dequeued, so no
+		// notice for that recovery will ever arrive -- and this site moves no
+		// counter, which makes the log line its only trace and the field its
+		// only loss signal.
+		w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+		w.Beat(id)
+		// A delivered missing notice, so the beat is alerted and the next ping
+		// queues a real recovered transition.
+		clock.Advance(11 * time.Minute)
+		w.sweep(t.Context())
+		if !recordedBeat(w, id) {
+			t.Fatalf("recovering Beat(%s) = false", id)
+		}
+		if got := len(w.recoveries); got != 1 {
+			t.Fatalf("queued recoveries = %d, want 1 (the test's own precondition)", got)
+		}
+		n.setFail(context.Canceled)
+		abandoned := capture.Default(t)
+		drainRecoveries(w)
+		if got := abandoned.CountLevel(slog.LevelInfo, "recovered notification abandoned"); got != 1 {
+			t.Fatalf("info lines = %d, want exactly 1: %v", got, abandoned.Messages())
+		}
+		if !abandoned.HasAttr("recovered notification abandoned", "retryable", "false") {
+			t.Errorf("log does not report retryable=false, and no counter moves for this loss at all: %v", abandoned.Records())
+		}
+	})
 
 	// The two sibling abandonments, each on its own beat so no earlier state in
 	// this test decides which branch the sweep takes. Both are shutdowns, so
 	// this process sends nothing further for them: retryable=false, even though
 	// the identically-shaped FAILURE above is retryable=true.
-	const canceledMissingID = "retryability-canceled-missing-probe"
-	cm, cmClock, cmNotifier := newTestWatcher(Beat{ID: canceledMissingID, Deadline: 10 * time.Minute})
-	cm.Beat(canceledMissingID)
-	cmClock.Advance(11 * time.Minute)
-	cmNotifier.setFail(context.Canceled)
-	canceledMissing := capture.Default(t)
-	cm.sweep(t.Context())
-	if got := canceledMissing.CountLevel(slog.LevelInfo, "missing notification abandoned"); got != 1 {
-		t.Fatalf("abandoned-missing info lines = %d, want exactly 1: %v", got, canceledMissing.Messages())
-	}
-	if !canceledMissing.HasAttr("missing notification abandoned", "retryable", "false") {
-		t.Errorf("abandoned-missing log does not report retryable=false, so a log rule reads a notice this process abandoned as one it will resend: %v", canceledMissing.Records())
-	}
 
-	const canceledHistoryID = "retryability-canceled-history-probe"
-	ch, chClock, chNotifier := newTestWatcher(Beat{ID: canceledHistoryID, Deadline: 10 * time.Minute})
-	ch.Beat(canceledHistoryID)
-	chClock.Advance(11 * time.Minute)
-	if !recordedBeat(ch, canceledHistoryID) {
-		t.Fatalf("closing Beat(%s) = false", canceledHistoryID)
-	}
-	chNotifier.setFail(context.Canceled)
-	canceledHistory := capture.Default(t)
-	ch.sweep(t.Context())
-	if got := canceledHistory.CountLevel(slog.LevelInfo, "outage history notification abandoned"); got != 1 {
-		t.Fatalf("abandoned-history info lines = %d, want exactly 1: %v", got, canceledHistory.Messages())
-	}
-	if !canceledHistory.HasAttr("outage history notification abandoned", "retryable", "false") {
-		t.Errorf("abandoned-history log does not report retryable=false: %v", canceledHistory.Records())
-	}
+	t.Run("a shutdown-abandoned missing notice is not retryable", func(t *testing.T) {
+		const canceledMissingID = "retryability-canceled-missing-probe"
+		cm, cmClock, cmNotifier := newTestWatcher(Beat{ID: canceledMissingID, Deadline: 10 * time.Minute})
+		cm.Beat(canceledMissingID)
+		cmClock.Advance(11 * time.Minute)
+		cmNotifier.setFail(context.Canceled)
+		canceledMissing := capture.Default(t)
+		cm.sweep(t.Context())
+		if got := canceledMissing.CountLevel(slog.LevelInfo, "missing notification abandoned"); got != 1 {
+			t.Fatalf("info lines = %d, want exactly 1: %v", got, canceledMissing.Messages())
+		}
+		if !canceledMissing.HasAttr("missing notification abandoned", "retryable", "false") {
+			t.Errorf("log does not report retryable=false, so a log rule reads a notice this process abandoned as one it will resend: %v", canceledMissing.Records())
+		}
+	})
+
+	t.Run("a shutdown-abandoned history notice is not retryable", func(t *testing.T) {
+		const canceledHistoryID = "retryability-canceled-history-probe"
+		ch, chClock, chNotifier := newTestWatcher(Beat{ID: canceledHistoryID, Deadline: 10 * time.Minute})
+		ch.Beat(canceledHistoryID)
+		chClock.Advance(11 * time.Minute)
+		if !recordedBeat(ch, canceledHistoryID) {
+			t.Fatalf("closing Beat(%s) = false", canceledHistoryID)
+		}
+		chNotifier.setFail(context.Canceled)
+		canceledHistory := capture.Default(t)
+		ch.sweep(t.Context())
+		if got := canceledHistory.CountLevel(slog.LevelInfo, "outage history notification abandoned"); got != 1 {
+			t.Fatalf("info lines = %d, want exactly 1: %v", got, canceledHistory.Messages())
+		}
+		if !canceledHistory.HasAttr("outage history notification abandoned", "retryable", "false") {
+			t.Errorf("log does not report retryable=false: %v", canceledHistory.Records())
+		}
+	})
 }
 
 func TestHistoryNoticeCountsOncePerMessageWhileOutagesCountEach(t *testing.T) {
@@ -843,45 +896,55 @@ func TestShutdownWarnsAboutQueuedRecoveredNotifications(t *testing.T) {
 	// Both directions are asserted: an empty queue must stay quiet, or the
 	// line becomes shutdown noise that trains operators to ignore it.
 	const id = "shutdown-queued-recovery-probe"
-	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 
-	quiet := capture.Default(t)
-	w.logUndelivered()
-	if got := quiet.CountLevel(slog.LevelWarn, "shutting down with queued recovered notifications"); got != 0 {
-		t.Fatalf("queued-recovery warnings with an empty queue = %d, want 0: %v", got, quiet.Messages())
-	}
-	if !quiet.HasAttr("watch loop stopped", "queued_recoveries", "0") {
-		t.Errorf("shutdown summary does not report queued_recoveries=0 for an empty queue: %v", quiet.Records())
-	}
+	// One subtest per direction, ordered and neither parallel: each builds its
+	// own watcher (so either is selectable with -run) and takes capture.Default
+	// itself, which scopes the process-global slog restore to that case.
+	t.Run("an empty queue stays quiet", func(t *testing.T) {
+		w, _, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 
-	// Alert the beat, then ping it: the recovered transition is queued and
-	// never drained, exactly as it sits when cancellation arrives.
-	clock.Advance(11 * time.Minute)
-	w.sweep(t.Context())
-	if !recordedBeat(w, id) {
-		t.Fatalf("Beat(%s) = false", id)
-	}
-	if got := len(w.recoveries); got != 1 {
-		t.Fatalf("queued recoveries = %d, want 1 (the test's own precondition)", got)
-	}
+		quiet := capture.Default(t)
+		w.logUndelivered()
+		if got := quiet.CountLevel(slog.LevelWarn, "shutting down with queued recovered notifications"); got != 0 {
+			t.Errorf("queued-recovery warnings = %d, want 0: %v", got, quiet.Messages())
+		}
+		if !quiet.HasAttr("watch loop stopped", "queued_recoveries", "0") {
+			t.Errorf("shutdown summary does not report queued_recoveries=0 for an empty queue: %v", quiet.Records())
+		}
+	})
 
-	rec := capture.Default(t)
-	w.logUndelivered()
-	if !rec.HasAttr("watch loop stopped", "queued_recoveries", "1") {
-		t.Errorf("shutdown summary does not count the queued recovery: %v", rec.Records())
-	}
-	if got := rec.CountLevel(slog.LevelWarn, "shutting down with queued recovered notifications"); got != 1 {
-		t.Errorf("queued-recovery warnings = %d, want exactly 1 (that notice will never be delivered): %v", got, rec.Messages())
-	}
-	if !rec.HasAttr("shutting down with queued recovered notifications", "queued", "1") {
-		t.Errorf("queued-recovery warning does not report how many notices are lost: %v", rec.Records())
-	}
-	if !rec.AttrContains("shutting down with queued recovered notifications", "beats", id) {
-		t.Errorf("queued-recovery warning does not name the beat whose recovered notice is lost: %v", rec.Records())
-	}
-	if !rec.HasAttr("shutting down with queued recovered notifications", "retryable", "false") {
-		t.Errorf("queued-recovery warning does not report retryable=false for notices that die with the channel: %v", rec.Records())
-	}
+	t.Run("a queued recovery is named as lost", func(t *testing.T) {
+		w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+
+		// Alert the beat, then ping it: the recovered transition is queued and
+		// never drained, exactly as it sits when cancellation arrives.
+		clock.Advance(11 * time.Minute)
+		w.sweep(t.Context())
+		if !recordedBeat(w, id) {
+			t.Fatalf("Beat(%s) = false", id)
+		}
+		if got := len(w.recoveries); got != 1 {
+			t.Fatalf("queued recoveries = %d, want 1 (the test's own precondition)", got)
+		}
+
+		rec := capture.Default(t)
+		w.logUndelivered()
+		if !rec.HasAttr("watch loop stopped", "queued_recoveries", "1") {
+			t.Errorf("shutdown summary does not count the queued recovery: %v", rec.Records())
+		}
+		if got := rec.CountLevel(slog.LevelWarn, "shutting down with queued recovered notifications"); got != 1 {
+			t.Errorf("queued-recovery warnings = %d, want exactly 1 (that notice will never be delivered): %v", got, rec.Messages())
+		}
+		if !rec.HasAttr("shutting down with queued recovered notifications", "queued", "1") {
+			t.Errorf("queued-recovery warning does not report how many notices are lost: %v", rec.Records())
+		}
+		if !rec.AttrContains("shutting down with queued recovered notifications", "beats", id) {
+			t.Errorf("queued-recovery warning does not name the beat whose recovered notice is lost: %v", rec.Records())
+		}
+		if !rec.HasAttr("shutting down with queued recovered notifications", "retryable", "false") {
+			t.Errorf("queued-recovery warning does not report retryable=false for notices that die with the channel: %v", rec.Records())
+		}
+	})
 }
 
 func TestLogUndeliveredCountsAnUnqueuedOngoingOutage(t *testing.T) {

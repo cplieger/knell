@@ -1738,33 +1738,42 @@ func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
 
 	overlong := strings.Repeat("A", 300)
-	rec := beatRequest(t, h, overlong, "/beat/api")
 
-	// The refusal itself is unchanged: the bogus method still routes to the
-	// method-agnostic catch-all, which answers 405 with a truthful Allow.
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("%d-byte bogus method = %d, want 405 (body %s)", len(overlong), rec.Code, rec.Body.String())
-	}
-	if got := rec.Header().Get("Allow"); got != "POST" {
-		t.Errorf("Allow = %q, want \"POST\": bounding the logged method must not change the refusal", got)
-	}
+	// Both subtests share the capture above, so neither may take t.Parallel.
+	t.Run("overlong method is bounded", func(t *testing.T) {
+		rec := beatRequest(t, h, overlong, "/beat/api")
 
-	// The logged method is the placeholder, never the caller's bytes.
-	if !logs.HasAttr("http", "method", overlongMethodMarker) {
-		t.Errorf("access line does not report method=%s; records = %v", overlongMethodMarker, logs.Records())
-	}
-	if logs.HasAttr("http", "method", overlong) {
-		t.Errorf("access line carries the caller's %d-byte method verbatim: an unauthenticated caller writes the text of knell's own log lines; records = %v",
-			len(overlong), logs.Records())
-	}
+		// The refusal itself is unchanged: the bogus method still routes to the
+		// method-agnostic catch-all, which answers 405 with a truthful Allow.
+		// It also gates the access-line assertions below: a request refused
+		// somewhere else writes a line about something else.
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%d-byte bogus method = %d, want 405 (body %s)", len(overlong), rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Allow"); got != "POST" {
+			t.Errorf("Allow = %q, want \"POST\": bounding the logged method must not change the refusal", got)
+		}
+
+		// The logged method is the placeholder, never the caller's bytes.
+		if !logs.HasAttr("http", "method", overlongMethodMarker) {
+			t.Errorf("access line does not report method=%s; records = %v", overlongMethodMarker, logs.Records())
+		}
+		if logs.HasAttr("http", "method", overlong) {
+			t.Errorf("access line carries the caller's %d-byte method verbatim: an unauthenticated caller writes the text of knell's own log lines; records = %v",
+				len(overlong), logs.Records())
+		}
+	})
 
 	// A real method passes through untouched: this is a bound, not a rewrite.
-	if got := beatRequest(t, h, http.MethodPost, "/beat/api"); got.Code != http.StatusOK {
-		t.Fatalf("post known = %d, want 200 (body %s)", got.Code, got.Body.String())
-	}
-	if !logs.HasAttr("http", "method", http.MethodPost) {
-		t.Errorf("access line does not report method=POST for an ordinary ping; records = %v", logs.Records())
-	}
+	t.Run("real method passes through", func(t *testing.T) {
+		rec := beatRequest(t, h, http.MethodPost, "/beat/api")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("post known = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+		}
+		if !logs.HasAttr("http", "method", http.MethodPost) {
+			t.Errorf("access line does not report method=POST for an ordinary ping; records = %v", logs.Records())
+		}
+	})
 }
 
 // TestAccessLogClientIPResolvesOnlyThroughTrustedProxies pins the wiring of
