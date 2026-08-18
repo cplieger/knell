@@ -23,7 +23,7 @@ import (
 
 	"github.com/cplieger/health"
 	"github.com/cplieger/knell/internal/config"
-	"github.com/cplieger/knell/internal/metrics"
+	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -373,7 +373,7 @@ func scrapeCounter(t *testing.T, series string) float64 {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
-	metrics.Handler().ServeHTTP(rec, req)
+	obs.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("in-process /metrics = %d, want 200", rec.Code)
 	}
@@ -1174,7 +1174,7 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 // health.Handler(marker) into webapi.Deps.Healthz -- the HTTP liveness
 // endpoint the README documents and external monitoring probes. The webapi
 // tests inject staticHealthz, a fixed verdict, so they cannot catch a root that
-// wires the wrong handler here: with metrics.Handler in that slot /healthz
+// wires the wrong handler here: with obs.Handler in that slot /healthz
 // answers 200 forever and an unhealthy switch is never reported, and with a nil
 // or absent route it answers 404/503 forever and a live switch is paged as
 // down. Removing the marker mid-run is what makes this a real oracle rather

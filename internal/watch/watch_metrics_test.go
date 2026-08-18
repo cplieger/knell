@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/knell/internal/metrics"
+	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -19,7 +19,7 @@ import (
 // of name{label="<value>"}, reporting whether the series is present at all.
 func findLabeledValue(name, label, value string) (string, bool) {
 	rec := httptest.NewRecorder()
-	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	obs.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	prefix := name + `{` + label + `="` + value + `"} `
 	for line := range strings.Lines(rec.Body.String()) {
 		if v, ok := strings.CutPrefix(line, prefix); ok {
@@ -708,7 +708,7 @@ func TestHistoryNoticeCountsOncePerMessageWhileOutagesCountEach(t *testing.T) {
 	// Baseline, not zero: the registry is package-global and survives every
 	// test in this binary, so `go test -count=N` re-enters this test with the
 	// previous invocation's total. The cold-start zero matrix is pinned once
-	// in internal/metrics (TestMintNotificationKindsPremintsEveryCounterAndKind);
+	// in internal/obs (TestMintNotificationKindsPremintsEveryCounterAndKind);
 	// what is unique here is the +3 delta.
 	outagesBefore := beatCounterValue(t, "knell_beat_outages_total", id)
 

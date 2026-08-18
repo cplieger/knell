@@ -1,7 +1,11 @@
-// Package metrics defines knell's Prometheus metrics and the registry that
+// Package obs defines knell's Prometheus metrics and the registry that
 // serves them: package-level singletons registered once at init, exposition
 // prefix "knell_". The registry and the collectors are unexported, so a caller
 // cannot register, rename or delete a series, nor write a raw label position.
+//
+// Named obs, not metrics: the github.com/cplieger/metrics library owns that
+// name, and the collision forced every meeting point through a metricslib
+// alias that no two consumers of the library spelled the same way.
 //
 // # Label-cardinality contract (read this before adding a caller)
 //
@@ -13,7 +17,7 @@
 // internal/watch is the only production caller of the id-taking functions. Any
 // other production call inherits that contract, and runtime enforcement here
 // would only add an init-order dependency on config in its place.
-package metrics
+package obs
 
 import (
 	"net/http"
@@ -21,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	metricslib "github.com/cplieger/metrics/v4"
+	"github.com/cplieger/metrics/v4"
 )
 
 // beatLabel names the watched beat on per-beat metrics; kindLabel names the
@@ -120,13 +124,13 @@ func mintRefusalReasons() {
 
 // registry serves every registered metric plus process metrics on /metrics;
 // Handler is its only exported view.
-var registry = metricslib.NewRegistry("knell")
+var registry = metrics.NewRegistry("knell")
 
 // beatFresh reports per beat whether its observed silence is within its
 // deadline; until a first ping arrives that silence runs from process start
 // (the boot-armed clock), so a beat nothing has pinged reads 1 for its first
 // deadline. This is the aggregation input for multi-observer quorum rules.
-var beatFresh = metricslib.NewLabeledGauge(
+var beatFresh = metrics.NewLabeledGauge(
 	"beat_fresh",
 	"Whether the beat's observed silence is within its deadline (1 = fresh, 0 = overdue; silence runs from process start until the first ping).",
 	[]string{beatLabel},
@@ -134,7 +138,7 @@ var beatFresh = metricslib.NewLabeledGauge(
 
 // beatLastSeen is the Unix timestamp of each beat's last accepted ping. Until
 // a first ping arrives it carries the process start time.
-var beatLastSeen = metricslib.NewLabeledGauge(
+var beatLastSeen = metrics.NewLabeledGauge(
 	"beat_last_seen_timestamp_seconds",
 	"Unix timestamp of the beat's last accepted ping (process start until the first ping).",
 	[]string{beatLabel},
@@ -145,7 +149,7 @@ var beatLastSeen = metricslib.NewLabeledGauge(
 // cannot answer two operator questions: how long until this overdue beat
 // fires, and whether the observers one quorum rule aggregates agree on the
 // deadline (a BEATS skew is otherwise invisible until one node alerts alone).
-var beatDeadline = metricslib.NewLabeledGauge(
+var beatDeadline = metrics.NewLabeledGauge(
 	"beat_deadline_seconds",
 	"Configured silence deadline per beat, in seconds.",
 	[]string{beatLabel},
@@ -153,7 +157,7 @@ var beatDeadline = metricslib.NewLabeledGauge(
 
 // beatsReceived counts accepted pings per beat. Unknown ids are rejected and
 // deliberately not counted: the id is a label.
-var beatsReceived = metricslib.NewLabeledCounter(
+var beatsReceived = metrics.NewLabeledCounter(
 	"beats_received_total",
 	"Accepted pings per beat (unknown ids are rejected and not counted).",
 	[]string{beatLabel},
@@ -164,7 +168,7 @@ var beatsReceived = metricslib.NewLabeledCounter(
 // notice was never delivered, dropped, or collapsed into a history message is
 // counted all the same. One of the two series counting OUTAGES rather than
 // messages (outageRecordsDropped is the other).
-var beatOutages = metricslib.NewLabeledCounter(
+var beatOutages = metrics.NewLabeledCounter(
 	"beat_outages_total",
 	"Detected outages per beat: one increment per deadline crossing detected, independent of notification delivery.",
 	[]string{beatLabel},
@@ -177,7 +181,7 @@ var beatOutages = metricslib.NewLabeledCounter(
 // from beatLastSeen), and a history message collapses several records, so N
 // discarded records are not N lost messages. The still-ONGOING overflow case
 // does not reach here: it is re-recorded by a later sweep, so nothing is lost.
-var outageRecordsDropped = metricslib.NewLabeledCounter(
+var outageRecordsDropped = metrics.NewLabeledCounter(
 	"outage_records_dropped_total",
 	"Ended-outage records discarded per beat because the per-beat queue was full; no notice for them will ever arrive.",
 	[]string{beatLabel},
@@ -186,7 +190,7 @@ var outageRecordsDropped = metricslib.NewLabeledCounter(
 // notificationsSent counts webhook notifications delivered, by kind: one
 // increment per delivered MESSAGE, so pair it with beatOutages to reason about
 // outages rather than messages.
-var notificationsSent = metricslib.NewLabeledCounter(
+var notificationsSent = metrics.NewLabeledCounter(
 	"notifications_sent_total",
 	"Webhook notifications delivered, by kind ("+notificationKindsText+"); one per delivered message.",
 	[]string{kindLabel},
@@ -198,7 +202,7 @@ var notificationsSent = metricslib.NewLabeledCounter(
 // fire-once, so a failed one is counted on notificationsDropped. A
 // notification never attempted because its record was discarded is a lost
 // RECORD, counted on outageRecordsDropped.
-var notificationsFailed = metricslib.NewLabeledCounter(
+var notificationsFailed = metrics.NewLabeledCounter(
 	"notifications_failed_total",
 	"Webhook delivery attempts that failed after retries, by kind ("+notificationKindsText+"); one per failed message. kind=recovered never moves here: recovered is fire-once with nothing left to retry, so a failed recovered send is counted on notifications_dropped_total instead.",
 	[]string{kindLabel},
@@ -210,7 +214,7 @@ var notificationsFailed = metricslib.NewLabeledCounter(
 // nothing left to retry from. Today only recovered can land here, being the
 // one fire-once kind. A discarded outage RECORD is not a message and goes to
 // outageRecordsDropped.
-var notificationsDropped = metricslib.NewLabeledCounter(
+var notificationsDropped = metrics.NewLabeledCounter(
 	"notifications_dropped_total",
 	"Notification messages that will never be delivered, by kind ("+notificationKindsText+"); a fire-once recovered notice whose send failed with nothing left to retry from; distinct from a delivery that failed and will retry.",
 	[]string{kindLabel},
@@ -221,7 +225,7 @@ var notificationsDropped = metricslib.NewLabeledCounter(
 // and 404 as "unmatched" beside scanner traffic and never sees the 429 at all.
 // It is a DIAGNOSTIC for a missing beat, not an alert source: a sender refused
 // here is not feeding its beat, so the missing notice fires on its own.
-var preRouteRefusals = metricslib.NewLabeledCounter(
+var preRouteRefusals = metrics.NewLabeledCounter(
 	"pre_route_refusals_total",
 	"Requests refused before the mux routes, by reason ("+refusalReasonsText+"); a diagnostic for a missing beat, not an alert source.",
 	[]string{reasonLabel},
@@ -232,7 +236,7 @@ var preRouteRefusals = metricslib.NewLabeledCounter(
 // and 503 never reach beatsReceived -- so without it a sender whose token was
 // rotated or whose id is misspelled stays invisible until the beat goes
 // missing a full deadline later. Labels are bounded by the CALLER.
-var httpRequests = metricslib.NewLabeledCounter(
+var httpRequests = metrics.NewLabeledCounter(
 	"http_requests_total",
 	"Served HTTP requests by matched route template, method and status. Series are not pre-minted, so a status series is born with its first request and increase() cannot see that first event; alert on the absolute value (status=401 > 0), which latches until restart.",
 	[]string{methodLabel, pathLabel, statusLabel},
@@ -244,7 +248,7 @@ var httpRequests = metricslib.NewLabeledCounter(
 // aggregate still surfaces the one signal that matters (a slow request lands
 // past the 1.0s top default bucket). Per-route LATENCY is deliberately not
 // derivable; add a route label here if that question becomes real.
-var httpDuration = metricslib.NewHistogram(
+var httpDuration = metrics.NewHistogram(
 	"http_request_duration_seconds",
 	"Served HTTP request duration in seconds.",
 )
@@ -337,7 +341,7 @@ func RecordOutageRecordDropped(id string) {
 // series is BORN with the first refused ping and increase() cannot see that
 // birth: alert on the ABSOLUTE value, which latches until restart.
 func RecordHTTP(method, path string, status int, d time.Duration) {
-	metricslib.RecordHTTP(httpRequests, httpDuration, d, method, path, strconv.Itoa(status))
+	metrics.RecordHTTP(httpRequests, httpDuration, d, method, path, strconv.Itoa(status))
 }
 
 // RecordPreRouteRefusal counts one request refused before the mux routed it,

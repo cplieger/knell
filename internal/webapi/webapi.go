@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/cplieger/knell/internal/metrics"
+	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/webhttp"
 )
@@ -96,7 +96,7 @@ func New(b Beater, deps Deps) http.Handler {
 	mux.HandleFunc("/beat/{$}", writeUnknownBeat)
 	mux.HandleFunc("/beat/{id}/{rest...}", writeUnknownBeat)
 	mux.Handle("GET /healthz", deps.Healthz)
-	mux.Handle("GET /metrics", metrics.Handler())
+	mux.Handle("GET /metrics", obs.Handler())
 
 	return webhttp.Chain(mux,
 		// Header baselines first, ahead of the throttle: its refusal is as
@@ -128,7 +128,7 @@ func New(b Beater, deps Deps) http.Handler {
 			// source at all. Trusting a forwarded header with no proxy in front
 			// is how the field becomes spoofable.
 			webhttp.WithClientIP(deps.TrustedProxies...),
-			webhttp.WithRecordRouteMetric(metrics.RecordHTTP),
+			webhttp.WithRecordRouteMetric(obs.RecordHTTP),
 		),
 		webhttp.Recoverer(),
 		// Immediately outside the Host policy, counting the refusal it answers:
@@ -158,7 +158,7 @@ func canonicalBeatPath(next http.Handler) http.Handler {
 		if !canonical && (inBeatNamespace(raw) || inBeatNamespace(clean)) {
 			// This lands before the mux routes, so the request counter buckets
 			// the whole class as "unmatched" beside scanner traffic.
-			metrics.RecordPreRouteRefusal(metrics.RefusalNonCanonicalBeatPath)
+			obs.RecordPreRouteRefusal(obs.RefusalNonCanonicalBeatPath)
 			writeUnknownBeat(w, r)
 			return
 		}
@@ -266,7 +266,7 @@ func beatAuthFailureLimiter(mux *http.ServeMux, verifier webhttp.StaticTokenVeri
 			recorder := webhttp.NewStatusRecorder(w)
 			limited.ServeHTTP(recorder, r)
 			if recorder.Status() == http.StatusTooManyRequests {
-				metrics.RecordPreRouteRefusal(metrics.RefusalAuthThrottled)
+				obs.RecordPreRouteRefusal(obs.RefusalAuthThrottled)
 			}
 		})
 	}
@@ -283,7 +283,7 @@ func countHostRefusals(hosts *webhttp.HostPolicy) webhttp.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !hosts.Allows(r) {
-				metrics.RecordPreRouteRefusal(metrics.RefusalHostNotAllowed)
+				obs.RecordPreRouteRefusal(obs.RefusalHostNotAllowed)
 			}
 			next.ServeHTTP(w, r)
 		})
@@ -299,7 +299,7 @@ func countHostRefusals(hosts *webhttp.HostPolicy) webhttp.Middleware {
 func HostPolicyOptions() []webhttp.HostAllowlistOption {
 	return []webhttp.HostAllowlistOption{
 		webhttp.WithLoopbackExempt(),
-		webhttp.WithHostAllowlistError(string(metrics.RefusalHostNotAllowed),
+		webhttp.WithHostAllowlistError(string(obs.RefusalHostNotAllowed),
 			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"),
 	}
 }

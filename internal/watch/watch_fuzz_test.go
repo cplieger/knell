@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/knell/internal/metrics"
+	"github.com/cplieger/knell/internal/obs"
 )
 
 // checkMissingQueueInvariants asserts the pending-missing queue's structural
@@ -219,7 +219,7 @@ func FuzzMissingQueue(f *testing.F) {
 // every observer scraping it, so the count must not move for an unknown id.
 func beatFreshSeriesCount() int {
 	rec := httptest.NewRecorder()
-	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	obs.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	n := 0
 	for line := range strings.Lines(rec.Body.String()) {
 		if strings.HasPrefix(line, "knell_beat_fresh{") {

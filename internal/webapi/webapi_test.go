@@ -13,7 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cplieger/knell/internal/metrics"
+	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/slogx/capture"
 	"github.com/cplieger/webhttp"
@@ -371,11 +371,11 @@ func TestMetricsExposition(t *testing.T) {
 	// Declare a beat so the per-beat series exist even when this package's
 	// tests run in isolation (labeled metrics emit no output until a first
 	// series is recorded). The notification counters need no touch: the
-	// metrics package pre-mints every kind at init.
-	metrics.InitBeat("webapi-test", 20*time.Minute, time.Unix(0, 0))
+	// obs package pre-mints every kind at init.
+	obs.InitBeat("webapi-test", 20*time.Minute, time.Unix(0, 0))
 	// The freshness verdict is published by the watch state machine, not by
 	// InitBeat, so this test mints the gauge series itself.
-	metrics.SetBeatFresh("webapi-test", true)
+	obs.SetBeatFresh("webapi-test", true)
 
 	h := newTestHandler(&fakeBeater{}, testBeatToken)
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
@@ -1231,7 +1231,7 @@ func TestRefusedBeatLeavesMetricsUnchanged(t *testing.T) {
 	// Publish the beat overdue, the state a sweep leaves behind for a silent
 	// beat: it is the sample the quorum rules alert on, and the one an accepted
 	// ping would flip back to 1.
-	metrics.SetBeatFresh(id, false)
+	obs.SetBeatFresh(id, false)
 	// Advance the clock so a recorded ping would be VISIBLE in lastSeen rather
 	// than landing on the same second as the live one.
 	clock.advance(time.Hour)

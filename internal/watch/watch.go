@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cplieger/knell/internal/metrics"
+	"github.com/cplieger/knell/internal/obs"
 )
 
 // --- Notification contract and the value types it carries ---
@@ -292,7 +292,7 @@ func (st *beatState) closedRun() []Outage {
 // a slot. Callers hold w.mu.
 func (st *beatState) queueDetectedOutage(rec *overdueBeat) bool {
 	if !st.overflowAccounted {
-		metrics.RecordOutage(rec.id)
+		obs.RecordOutage(rec.id)
 	}
 	if !st.pushMissing(rec) {
 		return false
@@ -311,7 +311,7 @@ func (st *beatState) recordEndedOutage(rec *overdueBeat) bool {
 	if st.queueDetectedOutage(rec) {
 		return false
 	}
-	metrics.RecordOutageRecordDropped(rec.id)
+	obs.RecordOutageRecordDropped(rec.id)
 	return true
 }
 
@@ -409,7 +409,7 @@ func New(beats []Beat, notifier Notifier, now func() time.Time, start time.Time)
 		w.beats[b.ID] = &beatState{lastSeen: start, deadline: b.Deadline}
 		// InitBeat publishes the beat's boot-armed baseline and pre-mints its
 		// per-beat counters at zero, so increase() has an earlier sample.
-		metrics.InitBeat(b.ID, b.Deadline, start)
+		obs.InitBeat(b.ID, b.Deadline, start)
 		// A beat that has never pinged is fresh until its first deadline passes.
 		// It goes through the same door as every later verdict, so overdue stays
 		// its only source of the boundary.
@@ -490,7 +490,7 @@ func (w *Watcher) Beat(id string) BeatOutcome {
 	}
 	// Publish the gauges under the lock so concurrent pings cannot write
 	// them out of state order (an older timestamp overwriting a newer one).
-	metrics.RecordBeat(id, now)
+	obs.RecordBeat(id, now)
 	publishFreshness(id, 0, st.deadline)
 	// Queue the recovered transition INSIDE the critical section that mutated the
 	// beat, so a ping that got here is wholly visible to the shutdown tally. The
@@ -720,7 +720,7 @@ func overdue(silence, deadline time.Duration) bool {
 // publishes before the Watcher is shared.
 func publishFreshness(id string, silence, deadline time.Duration) bool {
 	fresh := !overdue(silence, deadline)
-	metrics.SetBeatFresh(id, fresh)
+	obs.SetBeatFresh(id, fresh)
 	return fresh
 }
 
@@ -965,14 +965,14 @@ func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 				"beat", beat.id, "retryable", false)
 			return true
 		}
-		metrics.RecordNotificationFailed(metrics.KindMissing)
+		obs.RecordNotificationFailed(obs.KindMissing)
 		w.markUndelivered(beat.id, 1)
 		slog.Error("missing notification failed, will retry next sweep",
 			"beat", beat.id, "silence", beat.silence.DownFor().String(), "error", err,
 			"retryable", true)
 		return false
 	}
-	metrics.RecordNotificationSent(metrics.KindMissing)
+	obs.RecordNotificationSent(obs.KindMissing)
 	slog.Info("beat missing, notified", "beat", beat.id, "silence", beat.silence.DownFor().String())
 	if event, raced := w.markDelivered(beat.id); raced {
 		w.sendRecovered(ctx, event)
@@ -993,14 +993,14 @@ func (w *Watcher) sendHistory(ctx context.Context, past beatOutages) bool {
 				"beat", past.id, "retryable", false)
 			return true
 		}
-		metrics.RecordNotificationFailed(metrics.KindHistory)
+		obs.RecordNotificationFailed(obs.KindHistory)
 		w.markUndelivered(past.id, len(past.outages))
 		slog.Error("outage history notification failed, will retry next sweep",
 			"beat", past.id, "outages", len(past.outages), "error", err,
 			"retryable", true)
 		return false
 	}
-	metrics.RecordNotificationSent(metrics.KindHistory)
+	obs.RecordNotificationSent(obs.KindHistory)
 	slog.Info("ended outages notified as history",
 		"beat", past.id, "outages", len(past.outages),
 		"longest", LongestOutage(past.outages).String())
@@ -1076,12 +1076,12 @@ func (w *Watcher) sendRecovered(ctx context.Context, ev recoveryEvent) {
 				"beat", ev.id, "down_for", ev.silence.DownFor().String(), "retryable", false)
 			return
 		}
-		metrics.RecordNotificationDropped(metrics.KindRecovered)
+		obs.RecordNotificationDropped(obs.KindRecovered)
 		slog.Error("recovered notification failed, nothing retries it and no notice for this recovery will ever arrive",
 			"beat", ev.id, "down_for", ev.silence.DownFor().String(), "error", err,
 			"retryable", false)
 		return
 	}
-	metrics.RecordNotificationSent(metrics.KindRecovered)
+	obs.RecordNotificationSent(obs.KindRecovered)
 	slog.Info("beat recovered, notified", "beat", ev.id, "down_for", ev.silence.DownFor().String())
 }
