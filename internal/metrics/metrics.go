@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	metricslib "github.com/cplieger/metrics/v3"
+	metricslib "github.com/cplieger/metrics/v4"
 )
 
 // beatLabel names the watched beat on per-beat metrics; kindLabel names the
@@ -250,18 +250,27 @@ var httpDuration = metricslib.NewHistogram(
 )
 
 func init() {
-	registry.RegisterLabeledGauge(beatFresh)
-	registry.RegisterLabeledGauge(beatLastSeen)
-	registry.RegisterLabeledGauge(beatDeadline)
-	registry.RegisterLabeledCounter(beatsReceived)
-	registry.RegisterLabeledCounter(beatOutages)
-	registry.RegisterLabeledCounter(outageRecordsDropped)
-	registry.RegisterLabeledCounter(notificationsSent)
-	registry.RegisterLabeledCounter(notificationsFailed)
-	registry.RegisterLabeledCounter(notificationsDropped)
-	registry.RegisterLabeledCounter(preRouteRefusals)
-	registry.RegisterLabeledCounter(httpRequests)
-	registry.RegisterHistogram(httpDuration)
+	// MustRegister is the door for a package-level var metric set: an error
+	// door is unusable in a var initializer, and init-time registration has no
+	// caller to hand an error to. metrics v4 captures a construction error
+	// (malformed name, bad label set, bad bucket layout) into the metric value
+	// rather than panicking at the constructor, so registration is where that
+	// error surfaces -- at process start, failing the first test run and the
+	// container boot, never the scrape path.
+	registry.MustRegister(
+		beatFresh,
+		beatLastSeen,
+		beatDeadline,
+		beatsReceived,
+		beatOutages,
+		outageRecordsDropped,
+		notificationsSent,
+		notificationsFailed,
+		notificationsDropped,
+		preRouteRefusals,
+		httpRequests,
+		httpDuration,
+	)
 	mintNotificationKinds()
 	mintRefusalReasons()
 }
