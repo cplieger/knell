@@ -137,8 +137,9 @@ func New(b Beater, deps Deps) http.Handler {
 		// Inside the standard wrappers, so a rejected Host still answers with
 		// security and no-store headers. Inactive when ALLOWED_HOSTS is unset.
 		deps.Hosts.Middleware(),
-		// Inside the Host policy, and inside nothing else: a refused Host must
-		// still be refused as a Host (403), not as an unknown beat.
+		// Inside the Host policy, so a refused Host is still refused as a Host
+		// (403) and not as an unknown beat; and inside webhttp.Logging, so its
+		// 404 keeps an access line and a route-metric series.
 		canonicalBeatPath,
 	)
 }
@@ -184,11 +185,15 @@ func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 		"use POST to record a beat")
 }
 
-// writeUnknownBeat refuses a ping that names no configured beat. It is the
-// single home of that refusal for every /beat path a sender can produce, so a
-// sender parsing knell's coded body never hits net/http's plain 404 or its 307.
+// writeUnknownBeat refuses a ping that names no configured beat. It answers
+// every /beat path the route table matches and every non-canonical one
+// canonicalBeatPath refuses, so a sender parsing knell's coded body does not
+// hit net/http's plain 404 or its 307. The exception is a path whose ESCAPED
+// form matches no pattern (/beat%2Fapi): canonicalBeatPath judges the decoded
+// view, which is canonical there, so net/http's own plain 404 answers it.
 func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
-	webhttp.WriteError(w, r, http.StatusNotFound, "unknown_beat", "unknown beat id")
+	webhttp.WriteError(w, r, http.StatusNotFound, "unknown_beat",
+		"no beat at this URL: check the id against BEATS, and check the URL for extra or repeated path segments")
 }
 
 // drainBeatBody drains the deliberately ignored ping payload so keep-alive

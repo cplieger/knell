@@ -44,7 +44,9 @@ type Notifier interface {
 	BeatRecovered(ctx context.Context, id string, live Transition) error
 	// BeatOutageHistory reports outages of id that were already over by the
 	// time anything about them could be sent, collapsed into a single
-	// past-tense notice. outages is chronological and never empty, and every
+	// past-tense notice. outages is never empty and ascends by BOTH Started and
+	// Recovered -- a beat holds one open outage at a time, so its outages cannot
+	// overlap and the last entry is the most recent recovery -- and every
 	// entry carries its own recovery point, start and delivery blame, which the
 	// implementation must report rather than assume. Those guarantees are the
 	// CALLER's, so an implementation must not re-check them: every error it
@@ -537,7 +539,9 @@ func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
 	// sender loop for tens of seconds (3x10s attempts + backoff, or 30s
 	// rate-limit waits), and neither the fresh gauge nor a deadline crossing
 	// may wait on the very path whose failure is what parked the sender.
+	observationDone := make(chan struct{})
 	go func() {
+		defer close(observationDone)
 		observations := time.NewTicker(tick)
 		defer observations.Stop()
 		for {
@@ -557,8 +561,15 @@ func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
 			// Close admission before tallying: StopAccepting and the snapshot
 			// serialize on the same mutex, so nothing can be recorded between
 			// them. The composition root normally closed admission already, but
-			// Run must not depend on someone else having gone first.
+			// Run must not depend on someone else having gone first. Observation
+			// is deliberately NOT gated on admission -- it must keep detecting
+			// through the whole drain window -- so joining its goroutine is the
+			// only thing that orders its last mutation before the snapshot. The
+			// wait is unbounded on purpose: ctx is already cancelled, and a
+			// goroutine parked in a stalled log write would park logUndelivered
+			// on the same handler anyway.
 			w.StopAccepting()
+			<-observationDone
 			w.logUndelivered()
 			return
 		case ev := <-w.recoveries:
@@ -728,9 +739,12 @@ func publishFreshness(id string, silence, deadline time.Duration) bool {
 // each beat owes now. A failed send is not marked alerted, so the next sweep
 // retries it; the beat stays at one Discord message per live outage because
 // alerted flips only on a delivered send. Sending is bounded by sweepSendBudget,
-// and that an unreached beat is sent by the next sweep is a GUARANTEE the ORDER
-// makes: the worklist is least-recently-attempted first and every send stamps the
-// beat's attempt time before it starts.
+// and what the ORDER guarantees is precedence, not delivery on the immediately
+// following sweep: the worklist is least-recently-attempted first and every send
+// stamps the beat's attempt time before it starts, so a beat the budget did not
+// reach outranks every beat that took a turn and cannot be starved. It can still
+// wait up to one full rotation of the continuously due set, when each later
+// sweep spends the same budget before reaching it.
 func (w *Watcher) sweep(ctx context.Context) {
 	due := w.collectDue()
 	budget := w.now().Add(sweepSendBudget)

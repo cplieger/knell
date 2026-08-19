@@ -206,17 +206,15 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...webhttp.HostAllowlistOption) (
 	return cfg, nil
 }
 
-// nodeName resolves the observer name: NODE_NAME when set to a non-blank value
-// (a blank one is ignored), else the hostname, else "unknown".
+// nodeName resolves the observer name: NODE_NAME when set to a non-empty value
+// (an empty one is ignored), else the hostname, else "unknown".
 // A NODE_NAME past maxNodeNameBytes fails startup like any other malformed
 // required value: the cap is what guarantees no name can push a notification
 // past Discord's content limit, where the switch would arm and never ring. The
 // hostname fallback is not length-checked because the kernel bounds it far below
 // the cap, which holds only while maxNodeNameBytes stays at or above 255.
 func nodeName(maxNodeNameBytes int) (string, error) {
-	// Trimmed, not refused as BEAT_TOKEN is: knell is the only reader of the
-	// node name, so nothing has to reproduce it byte for byte.
-	node := strings.TrimFunc(os.Getenv("NODE_NAME"), invisibleInURL)
+	node := os.Getenv("NODE_NAME")
 	if node == "" {
 		return hostnameNode(), nil
 	}

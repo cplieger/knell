@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1036,6 +1037,49 @@ func TestLoadRejectsBlankWebhookFileVar(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsAWebhookWithNothingVisible pins the third webhook-absence refusal.
+// envx judges a secret file blank with strings.TrimSpace, which does not count U+200B or
+// U+FEFF as space, so such a file arrives as a VALUE and only knell's own trim empties
+// it; without this arm it reaches parseWebhookURL and a broken secret pipeline is
+// answered "scheme must be https", the wording that belongs to a schemeless URL.
+func TestLoadRejectsAWebhookWithNothingVisible(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		fromFile bool
+	}{
+		{name: "plain variable holding only spaces", value: "  "},
+		{name: "secret file holding only a zero-width space", value: "\u200b\n", fromFile: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
+			if tt.fromFile {
+				hookFile := filepath.Join(t.TempDir(), "webhook-url")
+				if err := os.WriteFile(hookFile, []byte(tt.value), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				unsetEnv(t, "DISCORD_WEBHOOK_URL")
+				t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
+			} else {
+				t.Setenv("DISCORD_WEBHOOK_URL", tt.value)
+			}
+
+			_, err := Load(maxNodeNameBytes)
+			if err == nil {
+				t.Fatal("Load() with a webhook holding nothing visible = nil, want a startup refusal: every notice would POST to a URL with no host at all and the bell never rings")
+			}
+			if !errors.Is(err, errWebhookSetButEmpty) {
+				t.Errorf("error = %v, want errWebhookSetButEmpty: the variable WAS supplied, so the operator's next move is the secret pipeline that delivered nothing", err)
+			}
+			if tt.fromFile && !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL_FILE") {
+				t.Errorf("error = %q does not name the channel that supplied the value, so the crash loop points at a variable the operator may never have set", err)
+			}
+		})
+	}
+}
+
 func TestLoadTrimsPaddedPlainWebhook(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook ")
@@ -1420,31 +1464,17 @@ func TestLoadTrimsPaddedListenAddr(t *testing.T) {
 	}
 }
 
-func TestLoadTrimsPaddedNodeName(t *testing.T) {
-	setValidLoadEnv(t)
-	t.Setenv("NODE_NAME", "  node-1  ")
-
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.Node != "node-1" {
-		t.Errorf("Node = %q, want \"node-1\": the node name prefixes every Discord notice, so padding misattributes which observer reported the outage", cfg.Node)
-	}
-}
-
-// TestLoadTrimsInvisibleConfigPadding pins the part of NODE_NAME's,
-// LISTEN_ADDR's and DISCORD_WEBHOOK_URL's trim that strings.TrimSpace does NOT
-// do. The padded tests above use ASCII spaces, so they stay green against
+// TestLoadTrimsInvisibleConfigPadding pins the part of LISTEN_ADDR's and
+// DISCORD_WEBHOOK_URL's trim that strings.TrimSpace does NOT
+// do. The padded test above uses ASCII spaces, so it stays green against
 // either predicate and cannot tell them apart; every value here survives
 // TrimSpace (a zero-width space, a soft hyphen and a BOM are Cf format runes,
-// not Unicode White_Space), so reverting any of the three
+// not Unicode White_Space), so reverting either of the two
 // strings.TrimFunc(…, invisibleInURL) calls to TrimSpace fails exactly one case
-// below. Without this test the invisible-padding behavior is unpinned in all
-// three places: a padded LISTEN_ADDR goes back to
-// crash-looping on a bind error whose cause cannot be seen in the log line, a
-// padded NODE_NAME goes back to prefixing every notice with a character the
-// operator cannot see, and a padded DISCORD_WEBHOOK_URL goes back to refusing
+// below. Without this test the invisible-padding behavior is unpinned in both
+// places: a padded LISTEN_ADDR goes back to
+// crash-looping on a bind error whose cause cannot be seen in the log line, and
+// a padded DISCORD_WEBHOOK_URL goes back to refusing
 // startup through parseWebhookURL over a rune nobody can see in the value.
 func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv.
@@ -1453,19 +1483,6 @@ func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
 		softHyphen     = "\u00ad"
 		byteOrderMark  = "\ufeff"
 	)
-
-	t.Run("a NODE_NAME padded with invisible runes is trimmed", func(t *testing.T) {
-		setValidLoadEnv(t)
-		t.Setenv("NODE_NAME", zeroWidthSpace+"node-1"+byteOrderMark)
-
-		cfg, err := Load(maxNodeNameBytes)
-		if err != nil {
-			t.Fatalf("Load() error: %v", err)
-		}
-		if cfg.Node != "node-1" {
-			t.Errorf("Node = %q, want \"node-1\": TrimSpace keeps these runes, so every Discord notice would read as this observer's name plus a character nobody can see", cfg.Node)
-		}
-	})
 
 	t.Run("a LISTEN_ADDR padded with invisible runes is trimmed", func(t *testing.T) {
 		setValidLoadEnv(t)

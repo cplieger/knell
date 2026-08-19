@@ -1,6 +1,8 @@
 // Package main is the knell entry point: a dead-man switch that listens for
 // heartbeat pings and rings a Discord webhook when a beat falls silent.
-// main.go is the composition root; all behavior lives in internal/*.
+// main.go is the composition root plus what only the process boundary can own: the
+// `knell health` probe dispatch, the health marker lifecycle, and shutdown/exit-code
+// classification; everything else lives in internal/*.
 package main
 
 import (
@@ -150,7 +152,7 @@ func run() error {
 	// Both teardown paths report whether the watch loop actually finished, so
 	// the exit cannot claim a clean stop over an abandoned loop. Read on
 	// webhttp.Run's own goroutine, so no synchronization is needed.
-	watchLoopStopped := true
+	var watchLoopStopped bool
 	onShutdown := func(teardownCtx context.Context) {
 		watchLoopStopped = awaitWatchLoop(teardownCtx, watcherDone)
 	}

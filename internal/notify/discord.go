@@ -194,7 +194,8 @@ func (d *Discord) historyMessage(id string, outages []watch.Outage) string {
 // Discord strips a backslash only in front of one of its own markup characters,
 // so escaping anything else would publish the backslash. Line breaks are
 // COLLAPSED for that same reason. The masked-link delimiters are in the set
-// because NODE_NAME is only trimmed and byte-capped.
+// because NODE_NAME is byte-capped only, and arrives exactly as the operator
+// supplied it.
 var markdownEscaper = strings.NewReplacer(
 	// Line breaks first, and collapsed rather than escaped: Discord's heading,
 	// blockquote and list markup is LINE-ANCHORED, so only removing the break can

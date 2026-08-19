@@ -288,6 +288,35 @@ func TestNonCanonicalBeatPathsAnswerTheCodedNotFound(t *testing.T) {
 	}
 }
 
+// TestEscapedSeparatorBeatPathNeverRecordsOrRedirects pins the one spelling
+// family where the decoded and escaped views of a path disagree about /beat
+// namespace membership: /beat%2Fapi decodes to /beat/api but matches no
+// pattern, since ServeMux matches escaped segments. canonicalBeatPath judges
+// the decoded view and passes it, so the refusal here is net/http's plain
+// 404 rather than the coded envelope (see writeUnknownBeat's doc) — this
+// test pins the properties that make that acceptable: a failure status, no
+// redirect, nothing recorded, and no per-beat series minted.
+func TestEscapedSeparatorBeatPathNeverRecordsOrRedirects(t *testing.T) {
+	for _, target := range []string{"/beat%2Fapi", "/beat%2F"} {
+		t.Run(target, func(t *testing.T) {
+			b := &fakeBeater{known: map[string]bool{"api": true}}
+			h := newTestHandler(b, testBeatToken)
+
+			rec := beatRequest(t, h, http.MethodPost, target)
+
+			if rec.Code < 400 {
+				t.Errorf("POST %s = %d, want a failure status: a fused-separator spelling must never read as success", target, rec.Code)
+			}
+			if loc := rec.Header().Get("Location"); loc != "" {
+				t.Errorf("POST %s answered Location %q: a redirect is a success to `curl -fsS`", target, loc)
+			}
+			if len(b.seen) != 0 {
+				t.Errorf("POST %s recorded %v, want nothing: the escaped view must not re-arm the switch under a decoded id", target, b.seen)
+			}
+		})
+	}
+}
+
 // FuzzBeatPathNeverRedirectsOrRecordsNonCanonically fuzzes the untrusted text
 // canonicalBeatPath judges. r.URL.Path is attacker-controlled, and the guard is
 // the only thing standing between a malformed sender URL and net/http's
@@ -496,13 +525,17 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 // the direction that masks the quorum alert.
 func TestNoStoreOnEveryRoute(t *testing.T) {
 	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
-	for _, path := range []string{"/beat/api", "/healthz", "/metrics"} {
-		t.Run(path, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, path, nil)
-			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, req)
+	// POST for the beat route: the case the comment above reasons about is the
+	// ACCEPTED ping's 200, and a GET there is answered 405 instead.
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/beat/api"},
+		{http.MethodGet, "/healthz"},
+		{http.MethodGet, "/metrics"},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			rec := beatRequest(t, h, tc.method, tc.path)
 			if got := rec.Header().Get("Cache-Control"); got != "no-store" {
-				t.Errorf("Cache-Control on GET %s = %q, want %q", path, got, "no-store")
+				t.Errorf("Cache-Control on %s %s = %q, want %q", tc.method, tc.path, got, "no-store")
 			}
 		})
 	}
@@ -993,10 +1026,10 @@ func TestEveryRejectedMethodAnswersTheSameRefusal(t *testing.T) {
 
 // FuzzLoggedPathIsBounded fuzzes the untrusted text the access line records as
 // its path. r.URL.Path is attacker-controlled, net/http accepts a megabyte of
-// it, and the access line is emitted BEFORE the token gate (webhttp.Logging is
-// outermost), so the bound is the only thing limiting an unauthenticated
-// caller's influence on knell's log lines -- the channel that carries the
-// undelivered-notice warnings no counter backs.
+// it, and webhttp.Logging sits OUTSIDE the mux, so the access line is emitted
+// before beatHandler's token gate and the bound is the only thing limiting an
+// unauthenticated caller's influence on knell's log lines -- the channel that
+// carries the undelivered-notice warnings no counter backs.
 //
 // The bound itself is webhttp's now, so what this pins is knell's WIRING of it:
 // that every request really does travel through a logger carrying
@@ -1413,8 +1446,9 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 			wantStatus: http.StatusOK, wantSeen: 1,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="200"}`,
 		},
-		// A rotated or mistyped BEAT_TOKEN. The gate is outermost, so this is
-		// the refusal an unauthenticated caller reaches first.
+		// A rotated or mistyped BEAT_TOKEN. The credential is checked before the
+		// body drain and before the id lookup, so a caller with no valid token
+		// gets 401 rather than 404 or 503.
 		"unauthorized ping": {
 			token: "a-different-token-entirely", method: http.MethodPost, path: "/beat/" + id,
 			wantStatus: http.StatusUnauthorized,
@@ -1596,11 +1630,12 @@ func assertRequestSeriesVocabulary(t *testing.T, series, allowedMethods, allowed
 // TestRequestMetricLabelsBoundedByTheRouteTable is the cardinality guard on the
 // request counter, and the reason knell hands webhttp.WithRecordRouteMetric the
 // job of deriving both labels instead of deriving them itself.
-// webhttp.Logging is outermost, so the hook fires before beatHandler's token
-// gate: the inputs below arrive from an UNAUTHENTICATED caller, and a Prometheus
-// series once minted is permanent for the process lifetime here and in every
-// observer scraping knell. So the label set must be bounded by the ROUTE TABLE
-// plus a closed method vocabulary, and by nothing the caller sends.
+// webhttp.Logging sits OUTSIDE the mux, so the route-metric hook fires before
+// beatHandler's token gate: the inputs below arrive from an UNAUTHENTICATED
+// caller, and a Prometheus series once minted is permanent for the process
+// lifetime here and in every observer scraping knell. So the label set must be
+// bounded by the ROUTE TABLE plus a closed method vocabulary, and by nothing
+// the caller sends.
 //
 // Two attack shapes, and knell is uniquely exposed to the second. The path is
 // the obvious one, and it collapses onto registered templates (or the single
@@ -1728,8 +1763,8 @@ func TestUnroutedRequestsAreCountedUnderTheCollapsedSeries(t *testing.T) {
 // by default), so without it one unauthenticated caller writes ~1 MiB of its own
 // text into a single access line and pushes knell's permanently-lost-notice
 // WARNs out of the retained log window — the same consequence the path cap
-// exists to prevent, on a request the token gate never sees (Logging is
-// outermost).
+// exists to prevent, on a request the token gate never sees (webhttp.Logging
+// sits outside the mux, ahead of beatHandler's token gate).
 func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and must be installed BEFORE New, because webhttp.Logging
@@ -2013,9 +2048,9 @@ func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 	}
 }
 
-// TestThrottledAuthFailureWritesNoAccessLine pins WHY beatAuthFailureLimiter is
-// the OUTERMOST wrapper in New's chain: an over-budget attempt must be answered
-// before webhttp.Logging, so a guessing run at wire speed cannot write one
+// TestThrottledAuthFailureWritesNoAccessLine pins WHY beatAuthFailureLimiter
+// sits OUTSIDE webhttp.Logging: an over-budget attempt must be answered before
+// the access logger, so a guessing run at wire speed cannot write one
 // access line per attempt and push knell's permanently-lost-notice WARNs out of
 // the retained log window. Nothing else pins that ordering -- the throttle's
 // other tests assert the 429 and its reason counter, both of which survive the

@@ -345,9 +345,11 @@ func FuzzRedirectResponsesNeverCarryLocationText(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, location string, statusSeed uint8) {
 		// The whole redirect band: 301/302/303 are the method-changing hops
-		// the policy surfaces as a 3xx, 307/308 the method-preserving ones it
-		// refuses with an error, and 300/304/305/306 reach net/http's
-		// no-usable-Location path.
+		// WithPreserveMethod refuses, and it refuses them by surfacing the 3xx
+		// itself (http.ErrUseLastResponse, not an error); 307/308 preserve the
+		// method and are followed when same-host, so they produce a cause only
+		// through WithSameHost's hard refusal or the hop cap; 300/304/305/306
+		// are not redirect statuses to net/http at all, so no Location is read.
 		status := 300 + int(statusSeed%9)
 		const rawURL = "https://discord.example/api/webhooks/1234567890/plainsegment"
 		// The control attempt differs in BOTH the webhook URL and the

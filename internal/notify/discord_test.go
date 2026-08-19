@@ -1006,8 +1006,9 @@ func TestNoticesEscapeDiscordMarkdownInConfiguredValues(t *testing.T) {
 	t.Parallel()
 
 	// The two values a notice interpolates that knell did not write itself: a
-	// beat id (config's grammar admits "_") and a node name (arbitrary, only
-	// trimmed and byte-capped, so it can carry Discord's masked-link
+	// beat id (config's grammar admits "_") and a node name (arbitrary,
+	// byte-capped only and exactly as the operator supplied it, so it can carry
+	// Discord's masked-link
 	// delimiters). Left literal, Discord CONSUMES the markup characters, so the
 	// notice names a beat matching nothing in BEATS and nothing on /beat/{id},
 	// and the node reads as something other than the configured identity.
@@ -1060,7 +1061,8 @@ func TestNoticesEscapeDiscordMarkdownInConfiguredValues(t *testing.T) {
 // asterisk, the brackets and the beat-id underscore, so deleting the
 // backslash, tilde, backtick or pipe entry leaves the suite green while the
 // configured observer identity is rendered as something else — NODE_NAME is
-// only trimmed and byte-capped, so it can carry any of them.
+// byte-capped only and arrives exactly as the operator supplied it, so it can
+// carry any of them.
 func TestBeatMissingEscapesEveryDiscordMarkdownCharacterInNodeName(t *testing.T) {
 	t.Parallel()
 
@@ -1076,6 +1078,10 @@ func TestBeatMissingEscapesEveryDiscordMarkdownCharacterInNodeName(t *testing.T)
 		"pipe":            {node: "a|b", want: `a\|b`},
 		"opening bracket": {node: "a[b", want: `a\[b`},
 		"closing bracket": {node: "a]b", want: `a\]b`},
+
+		"CRLF collapses to a space": {node: "a\r\nb", want: "a b"},
+		"CR collapses to a space":   {node: "a\rb", want: "a b"},
+		"LF collapses to a space":   {node: "a\nb", want: "a b"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1125,7 +1131,8 @@ func TestEscapeMarkdownLeavesEveryOtherCharacterAlone(t *testing.T) {
 	// Whole values a deployment really configures, including the shapes the
 	// loop's single-character cases cannot show: a hyphenated beat id (every
 	// README example and both homelab beats) and a non-ASCII node name, since
-	// NODE_NAME is only trimmed and byte-capped.
+	// NODE_NAME is byte-capped only and arrives exactly as the operator
+	// supplied it.
 	for _, in := range []string{"cron-backup", "watchdog-mimir", "caf\u00e9", "obs\u00a01"} {
 		if got := escapeMarkdown(in); got != in {
 			t.Errorf("escapeMarkdown(%q) = %q, want it unchanged: it carries no Discord markup character", in, got)
@@ -1591,6 +1598,38 @@ func TestNoticesReportWholeSecondDurations(t *testing.T) {
 			content := <-rec.contents
 			if !strings.Contains(content, tc.want) {
 				t.Errorf("the %s notice = %q, want it to report %q: an untruncated span renders nanoseconds, and every production span carries them", name, content, tc.want)
+			}
+		})
+	}
+}
+
+
+func TestTransportErrorNamesTheFailedStage(t *testing.T) {
+	t.Parallel()
+
+	// net.OpError's Op is one of net's own fixed verbs, so it is printable where
+	// the cause's text is not, and it is the only diagnosis a transport failure
+	// gets: a stalled dial points at egress or DNS, a stalled read means the host
+	// accepted the connection and went quiet. The exact-equality assertion is also
+	// the leak oracle: the input carries the credential in its URL field, so any
+	// rendering of it fails the comparison.
+	rawURL := "https://discord.example/api/webhooks/1234567890/verysecretstagetoken"
+	for name, tc := range map[string]struct {
+		op   string
+		want string
+	}{
+		"a refused dial names the dial":     {op: "dial", want: "webhook transport failed during dial"},
+		"a stalled read names the read":     {op: "read", want: "webhook transport failed during read"},
+		"an OpError with no verb adds none": {op: "", want: "webhook transport failed"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			in := &url.Error{Op: "Post", URL: rawURL, Err: &net.OpError{
+				Op: tc.op, Net: "tcp", Err: errors.New("connect: connection refused"),
+			}}
+			if got := safeTransportError(in); got.Error() != tc.want {
+				t.Errorf("safeTransportError(*net.OpError{Op: %q}).Error() = %q, want %q", tc.op, got.Error(), tc.want)
 			}
 		})
 	}

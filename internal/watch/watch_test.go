@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 	"testing"
@@ -306,6 +307,133 @@ func TestAdmissionClosedBeforeRunExitsStillTalliesUndeliveredWork(t *testing.T) 
 	}
 	if got := w.Beat(id); got != BeatClosed {
 		t.Errorf("Beat after the second close = %v, want BeatClosed: closing twice must leave admission closed", got)
+	}
+}
+
+// parkingHandler holds one message inside slog until a test releases it, and
+// records everything through the embedded recorder. Parking a log write is the
+// only way to hold the observation goroutine at a point where it is NOT holding
+// w.mu: every gate reachable from a test sits inside the critical section, so a
+// test that blocks there proves nothing about Run's exit ordering.
+type parkingHandler struct {
+	slog.Handler
+	release chan struct{}
+	parked  chan struct{}
+	on      string
+}
+
+func (h *parkingHandler) Handle(ctx context.Context, r slog.Record) error {
+	if r.Message == h.on {
+		select {
+		case h.parked <- struct{}{}:
+		default:
+		}
+		<-h.release
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+// TestRunJoinsTheObservationGoroutineBeforeTallying pins the shutdown JOIN.
+// Observation runs on its own goroutine and is deliberately not gated on
+// admission (it must keep detecting through the whole drain window), so closing
+// admission does not stop it: without the join, Run's ctx.Done arm can publish
+// the undelivered tally while the observation goroutine still owes a mutation,
+// and that tally is the operator's only trace of the notices this process will
+// never send. The observation goroutine is held in a DEBUG write it makes after
+// releasing w.mu, which is the one reachable point where it is running and
+// lockless at once.
+func TestRunJoinsTheObservationGoroutineBeforeTallying(t *testing.T) {
+	// Serial (no t.Parallel): the parking handler is installed as the process
+	// slog default.
+	const id = "observation-join-probe"
+	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+
+	// Fill the queue to its bound through the production paths: an observation
+	// detects each crossing, the ping that follows seals that record, and
+	// nothing is ever delivered, so all eight records stay queued and closed.
+	for range missingQueueSize {
+		clock.Advance(11 * time.Minute)
+		w.observeBeats()
+		clock.Advance(time.Minute)
+		if !recordedBeat(w, id) {
+			t.Fatalf("Beat(%s) refused during setup", id)
+		}
+	}
+	if got := len(w.beats[id].pendingMissing); got != missingQueueSize {
+		t.Fatalf("queued records = %d, want the queue at its bound %d", got, missingQueueSize)
+	}
+
+	// The history send parks, which is what makes the crossing below detectable
+	// by the observation goroutine ALONE: the sender observes every beat too,
+	// and whichever path detects the overflow first owns its one DEBUG line.
+	sending := make(chan struct{}, 1)
+	releaseSend := make(chan struct{})
+	releaseSendOnce := sync.OnceFunc(func() { close(releaseSend) })
+	n.onHistory = func() {
+		select {
+		case sending <- struct{}{}:
+		default:
+		}
+		<-releaseSend
+	}
+
+	_, rec := capture.New()
+	parked := make(chan struct{}, 1)
+	releaseLog := make(chan struct{})
+	releaseLogOnce := sync.OnceFunc(func() { close(releaseLog) })
+	// Released through Cleanup as well as inline, so a failed assertion above
+	// unwinds the parked goroutines instead of wedging the package's test run.
+	t.Cleanup(releaseSendOnce)
+	t.Cleanup(releaseLogOnce)
+	previous := slog.Default()
+	slog.SetDefault(slog.New(&parkingHandler{
+		Handler: rec,
+		on:      "pending missing queue full, ongoing outage stays detected and is queued once a slot frees",
+		parked:  parked,
+		release: releaseLog,
+	}))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runReturned := make(chan struct{})
+	go func() {
+		defer close(runReturned)
+		w.Run(ctx, 5*time.Millisecond)
+	}()
+
+	awaitSignal(t, sending, "the sweep never reached the history send")
+	// The ninth crossing: the queue is at its bound, so the record cannot be
+	// queued and the observation goroutine owes the deferral line.
+	clock.Advance(11 * time.Minute)
+	awaitSignal(t, parked, "the observation goroutine never reached the deferral line")
+
+	cancel()
+	// Let the sender out of the notifier so Run reaches its ctx.Done arm. The
+	// sweep cannot run again: handleTick checks ctx before sweeping.
+	releaseSendOnce()
+
+	select {
+	case <-runReturned:
+		t.Fatal("Run returned while the observation goroutine was still mid-observation outside w.mu: its last mutation lands after the tally that was supposed to report it")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseLogOnce()
+	awaitSignal(t, runReturned, "Run did not return after the observation goroutine was released")
+	if !rec.HasAttr("watch loop stopped", "ongoing_records", "1") {
+		t.Errorf("shutdown summary does not count the observed outage as ongoing: %v", rec.Records())
+	}
+}
+
+// awaitSignal waits for one test handshake, failing with what did not happen
+// rather than letting the package run to the go-test timeout.
+func awaitSignal[T any](t *testing.T, ch <-chan T, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out after 5s: %s", what)
 	}
 }
 

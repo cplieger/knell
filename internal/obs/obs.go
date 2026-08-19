@@ -3,10 +3,6 @@
 // prefix "knell_". The registry and the collectors are unexported, so a caller
 // cannot register, rename or delete a series, nor write a raw label position.
 //
-// Named obs, not metrics: the github.com/cplieger/metrics library owns that
-// name, and the collision forced every meeting point through a metricslib
-// alias that no two consumers of the library spelled the same way.
-//
 // # Label-cardinality contract (read this before adding a caller)
 //
 // Cardinality is NOT structurally contained: Prometheus mints the labelled
