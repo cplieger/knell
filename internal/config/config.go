@@ -83,7 +83,8 @@ const MaxBeatIDLen = 64
 // beatIDPattern is the accepted beat-id grammar: URL-path and metric-label
 // safe, human-readable, bounded by MaxBeatIDLen.
 var beatIDPattern = regexp.MustCompile(
-	fmt.Sprintf(`^[A-Za-z0-9][A-Za-z0-9_-]{0,%d}$`, MaxBeatIDLen-1))
+	fmt.Sprintf(`^[A-Za-z0-9][A-Za-z0-9_-]{0,%d}$`, MaxBeatIDLen-1),
+)
 
 // Beat is one watched heartbeat: an id senders ping and the silence deadline
 // after which the beat is declared missing.
@@ -359,8 +360,7 @@ func secretFileError(key string, err error) error {
 		// The OS refused the open, stat or read. envx keeps the *os.PathError
 		// reachable, so the syscall and its bare reason can be named while
 		// pathErr.Path, the operator-supplied value, stays out.
-		var pathErr *os.PathError
-		if errors.As(err, &pathErr) {
+		if pathErr, ok := errors.AsType[*os.PathError](err); ok {
 			return fmt.Errorf("%s_FILE could not be read (%s failed): %v: check that the path the variable names exists inside the container and is readable by knell's non-root user", key, pathErr.Op, pathErr.Err)
 		}
 		return fmt.Errorf("%s_FILE could not be read: check that the path the variable names exists inside the container and is readable by knell's non-root user", key)
@@ -663,7 +663,7 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		// would refuse it forever while startup reported success.
 		return nil, errors.New("missing path (the webhook URL's own path carries the credential, so a host-only URL cannot deliver a notification)")
 	}
-	if !utf8.ValidString(raw) || strings.IndexFunc(raw, invisibleInURL) >= 0 {
+	if !utf8.ValidString(raw) || strings.ContainsFunc(raw, invisibleInURL) {
 		// Visible runes are NOT refused: that would reject a working non-Discord
 		// relay URL. utf8.ValidString carries the rule to the BYTE level, which the
 		// rune predicate cannot: an invalid byte decodes to U+FFFD, which IsPrint accepts.

@@ -205,8 +205,7 @@ func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
 func drainBeatBody(w http.ResponseWriter, r *http.Request) {
 	webhttp.LimitBody(w, r, maxBeatBody)
 	_, err := io.Copy(io.Discard, r.Body)
-	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) {
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 		// No beat id: it is still an unvalidated path segment here, so
 		// correlate through the request id.
 		slog.WarnContext(r.Context(), "beat body exceeded the cap and was not fully read",

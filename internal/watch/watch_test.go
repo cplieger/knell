@@ -621,8 +621,7 @@ func TestRunLoopDeliversSweepAndRecovery(t *testing.T) {
 		}()
 
 		synctest.Wait()
-		time.Sleep(5 * time.Millisecond)
-		synctest.Wait()
+		synctest.Sleep(5 * time.Millisecond)
 		got := n.snapshot()
 		if len(got) != 1 || got[0].kind != "missing" {
 			t.Fatalf("calls after sweep tick = %v, want one missing", got)
@@ -825,8 +824,7 @@ func TestFreshnessGaugeUpdatesWhileSenderBlocked(t *testing.T) {
 		// The sweep cannot run, so only the independent gauge ticker can
 		// flip b's freshness -- the documented ground-truth path.
 		clock.Advance(25 * time.Minute)
-		time.Sleep(5 * time.Millisecond)
-		synctest.Wait()
+		synctest.Sleep(5 * time.Millisecond)
 
 		if got := labeledValue(t, "knell_beat_fresh", "beat", "blocked-sender-b"); got != "0" {
 			t.Fatalf("beat_fresh for b while sender blocked = %s, want 0 (gauge ticker must not depend on the sender loop)", got)

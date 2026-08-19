@@ -271,15 +271,15 @@ func webhookNeedles(rawURL string) []string {
 		if suffix, ok := strings.CutPrefix(p, "/api/webhooks/"); ok {
 			needles = append(needles, suffix)
 		}
-		if i := strings.LastIndex(p, "/"); i >= 0 {
-			needles = append(needles, p[i+1:])
+		if _, lastSegment, ok := strings.CutLast(p, "/"); ok {
+			needles = append(needles, lastSegment)
 		}
 	}
 	needles = append(needles, u.RawQuery)
 	for _, values := range u.Query() {
 		needles = append(needles, values...)
 	}
-	for _, form := range needles[:len(needles):len(needles)] {
+	for _, form := range slices.Clip(needles) {
 		if escaped := strings.ReplaceAll(form, "/", `\/`); escaped != form {
 			needles = append(needles, escaped)
 		}
@@ -294,7 +294,7 @@ func webhookNeedles(rawURL string) []string {
 // segment carrying a quote, a backslash or a control byte renders escaped
 // there, so the raw needle alone would not match it.
 func withQuotedForms(needles []string) []string {
-	for _, form := range needles[:len(needles):len(needles)] {
+	for _, form := range slices.Clip(needles) {
 		q := strconv.Quote(form)
 		if quoted := q[1 : len(q)-1]; quoted != form {
 			needles = append(needles, quoted)
@@ -385,8 +385,8 @@ func locationNeedles(location string) []string {
 	if u, err := url.Parse(location); err == nil {
 		needles = append(needles, u.Host, u.Hostname(), u.Path, u.EscapedPath(), u.RawQuery)
 	}
-	if i := strings.LastIndex(location, "/"); i >= 0 {
-		needles = append(needles, location[i+1:])
+	if _, lastSegment, ok := strings.CutLast(location, "/"); ok {
+		needles = append(needles, lastSegment)
 	}
 	return withQuotedForms(needles)
 }

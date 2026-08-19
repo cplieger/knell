@@ -73,7 +73,7 @@ func FuzzParseWebhookURL(f *testing.F) {
 			// production predicate here would let a narrowed predicate relax the
 			// parser and its test together. unicode.IsPrint states the configured
 			// contract without calling the implementation helper.
-			if strings.IndexFunc(raw, func(r rune) bool { return r == ' ' || !unicode.IsPrint(r) }) >= 0 {
+			if strings.ContainsFunc(raw, func(r rune) bool { return r == ' ' || !unicode.IsPrint(r) }) {
 				t.Fatal("accepted a URL containing a space or non-printable rune: it is percent-encoded on every request, so the host or path that reaches the other end is not the configured one")
 			}
 			return

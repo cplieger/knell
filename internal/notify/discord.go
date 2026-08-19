@@ -311,8 +311,7 @@ func safeTransportError(err error) error {
 	const maxURLErrorDepth = 8
 	cause := httpx.LogSafeError(err)
 	for range maxURLErrorDepth {
-		var nested *url.Error
-		if !errors.As(cause, &nested) {
+		if _, ok := errors.AsType[*url.Error](cause); !ok {
 			break
 		}
 		cause = httpx.LogSafeError(cause)
@@ -322,8 +321,7 @@ func safeTransportError(err error) error {
 	// that matters during an outage: a stalled dial points at egress or DNS, a
 	// stalled read means the host accepted the connection and went quiet.
 	phrase := "webhook transport failed"
-	var opErr *net.OpError
-	if errors.As(cause, &opErr) && opErr.Op != "" {
+	if opErr, ok := errors.AsType[*net.OpError](cause); ok && opErr.Op != "" {
 		phrase += " during " + opErr.Op
 	}
 	return transportError{phrase: phrase, cause: cause}
@@ -389,7 +387,8 @@ func deliveryError(resp *http.Response) error {
 		// request URL is included: for a webhook the path IS the credential.
 		return fmt.Errorf(
 			"%w: redirect or other 3xx response was not followed, nothing was delivered (point DISCORD_WEBHOOK_URL at an endpoint that accepts the POST with a 2xx response)",
-			statusErr)
+			statusErr,
+		)
 	}
 	// The code alone cannot tell a deleted webhook from a rejected payload;
 	// Discord names that difference in the body as a numeric code.
