@@ -1603,7 +1603,6 @@ func TestNoticesReportWholeSecondDurations(t *testing.T) {
 	}
 }
 
-
 func TestTransportErrorNamesTheFailedStage(t *testing.T) {
 	t.Parallel()
 
