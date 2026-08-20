@@ -129,50 +129,17 @@ Plus standard `go_*` / `process_*` runtime metrics.
 
 ## Alerting
 
-knell is itself the alert path for the things it watches, so alert rules about knell should come from a second vantage point (your metrics stack scraping `/metrics`). Two rules cover its state, plus one for restart churn below:
+knell is itself the alert path for the things it watches, so alert rules about knell should come from a second vantage point (your metrics stack scraping `/metrics`). Ship the group in [`alerts.yaml`](alerts.yaml) and evaluate it with Prometheus or the Mimir ruler:
 
-```yaml
-# A beat is overdue but the missing notification may not have reached you
-# (Discord outage): the metric is the ground truth.
-- alert: KnellBeatOverdue
-  expr: knell_beat_fresh == 0
-  for: 5m
-  labels:
-    severity: warning
-  annotations:
-    summary: "beat {{ $labels.beat }} is overdue on {{ $labels.instance }}"
+| Alert | Fires when | Severity |
+| --- | --- | --- |
+| `KnellBeatOverdue` | `knell_beat_fresh == 0` for 5m: a beat is overdue, and the missing notice may not have reached you | warning |
+| `KnellNotifyFailing` | a delivery failed after retries, or a notification or an outage record was dropped for good | warning |
+| `KnellRestartChurn` | knell restarted more than once inside a beat's deadline window | warning |
 
-# knell could not get a notification through. The three legs are distinct
-# consequences: failed = a delivery attempt failed after retries and its
-# record is still queued, so the notice is late and retried every 15s sweep;
-# either dropped = nothing will arrive and you reconstruct the window
-# yourself (see Notification semantics). Keep all three: when a full queue
-# discards an ended outage, only the third leg moves.
-- alert: KnellNotifyFailing
-  expr: >
-    increase(knell_notifications_failed_total[15m]) > 0
-    or increase(knell_notifications_dropped_total[15m]) > 0
-    or increase(knell_outage_records_dropped_total[15m]) > 0
-  for: 0m
-  labels:
-    severity: warning
-  annotations:
-    summary: "knell on {{ $labels.instance }} failed to deliver a notification, or dropped a notification or an outage record"
-```
+`KnellNotifyFailing` carries three `or` legs on purpose. `failed` means the notice is late and the 15s sweep retries it, so you wait. Either `dropped` means nothing will arrive and you reconstruct the window yourself from `knell_beat_last_seen_timestamp_seconds`. Drop the third leg and a permanently lost outage record pages nobody.
 
-One caveat comes with the boot-armed clock: every restart re-arms each beat's full deadline, so an observer restarting more often than a beat's deadline never fires that beat's alert. The runtime metrics already expose this; alert on restart churn within your longest deadline window:
-
-```yaml
-# knell restarting faster than a beat's deadline (26h here) keeps re-arming
-# that beat's clock; the alert for an ongoing outage is deferred each time.
-- alert: KnellRestartChurn
-  expr: changes(process_start_time_seconds{job="knell"}[26h]) > 1
-  for: 0m
-  labels:
-    severity: warning
-  annotations:
-    summary: "knell on {{ $labels.instance }} keeps restarting within a beat deadline window; boot-armed clocks are re-armed before they can fire"
-```
+One caveat comes with the boot-armed clock: every restart re-arms each beat's full deadline, so an observer restarting more often than a beat's deadline never fires that beat's alert. That is what `KnellRestartChurn` covers; set its window to your longest beat deadline.
 
 Running several instances? Point each sender at all of them and aggregate: `sum by (beat) (knell_beat_fresh)` gives an N-of-M quorum view where one observer being down degrades the count instead of paging falsely.
 

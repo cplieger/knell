@@ -1,0 +1,52 @@
+# Recommended alert rules for knell. Prometheus / Mimir ruler rule group
+# (PromQL): scrape knell's /metrics endpoint and evaluate these with Prometheus
+# or the Mimir ruler; firing alerts deliver through your Alertmanager like any
+# other Prometheus alert.
+#
+# These rules watch knell itself, so they must come from a second vantage point.
+# knell is the alert path for the things it watches, and an observer cannot
+# report its own silence.
+#
+# Thresholds, the `for:` windows and the severity labels are starting points.
+# Set the churn window to your longest beat deadline, match the `job` selector
+# to your scrape config, and route by whatever labels your Alertmanager uses.
+groups:
+  - name: knell
+    rules:
+      # A beat is overdue but the missing notification may not have reached you
+      # (Discord outage): the metric is the ground truth.
+      - alert: KnellBeatOverdue
+        expr: knell_beat_fresh == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "beat {{ $labels.beat }} is overdue on {{ $labels.instance }}"
+
+      # knell could not get a notification through. The three legs are distinct
+      # consequences: failed = a delivery attempt failed after retries and its
+      # record is still queued, so the notice is late and retried every 15s
+      # sweep; either dropped = nothing will arrive and you reconstruct the
+      # window yourself. Keep all three: when a full queue discards an ended
+      # outage, only the third leg moves.
+      - alert: KnellNotifyFailing
+        expr: >
+          increase(knell_notifications_failed_total[15m]) > 0
+          or increase(knell_notifications_dropped_total[15m]) > 0
+          or increase(knell_outage_records_dropped_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "knell on {{ $labels.instance }} failed to deliver a notification, or dropped a notification or an outage record"
+
+      # knell restarting faster than a beat's deadline (26h here) keeps
+      # re-arming that beat's clock; the alert for an ongoing outage is
+      # deferred each time. Set the window to your longest beat deadline.
+      - alert: KnellRestartChurn
+        expr: changes(process_start_time_seconds{job="knell"}[26h]) > 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "knell on {{ $labels.instance }} keeps restarting inside a beat deadline window; boot-armed clocks re-arm before they can fire"
