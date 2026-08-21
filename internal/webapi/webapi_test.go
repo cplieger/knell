@@ -317,6 +317,68 @@ func TestEscapedSeparatorBeatPathNeverRecordsOrRedirects(t *testing.T) {
 	}
 }
 
+// TestNonCanonicalPathOutsideTheBeatNamespaceIsLeftToTheMux pins the other edge
+// of the same guard: canonicalBeatPath refuses the /beat spellings net/http
+// would rewrite, and it must claim nothing else. Two things break if its
+// namespace test ever widens. Traffic that names no beat starts answering
+// knell's unknown_beat envelope, which tells whoever reads it to go check an id
+// against BEATS when no beat was ever addressed; and the pre-route reason
+// counter inflates with it. That counter is the ONLY series separating a
+// malformed sender URL from a port scan — the route metric buckets both as
+// "unmatched" — so drowning it costs the diagnostic
+// TestNonCanonicalBeatPathsAnswerTheCodedNotFound exists to protect, on the one
+// occasion an operator needs it: a beat that stopped arriving because its
+// sender's URL is malformed. Off the namespace the rewrite therefore stays
+// net/http's, and a Location header is exactly what this class must KEEP —
+// the inverse of the assertion the beat cases carry.
+func TestNonCanonicalPathOutsideTheBeatNamespaceIsLeftToTheMux(t *testing.T) {
+	// Non-canonical spellings of a real route and of no route at all. Neither
+	// the raw nor the cleaned form sits under /beat, which is what puts each
+	// one outside the guard.
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "double slash before a routed path", path: "//healthz"},
+		{name: "double slash after a routed path", path: "/healthz//"},
+		{name: "dot segment on an unrouted path", path: "/nope/../ghost"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &fakeBeater{known: map[string]bool{"api": true}}
+			h := newTestHandler(b, testBeatToken)
+			// Deltas against the shared registry, as above; the reason series
+			// is pre-minted, so mustSeriesValue reads it before any refusal.
+			before := scrapeExposition(t, h)
+			reasonBefore := mustSeriesValue(t, before, nonCanonicalReasonSeries)
+
+			// The path is assigned rather than passed as a target: "//healthz"
+			// is a protocol-relative URL, so httptest.NewRequest would read
+			// "healthz" as the host and leave the path empty. No credential is
+			// presented, because the bearer gate covers the beat route only —
+			// any refusal here could only be the path guard's.
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			req.URL.Path = tt.path
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if strings.Contains(rec.Body.String(), "unknown_beat") {
+				t.Errorf("POST %s = %d %s, want no unknown_beat envelope: nothing here addresses a beat, so naming one sends an operator after a sender that does not exist",
+					tt.path, rec.Code, rec.Body.String())
+			}
+			if loc := rec.Header().Get("Location"); loc == "" {
+				t.Errorf("POST %s = %d with no Location, want net/http's own rewrite: the beat guard must not answer for a path outside /beat",
+					tt.path, rec.Code)
+			}
+			after := scrapeExposition(t, h)
+			if got := mustSeriesValue(t, after, nonCanonicalReasonSeries); got != reasonBefore {
+				t.Errorf("POST %s moved %s to %v, want %v: counting non-beat traffic there drowns the one signal that names a malformed sender URL",
+					tt.path, nonCanonicalReasonSeries, got, reasonBefore)
+			}
+		})
+	}
+}
+
 // FuzzBeatPathNeverRedirectsOrRecordsNonCanonically fuzzes the untrusted text
 // canonicalBeatPath judges. r.URL.Path is attacker-controlled, and the guard is
 // the only thing standing between a malformed sender URL and net/http's

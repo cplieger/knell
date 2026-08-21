@@ -939,6 +939,18 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 	if rateLimitMaxWait <= 0 || sendBudget > 4*watch.DefaultTick {
 		t.Errorf("rateLimitMaxWait = %s gives sendBudget = %s, want a positive ceiling whose delivery budget stays within four %s sweep ticks: the sweep is the single sender, so the budget is what holds every other beat's notice", rateLimitMaxWait, sendBudget, watch.DefaultTick)
 	}
+	// That upper bound has a floor to clear, and the floor is the schedule the
+	// budget is derived from rather than the derivation itself: httpx parks up
+	// to rateLimitMaxWait before a retry and then spends up to attemptTimeout
+	// running it, so a budget that cannot fit one park plus one attempt is
+	// spent on the first attempt alone. maxAttempts would then read as 3 and
+	// behave as 1 the moment anything in front of Discord answers a
+	// header-less 429 -- and a non-positive budget is worse again, being
+	// ContextWithDefaultTimeout's pass-through path, which leaves the delivery
+	// with no deadline at all and the sweep's single sender parked on it.
+	if sendBudget <= rateLimitMaxWait+attemptTimeout {
+		t.Errorf("sendBudget = %s, want more than one %s rate-limit park plus one %s attempt: a budget the retry schedule cannot fit inside is spent on attempt one, so the other %d never run", sendBudget, rateLimitMaxWait, attemptTimeout, maxAttempts-1)
+	}
 	// Shorten only this notifier's ceiling: the branch under test cares that
 	// knell's own ceiling bounds the wait, not how long the production one is.
 	const ceiling = 50 * time.Millisecond

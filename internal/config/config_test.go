@@ -495,6 +495,27 @@ func TestBeatTokenLengthCeiling(t *testing.T) {
 		}
 	})
 
+	t.Run("the header cap carries a token at the maximum", func(t *testing.T) {
+		// The reserve the comment above describes, asserted rather than
+		// described. Spelled from the WIRE instead of from the constants'
+		// own sum, which would only restate the thing under test: the
+		// Authorization line a maximum-length token actually travels in, plus
+		// a generous ceiling on the rest of a ping's header block -- the
+		// request line naming a maximum-length beat id, a maximum-length Host,
+		// Content-Length, and whatever a proxy in front appends. A cap that
+		// cannot carry all of that admits a token at startup and then has
+		// net/http answer 431 to every ping presenting it, while /healthz stays
+		// green and the endpoint reports itself gated; one deadline later every
+		// configured beat posts a false MISSING notice.
+		const restOfTheHeaderBlock = 1 << 10
+		authorization := len("Authorization: Bearer " + atMax + "\r\n")
+
+		if MaxRequestHeaderBytes < authorization+restOfTheHeaderBlock {
+			t.Errorf("MaxRequestHeaderBytes = %d, want at least %d: a %d-byte Authorization line plus %d bytes for the request line, Host and anything a proxy adds, because a cap under that 431s every ping carrying a token Load just accepted",
+				MaxRequestHeaderBytes, authorization+restOfTheHeaderBlock, authorization, restOfTheHeaderBlock)
+		}
+	})
+
 	t.Run("one byte past the maximum refuses startup", func(t *testing.T) {
 		setValidLoadEnv(t)
 		t.Setenv("BEAT_TOKEN", atMax+"a")
