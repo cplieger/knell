@@ -13,8 +13,56 @@
 groups:
   - name: knell
     rules:
+      # The floor under every other rule here: all of them read a knell metric,
+      # so all of them go quiet together when knell stops being scraped. A dead
+      # watchdog is the failure its own users are least able to notice.
+      #
+      # Two arms, because neither covers the other. `up == 0` catches a target
+      # that is configured and failing, and keeps its labels so the alert names
+      # which node. `absent(up{...})` catches a target that stopped EXISTING — a
+      # dropped scrape target, a removed scrape config, a deleted Kubernetes pod
+      # or ServiceMonitor — where `up` has no series and `up == 0` cannot match.
+      #
+      # Use an EXACT job matcher, not a regex. A regex absent() form asks
+      # whether ANY matching target is up, which is the wrong question here
+      # above all: with several observers, one survivor would mask every dead
+      # one, and masking a dead observer is the failure this rule exists for.
+      # Its synthetic result also carries no job label to route on.
+      #
+      # If you run several observers, alert per node (the `instance` label
+      # arrives on the `up == 0` arm) and remember this rule needs the same
+      # second vantage point the rest of the group documents: it has to be
+      # evaluated somewhere other than the box it watches.
+      - alert: KnellTargetDown
+        expr: up{job="knell"} == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "knell is not being scraped successfully"
+          description: >
+            No successful scrape of knell for 15m, so knell_beat_fresh is stale
+            and every beat it watches is unmonitored. Either the scrape is
+            failing (container down, wrong port, network) or the target is gone
+            from service discovery entirely. A dead-man switch that is itself
+            dead reports nothing, which is why this is critical rather than
+            warning. Set the job matcher to whatever your scrape config calls
+            knell.
+
       # A beat is overdue but the missing notification may not have reached you
       # (Discord outage): the metric is the ground truth.
+      - alert: KnellTargetAbsent
+        expr: absent(up{job="knell"})
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "knell has no scrape target at all"
+          description: >
+            There is no up{job="knell"} series, so knell is not merely
+            failing to scrape but is no longer a configured target: a dropped
+            scrape target, a removed scrape config, or a deleted Kubernetes pod
+            or ServiceMonitor. Every other rule in this group is blind.
       - alert: KnellBeatOverdue
         expr: knell_beat_fresh == 0
         for: 5m
