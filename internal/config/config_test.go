@@ -962,7 +962,7 @@ func TestLoadThreadsTheHostPolicyOptionsThrough(t *testing.T) {
 		return r
 	}
 
-	exempt, err := Load(maxNodeNameBytes, webhttp.WithLoopbackExempt())
+	exempt, err := Load(maxNodeNameBytes, webhttp.WithLoopbackExempt(true))
 	if err != nil {
 		t.Fatalf("Load() with the loopback exemption: %v", err)
 	}

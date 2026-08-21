@@ -128,7 +128,13 @@ func New(b Beater, deps Deps) http.Handler {
 			// source at all. Trusting a forwarded header with no proxy in front
 			// is how the field becomes spoofable.
 			webhttp.WithClientIP(deps.TrustedProxies...),
-			webhttp.WithRecordRouteMetric(obs.RecordHTTP),
+			// Adapted rather than passed directly so obs keeps its own
+			// signature and never imports webhttp: the metrics package is the
+			// leaf here, and a library struct in its parameter list would
+			// invert that.
+			webhttp.WithRecordRouteMetric(func(m webhttp.RequestMetric) {
+				obs.RecordHTTP(m.Method, m.Path, m.Status, m.Latency)
+			}),
 		),
 		webhttp.Recoverer(),
 		// Immediately outside the Host policy, counting the refusal it answers:
@@ -302,8 +308,8 @@ func countHostRefusals(hosts *webhttp.HostPolicy) webhttp.Middleware {
 // a rebinding request never qualifies.
 func HostPolicyOptions() []webhttp.HostAllowlistOption {
 	return []webhttp.HostAllowlistOption{
-		webhttp.WithLoopbackExempt(),
-		webhttp.WithHostAllowlistError(string(obs.RefusalHostNotAllowed),
+		webhttp.WithLoopbackExempt(true),
+		webhttp.WithHostAllowlistError(webhttp.ErrorCode(obs.RefusalHostNotAllowed),
 			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"),
 	}
 }
