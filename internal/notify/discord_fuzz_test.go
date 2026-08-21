@@ -76,8 +76,8 @@ func FuzzDeliveryErrorNeverCarriesWebhookURL(f *testing.F) {
 //
 // A needle that also appears in the error built for a DIFFERENT (control)
 // webhook URL is skipped: that text came from knell's own message template, so
-// a fuzz tail that happens to contain a phrase like "detail dropped" cannot
-// masquerade as a leak. Everything else is a leak by definition — nothing in
+// a fuzz tail that happens to contain a phrase like "Discord error code"
+// cannot masquerade as a leak. Everything else is a leak by definition — nothing in
 // the delivery path is supposed to depend on the URL at all.
 func assertDeliveryErrorHidesWebhookURL(t *testing.T, rawURL string, status int, body string) {
 	t.Helper()
@@ -203,8 +203,8 @@ func assertNoNeedleLeaked(t *testing.T, gotErr, controlErr error, needles []stri
 
 // assertTypedStatusError checks the other half of the contract the status
 // branch must keep: every non-2xx keeps CheckHTTPStatus's typed error
-// reachable in its chain -- by %w, or by webhookCredentialError's own Unwrap
-// on the 401/403 path -- which is what lets httpx.Do classify 502/503/504 as transient
+// reachable in its chain by %w, which is what lets httpx.Do classify
+// 502/503/504 as transient
 // and find the 429's *RateLimitError. A run where the request was never made
 // (an unusable fuzzed URL) reaches no status at all, and a 2xx is a delivery.
 //
@@ -271,15 +271,15 @@ func webhookNeedles(rawURL string) []string {
 		if suffix, ok := strings.CutPrefix(p, "/api/webhooks/"); ok {
 			needles = append(needles, suffix)
 		}
-		if i := strings.LastIndex(p, "/"); i >= 0 {
-			needles = append(needles, p[i+1:])
+		if _, lastSegment, ok := strings.CutLast(p, "/"); ok {
+			needles = append(needles, lastSegment)
 		}
 	}
 	needles = append(needles, u.RawQuery)
 	for _, values := range u.Query() {
 		needles = append(needles, values...)
 	}
-	for _, form := range needles[:len(needles):len(needles)] {
+	for _, form := range slices.Clip(needles) {
 		if escaped := strings.ReplaceAll(form, "/", `\/`); escaped != form {
 			needles = append(needles, escaped)
 		}
@@ -294,7 +294,7 @@ func webhookNeedles(rawURL string) []string {
 // segment carrying a quote, a backslash or a control byte renders escaped
 // there, so the raw needle alone would not match it.
 func withQuotedForms(needles []string) []string {
-	for _, form := range needles[:len(needles):len(needles)] {
+	for _, form := range slices.Clip(needles) {
 		q := strconv.Quote(form)
 		if quoted := q[1 : len(q)-1]; quoted != form {
 			needles = append(needles, quoted)
@@ -310,10 +310,10 @@ func withQuotedForms(needles []string) []string {
 // redirect to <host>`), so an endpoint answering a webhook POST with a
 // redirect that echoes the request URI would put the credential into the
 // returned error and into httpx.Do's attempt lines without ever sending a
-// body. TestRedirectDerivedTransportErrorsCarryNoRemoteText pins two
-// hand-picked shapes; this target explores the whole header space and the
-// whole 3xx band, so the seed corpus committed here is the durable coverage of
-// the class (the weekly run's generated corpus is discarded).
+// body. This target is the class's only pin: it explores the whole header
+// space and the whole 3xx band, so the seed corpus committed here is the
+// durable coverage of the class (the weekly run's generated corpus is
+// discarded).
 func FuzzRedirectResponsesNeverCarryLocationText(f *testing.F) {
 	// Seed Locations cover the shapes that reach a different cause: an
 	// unparseable header, a cross-host method-preserving hop (refused by
@@ -345,9 +345,11 @@ func FuzzRedirectResponsesNeverCarryLocationText(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, location string, statusSeed uint8) {
 		// The whole redirect band: 301/302/303 are the method-changing hops
-		// the policy surfaces as a 3xx, 307/308 the method-preserving ones it
-		// refuses with an error, and 300/304/305/306 reach net/http's
-		// no-usable-Location path.
+		// WithPreserveMethod refuses, and it refuses them by surfacing the 3xx
+		// itself (http.ErrUseLastResponse, not an error); 307/308 preserve the
+		// method and are followed when same-host, so they produce a cause only
+		// through WithSameHost's hard refusal or the hop cap; 300/304/305/306
+		// are not redirect statuses to net/http at all, so no Location is read.
 		status := 300 + int(statusSeed%9)
 		const rawURL = "https://discord.example/api/webhooks/1234567890/plainsegment"
 		// The control attempt differs in BOTH the webhook URL and the
@@ -383,8 +385,8 @@ func locationNeedles(location string) []string {
 	if u, err := url.Parse(location); err == nil {
 		needles = append(needles, u.Host, u.Hostname(), u.Path, u.EscapedPath(), u.RawQuery)
 	}
-	if i := strings.LastIndex(location, "/"); i >= 0 {
-		needles = append(needles, location[i+1:])
+	if _, lastSegment, ok := strings.CutLast(location, "/"); ok {
+		needles = append(needles, lastSegment)
 	}
 	return withQuotedForms(needles)
 }

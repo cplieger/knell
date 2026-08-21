@@ -48,38 +48,27 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 	live := watch.Transition{Started: started, Observed: observed}
 
 	// Both fixtures carry the LONGEST clause of their shape, measured rather than
-	// presumed: lateClause's LateSchedulerDeferred branch is 176 characters
-	// against 111 for LateEndedBeforeDetection and 69 for LateUndelivered, and
-	// batchLateClause's all-deferred whole-batch sentence is 141 against 135 for
-	// the mixed three-reason count at watch's MaxHistoryBatch bound, 72 for
-	// all-ended and 58 for all-undelivered. So the single record and every record
-	// of the widest batch name LateSchedulerDeferred. The mixed batch is kept as a
+	// presumed: lateClause's nothing-attempted branch is 105 characters against 69
+	// for the refused-delivery branch, and batchLateClause's none-attempted
+	// whole-batch sentence is 86 against 72 for the mixed count at watch's
+	// MaxHistoryBatch bound and 58 for all-delayed. So the single record and every
+	// record of the widest batch are unattempted. The mixed batch is kept as a
 	// second case because it is the only shape that renders COUNTS, whose digit
-	// width grows if MaxHistoryBatch ever passes 9 — a batch that names one reason
-	// keeps that reason's own sentence and never a count of itself.
-	single := []watch.Outage{{Started: started, Recovered: observed, LateReason: watch.LateSchedulerDeferred}}
-	deferred := make([]watch.Outage, 0, watch.MaxHistoryBatch)
+	// width grows if MaxHistoryBatch ever passes 9 — a whole-batch sentence never
+	// carries a count of itself.
+	single := []watch.Outage{{Started: started, Recovered: observed}}
+	unattempted := make([]watch.Outage, 0, watch.MaxHistoryBatch)
 	for range watch.MaxHistoryBatch {
-		deferred = append(deferred, watch.Outage{
-			Started:    started,
-			Recovered:  observed,
-			LateReason: watch.LateSchedulerDeferred,
-		})
+		unattempted = append(unattempted, watch.Outage{Started: started, Recovered: observed})
 	}
-	// The mixed batch cycles through ALL THREE reasons, because the count
-	// sentence names one count per reason: a two-reason batch measures a clause a
-	// real three-cause batch overruns.
-	reasons := []watch.LateReason{
-		watch.LateUndelivered,
-		watch.LateSchedulerDeferred,
-		watch.LateEndedBeforeDetection,
-	}
+	// The mixed batch is the widest count sentence: one refused and the rest not,
+	// so both counts render at their maximum digit width for this bound.
 	mixed := make([]watch.Outage, 0, watch.MaxHistoryBatch)
 	for i := range watch.MaxHistoryBatch {
 		mixed = append(mixed, watch.Outage{
-			Started:    started,
-			Recovered:  observed,
-			LateReason: reasons[i%len(reasons)],
+			Started:     started,
+			Recovered:   observed,
+			Undelivered: i == 0,
 		})
 	}
 
@@ -87,7 +76,7 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 		"missing":               func() error { return d.BeatMissing(t.Context(), id, live) },
 		"recovered":             func() error { return d.BeatRecovered(t.Context(), id, live) },
 		"history one":           func() error { return d.BeatOutageHistory(t.Context(), id, single) },
-		"history several":       func() error { return d.BeatOutageHistory(t.Context(), id, deferred) },
+		"history several":       func() error { return d.BeatOutageHistory(t.Context(), id, unattempted) },
 		"history several mixed": func() error { return d.BeatOutageHistory(t.Context(), id, mixed) },
 	}
 	for name, send := range cases {
@@ -96,8 +85,8 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 				t.Fatalf("sending the %s notice: %v", name, err)
 			}
 			content := <-rec.contents
-			if runes := len([]rune(content)); runes >= discordContentLimit {
-				t.Errorf("the %s notice renders %d characters at the worst case, want under Discord's %d-character content limit: either shorten the template or lower MaxNodeNameBytes, because Discord answers 400 for an over-limit content and the notice is never delivered",
+			if runes := len([]rune(content)); runes > discordContentLimit {
+				t.Errorf("the %s notice renders %d characters at the worst case, want at most Discord's %d-character content limit: either shorten the template or lower MaxNodeNameBytes, because Discord answers 400 for an over-limit content and the notice is never delivered",
 					name, runes, discordContentLimit)
 			}
 		})

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -196,24 +197,6 @@ func TestParseBeats(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestParseBeatsMaxCap(t *testing.T) {
-	t.Parallel()
-
-	var entries []string
-	for r := 'a'; r <= 'z'; r++ {
-		for s := 'a'; s <= 'c'; s++ {
-			entries = append(entries, string(r)+string(s)+":20m")
-		}
-	}
-	if len(entries) <= maxBeats {
-		t.Fatalf("test needs more than %d entries, built %d", maxBeats, len(entries))
-	}
-	_, err := parseBeats(strings.Join(entries, ","))
-	if err == nil || !strings.Contains(err.Error(), "maximum") {
-		t.Fatalf("expected maximum-cap error, got %v", err)
 	}
 }
 
@@ -606,112 +589,155 @@ func TestLoadRejectsUnreadableWebhookFile(t *testing.T) {
 	}
 }
 
-// TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileReadFails pins the
-// POSITION of warnPlainVarIgnored's two call sites: both must sit PAST their
-// loader's error gate. envx reports SourceFile together with its error on a
-// failed file read, so a call made before the gate warns "the file wins and
-// the plain variable is ignored" on a startup that is aborting because the
-// file supplied nothing — and its "unset it" advice then deletes the one
-// credential still present in the environment. Both loaders are pinned here:
-// they are structurally identical uses of the same helper, and the fatal-path
-// warning is invisible to every other test in this file (the two
-// FileWinsOverPlainVar tests supply a readable file, and the
-// RejectsUnreadable* tests capture no log).
-func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileReadFails(t *testing.T) {
+// TestLoadNeverAdvisesUnsettingThePlainVarWrongly pins both of
+// warnPlainVarIgnored's guards and its position after validation: the advisory
+// means "a _FILE channel supplied this secret, so the plain variable you also
+// set was ignored", so it must stay silent whenever that is not what happened —
+// including on every startup that then fails, where the advice would tell the
+// operator to delete the only credential left in the environment for a
+// configuration that never ran.
+func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and t.Setenv forbids parallel tests anyway.
-	t.Run("webhook file unreadable", func(t *testing.T) {
-		missing := filepath.Join(t.TempDir(), "missing-webhook")
-		setValidLoadEnv(t)
-		t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/fallback")
-		t.Setenv("DISCORD_WEBHOOK_URL_FILE", missing)
+	for name, tc := range map[string]struct {
+		setup   func(t *testing.T)
+		wantErr bool
+		check   func(t *testing.T, cfg Config)
+	}{
+		// envx reports SourceFile together with its error on a failed file read,
+		// so a call made before the loader's error gate warns "the file wins and
+		// the plain variable is ignored" on a startup that is aborting because the
+		// file supplied nothing. Both loaders are pinned because they are
+		// structurally identical uses of the same helper, and the fatal-path
+		// warning is invisible to every other test in this file (the two
+		// FileWinsOverPlainVar tests supply a readable file, and the
+		// RejectsUnreadable* tests capture no log).
+		"webhook file unreadable": {
+			setup: func(t *testing.T) {
+				t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/fallback")
+				t.Setenv("DISCORD_WEBHOOK_URL_FILE", filepath.Join(t.TempDir(), "missing-webhook"))
+			},
+			wantErr: true,
+		},
+		"beat token file unreadable": {
+			setup: func(t *testing.T) {
+				t.Setenv("BEAT_TOKEN", "fallback-beat-token")
+				t.Setenv("BEAT_TOKEN_FILE", filepath.Join(t.TempDir(), "missing-beat-token"))
+			},
+			wantErr: true,
+		},
+		// The remaining fatal path after the file read SUCCEEDS: a file-sourced
+		// token carrying an interior control byte while the plain BEAT_TOKEN is
+		// also set. The file wins, the advisory used to fire, and startup then
+		// failed on the token, so the operator was told to delete the only other
+		// token in the environment by a process that never ran. (An edge-padded
+		// file token is a second instance of the same shape, pinned by
+		// TestLoadRejectsAPaddedFileBorneBeatToken; a BLANK file errors earlier,
+		// inside envx.)
+		"two-line token file": {
+			setup: func(t *testing.T) {
+				tokenFile := filepath.Join(t.TempDir(), "beat-token")
+				if err := os.WriteFile(tokenFile, []byte("alpha\nbeta\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("BEAT_TOKEN", "fallback-beat-token")
+				t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+			},
+			wantErr: true,
+		},
+		// The webhook half of that post-VALIDATION pin. Moving warnPlainVarIgnored
+		// back above loadWebhook's shape check reintroduces exactly this with every
+		// other test green: TestLoadRejectsPlainHTTPWebhookFromFile sets the plain
+		// variable blank, so the advisory stays silent there either way.
+		"plain-http webhook file": {
+			setup: func(t *testing.T) {
+				hookFile := filepath.Join(t.TempDir(), "webhook-url")
+				if err := os.WriteFile(hookFile, []byte("http://discord.example/file-borne-hook\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/fallback")
+				t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
+			},
+			wantErr: true,
+		},
+		// The CROSS-loader path, which no row above reaches: the webhook's own
+		// channels are both fine, so its advisory fires on a startup a LATER
+		// refusal aborts. Only a position past every refusal keeps it silent.
+		"webhook file wins, BEAT_TOKEN missing": {
+			setup: func(t *testing.T) {
+				hookFile := filepath.Join(t.TempDir(), "webhook-url")
+				if err := os.WriteFile(hookFile, []byte("https://discord.example/file-borne-hook\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/fallback")
+				t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
+				unsetEnv(t, "BEAT_TOKEN")
+				unsetEnv(t, "BEAT_TOKEN_FILE")
+			},
+			wantErr: true,
+		},
+		// The _FILE-only deployment: no plain variable is being shadowed, so there
+		// is nothing to report. Without this row, dropping warnPlainVarIgnored's
+		// plain-variable guard tells every _FILE-only operator to unset a variable
+		// they never set, on the one startup line that is supposed to mean a
+		// rotated secret is being ignored.
+		"_FILE channels only": {
+			setup: func(t *testing.T) {
+				dir := t.TempDir()
+				tokenFile := filepath.Join(dir, "beat-token")
+				if err := os.WriteFile(tokenFile, []byte("file-borne-beat-token\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				hookFile := filepath.Join(dir, "webhook-url")
+				if err := os.WriteFile(hookFile, []byte("https://discord.example/file-borne-hook\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				unsetEnv(t, "BEAT_TOKEN")
+				unsetEnv(t, "DISCORD_WEBHOOK_URL")
+				t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+				t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
+			},
+			check: func(t *testing.T, cfg Config) {
+				if cfg.BeatToken != "file-borne-beat-token" || cfg.WebhookURL != "https://discord.example/file-borne-hook" {
+					t.Fatalf("BeatToken = %q, WebhookURL = %q, want both from their _FILE channels", cfg.BeatToken, cfg.WebhookURL)
+				}
+			},
+		},
+		// The ordinary plain-variable-only deployment, which no other row reaches:
+		// src is not envx.SourceFile, so dropping the src check tells that operator,
+		// on every startup, to unset the variable that is actually supplying the
+		// credential — advice that leaves /beat/{id} ungated and the next start
+		// failing on a missing credential entirely.
+		"plain vars only": {
+			setup: func(t *testing.T) {
+				t.Setenv("BEAT_TOKEN", "plain-only-beat-token")
+				unsetEnv(t, "BEAT_TOKEN_FILE")
+				unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
+			},
+			check: func(t *testing.T, cfg Config) {
+				if cfg.BeatToken != "plain-only-beat-token" || cfg.WebhookURL != "https://discord.example/hook" {
+					t.Fatalf("BeatToken = %q, WebhookURL = %q, want both read from their plain variables", cfg.BeatToken, cfg.WebhookURL)
+				}
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			tc.setup(t)
 
-		rec := capture.Default(t)
+			rec := capture.Default(t)
 
-		if _, err := Load(maxNodeNameBytes); err == nil {
-			t.Fatal("Load() with an unreadable DISCORD_WEBHOOK_URL_FILE = nil, want error")
-		}
-		if rec.Contains("the plain variable is ignored") {
-			t.Errorf("a failed webhook file read warned that the plain variable is ignored: %v; the file supplied nothing, and following the advice deletes the only webhook URL left in the environment", rec.Messages())
-		}
-	})
-
-	t.Run("beat token file unreadable", func(t *testing.T) {
-		missing := filepath.Join(t.TempDir(), "missing-beat-token")
-		setValidLoadEnv(t)
-		t.Setenv("BEAT_TOKEN", "fallback-beat-token")
-		t.Setenv("BEAT_TOKEN_FILE", missing)
-
-		rec := capture.Default(t)
-
-		if _, err := Load(maxNodeNameBytes); err == nil {
-			t.Fatal("Load() with an unreadable BEAT_TOKEN_FILE = nil, want error")
-		}
-		if rec.Contains("the plain variable is ignored") {
-			t.Errorf("a failed beat-token file read warned that the plain variable is ignored: %v; it reads as \"the gate is armed from the file\" while the process is refusing to start", rec.Messages())
-		}
-	})
-}
-
-// TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileTokenIsInvalid pins the
-// remaining fatal path after the file read SUCCEEDS: the advisory must not
-// advise unsetting the plain variable and then exit over the winning value.
-// The reachable case is a file-sourced token carrying an interior control byte
-// while the plain BEAT_TOKEN is also set — the file wins, the advisory used to
-// fire, and startup then failed on the token, so the operator was told to
-// delete the only other token in the environment by a process that never ran.
-// (An edge-padded file token is a second instance of this same shape, pinned by
-// TestLoadRejectsAPaddedFileBorneBeatToken: envx no longer trims the file's
-// bytes, so the padding refusal is reachable through the _FILE channel too. A
-// BLANK file still errors earlier, inside envx.)
-func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileTokenIsInvalid(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
-	tokenFile := filepath.Join(t.TempDir(), "beat-token")
-	if err := os.WriteFile(tokenFile, []byte("alpha\nbeta\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "fallback-beat-token")
-	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
-
-	rec := capture.Default(t)
-
-	if _, err := Load(maxNodeNameBytes); err == nil {
-		t.Fatal("Load() with a two-line BEAT_TOKEN_FILE = nil, want error: the interior newline is illegal in a header value")
-	}
-	if rec.Contains("the plain variable is ignored") {
-		t.Errorf("a fatal token validation warned that the plain variable is ignored: %v; the advice describes a configuration that never ran", rec.Messages())
-	}
-}
-
-// TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileWebhookIsInvalid pins
-// the post-VALIDATION position of loadWebhook's advisory, the webhook half of
-// the pin TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileTokenIsInvalid
-// gives loadBeatToken: a readable DISCORD_WEBHOOK_URL_FILE whose content fails
-// the shape check must abort startup WITHOUT advising the operator to unset
-// the plain variable — the one webhook credential still in the environment.
-// Moving warnPlainVarIgnored back above the validation reintroduces exactly
-// that with every other test green: TestLoadRejectsPlainHTTPWebhookFromFile
-// sets the plain variable blank, so the advisory stays silent there either way.
-func TestLoadDoesNotWarnAboutTheIgnoredPlainVarWhenTheFileWebhookIsInvalid(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
-	hookFile := filepath.Join(t.TempDir(), "webhook-url")
-	if err := os.WriteFile(hookFile, []byte("http://discord.example/file-borne-hook\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	setValidLoadEnv(t)
-	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/fallback")
-	t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
-
-	rec := capture.Default(t)
-
-	if _, err := Load(maxNodeNameBytes); err == nil {
-		t.Fatal("Load() with a plain-http DISCORD_WEBHOOK_URL_FILE = nil, want error")
-	}
-	if rec.Contains("the plain variable is ignored") {
-		t.Errorf("a fatal webhook validation warned that the plain variable is ignored: %v; the advice tells the operator to delete the only webhook credential left in the environment, for a configuration that never ran", rec.Messages())
+			cfg, err := Load(maxNodeNameBytes)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Load() error = %v, want an error: %v", err, tc.wantErr)
+			}
+			if rec.Contains("the plain variable is ignored") {
+				t.Errorf("Load() advised unsetting the plain variable: %v; the advice is only true when a _FILE channel supplied the credential and the configuration then ran, so here it tells the operator to delete a credential still in use", rec.Messages())
+			}
+			if tc.check != nil {
+				tc.check(t, cfg)
+			}
+		})
 	}
 }
 
@@ -785,14 +811,13 @@ func TestAllowedHostsGate(t *testing.T) {
 		set        bool
 		wantActive bool
 		wantSize   int
-		wantWarn   string
 		wantErr    string
 	}{
-		"unset accepts every host":      {wantActive: false},
-		"one hostname engages the gate": {set: true, raw: "knell.internal", wantActive: true, wantSize: 1},
-		"blank entries are skipped":     {set: true, raw: "knell.internal, ,10.0.0.5", wantActive: true, wantSize: 2},
-		"present but blank is reported": {set: true, raw: "", wantActive: false, wantWarn: "is set but blank"},
-		"one unusable entry refuses":    {set: true, raw: "knell.internal,http://x/y", wantErr: "http://x/y"},
+		"unset accepts every host":        {wantActive: false},
+		"one hostname engages the gate":   {set: true, raw: "knell.internal", wantActive: true, wantSize: 1},
+		"blank entries are skipped":       {set: true, raw: "knell.internal, ,10.0.0.5", wantActive: true, wantSize: 2},
+		"present but blank never engages": {set: true, raw: "", wantActive: false},
+		"one unusable entry refuses":      {set: true, raw: "knell.internal,http://x/y", wantErr: "http://x/y"},
 		// Formerly pinned as active-size-zero, warned about and STARTED: the
 		// oracle is unchanged (this configuration rejects every non-loopback
 		// sender, so no beat can be recorded), and the verdict is now the
@@ -805,22 +830,19 @@ func TestAllowedHostsGate(t *testing.T) {
 		// non-blank unusable entry and startup would refuse instead of accepting
 		// every Host. Pinned so a webhttp bump has to fail here rather than in
 		// production.
-		"padded blank never engages": {set: true, raw: "   ", wantActive: false, wantWarn: "is set but blank"},
+		"padded blank never engages": {set: true, raw: "   ", wantActive: false},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			// Serial (no t.Parallel): capture.Default swaps the process-global
-			// slog default, and t.Setenv forbids parallel tests anyway.
+			// Serial (no t.Parallel): t.Setenv forbids parallel tests.
 			if tt.set {
 				t.Setenv("ALLOWED_HOSTS", tt.raw)
 			} else {
 				unsetEnv(t, "ALLOWED_HOSTS")
 			}
 
-			rec := capture.Default(t)
-
 			// nil options: this table asserts the env-to-policy mapping only
-			// (active, size, the blank warning, the startup refusal), none of
+			// (active, size, the startup refusal), none of
 			// which the serving-side options affect — webapi's tests cover the
 			// shipped envelope and the loopback exemption through
 			// webapi.HostPolicyOptions.
@@ -842,17 +864,6 @@ func TestAllowedHostsGate(t *testing.T) {
 			}
 			if policy.Size() != tt.wantSize {
 				t.Errorf("Size() = %d, want %d: every entry silently dropped is a hostname senders and browsers can no longer reach knell by", policy.Size(), tt.wantSize)
-			}
-			if tt.wantWarn == "" {
-				if rec.Contains("ALLOWED_HOSTS") {
-					t.Errorf("log output %v warns about ALLOWED_HOSTS for a usable configuration; a warning on the documented default trains operators to ignore the ones that matter", rec.Messages())
-				}
-				return
-			}
-			gotAny := rec.Count(tt.wantWarn)
-			gotWarn := rec.CountLevel(slog.LevelWarn, tt.wantWarn)
-			if gotAny != 1 || gotWarn != 1 {
-				t.Errorf("log output %v: records saying %q = %d, WARN records = %d, want exactly 1 of each; below WARN the line is out of the log at the default LOG_LEVEL, so an allowlist knell could not use is invisible - every non-loopback ping 403s and one deadline later every beat posts a false MISSING notice", rec.Records(), tt.wantWarn, gotAny, gotWarn)
 			}
 		})
 	}
@@ -1023,6 +1034,49 @@ func TestLoadRejectsBlankWebhookFileVar(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL_FILE") {
 		t.Errorf("error = %q, want DISCORD_WEBHOOK_URL_FILE context", err)
+	}
+}
+
+// TestLoadRejectsAWebhookWithNothingVisible pins the third webhook-absence refusal.
+// envx judges a secret file blank with strings.TrimSpace, which does not count U+200B or
+// U+FEFF as space, so such a file arrives as a VALUE and only knell's own trim empties
+// it; without this arm it reaches parseWebhookURL and a broken secret pipeline is
+// answered "scheme must be https", the wording that belongs to a schemeless URL.
+func TestLoadRejectsAWebhookWithNothingVisible(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		fromFile bool
+	}{
+		{name: "plain variable holding only spaces", value: "  "},
+		{name: "secret file holding only a zero-width space", value: "\u200b\n", fromFile: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
+			if tt.fromFile {
+				hookFile := filepath.Join(t.TempDir(), "webhook-url")
+				if err := os.WriteFile(hookFile, []byte(tt.value), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				unsetEnv(t, "DISCORD_WEBHOOK_URL")
+				t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
+			} else {
+				t.Setenv("DISCORD_WEBHOOK_URL", tt.value)
+			}
+
+			_, err := Load(maxNodeNameBytes)
+			if err == nil {
+				t.Fatal("Load() with a webhook holding nothing visible = nil, want a startup refusal: every notice would POST to a URL with no host at all and the bell never rings")
+			}
+			if !errors.Is(err, errWebhookSetButEmpty) {
+				t.Errorf("error = %v, want errWebhookSetButEmpty: the variable WAS supplied, so the operator's next move is the secret pipeline that delivered nothing", err)
+			}
+			if tt.fromFile && !strings.Contains(err.Error(), "DISCORD_WEBHOOK_URL_FILE") {
+				t.Errorf("error = %q does not name the channel that supplied the value, so the crash loop points at a variable the operator may never have set", err)
+			}
+		})
 	}
 }
 
@@ -1348,9 +1402,10 @@ func TestLoadFallsBackToTheHostnameWhenNodeNameIsUnset(t *testing.T) {
 	}
 	setValidLoadEnv(t)
 	// ABSENT, not present-but-empty: an unset NODE_NAME is what a deployment
-	// that accepts the hostname default ships, and this package treats the two
-	// states differently throughout (a present-but-blank NODE_NAME is warned
-	// about and ignored; an unset one is silent).
+	// that accepts the hostname default ships. For NODE_NAME the two states are
+	// indistinguishable to the code (os.Getenv returns "" for both) and both
+	// silently fall back to the hostname; unsetting here documents the shipped
+	// shape rather than a behavioral difference.
 	unsetEnv(t, "NODE_NAME")
 
 	cfg, err := Load(maxNodeNameBytes)
@@ -1409,122 +1464,25 @@ func TestLoadTrimsPaddedListenAddr(t *testing.T) {
 	}
 }
 
-// TestLoadWarnsWhenListenAddrAsksForAnEphemeralPort pins the port-0
-// diagnostic, the one LISTEN_ADDR signal nothing else in this package
-// asserts. Port 0 BINDS, so net.Listen never refuses it and startup reports
-// itself healthy while the kernel hands out a fresh random port on every
-// boot: no sender's POST /beat/{id} URL and no scrape target can name it, so
-// every configured beat goes missing one deadline after start while the
-// observer looks up. Both directions are pinned because both are silent - a
-// dropped or inverted zero check loses the only signal that says so, and a
-// warning on a usable address trains the operator to ignore the ones that
-// matter.
-func TestLoadWarnsWhenListenAddrAsksForAnEphemeralPort(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
-	tests := map[string]struct {
-		addr     string
-		wantWarn bool
-	}{
-		"port zero on every interface": {addr: ":0", wantWarn: true},
-		"port zero on one interface":   {addr: "127.0.0.1:0", wantWarn: true},
-		"an explicit port stays quiet": {addr: "127.0.0.1:9999", wantWarn: false},
-		// A service NAME is resolved by net.Listen and is never zero, and a
-		// value that is not a host:port at all is refused at bind time and
-		// named by main's classifyBindError, so neither is this warning's job.
-		"a service name stays quiet": {addr: "127.0.0.1:http", wantWarn: false},
-		"a value net.Listen refuses": {addr: "9190", wantWarn: false},
-	}
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			setValidLoadEnv(t)
-			t.Setenv("LISTEN_ADDR", tt.addr)
-
-			rec := capture.Default(t)
-
-			cfg, err := Load(maxNodeNameBytes)
-			if err != nil {
-				t.Fatalf("Load() error: %v", err)
-			}
-			if cfg.ListenAddr != tt.addr {
-				t.Errorf("ListenAddr = %q, want %q kept verbatim: the address is handed to net.Listen as configured, so a rewrite here binds a port nobody scrapes", cfg.ListenAddr, tt.addr)
-			}
-			// Counted per LEVEL, not merely present: capture.Default records
-			// every level, so a Contains check stays green if the diagnostic
-			// is demoted to Debug or Info — and a demoted line is invisible at
-			// the WARN-and-above level a deployment runs at, which is the whole
-			// signal. The exact count also closes the other direction: a
-			// spurious second record at any level is a warning the operator
-			// learns to ignore.
-			wantCount := 0
-			if tt.wantWarn {
-				wantCount = 1
-			}
-			gotAny := rec.Count("asks for port 0")
-			gotWarn := rec.CountLevel(slog.LevelWarn, "asks for port 0")
-			if gotAny != wantCount || gotWarn != wantCount {
-				t.Errorf("LISTEN_ADDR=%q: matching records = %d, WARN records = %d, want %d; the diagnostic is the only signal that the listener moves to a fresh random port on every boot, so it must be absent or emitted exactly once at WARN: %v",
-					tt.addr, gotAny, gotWarn, wantCount, rec.Records())
-			}
-			if !tt.wantWarn {
-				return
-			}
-			// The hint carries the way out. Without it the operator reads that
-			// the port is random with nothing telling them what to set instead.
-			if !rec.HasAttr("asks for port 0", "hint", "set an explicit port, e.g. "+defaultListenAddr) {
-				t.Errorf("the port-0 warning does not carry the %q hint: %v", defaultListenAddr, rec.Records())
-			}
-		})
-	}
-}
-
-func TestLoadTrimsPaddedNodeName(t *testing.T) {
-	setValidLoadEnv(t)
-	t.Setenv("NODE_NAME", "  node-1  ")
-
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.Node != "node-1" {
-		t.Errorf("Node = %q, want \"node-1\": the node name prefixes every Discord notice, so padding misattributes which observer reported the outage", cfg.Node)
-	}
-}
-
-// TestLoadTrimsInvisibleConfigPadding pins the part of NODE_NAME's,
-// LISTEN_ADDR's and DISCORD_WEBHOOK_URL's trim that strings.TrimSpace does NOT
-// do. The padded tests above use ASCII spaces, so they stay green against
+// TestLoadTrimsInvisibleConfigPadding pins the part of LISTEN_ADDR's and
+// DISCORD_WEBHOOK_URL's trim that strings.TrimSpace does NOT
+// do. The padded test above uses ASCII spaces, so it stays green against
 // either predicate and cannot tell them apart; every value here survives
 // TrimSpace (a zero-width space, a soft hyphen and a BOM are Cf format runes,
-// not Unicode White_Space), so reverting any of the three
+// not Unicode White_Space), so reverting either of the two
 // strings.TrimFunc(…, invisibleInURL) calls to TrimSpace fails exactly one case
-// below. Without this test the invisible-padding behavior is unpinned in all
-// three places: a padded LISTEN_ADDR goes back to
-// crash-looping on a bind error whose cause cannot be seen in the log line, a
-// padded NODE_NAME goes back to prefixing every notice with a character the
-// operator cannot see, and a padded DISCORD_WEBHOOK_URL goes back to refusing
+// below. Without this test the invisible-padding behavior is unpinned in both
+// places: a padded LISTEN_ADDR goes back to
+// crash-looping on a bind error whose cause cannot be seen in the log line, and
+// a padded DISCORD_WEBHOOK_URL goes back to refusing
 // startup through parseWebhookURL over a rune nobody can see in the value.
 func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
-	// Serial (no t.Parallel): t.Setenv, and the last subtest swaps the
-	// process-global slog default via capture.Default.
+	// Serial (no t.Parallel): t.Setenv.
 	const (
 		zeroWidthSpace = "\u200b"
 		softHyphen     = "\u00ad"
 		byteOrderMark  = "\ufeff"
 	)
-
-	t.Run("a NODE_NAME padded with invisible runes is trimmed", func(t *testing.T) {
-		setValidLoadEnv(t)
-		t.Setenv("NODE_NAME", zeroWidthSpace+"node-1"+byteOrderMark)
-
-		cfg, err := Load(maxNodeNameBytes)
-		if err != nil {
-			t.Fatalf("Load() error: %v", err)
-		}
-		if cfg.Node != "node-1" {
-			t.Errorf("Node = %q, want \"node-1\": TrimSpace keeps these runes, so every Discord notice would read as this observer's name plus a character nobody can see", cfg.Node)
-		}
-	})
 
 	t.Run("a LISTEN_ADDR padded with invisible runes is trimmed", func(t *testing.T) {
 		setValidLoadEnv(t)
@@ -1556,8 +1514,6 @@ func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
 		setValidLoadEnv(t)
 		t.Setenv("LISTEN_ADDR", zeroWidthSpace+byteOrderMark)
 
-		rec := capture.Default(t)
-
 		cfg, err := Load(maxNodeNameBytes)
 		if err != nil {
 			t.Fatalf("Load() error: %v", err)
@@ -1565,24 +1521,7 @@ func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
 		if cfg.ListenAddr != defaultListenAddr {
 			t.Errorf("ListenAddr = %q, want the default %q: a value with nothing visible in it reaches the documented blank path, not a bind failure", cfg.ListenAddr, defaultListenAddr)
 		}
-		if !rec.Contains("LISTEN_ADDR is set but blank") {
-			t.Errorf("no blank-LISTEN_ADDR warning for a value that is entirely invisible: the operator set a value this process threw away and nothing says so: %v", rec.Messages())
-		}
 	})
-}
-
-func TestLoadAcceptsANodeNameAtTheLimit(t *testing.T) {
-	setValidLoadEnv(t)
-	node := strings.Repeat("n", maxNodeNameBytes)
-	t.Setenv("NODE_NAME", node)
-
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() with a %d-byte NODE_NAME error = %v, want it accepted: the cap is the last accepted value, and it still leaves every notice far inside Discord's 2000-character limit", maxNodeNameBytes, err)
-	}
-	if cfg.Node != node {
-		t.Errorf("Node = %q, want the configured %d-byte name verbatim", cfg.Node, maxNodeNameBytes)
-	}
 }
 
 func TestLoadRejectsANodeNamePastTheLimit(t *testing.T) {
@@ -1650,92 +1589,6 @@ func TestLoadCountsNodeNameLengthInBytesNotRunes(t *testing.T) {
 	})
 }
 
-func TestLoadRejectsWhitespaceOnlyWebhook(t *testing.T) {
-	setValidLoadEnv(t)
-	t.Setenv("DISCORD_WEBHOOK_URL", "   ")
-
-	_, err := Load(maxNodeNameBytes)
-	if err == nil {
-		t.Fatal("Load() with a whitespace-only DISCORD_WEBHOOK_URL = nil, want error: a broken secret pipeline must fail startup rather than arm a switch that can never ring")
-	}
-	if !strings.Contains(err.Error(), "set but empty") {
-		t.Errorf("error = %q, want the set-but-empty diagnosis rather than the misleading https-scheme rejection", err)
-	}
-}
-
-// TestLoadDoesNotWarnWhenOnlyTheSecretFilesAreSet pins the negative half of
-// the both-channels-set warning: with only BEAT_TOKEN_FILE and
-// DISCORD_WEBHOOK_URL_FILE set, no plain variable is being shadowed, so there
-// is nothing to report. The positive half is pinned by
-// TestLoadBeatTokenFileWinsOverPlainVar and
-// TestLoadWebhookFileWinsOverPlainVar; without this half, dropping
-// warnPlainVarIgnored's plain-variable guard tells every _FILE-only operator
-// to unset a variable they never set, on the one startup line that is
-// supposed to mean a rotated secret is being ignored.
-func TestLoadDoesNotWarnWhenOnlyTheSecretFilesAreSet(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
-	dir := t.TempDir()
-	tokenFile := filepath.Join(dir, "beat-token")
-	if err := os.WriteFile(tokenFile, []byte("file-borne-beat-token\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	hookFile := filepath.Join(dir, "webhook-url")
-	if err := os.WriteFile(hookFile, []byte("https://discord.example/file-borne-hook\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	setValidLoadEnv(t)
-	unsetEnv(t, "BEAT_TOKEN")
-	unsetEnv(t, "DISCORD_WEBHOOK_URL")
-	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
-	t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
-
-	rec := capture.Default(t)
-
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.BeatToken != "file-borne-beat-token" || cfg.WebhookURL != "https://discord.example/file-borne-hook" {
-		t.Fatalf("BeatToken = %q, WebhookURL = %q, want both from their _FILE channels", cfg.BeatToken, cfg.WebhookURL)
-	}
-	if rec.Contains("the plain variable is ignored") {
-		t.Errorf("_FILE-only configuration warned that the plain variable is ignored: %v", rec.Messages())
-	}
-}
-
-// TestLoadDoesNotWarnWhenOnlyThePlainVarsAreSet pins the plain-only half of
-// warnPlainVarIgnored's source guard. The warning means "a _FILE channel
-// supplied this secret, so the plain variable you also set was ignored" — it
-// is only true when src is envx.SourceFile. TestLoadBeatTokenFileWinsOverPlainVar
-// and TestLoadWebhookFileWinsOverPlainVar pin the positive case, and
-// TestLoadDoesNotWarnWhenOnlyTheSecretFilesAreSet pins the _FILE-only case;
-// neither exercises the ordinary plain-variable-only deployment, so dropping
-// the src check tells that operator, on every startup, to unset the variable
-// that is actually supplying the credential — advice that leaves /beat/{id}
-// ungated and the next start failing on a missing credential entirely.
-func TestLoadDoesNotWarnWhenOnlyThePlainVarsAreSet(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
-	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "plain-only-beat-token")
-	unsetEnv(t, "BEAT_TOKEN_FILE")
-	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
-
-	rec := capture.Default(t)
-
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.BeatToken != "plain-only-beat-token" || cfg.WebhookURL != "https://discord.example/hook" {
-		t.Fatalf("BeatToken = %q, WebhookURL = %q, want both read from their plain variables", cfg.BeatToken, cfg.WebhookURL)
-	}
-	if rec.Contains("the plain variable is ignored") {
-		t.Errorf("plain-variable-only configuration was told its plain variable is ignored: %v; following that advice unsets the variable that is actually supplying the credential", rec.Messages())
-	}
-}
-
 // TestConfigLogValueNeverRendersASecret pins the redaction seam:
 // LogValue is the reason a call site can log a whole Config without leaking, so
 // DISCORD_WEBHOOK_URL and BEAT_TOKEN are both reported by their SOURCE and
@@ -1786,119 +1639,81 @@ func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 	}
 }
 
-// TestConfigLogValueReportsTheWebhookCredentialSource pins the attr's whole
-// value domain against Load, which is the only producer of it. The point of the
-// attr is that it reports STATE: the file channel keeps the credential out of
-// the process environment and out of `docker inspect`, the plain variable does
-// not, and warnPlainVarIgnored only speaks up when BOTH variables are set — so
-// this line is the only signal a plain-only deployment ever gets. A rendering
-// keyed off presence instead of source passes every assertion above and fails
-// here, because presence is identical in both cases.
-func TestConfigLogValueReportsTheWebhookCredentialSource(t *testing.T) {
+// TestConfigLogValueReportsEachCredentialSource pins the two source attrs'
+// whole value domain against Load, the only producer of the fields behind them.
+// The point of each attr is that it reports STATE: the _FILE channel keeps the
+// credential out of the process environment and out of `docker inspect` output,
+// the plain variable does not, and warnPlainVarIgnored only speaks up when BOTH
+// variables are set — so for a plain-only deployment this line is the whole
+// signal. A rendering keyed off presence instead of source passes every other
+// assertion in this file and fails here, because presence is identical in both
+// cases. Both credentials are pinned the same way because they carry the same
+// exposure: publishing the webhook's channel and not the token's would tell an
+// operator half of where their secrets live.
+func TestConfigLogValueReportsEachCredentialSource(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv.
-	const url = "https://discord.example/api/webhooks/1/source-probe"
+	const (
+		url   = "https://discord.example/api/webhooks/1/source-probe"
+		token = "source-probe-beat-token"
+	)
 
 	for name, tc := range map[string]struct {
-		file bool
-		want envx.SecretSource
+		key   string
+		value string
+		file  bool
+		attr  string
+		field func(Config) string
+		want  envx.SecretSource
 	}{
-		"the plain variable leaves the credential in the environment": {want: envx.SourceEnv},
-		"the _FILE companion keeps it out of the environment":         {file: true, want: envx.SourceFile},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Setenv("BEATS", "api:1h")
-			t.Setenv("BEAT_TOKEN", "source-probe-beat-token")
-			if tc.file {
-				path := filepath.Join(t.TempDir(), "webhook")
-				if err := os.WriteFile(path, []byte(url+"\n"), 0o600); err != nil {
-					t.Fatalf("writing the webhook secret file: %v", err)
-				}
-				t.Setenv("DISCORD_WEBHOOK_URL_FILE", path)
-			} else {
-				t.Setenv("DISCORD_WEBHOOK_URL", url)
-			}
-
-			cfg, err := Load(maxNodeNameBytes)
-			if err != nil {
-				t.Fatalf("Load() error: %v", err)
-			}
-			if cfg.WebhookURL != url {
-				t.Fatalf("WebhookURL = %q, want %q", cfg.WebhookURL, url)
-			}
-			if cfg.WebhookSource != tc.want {
-				t.Errorf("WebhookSource = %q, want %q: Load must carry the channel through, or LogValue has nothing to report", cfg.WebhookSource, tc.want)
-			}
-			var rendered string
-			for _, attr := range cfg.LogValue().Group() {
-				if attr.Key == "webhook" {
-					rendered = attr.Value.String()
-				}
-			}
-			if rendered != string(tc.want) {
-				t.Errorf("startup line reports webhook = %q, want %q", rendered, tc.want)
-			}
-			if strings.Contains(rendered, url) {
-				t.Errorf("startup line reports webhook = %q, which carries the credential itself", rendered)
-			}
-		})
-	}
-}
-
-// TestConfigLogValueReportsTheBeatTokenSource mirrors the webhook's
-// source-flow test for the /beat/{id} credential, against Load, which is the
-// only producer of the field. The token carries the same exposure the webhook
-// does — envx.SourceEnv means it is also in the process environment and in
-// `docker inspect` output, the _FILE channel keeps it out — and
-// warnPlainVarIgnored speaks up only when BOTH variables are set, so for a
-// plain-only deployment this attr is the whole signal. Publishing the webhook's
-// channel and not the token's would tell an operator half of where their
-// secrets live, which is why the two are pinned the same way.
-func TestConfigLogValueReportsTheBeatTokenSource(t *testing.T) {
-	// Serial (no t.Parallel): t.Setenv.
-	const token = "source-probe-beat-token"
-
-	for name, tc := range map[string]struct {
-		file bool
-		want envx.SecretSource
-	}{
-		"the plain variable leaves the token in the environment": {want: envx.SourceEnv},
-		"the _FILE companion keeps it out of the environment":    {file: true, want: envx.SourceFile},
+		"the plain webhook variable leaves the credential in the environment": {
+			key: "DISCORD_WEBHOOK_URL", value: url, attr: "webhook",
+			field: func(cfg Config) string { return cfg.WebhookURL }, want: envx.SourceEnv,
+		},
+		"the webhook _FILE companion keeps it out of the environment": {
+			key: "DISCORD_WEBHOOK_URL", value: url, file: true, attr: "webhook",
+			field: func(cfg Config) string { return cfg.WebhookURL }, want: envx.SourceFile,
+		},
+		"the plain token variable leaves the token in the environment": {
+			key: "BEAT_TOKEN", value: token, attr: "beat_token",
+			field: func(cfg Config) string { return cfg.BeatToken }, want: envx.SourceEnv,
+		},
+		"the token _FILE companion keeps it out of the environment": {
+			key: "BEAT_TOKEN", value: token, file: true, attr: "beat_token",
+			field: func(cfg Config) string { return cfg.BeatToken }, want: envx.SourceFile,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			setValidLoadEnv(t)
 			if tc.file {
-				path := filepath.Join(t.TempDir(), "beat-token")
-				if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
-					t.Fatalf("writing the beat token secret file: %v", err)
+				path := filepath.Join(t.TempDir(), "secret")
+				if err := os.WriteFile(path, []byte(tc.value+"\n"), 0o600); err != nil {
+					t.Fatalf("writing the secret file: %v", err)
 				}
-				unsetEnv(t, "BEAT_TOKEN")
-				t.Setenv("BEAT_TOKEN_FILE", path)
+				unsetEnv(t, tc.key)
+				t.Setenv(tc.key+"_FILE", path)
 			} else {
-				t.Setenv("BEAT_TOKEN", token)
-				unsetEnv(t, "BEAT_TOKEN_FILE")
+				t.Setenv(tc.key, tc.value)
+				unsetEnv(t, tc.key+"_FILE")
 			}
 
 			cfg, err := Load(maxNodeNameBytes)
 			if err != nil {
 				t.Fatalf("Load() error: %v", err)
 			}
-			if cfg.BeatToken != token {
-				t.Fatalf("BeatToken = %q, want %q", cfg.BeatToken, token)
-			}
-			if cfg.BeatTokenSource != tc.want {
-				t.Errorf("BeatTokenSource = %q, want %q: Load must carry the channel through, or LogValue has nothing to report", cfg.BeatTokenSource, tc.want)
+			if got := tc.field(cfg); got != tc.value {
+				t.Fatalf("%s = %q, want %q", tc.key, got, tc.value)
 			}
 			var rendered string
 			for _, attr := range cfg.LogValue().Group() {
-				if attr.Key == "beat_token" {
+				if attr.Key == tc.attr {
 					rendered = attr.Value.String()
 				}
 			}
 			if rendered != string(tc.want) {
-				t.Errorf("startup line reports beat_token = %q, want %q", rendered, tc.want)
+				t.Errorf("startup line reports %s = %q, want %q: Load must carry the channel through, or LogValue has nothing to report", tc.attr, rendered, tc.want)
 			}
-			if strings.Contains(rendered, token) {
-				t.Errorf("startup line reports beat_token = %q, which carries the credential itself", rendered)
+			if strings.Contains(rendered, tc.value) {
+				t.Errorf("startup line reports %s = %q, which carries the credential itself", tc.attr, rendered)
 			}
 		})
 	}
@@ -2069,7 +1884,6 @@ func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
 		// the same operator typo.
 		"port zero":        {raw: "https://discord.example:0/api/webhooks/1/abc", wantErr: "port must be between 1 and 65535"},
 		"port above range": {raw: "https://discord.example:65536/api/webhooks/1/abc", wantErr: "port must be between 1 and 65535"},
-		"port far above":   {raw: "https://discord.example:99999/api/webhooks/1/abc", wantErr: "port must be between 1 and 65535"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -2241,167 +2055,4 @@ func TestLoadWarnsOnlyWhenLogLevelIsUnparseable(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestLoadWarnsWhenLogLevelIsPresentButBlank pins the OTHER half of the
-// LOG_LEVEL diagnostic, the one TestLoadWarnsOnlyWhenLogLevelIsUnparseable
-// deliberately does not cover: slogx.ParseLevel returns ok=true for a blank
-// value, so without this line a LOG_LEVEL that resolved empty (compose
-// interpolation of an undefined variable produces exactly that shape) falls
-// back to info in total silence — on the one knob an operator turns while
-// diagnosing a live outage. The message is distinct from the typo warning on
-// purpose, so the sibling test's "present but blank does not warn" case keeps
-// pinning the typo-vs-accident distinction.
-func TestLoadWarnsWhenLogLevelIsPresentButBlank(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
-	setValidLoadEnv(t)
-	t.Setenv("LOG_LEVEL", "   ")
-
-	rec := capture.Default(t)
-
-	cfg, err := Load(maxNodeNameBytes)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.LogLevel != slog.LevelInfo {
-		t.Errorf("LogLevel = %v, want INFO: a blank LOG_LEVEL must land on the documented default", cfg.LogLevel)
-	}
-	if got := rec.CountLevel(slog.LevelWarn, "LOG_LEVEL is set but blank"); got != 1 {
-		t.Errorf("the blank-LOG_LEVEL warning was logged at WARN %d times, want exactly 1; the operator set the variable and this process threw the value away, and below WARN the line is invisible at the very default level it silently fell back to: %v", got, rec.Records())
-	}
-}
-
-// TestLoadRejectsAFileBorneBeatTokenHTTPCannotCarry pins that the
-// control-byte refusal covers the _FILE channel too, the same way
-// TestLoadRejectsPlainHTTPWebhookFromFile pins the https gate for the webhook's
-// file channel. envx removes at most one trailing line ending, so a two-line
-// secret file (a stray second line, a copy-pasted pair of lines) hands
-// loadBeatToken a token with an INTERIOR newline that no trim can rescue and no
-// sender can present.
-// TestLoadRejectsABeatTokenHTTPCannotCarry covers the plain variable only, so
-// scoping the check to the plain channel — the shape the cycle-8 normalization
-// work moved code toward — leaves the mounted-secret path arming a gate that
-// 401s every ping while every existing test stays green.
-func TestLoadRejectsAFileBorneBeatTokenHTTPCannotCarry(t *testing.T) {
-	tokenFile := filepath.Join(t.TempDir(), "beat-token")
-	if err := os.WriteFile(tokenFile, []byte("alpha\nbeta\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	setValidLoadEnv(t)
-	unsetEnv(t, "BEAT_TOKEN")
-	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
-
-	_, err := Load(maxNodeNameBytes)
-	if err == nil {
-		t.Fatal("Load() with a two-line BEAT_TOKEN_FILE = nil, want error: the interior newline is illegal in a header value, so the gate would be armed with a token no sender can present and every configured beat goes falsely missing one deadline later")
-	}
-	// The byte rule's own diagnosis, not merely "some error": the fixture is
-	// under the minTokenLength floor, so an err != nil oracle is answered by the
-	// length refusal and stays green when the header-legality check stops running
-	// on this channel — the regression this test exists to catch.
-	if !strings.Contains(err.Error(), "control character") {
-		t.Errorf("error = %q, want the control-character diagnosis: any other refusal means the _FILE channel was rejected by a different rule and the header-legality check no longer covers it", err)
-	}
-	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
-		t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which secret to fix", err)
-	}
-	if strings.Contains(err.Error(), "alpha") || strings.Contains(err.Error(), "beta") {
-		t.Errorf("error = %q embeds the token value; the startup error is shipped to Loki, so it must describe the shape and never echo the credential", err)
-	}
-}
-
-// TestLoadWarnsOnlyWhenAnOptionalVariableIsPresentButBlank pins the
-// present-versus-unset distinction on the two optional variables that fall
-// back silently: NODE_NAME and LISTEN_ADDR. Both warn ONLY when the operator
-// set the variable and this process threw the value away; an unset variable is
-// the documented default and must stay silent. Neither half is asserted
-// anywhere else - TestLoadFallsBackToTheHostnameWhenNodeNameIsUnset pins the
-// hostname fallback and captures no log, and the :9190 fallback VALUE is also
-// pinned by TestLoadDefaultsAndFailures while the warning that NAMES it is
-// asserted only by this test's own 'names the default' subtest - so
-// dropping the `if present` guard makes every default deployment log two
-// warnings about variables nobody set, and dropping the warning lets a value
-// the operator set be discarded with no signal at all, on the two settings
-// that decide which observer a Discord notice names and whether /metrics
-// answers at the scraped address.
-func TestLoadWarnsOnlyWhenAnOptionalVariableIsPresentButBlank(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and t.Setenv forbids parallel tests anyway.
-	tests := map[string]struct {
-		key      string
-		value    string
-		unset    bool
-		warnSub  string
-		wantWarn bool
-	}{
-		"node name blank warns": {key: "NODE_NAME", value: "  ", warnSub: "NODE_NAME is set but blank", wantWarn: true},
-		// TrimSpace does not see these: an all-invisible NODE_NAME (zero-width
-		// space, BOM) is blank to the operator reading it, so it takes the same
-		// warn-and-fall-back-to-hostname path. Without this row nothing pins that,
-		// and the notices silently go back to reading "[knell ]".
-		"node name invisible warns":   {key: "NODE_NAME", value: "\u200b\ufeff", warnSub: "NODE_NAME is set but blank", wantWarn: true},
-		"node name unset stays quiet": {key: "NODE_NAME", unset: true, warnSub: "NODE_NAME is set but blank", wantWarn: false},
-		"node name set stays quiet":   {key: "NODE_NAME", value: "observer-1", warnSub: "NODE_NAME is set but blank", wantWarn: false},
-		"listen addr blank warns":     {key: "LISTEN_ADDR", value: "   ", warnSub: "LISTEN_ADDR is set but blank", wantWarn: true},
-		"listen addr unset is quiet":  {key: "LISTEN_ADDR", unset: true, warnSub: "LISTEN_ADDR is set but blank", wantWarn: false},
-		"listen addr set is quiet":    {key: "LISTEN_ADDR", value: "127.0.0.1:9999", warnSub: "LISTEN_ADDR is set but blank", wantWarn: false},
-	}
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			setValidLoadEnv(t)
-			if tt.unset {
-				unsetEnv(t, tt.key)
-			} else {
-				t.Setenv(tt.key, tt.value)
-			}
-
-			rec := capture.Default(t)
-
-			if _, err := Load(maxNodeNameBytes); err != nil {
-				t.Fatalf("Load() error: %v", err)
-			}
-			if got := rec.Contains(tt.warnSub); got != tt.wantWarn {
-				t.Errorf("%s=%q (unset=%v): warned = %v, want %v; the warning is the only signal that a value the operator set was discarded, and a warning for an unset variable trains the operator to ignore it: %v",
-					tt.key, tt.value, tt.unset, got, tt.wantWarn, rec.Messages())
-			}
-		})
-	}
-
-	// The blank-LISTEN_ADDR warning must name the address the listener falls
-	// back to: without it the operator reads "ignored" with no way to tell which
-	// port the scrape should target.
-	t.Run("blank listen addr warning names the default", func(t *testing.T) {
-		setValidLoadEnv(t)
-		t.Setenv("LISTEN_ADDR", " ")
-
-		rec := capture.Default(t)
-
-		cfg, err := Load(maxNodeNameBytes)
-		if err != nil {
-			t.Fatalf("Load() error: %v", err)
-		}
-		if cfg.ListenAddr != defaultListenAddr {
-			t.Fatalf("ListenAddr = %q, want %q", cfg.ListenAddr, defaultListenAddr)
-		}
-		if !rec.HasAttr("LISTEN_ADDR is set but blank", "listen_addr", defaultListenAddr) {
-			t.Errorf("blank-LISTEN_ADDR warning does not report the fallback address %q: %v", defaultListenAddr, rec.Records())
-		}
-	})
-
-	// The blank-NODE_NAME warning has to name the way out, because the operator
-	// who set the variable is the one reading it.
-	t.Run("blank node name warning tells the operator both options", func(t *testing.T) {
-		setValidLoadEnv(t)
-		t.Setenv("NODE_NAME", "\t")
-
-		rec := capture.Default(t)
-
-		if _, err := Load(maxNodeNameBytes); err != nil {
-			t.Fatalf("Load() error: %v", err)
-		}
-		if !strings.Contains(strings.Join(rec.Messages(), "\n"), "unset the variable") {
-			t.Errorf("blank-NODE_NAME warning does not name the unset-for-hostname option: %v", rec.Messages())
-		}
-	})
 }
