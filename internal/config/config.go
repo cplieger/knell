@@ -322,7 +322,7 @@ func logLevel() slog.Level {
 // which is not the credential the operator pointed knell at, and for BEAT_TOKEN
 // would arm the gate for a stale value while a rotated secret file sat unread.
 // envx.IsBlankSecretFilePath reports the state; the refusal is knell's policy.
-func rejectBlankFileVar(key string) error {
+func rejectBlankFileVar(key envx.Key) error {
 	if envx.IsBlankSecretFilePath(key) {
 		return fmt.Errorf("%s_FILE is set but empty: unset it to configure %s directly, or point it at a secret file", key, key)
 	}
@@ -406,7 +406,7 @@ func fileSourcedValueError(key string, src envx.SecretSource, err error) error {
 // back; its error is sanitized by secretFileError and never wrapped, because it
 // embeds the KEY_FILE value. An absent credential is reported as setButEmpty or
 // missing, which envx cannot tell apart and whose remedies differ.
-func resolveSecret(key string, setButEmpty, missing error) (string, envx.SecretSource, error) {
+func resolveSecret(key envx.Key, setButEmpty, missing error) (string, envx.SecretSource, error) {
 	if err := rejectBlankFileVar(key); err != nil {
 		return "", envx.SourceNone, err
 	}
@@ -415,12 +415,12 @@ func resolveSecret(key string, setButEmpty, missing error) (string, envx.SecretS
 	case err == nil:
 		return value, src, nil
 	case errors.As(err, new(*envx.MissingError)):
-		if v, ok := os.LookupEnv(key); ok && v == "" {
+		if v, ok := os.LookupEnv(string(key)); ok && v == "" {
 			return "", src, setButEmpty
 		}
 		return "", src, fmt.Errorf("%w: %w", missing, err)
 	default:
-		return "", src, secretFileError(key, err)
+		return "", src, secretFileError(string(key), err)
 	}
 }
 

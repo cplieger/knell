@@ -105,7 +105,7 @@ func New(webhookURL, node string) *Discord {
 	// bodyless GET. The Referer deletion is separate: net/http writes the
 	// PREVIOUS request's full URL there, and for a webhook the path IS the
 	// credential.
-	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
+	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithPreserveMethod(true))
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		req.Header.Del("Referer")
 		return policy(req, via)
