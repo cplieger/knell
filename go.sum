@@ -4,8 +4,8 @@ github.com/cplieger/health v1.5.2 h1:EJcp1u5Me5ARd028gbchruhQqYEASMYuxB2cIrEB048
 github.com/cplieger/health v1.5.2/go.mod h1:ViT0fs8p3ZpM1yQeE0k5TroM0SCT/Q56MdKWpv4q9us=
 github.com/cplieger/httpx/v4 v4.3.2 h1:Vba8zyuBmPpeRAKtS9luI/DD5aNoxU+oVO76GQwsIIM=
 github.com/cplieger/httpx/v4 v4.3.2/go.mod h1:5zw0hQHzTI3P6WZHOkZtU/pNhgNCckXvvUykAsH+4PA=
-github.com/cplieger/metrics/v3 v3.0.3 h1:Vv149r/UQJgv8BpS7zT15OJUJ2LGM3fL326FxrB4KM4=
-github.com/cplieger/metrics/v3 v3.0.3/go.mod h1:e3k/oOBcWTqlxiJn4D7N+C3G7VugU/h2GLJMQDUQJRY=
+github.com/cplieger/metrics/v4 v4.0.0 h1:Ps4p3iDwEK9FsxNs94KfPeLBJrpN0xDaQi7hmahVq8I=
+github.com/cplieger/metrics/v4 v4.0.0/go.mod h1:UHgCGvnEbvrx5YCUKxUZcOQEkASPzkIuzi7gJS5jNNI=
 github.com/cplieger/pathinside v1.0.2 h1:KP06X7uiKCrXDhgpg3tv3VYs40vEsECEVhxT1Qu6JGc=
 github.com/cplieger/pathinside v1.0.2/go.mod h1:71xlTttDRbMdtyIqyQGRW+BDIm06s2ploc6T5zNUXng=
 github.com/cplieger/slogx v1.6.2 h1:PfF+3SugvCJn4jYFOWrrLt8CFp2AJVqmnrkxWEDSPGU=
