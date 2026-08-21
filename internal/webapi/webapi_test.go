@@ -16,7 +16,7 @@ import (
 	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // fakeBeater accepts a fixed id set and records what was recorded. closed

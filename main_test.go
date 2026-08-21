@@ -14,13 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/envx"
+	"github.com/cplieger/envx/v2"
 	"github.com/cplieger/health"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // testWebhookSecret is the credential half of the webhook every boot test
