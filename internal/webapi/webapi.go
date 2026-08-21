@@ -13,7 +13,7 @@ import (
 
 	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/knell/internal/watch"
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // maxBeatBody caps how much of a ping request body is drained: draining keeps

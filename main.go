@@ -23,7 +23,7 @@ import (
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/knell/internal/webapi"
 	"github.com/cplieger/slogx"
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // shutdownGrace bounds the whole stop sequence: pre-drain, request drain and
