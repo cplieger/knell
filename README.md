@@ -129,15 +129,22 @@ Plus standard `go_*` / `process_*` runtime metrics.
 
 ## Alerting
 
-knell is itself the alert path for the things it watches, so alert rules about knell should come from a second vantage point (your metrics stack scraping `/metrics`). Ship the group in [`alerts.yaml`](alerts.yaml) and evaluate it with Prometheus or the Mimir ruler:
+knell is itself the alert path for the things it watches, so alert rules about knell have to come from a second vantage point: your metrics stack scraping `/metrics`, and your log stack reading its container log. The group in [`alerts.yaml`](alerts.yaml) is mixed for that reason. Five rules are PromQL, evaluated with Prometheus or the Mimir ruler. Three are LogQL, evaluated with Loki's ruler, because their conditions leave no series to read at all: a switch that refuses its configuration exits before it binds a listener, so it publishes no metrics and a crash-looping container is never scraped.
 
 | Alert | Fires when | Severity |
 | --- | --- | --- |
+| `KnellTargetDown` | `up{job="knell"} == 0` for 15m: knell is not being scraped, so every beat it watches is unmonitored | critical |
+| `KnellTargetAbsent` | `absent(up{job="knell"})` for 15m: knell is not a configured scrape target at all | critical |
 | `KnellBeatOverdue` | `knell_beat_fresh == 0` for 5m: a beat is overdue, and the missing notice may not have reached you | warning |
 | `KnellNotifyFailing` | a delivery failed after retries, or a notification or an outage record was dropped for good | warning |
 | `KnellRestartChurn` | knell restarted more than once inside a beat's deadline window | warning |
+| `KnellExitedWithError` | knell logged its own exit: a refused configuration, a listener it could not bind, an unknown command, or a stop that outlived its grace | critical |
+| `KnellNoticeLostForGood` | a log line reports a notice nothing will retry, including the queued records a stop discards, which move no counter | warning |
+| `KnellAcceptFailing` | the listener logged an accept failure, so pings stop landing while the process stays alive | critical |
 
 `KnellNotifyFailing` carries three `or` legs on purpose. `failed` means the notice is late and the 15s sweep retries it, so you wait. Either `dropped` means nothing will arrive and you reconstruct the window yourself from `knell_beat_last_seen_timestamp_seconds`. Drop the third leg and a permanently lost outage record pages nobody.
+
+`KnellNoticeLostForGood` is the same question on the axis the counters cannot reach. It keys on the `retryable=false` field every notification-loss line carries, which covers the losses a stop causes: queued records and pending recovered notices die with the process and move no counter at all. Keep `LOG_LEVEL` at its `info` default for it to mean that, because those lines sit at `info` and `warn`.
 
 One caveat comes with the boot-armed clock: every restart re-arms each beat's full deadline, so an observer restarting more often than a beat's deadline never fires that beat's alert. That is what `KnellRestartChurn` covers; set its window to your longest beat deadline.
 
