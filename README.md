@@ -9,6 +9,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/knell/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/knell)
 [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/knell/releases)
 
+<!-- hub-overview BEGIN -->
 A dead man's switch in a single tiny container: things ping it while they're alive, and when the pings stop, it rings a Discord webhook.
 
 ## What it does
@@ -22,6 +23,7 @@ You configure named beats, each with a deadline. Anything that can send an HTTP 
 - One missing notice per live outage (delivery is retried every sweep until it succeeds), one recovered notice when the beat returns
 - Outages that were already over before anything could be sent are reported once, in the past tense, with the reason the notice is late, instead of arriving as apparent new failures
 - Unknown beat ids are rejected with 404 and never create metric series
+<!-- hub-overview END -->
 
 ## Quick start
 
