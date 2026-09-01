@@ -199,10 +199,9 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	if rec.Contains(testWebhookSecret) || rec.AttrContains("", "", testWebhookSecret) {
 		t.Errorf("startup log leaks the webhook URL: %v", rec.Messages())
 	}
-	// Every attribute config.LogValue publishes must reach the shipped line:
-	// the hand-picked copy this call site used to build had already dropped
-	// log_level, so an operator diagnosing a level that "did not apply" had
-	// nothing in the configuration line to confirm it against.
+	// Every attribute config.LogValue publishes must reach the shipped line, or
+	// an operator diagnosing a level that "did not apply" has nothing in the
+	// configuration line to confirm it against.
 	if !rec.HasAttr("configuration loaded", "log_level", "INFO") {
 		t.Errorf("startup summary omits the effective log_level: %v", rec.Messages())
 	}
