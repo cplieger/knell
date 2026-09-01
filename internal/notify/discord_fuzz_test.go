@@ -16,15 +16,13 @@ import (
 
 // FuzzDeliveryErrorNeverCarriesWebhookURL checks that arbitrary response
 // statuses and bodies cannot place the configured webhook URL or a
-// credential-bearing path fragment in a delivery error. It invokes
-// postAttempt directly because that is the exact error httpx.Do logs, while
-// avoiding retry backoff and rate-limit waits. It also checks that non-2xx
-// responses retain the typed errors used for retry classification.
+// credential-bearing path fragment in a delivery error, and that non-2xx
+// responses retain the typed errors retry classification depends on.
+// postAttempt is invoked directly because that is the exact error httpx.Do
+// logs, without retry backoff or rate-limit waits.
 func FuzzDeliveryErrorNeverCarriesWebhookURL(f *testing.F) {
-	// Seed bodies stand in for what the other end can answer with; seed tails
-	// for the credential segment of a webhook URL. They deliberately avoid
-	// secret-shaped keywords ("token", "secret", …): a literal that looks like
-	// a real credential trips the repo's secret scan even as fuzz seed data.
+	// Seeds avoid secret-shaped keywords ("token", "secret", …): those trip
+	// the repo's secret scan even as fuzz seed data.
 	for _, seed := range []struct {
 		tail   string
 		status uint16
@@ -32,11 +30,10 @@ func FuzzDeliveryErrorNeverCarriesWebhookURL(f *testing.F) {
 	}{
 		{"1234567890/plainsegment", 404, `{"message": "Unknown Webhook", "code": 10015}`},
 		{"1234567890/plainsegment", 400, `{"message": "Invalid Form Body", "code": 50035, "errors": {"content": {}}}`},
-		// The leak shape behind both real leaks: the body echoes the request
-		// URI, which for a webhook IS the credential.
+		// The body echoes the request URI, which for a webhook IS the
+		// credential.
 		{"1234567890/plainsegment", 503, "502 Bad Gateway: upstream failed for /api/webhooks/1234567890/plainsegment"},
-		// The same echo, JSON-escaped ("\/"), a form no byte-for-byte
-		// filtering of the body ever matched.
+		// Same echo, JSON-escaped ("\/").
 		{"1234567890/plainsegment", 500, `{"message": "failed for \/api\/webhooks\/1234567890\/plainsegment"}`},
 		// The credential-bearing tail alone, with no surrounding URL.
 		{"1234567890/plainsegment", 502, "upstream rejected 1234567890/plainsegment"},
@@ -71,14 +68,10 @@ func FuzzDeliveryErrorNeverCarriesWebhookURL(f *testing.F) {
 }
 
 // assertDeliveryErrorHidesWebhookURL runs one delivery attempt against a stub
-// transport that answers with the given status and body, and checks that the
-// resulting error carries nothing derived from the configured webhook URL.
-//
-// A needle that also appears in the error built for a DIFFERENT (control)
-// webhook URL is skipped: that text came from knell's own message template, so
-// a fuzz tail that happens to contain a phrase like "Discord error code"
-// cannot masquerade as a leak. Everything else is a leak by definition — nothing in
-// the delivery path is supposed to depend on the URL at all.
+// transport and checks the resulting error carries nothing derived from the
+// configured webhook URL. A needle that also appears in the control error
+// (a different webhook URL) is skipped: that text came from knell's own
+// message template, not a leak.
 func assertDeliveryErrorHidesWebhookURL(t *testing.T, rawURL string, status int, body string) {
 	t.Helper()
 
@@ -102,21 +95,14 @@ func assertDeliveryErrorHidesWebhookURL(t *testing.T, rawURL string, status int,
 	assertTypedStatusError(t, gotErr, requested, status)
 }
 
-// controlBody blanks every webhook-derived text in the fuzzed body, byte for
-// byte, so the control attempt renders the same template from an input that
-// does NOT carry the credential. Without it the control shares the fuzzed body
-// verbatim, and a body echoing the request URI -- the shape both real leaks in
-// this file's history came from, and what half the seeds above are -- lands the
-// same text in BOTH errors, so the skip above swallows exactly the leak this
-// target exists to find. Blanking is length-preserving so the control keeps the
-// byte counts and the JSON-with-a-code branch of the real attempt.
-//
-// One fixed fill byte is not enough: a credential fragment made entirely of
-// that byte blanks to ITSELF (rawURL ending in /zzzzzzzz against a body
-// carrying zzzzzzzz), leaving the needle in the control body and re-opening the
-// skip. So each candidate fill is VERIFIED to leave no active needle behind --
-// which also covers a needle re-formed across a blank's boundary -- and the
-// next candidate is tried until one holds.
+// controlBody blanks every webhook-derived text in the fuzzed body so the
+// control attempt renders the same template from an input that does NOT carry
+// the credential; otherwise a body echoing the request URI would land the
+// same text in both errors and the leak oracle above would skip a genuine
+// leak. Blanking is length-preserving so the control keeps the real attempt's
+// byte counts. A single fixed fill byte is not enough (a credential made
+// entirely of that byte blanks to itself), so each candidate fill is verified
+// to leave no needle behind before it is used.
 func controlBody(body string, needles []string) string {
 	active := make([]string, 0, len(needles))
 	for _, needle := range needles {
