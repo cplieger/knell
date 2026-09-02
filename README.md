@@ -131,7 +131,7 @@ Plus standard `go_*` / `process_*` runtime metrics.
 
 ## Alerting
 
-knell is itself the alert path for the things it watches, so alert rules about knell have to come from a second vantage point: your metrics stack scraping `/metrics`, and your log stack reading its container log. The group in [`alerts.yaml`](alerts.yaml) is mixed for that reason. Five rules are PromQL, evaluated with Prometheus or the Mimir ruler. Three are LogQL, evaluated with Loki's ruler, because their conditions leave no series to read at all: a switch that refuses its configuration exits before it binds a listener, so it publishes no metrics and a crash-looping container is never scraped.
+knell is itself the alert path for the things it watches, so alert rules about knell have to come from a second vantage point: your metrics stack scraping `/metrics`, and your log stack reading its container log. The rules ship as one file per expression language for that reason. The five PromQL rules in [`alerts/promql.yaml`](alerts/promql.yaml) go to Prometheus or the Mimir ruler; the three LogQL rules in [`alerts/logql.yaml`](alerts/logql.yaml) go to Loki's ruler. Load each half into its own ruler: neither ruler parses the other's expressions. The three log rules exist because their conditions leave no series to read at all: a switch that refuses its configuration exits before it binds a listener, so it publishes no metrics and a crash-looping container is never scraped.
 
 | Alert | Fires when | Severity |
 | --- | --- | --- |
