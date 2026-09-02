@@ -1,19 +1,14 @@
-# Recommended alert rules for knell. MIXED rule group: five rules are PromQL
-# and three are LogQL, because a dead-man switch that dies takes its own
-# /metrics endpoint with it, and every condition that leaves no series still
-# leaves a log line.
+# Recommended alert rules for knell, the LogQL half: the three rules a Loki
+# ruler evaluates. The other five are PromQL and live in alerts/promql.yaml,
+# because a dead-man switch that dies takes its own /metrics endpoint with it,
+# and every condition that leaves no series still leaves a log line. Load each
+# half into its own ruler: neither ruler parses the other's expressions.
 #
 # These rules watch knell itself, so they must come from a second vantage point.
 # knell is the alert path for the things it watches, and an observer cannot
 # report its own silence.
 #
-# The five PromQL rules (KnellTargetDown, KnellTargetAbsent, KnellBeatOverdue,
-# KnellNotifyFailing, KnellRestartChurn) read series from /metrics: scrape it
-# and evaluate them with Prometheus or the Mimir ruler. Every series they key on
-# is registered unconditionally, and the counters are pre-minted at zero, so
-# increase() sees the first event and no rule needs an option set first.
-#
-# The three LogQL rules (KnellExitedWithError, KnellNoticeLostForGood,
+# The three rules here (KnellExitedWithError, KnellNoticeLostForGood,
 # KnellAcceptFailing) read the container's log stream, because their conditions
 # have no series at all. A process that refuses its configuration exits before
 # it binds a listener, so it publishes no metrics and a crash-looping container
@@ -21,10 +16,10 @@
 # moves no counter, which is why every notification-loss line carries a
 # `retryable` field instead. An accept failure produces no request, so nothing
 # request-scoped records it. Ship the container's logs to Loki and evaluate
-# those three with Loki's ruler; firing alerts deliver through your Alertmanager
-# exactly like the metric ones.
+# these with Loki's ruler; firing alerts deliver through your Alertmanager
+# exactly like metric ones.
 #
-# Two prerequisites belong to the log rules only. The ENCODING: knell writes
+# Two prerequisites belong to these three rules. The ENCODING: knell writes
 # logfmt to stderr with no configuration, and Go renders the level UPPERCASE,
 # so the matchers read `level=ERROR` and never `level=error`. And the LEVEL:
 # KnellExitedWithError and KnellAcceptFailing key on ERROR and hold at every
@@ -35,102 +30,13 @@
 # (the default) for it to mean what it says.
 #
 # Thresholds, the `for:` windows and the severity labels are starting points.
-# Set the churn window to your longest beat deadline, match the `job` selector
-# to your scrape config, adjust the `container` selector on the log rules to
-# whatever your collector sets (Grafana Alloy's Docker log discovery sets
-# `container` with no configuration; Promtail and others may key on `job` or
-# `service`), and route by whatever labels your Alertmanager uses.
+# Adjust the `container` selector to whatever your collector sets (Grafana
+# Alloy's Docker log discovery sets `container` with no configuration; Promtail
+# and others may key on `job` or `service`), and route by whatever labels your
+# Alertmanager uses.
 groups:
   - name: knell
     rules:
-      # The floor under every other rule here: all of them read a knell metric,
-      # so all of them go quiet together when knell stops being scraped. A dead
-      # watchdog is the failure its own users are least able to notice.
-      #
-      # Two arms, because neither covers the other. `up == 0` catches a target
-      # that is configured and failing, and keeps its labels so the alert names
-      # which node. `absent(up{...})` catches a target that stopped EXISTING — a
-      # dropped scrape target, a removed scrape config, a deleted Kubernetes pod
-      # or ServiceMonitor — where `up` has no series and `up == 0` cannot match.
-      #
-      # Use an EXACT job matcher, not a regex. A regex absent() form asks
-      # whether ANY matching target is up, which is the wrong question here
-      # above all: with several observers, one survivor would mask every dead
-      # one, and masking a dead observer is the failure this rule exists for.
-      # Its synthetic result also carries no job label to route on.
-      #
-      # If you run several observers, alert per node (the `instance` label
-      # arrives on the `up == 0` arm) and remember this rule needs the same
-      # second vantage point the rest of the group documents: it has to be
-      # evaluated somewhere other than the box it watches.
-      - alert: KnellTargetDown
-        expr: up{job="knell"} == 0
-        for: 15m
-        labels:
-          severity: critical
-        annotations:
-          summary: "knell is not being scraped successfully"
-          description: >
-            No successful scrape of knell for 15m, so knell_beat_fresh is stale
-            and every beat it watches is unmonitored. Either the scrape is
-            failing (container down, wrong port, network) or the target is gone
-            from service discovery entirely. A dead-man switch that is itself
-            dead reports nothing, which is why this is critical rather than
-            warning. Set the job matcher to whatever your scrape config calls
-            knell.
-
-      # A beat is overdue but the missing notification may not have reached you
-      # (Discord outage): the metric is the ground truth.
-      - alert: KnellTargetAbsent
-        expr: absent(up{job="knell"})
-        for: 15m
-        labels:
-          severity: critical
-        annotations:
-          summary: "knell has no scrape target at all"
-          description: >
-            There is no up{job="knell"} series, so knell is not merely
-            failing to scrape but is no longer a configured target: a dropped
-            scrape target, a removed scrape config, or a deleted Kubernetes pod
-            or ServiceMonitor. Every other rule in this group is blind.
-      - alert: KnellBeatOverdue
-        expr: knell_beat_fresh == 0
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "beat {{ $labels.beat }} is overdue on {{ $labels.instance }}"
-
-      # knell could not get a notification through. The three legs are distinct
-      # consequences: failed = a delivery attempt failed after retries and its
-      # record is still queued, so the notice is late and retried every 15s
-      # sweep; either dropped = nothing will arrive and you reconstruct the
-      # window yourself. Keep all three: when a full queue discards an ended
-      # outage, only the third leg moves.
-      - alert: KnellNotifyFailing
-        expr: >
-          increase(knell_notifications_failed_total[15m]) > 0
-          or increase(knell_notifications_dropped_total[15m]) > 0
-          or increase(knell_outage_records_dropped_total[15m]) > 0
-        for: 0m
-        labels:
-          severity: warning
-        annotations:
-          summary: "knell on {{ $labels.instance }} failed to deliver a notification, or dropped a notification or an outage record"
-
-      # knell restarting faster than a beat's deadline (26h here) keeps
-      # re-arming that beat's clock; the alert for an ongoing outage is
-      # deferred each time. Set the window to your longest beat deadline.
-      - alert: KnellRestartChurn
-        expr: changes(process_start_time_seconds{job="knell"}[26h]) > 1
-        for: 0m
-        labels:
-          severity: warning
-        annotations:
-          summary: "knell on {{ $labels.instance }} keeps restarting inside a beat deadline window; boot-armed clocks re-arm before they can fire"
-
-      # --- LogQL from here: conditions with no series to read ---
-
       # knell refused to run, or died. Startup fails fast on purpose (a
       # dead-man switch with the wrong configuration is worse than none), so a
       # `BEATS` entry that is not `id:deadline`, a webhook that is not https, a
