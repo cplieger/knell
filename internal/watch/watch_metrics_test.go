@@ -343,9 +343,7 @@ func TestQueueFullLogsAreEmittedWithTheWatcherMutexReleased(t *testing.T) {
 	fillMissingQueue(t, w, clock, id)
 
 	probe := &mutexProbeHandler{t: t, w: w}
-	previous := slog.Default()
-	slog.SetDefault(slog.New(probe))
-	t.Cleanup(func() { slog.SetDefault(previous) })
+	installDefaultLogger(t, probe)
 
 	// The sweep path: the full queue defers an ongoing outage, and collectDue
 	// announces the back-pressure at Debug.

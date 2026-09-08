@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"log/slog"
 	"slices"
 	"sync"
@@ -310,6 +312,50 @@ func TestAdmissionClosedBeforeRunExitsStillTalliesUndeliveredWork(t *testing.T) 
 	}
 }
 
+// installDefaultLogger swaps slog's default handler for the test's duration.
+// Callers must be serial (no t.Parallel): the default logger is a process
+// global.
+//
+// slog.SetDefault also points the standard log package at the installed
+// handler, and it skips that redirect when the logger being installed carries
+// slog's own default handler. Reinstalling the previous logger therefore does
+// not undo the redirect, so the writer and flags are saved and restored
+// explicitly. slog goes back first: reinstalling a previous handler that is
+// not slog's default re-runs the redirect and would overwrite a log restore
+// done before it.
+func installDefaultLogger(t *testing.T, h slog.Handler) {
+	t.Helper()
+	previous, previousWriter, previousFlags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	})
+}
+
+// TestInstallDefaultLoggerRestoresLogGlobals pins the restore: the swap
+// redirects the log package's writer and zeroes its flags, and the cleanup must
+// put both back. Without it, one test silences slog for the rest of the
+// package, because slog's own default handler writes through log.Output.
+func TestInstallDefaultLoggerRestoresLogGlobals(t *testing.T) {
+	wantWriter, wantFlags := log.Writer(), log.Flags()
+
+	t.Run("swap", func(t *testing.T) {
+		installDefaultLogger(t, slog.NewTextHandler(io.Discard, nil))
+		if log.Writer() == wantWriter {
+			t.Fatal("the swap did not redirect log.Writer(); the restore under test would guard nothing")
+		}
+	})
+
+	if got := log.Writer(); got != wantWriter {
+		t.Errorf("log.Writer() after cleanup = %#v, want the original %#v", got, wantWriter)
+	}
+	if got := log.Flags(); got != wantFlags {
+		t.Errorf("log.Flags() after cleanup = %d, want %d", got, wantFlags)
+	}
+}
+
 // parkingHandler holds one message inside slog until a test releases it, and
 // records everything through the embedded recorder. Parking a log write is the
 // only way to hold the observation goroutine at a point where it is NOT holding
@@ -385,14 +431,12 @@ func TestRunJoinsTheObservationGoroutineBeforeTallying(t *testing.T) {
 	// unwinds the parked goroutines instead of wedging the package's test run.
 	t.Cleanup(releaseSendOnce)
 	t.Cleanup(releaseLogOnce)
-	previous := slog.Default()
-	slog.SetDefault(slog.New(&parkingHandler{
+	installDefaultLogger(t, &parkingHandler{
 		Handler: rec,
 		on:      "pending missing queue full, ongoing outage stays detected and is queued once a slot frees",
 		parked:  parked,
 		release: releaseLog,
-	}))
-	t.Cleanup(func() { slog.SetDefault(previous) })
+	})
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
