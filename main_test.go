@@ -20,7 +20,7 @@ import (
 	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/webhttp/v2"
+	"github.com/cplieger/webhttp/v3"
 )
 
 // testWebhookSecret is the credential half of the webhook every boot test
