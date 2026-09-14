@@ -21,7 +21,7 @@ import (
 
 	"github.com/cplieger/envx/v2"
 	"github.com/cplieger/slogx"
-	"github.com/cplieger/webhttp/v2"
+	"github.com/cplieger/webhttp/v3"
 )
 
 // maxBeats caps how many beats one instance will watch, keeping the metric

@@ -15,7 +15,7 @@ import (
 	"github.com/cplieger/envx/v2"
 	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/webhttp/v2"
+	"github.com/cplieger/webhttp/v3"
 )
 
 // maxNodeNameBytes is the NODE_NAME bound the composition root passes to Load
