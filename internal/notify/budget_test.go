@@ -11,23 +11,20 @@ import (
 	"github.com/cplieger/knell/internal/watch"
 )
 
-// TestEveryNoticeStaysInsideDiscordsContentLimit renders every notice shape at
-// its worst case (max node name, max beat id, a multi-year silence, and each
-// branch's longest wording) and asserts the result fits Discord's content
-// limit, so a wording change that busts the budget fails here rather than
-// silently invalidating MaxNodeNameBytes (an over-limit notice is answered 400
-// and never delivered).
-func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
-	// Discord's hard limit on a webhook message's content field.
-	const discordContentLimit = 2000
-
+// TestEveryNoticeStaysInsideDiscordsPayloadLimits renders every notice shape at
+// its worst case (max node name, max beat id, a multi-year silence, a full
+// history batch, and each branch's longest wording) and measures the result
+// against every limit Discord documents, so a wording change that busts one
+// fails here rather than silently invalidating MaxNodeNameBytes (an over-limit
+// payload is answered 400 and never delivered).
+func TestEveryNoticeStaysInsideDiscordsPayloadLimits(t *testing.T) {
 	rec := newWebhookRecorder(http.StatusNoContent)
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
 
 	// "*" fillers so markdown escaping (which doubles each character) is
 	// inside the measured worst case.
-	d := New(srv.URL, strings.Repeat("*", MaxNodeNameBytes))
+	d := newTestNotifier(t, srv.URL, strings.Repeat("*", MaxNodeNameBytes))
 	defer d.Close()
 	id := "b" + strings.Repeat("_", config.MaxBeatIDLen-1)
 	started := time.Date(1970, time.January, 1, 0, 0, 0, 0, time.UTC)
@@ -64,10 +61,31 @@ func TestEveryNoticeStaysInsideDiscordsContentLimit(t *testing.T) {
 			if err := send(); err != nil {
 				t.Fatalf("sending the %s notice: %v", name, err)
 			}
-			content := <-rec.contents
-			if runes := len([]rune(content)); runes > discordContentLimit {
-				t.Errorf("the %s notice renders %d characters at the worst case, want at most Discord's %d-character content limit: either shorten the template or lower MaxNodeNameBytes, because Discord answers 400 for an over-limit content and the notice is never delivered",
-					name, runes, discordContentLimit)
+			payload := <-rec.payloads
+
+			if got := len(payload.Embeds); got > limitEmbeds {
+				t.Errorf("the %s notice carries %d embeds at the worst case, want at most Discord's %d: either shorten the template or lower MaxNodeNameBytes, because Discord answers 400 for an over-limit payload and the notice is never delivered",
+					name, got, limitEmbeds)
+			}
+			for i, e := range payload.Embeds {
+				if got := len(e.Fields); got > limitFields {
+					t.Errorf("the %s notice renders %d fields in embeds.%d at the worst case, want at most Discord's %d: either shorten the template or lower MaxNodeNameBytes, because Discord answers 400 for an over-limit payload and the notice is never delivered",
+						name, got, i, limitFields)
+				}
+			}
+			var combined int
+			for _, slot := range measureSlots(payload) {
+				if slot.counted {
+					combined += slot.runes
+				}
+				if slot.runes > slot.limit {
+					t.Errorf("the %s notice renders %d characters in %s at the worst case, want at most Discord's %d: either shorten the template or lower MaxNodeNameBytes, because Discord answers 400 for an over-limit payload and the notice is never delivered",
+						name, slot.runes, slot.slot, slot.limit)
+				}
+			}
+			if combined > limitCombined {
+				t.Errorf("the %s notice renders %d characters across every embed slot at the worst case, want at most Discord's %d-character combined embed budget: either shorten the template or lower MaxNodeNameBytes, because Discord answers 400 for an over-limit payload and the notice is never delivered",
+					name, combined, limitCombined)
 			}
 		})
 	}
