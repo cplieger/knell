@@ -53,16 +53,21 @@ Then ping a beat from the thing being watched, presenting the token:
 curl -fsS -X POST -H "Authorization: Bearer $BEAT_TOKEN" http://knell:9190/beat/cron-backup
 ```
 
-Silence past the deadline rings the bell:
+Silence past the deadline rings the bell. Every notice is a one-line message plus a card carrying the figures:
 
-> 🚨 [knell server-1] beat **cron-backup** MISSING: silent for 26h0m1s. Nothing has pinged it in time: check the sender, its path to this observer, and that anything is pinging this beat id at all.
+> 🚨 [knell server-1] beat **cron-backup** MISSING
+>
+> **🚨 beat cron-backup MISSING**
+> Nothing has pinged it in time: check the sender, its path to this observer, and that anything is pinging this beat id at all.
+>
+> **Silent for** 26h0m1s / **Silence began** 2026-07-22 10:00 UTC / **Observer** server-1
 
 ## Configuration reference
 
 | Variable | Description | Default | Required |
 | --- | --- | --- | --- |
 | `BEATS` | comma-separated `id:deadline` list, for example `api:20m,backup:26h`; whitespace around an entry and around its colon is ignored, so `api:20m, backup:26h` is the same list. Ids match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; deadlines are Go durations of at least `30s`; at most 64 beats | _none_ | Yes |
-| `DISCORD_WEBHOOK_URL` | the webhook notifications post to. `https` only, and it must carry a path, since the path is the credential Discord issues (`/api/webhooks/{id}/{token}`); a host-only URL fails startup, and any other `https` path is accepted, so a Discord-compatible relay works too. `DISCORD_WEBHOOK_URL_FILE` reads it from a mounted secret file instead | _none_ | Yes |
+| `DISCORD_WEBHOOK_URL` | the webhook notifications post to. `https` only, and it must carry a path, since the path is the credential Discord issues (`/api/webhooks/{id}/{token}`); a host-only URL fails startup, and any other `https` path is accepted, so a Discord-compatible relay works too, provided it accepts Discord's `content` plus `embeds` message shape. `DISCORD_WEBHOOK_URL_FILE` reads it from a mounted secret file instead | _none_ | Yes |
 | `NODE_NAME` | names this observer in every notification; maximum 256 bytes, since it prefixes every notice and Discord caps a message at 2000 characters | container hostname | No |
 | `BEAT_TOKEN` | the bearer token every sender presents as `Authorization: Bearer <token>` on `POST /beat/{id}`, and the endpoint's only gate. Required, 16 to 512 bytes, and verified exactly as configured: generate one with `openssl rand -hex 16`. `BEAT_TOKEN_FILE` reads it from a mounted secret file instead | _none_ | Yes |
 | `LISTEN_ADDR` | TCP listen address (`host:port`) | `:9190` | No |
@@ -100,9 +105,14 @@ A live incident and one that is already over are reported differently: nothing a
 - **Recovered**: sent on the first accepted ping after a missing notice, best-effort. Delivery uses bounded retries with jittered backoff and honors `Retry-After` on rate limits. It is fire-once: the queued transition is consumed before the send, so a delivery that still fails has nothing left to retry from and that notice will never arrive. It therefore counts as `knell_notifications_dropped_total{kind="recovered"}`, not as a failure you can wait out.
 - **Ended outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of being collapsed into that earlier one and lost. Records whose outage has already ended by the time they can be delivered are reported once in the past tense, and the notice says why it is late, because the two reasons ask for different things:
 
-  > 🕓 [knell server-1] beat **cron-backup** was missing for 12m0s, recovered at 2026-07-23 14:07 UTC. This notice is late because delivery was delayed - check the webhook.
+  > 🕓 [knell server-1] beat **cron-backup** outage history
+  >
+  > **🕓 beat cron-backup outage history**
+  > This notice is late because delivery was delayed - check the webhook.
+  >
+  > **Was missing for** 12m0s / **Silence began** 2026-07-23 13:55 UTC / **Recovered at** 2026-07-23 14:07 UTC / **Delivery** refused / **Observer** server-1
 
-  An outage nothing was ever attempted for (no sweep saw it before a ping ended it, or a sweep saw it and deferred it) says so instead and points at nothing to check. That wording is only used while nothing about the outage has failed to send: a past-tense notice that itself fails and is retried carries the webhook wording when it finally arrives, so it never vouches for a webhook that just refused it. Several ended outages become one summary message stating both counts ("had 3 outages: longest 47m0s ... Delivery was delayed for 2 (check the webhook); 1 had nothing attempted"), delivered in a single sweep, so a genuinely live outage queued behind a full backlog waits one sweep rather than one per stale record. Because the notice states the outages are over, no recovered notice follows for them.
+  An outage nothing was ever attempted for (no sweep saw it before a ping ended it, or a sweep saw it and deferred it) says so instead and points at nothing to check. That wording is only used while nothing about the outage has failed to send: a past-tense notice that itself fails and is retried carries the webhook wording when it finally arrives, so it never vouches for a webhook that just refused it. Several ended outages become one summary card carrying the outage count, the longest outage, the last recovery point and the delivery split, and it states both counts ("Delivery was delayed for 2 (check the webhook); 1 had nothing attempted"). It is delivered in a single sweep, so a genuinely live outage queued behind a full backlog waits one sweep rather than one per stale record. Because the notice states the outages are over, no recovered notice follows for them.
 - **Queued outages**: each beat queues up to 8 records and reports them oldest first. When a beat's queue is full, the newest record is not queued, and the two cases differ in consequence:
   - an outage a ping has already ended is **dropped for good**: its record was the last trace of it, so no notice for it will ever arrive. `knell_outage_records_dropped_total{beat}` increments and a warning is logged, once for that outage. Reconstruct the missed window from `knell_beat_last_seen_timestamp_seconds`.
   - an outage still in progress **loses nothing**: it stays detected (`knell_beat_outages_total{beat}` already counted it), and it is queued and delivered once a slot opens. That is ordinary back-pressure while notifications are failing, so it is logged at debug level and moves no delivery counter.

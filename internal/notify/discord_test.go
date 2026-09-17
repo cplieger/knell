@@ -25,11 +25,11 @@ import (
 type webhookRecorder struct {
 	statuses []int
 	hits     atomic.Int64
-	contents chan string
+	payloads chan discordMessage
 }
 
 func newWebhookRecorder(statuses ...int) *webhookRecorder {
-	return &webhookRecorder{statuses: statuses, contents: make(chan string, 16)}
+	return &webhookRecorder{statuses: statuses, payloads: make(chan discordMessage, 16)}
 }
 
 func (rec *webhookRecorder) handler(t *testing.T) http.HandlerFunc {
@@ -46,16 +46,31 @@ func (rec *webhookRecorder) handler(t *testing.T) http.HandlerFunc {
 		if err != nil {
 			t.Errorf("reading body: %v", err)
 		}
-		var payload struct {
-			Content string `json:"content"`
-		}
+		var payload discordMessage
 		if err := json.Unmarshal(body, &payload); err != nil {
 			t.Errorf("payload not JSON: %v", err)
 		}
-		rec.contents <- payload.Content
+		payload.raw = body
+		rec.payloads <- payload
 		status := rec.statuses[min(int(hit)-1, len(rec.statuses)-1)]
 		w.WriteHeader(status)
 	}
+}
+
+// newTestNotifier builds a notifier whose connection pool is its own.
+// httpx.NewClient leaves Transport nil, so every notifier here would otherwise
+// share http.DefaultTransport's process-wide idle pool, and two mechanisms then
+// make one test fail because of another: Close calls CloseIdleConnections on
+// that shared transport, closing every other notifier's idle connections, and a
+// pooled connection to a port an httptest server has already released is handed
+// to whichever test next binds that port. Both surface as "webhook transport
+// failed" in an unrelated test (measured under -race at 1 run in 20).
+func newTestNotifier(t *testing.T, webhookURL, node string) *Discord {
+	t.Helper()
+
+	d := New(webhookURL, node)
+	d.client.Transport = &http.Transport{}
+	return d
 }
 
 // captureDeliveryLogs captures slog.Default()'s records for the duration of
@@ -93,6 +108,13 @@ func liveSilence(d time.Duration) watch.Transition {
 	return watch.Transition{Started: started, Observed: started.Add(d)}
 }
 
+// probeNotice is the payload for the tests whose subject is the retry loop, the
+// attempt deadline, the rate-limit ceiling or the send budget. What the notice
+// says is incidental to all of them, so it carries the minimum a render needs.
+func probeNotice() *notice {
+	return &notice{kind: kindMissing, id: "probe", guidance: "probe"}
+}
+
 func TestBeatMissingDelivers(t *testing.T) {
 	t.Parallel()
 
@@ -100,16 +122,16 @@ func TestBeatMissingDelivers(t *testing.T) {
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
 
-	d := New(srv.URL, "node-1")
+	d := newTestNotifier(t, srv.URL, "node-1")
 	defer d.Close()
 
 	if err := d.BeatMissing(t.Context(), "api", liveSilence(21*time.Minute+30*time.Second)); err != nil {
 		t.Fatalf("BeatMissing: %v", err)
 	}
-	content := <-rec.contents
+	rendered := (<-rec.payloads).text()
 	for _, want := range []string{"node-1", "api", "MISSING", "21m30s"} {
-		if !strings.Contains(content, want) {
-			t.Errorf("content %q missing %q", content, want)
+		if !strings.Contains(rendered, want) {
+			t.Errorf("delivered notice %q missing %q", rendered, want)
 		}
 	}
 }
@@ -132,7 +154,7 @@ func TestEveryNoticeSuppressesMentions(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	d := New(srv.URL, "@everyone")
+	d := newTestNotifier(t, srv.URL, "@everyone")
 	t.Cleanup(d.Close)
 
 	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
@@ -172,16 +194,16 @@ func TestMissingNoticeDoesNotPresumeTheBeatEverPinged(t *testing.T) {
 	srv := httptest.NewServer(rec.handler(t))
 	t.Cleanup(srv.Close)
 
-	d := New(srv.URL, "node-1")
+	d := newTestNotifier(t, srv.URL, "node-1")
 	t.Cleanup(d.Close)
 
 	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
 		t.Fatalf("BeatMissing: %v", err)
 	}
-	content := <-rec.contents
+	rendered := (<-rec.payloads).text()
 	for _, want := range []string{"check the sender", "anything is pinging this beat id at all"} {
-		if !strings.Contains(content, want) {
-			t.Errorf("the missing notice = %q, want it to say %q: the beat may never have been pinged at all, and this notice is the only place that says so", content, want)
+		if !strings.Contains(rendered, want) {
+			t.Errorf("the missing notice = %q, want it to say %q: the beat may never have been pinged at all, and this notice is the only place that says so", rendered, want)
 		}
 	}
 }
@@ -193,16 +215,16 @@ func TestBeatRecoveredDelivers(t *testing.T) {
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
 
-	d := New(srv.URL, "node-1")
+	d := newTestNotifier(t, srv.URL, "node-1")
 	defer d.Close()
 
 	if err := d.BeatRecovered(t.Context(), "api", liveSilence(45*time.Minute)); err != nil {
 		t.Fatalf("BeatRecovered: %v", err)
 	}
-	content := <-rec.contents
+	rendered := (<-rec.payloads).text()
 	for _, want := range []string{"node-1", "api", "recovered", "45m"} {
-		if !strings.Contains(content, want) {
-			t.Errorf("content %q missing %q", content, want)
+		if !strings.Contains(rendered, want) {
+			t.Errorf("delivered notice %q missing %q", rendered, want)
 		}
 	}
 }
@@ -238,29 +260,50 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 		noAttemptAll = "No delivery was ever attempted for any of them"
 		notThePlace  = "the webhook is not the place to look"
 	)
+	// wantFields carries the figures the card states as labelled values rather
+	// than as prose, asserted by exact equality: a stronger oracle than the
+	// substring it replaces. The Delivery row is what stops the compact field
+	// and the description sentence disagreeing about the same fact.
 	cases := map[string]struct {
-		outages []watch.Outage
-		want    []string
-		forbid  []string
+		outages    []watch.Outage
+		wantFields map[string]string
+		want       []string
+		forbid     []string
 	}{
 		// The reason the split exists: nothing was ever sent for this outage, so
 		// the notice must not spend the operator's evening on a healthy webhook.
 		"one outage nothing was attempted for": {
 			outages: []watch.Outage{outage(12*time.Minute, false)},
-			want:    []string{"was missing for 12m0s", noAttemptOne, notThePlace},
-			forbid:  []string{webhookClause, delayedOne, "notifications were failing"},
+			wantFields: map[string]string{
+				"Was missing for": "12m0s",
+				"Recovered at":    "2026-07-23 14:07 UTC",
+				"Delivery":        "never attempted",
+			},
+			want:   []string{noAttemptOne, notThePlace},
+			forbid: []string{webhookClause, delayedOne, "notifications were failing"},
 		},
 		"one outage whose alert the webhook refused": {
 			outages: []watch.Outage{outage(12*time.Minute, true)},
-			want:    []string{"was missing for 12m0s", delayedOne, webhookClause},
-			forbid:  []string{noAttemptOne, notThePlace},
+			wantFields: map[string]string{
+				"Was missing for": "12m0s",
+				"Recovered at":    "2026-07-23 14:07 UTC",
+				"Delivery":        "refused",
+			},
+			want:   []string{delayedOne, webhookClause},
+			forbid: []string{noAttemptOne, notThePlace},
 		},
 		"a batch of outages nothing was attempted for": {
 			outages: []watch.Outage{
 				outage(12*time.Minute, false),
 				outage(47*time.Minute, false),
 			},
-			want:   []string{"had 2 outages", "longest 47m0s", noAttemptAll, notThePlace},
+			wantFields: map[string]string{
+				"Outages":           "2",
+				"Longest outage":    "47m0s",
+				"Last recovered at": "2026-07-23 14:07 UTC",
+				"Delivery":          "none attempted",
+			},
+			want:   []string{noAttemptAll, notThePlace},
 			forbid: []string{webhookClause, delayedAll},
 		},
 		"a batch of outages whose alerts the webhook all refused": {
@@ -268,7 +311,13 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 				outage(12*time.Minute, true),
 				outage(47*time.Minute, true),
 			},
-			want:   []string{"had 2 outages", "longest 47m0s", delayedAll, webhookClause},
+			wantFields: map[string]string{
+				"Outages":           "2",
+				"Longest outage":    "47m0s",
+				"Last recovered at": "2026-07-23 14:07 UTC",
+				"Delivery":          "all refused",
+			},
+			want:   []string{delayedAll, webhookClause},
 			forbid: []string{noAttemptAll, notThePlace},
 		},
 		// The batch a real webhook outage produces on a flapping beat: some
@@ -281,8 +330,12 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 				outage(47*time.Minute, true),
 				outage(9*time.Minute, false),
 			},
+			wantFields: map[string]string{
+				"Outages":        "3",
+				"Longest outage": "47m0s",
+				"Delivery":       "2 refused, 1 never attempted",
+			},
 			want: []string{
-				"had 3 outages", "longest 47m0s",
 				"Delivery was delayed for 2 (check the webhook)", "1 had nothing attempted", webhookClause,
 			},
 			// No single-case clause may stand in for a mixed batch.
@@ -297,27 +350,28 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 			srv := httptest.NewServer(rec.handler(t))
 			defer srv.Close()
 
-			d := New(srv.URL, "node-1")
+			d := newTestNotifier(t, srv.URL, "node-1")
 			defer d.Close()
 
 			if err := d.BeatOutageHistory(t.Context(), "api", tc.outages); err != nil {
 				t.Fatalf("BeatOutageHistory: %v", err)
 			}
-			content := <-rec.contents
+			payload := <-rec.payloads
+			rendered := payload.text()
 			for _, want := range tc.want {
-				if !strings.Contains(content, want) {
-					t.Errorf("content %q missing %q", content, want)
+				if !strings.Contains(rendered, want) {
+					t.Errorf("the notice %q is missing %q", rendered, want)
 				}
 			}
 			for _, forbidden := range tc.forbid {
-				if strings.Contains(content, forbidden) {
-					t.Errorf("content %q states %q, which belongs to the other case", content, forbidden)
+				if strings.Contains(rendered, forbidden) {
+					t.Errorf("the notice %q states %q, which belongs to the other case", rendered, forbidden)
 				}
 			}
-			// Past tense and the recovery point are the same either way;
-			// only the explanation differs.
-			if !strings.Contains(content, "recovered at 2026-07-23 14:07 UTC") {
-				t.Errorf("content %q does not report the recovery point", content)
+			for field, want := range tc.wantFields {
+				if got := payload.field(t, field); got != want {
+					t.Errorf("the %q field = %q, want %q", field, got, want)
+				}
 			}
 		})
 	}
@@ -333,7 +387,7 @@ func TestTransientFailureRetries(t *testing.T) {
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
 
-	d := New(srv.URL, "node-1")
+	d := newTestNotifier(t, srv.URL, "node-1")
 	defer d.Close()
 
 	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
@@ -351,7 +405,7 @@ func TestPermanentFailureDoesNotRetry(t *testing.T) {
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
 
-	d := New(srv.URL, "node-1")
+	d := newTestNotifier(t, srv.URL, "node-1")
 	defer d.Close()
 
 	err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
@@ -374,7 +428,7 @@ func TestUnfollowedRedirectIsNotDelivery(t *testing.T) {
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
 
-	d := New(srv.URL, "node-1")
+	d := newTestNotifier(t, srv.URL, "node-1")
 	defer d.Close()
 
 	err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
@@ -557,7 +611,7 @@ func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 
 	// Connection refused is transient, so all maxAttempts run and both the
 	// per-attempt and exhausted lines are emitted.
-	d := New("http://127.0.0.1:9/api/webhooks/1234567890/"+secret, "node-1")
+	d := newTestNotifier(t, "http://127.0.0.1:9/api/webhooks/1234567890/"+secret, "node-1")
 	t.Cleanup(d.Close)
 
 	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err == nil {
@@ -596,7 +650,7 @@ func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
 
 	rec := captureDeliveryLogs(t)
 
-	d := New(srv.URL+secretPath, "node-1")
+	d := newTestNotifier(t, srv.URL+secretPath, "node-1")
 	t.Cleanup(d.Close)
 
 	err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
@@ -623,14 +677,13 @@ func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
 }
 
 func TestSuccessfulResponsesAreDrainedForConnectionReuse(t *testing.T) {
-	// NOT t.Parallel(): the oracle is idle-connection reuse, and
-	// httpx.NewClient's client rides the process-wide http.DefaultTransport
-	// whose idle pool every other test in this package shares. Run
-	// concurrently, their churn evicts this notifier's idle connection between
-	// the two notices and the second one dials again -- a failure about the
-	// suite's parallelism, not about knell's drain (measured: passes alone,
-	// fails in the full package with connections = 2). Serial execution makes
-	// the reuse observation belong to this test alone.
+	t.Parallel()
+
+	// newTestNotifier's private transport is what makes the reuse observation
+	// belong to this test alone: on the shared pool, another test's churn
+	// evicted this notifier's idle connection between the two notices and the
+	// second one dialled again (measured: passed alone, failed in the full
+	// package with connections = 2).
 	// The drain's other half, and the one no absence assertion can reach: that
 	// knell's delivery path actually DRAINS a successful response rather than
 	// just closing it. Read VOLUME is not observable from a handler, so the
@@ -654,7 +707,7 @@ func TestSuccessfulResponsesAreDrainedForConnectionReuse(t *testing.T) {
 	srv.Start()
 	t.Cleanup(srv.Close)
 
-	d := New(srv.URL, "node-1")
+	d := newTestNotifier(t, srv.URL, "node-1")
 	t.Cleanup(d.Close)
 	live := liveSilence(time.Hour)
 
@@ -676,12 +729,14 @@ func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 	t.Parallel()
 
 	// Discord names WHY it rejected a webhook POST as a numeric code in its
-	// JSON error body, and that number is the only part of the body knell
-	// publishes: a number cannot carry a credential, while the object's
-	// "message" string and nested "errors" object are authored by the other
-	// end. knell claims no meaning for a code, so the number is always
-	// reported bare and a body carrying none leaves the status as the whole
-	// verdict.
+	// JSON error body, and says WHICH field it blamed inside a nested "errors"
+	// object. Two things are published from that and nothing else: the number,
+	// which cannot carry a credential, and the blamed path projected onto
+	// knell's own payload field names with a class-gated machine code. Every
+	// prose string in the object, top-level and nested, is authored by the
+	// other end and never published. knell claims no meaning for a code, so the
+	// number is always reported bare and a body carrying none leaves the status
+	// as the whole verdict.
 	//
 	// All cases use a non-transient status so each runs exactly one attempt.
 	for name, tc := range map[string]struct {
@@ -711,8 +766,17 @@ func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 		"invalid request body": {
 			status:  http.StatusBadRequest,
 			body:    `{"message": "Invalid Form Body", "code": 50035, "errors": {"content": {"_errors": [{"code": "BASE_TYPE_MAX_LENGTH", "message": "Must be 2000 or fewer in length."}]}}}`,
-			want:    []string{"Discord error code 50035"},
-			notWant: []string{"Invalid Form Body", "BASE_TYPE_MAX_LENGTH", "2000 or fewer"},
+			want:    []string{"Discord error code 50035", "content: BASE_TYPE_MAX_LENGTH"},
+			notWant: []string{"Invalid Form Body", "2000 or fewer"},
+		},
+		// The shape the embed makes reachable, and the reason the blamed path
+		// is published at all: one of five limits, a bad colour, a malformed
+		// timestamp and an empty field name all arrive as the same 50035.
+		"invalid embed field names which one": {
+			status:  http.StatusBadRequest,
+			body:    `{"message": "Invalid Form Body", "code": 50035, "errors": {"embeds": {"0": {"fields": {"0": {"name": {"_errors": [{"code": "BASE_TYPE_REQUIRED", "message": "This field is required"}]}}}}}}}`,
+			want:    []string{"Discord error code 50035", "embeds.0.fields.0.name: BASE_TYPE_REQUIRED"},
+			notWant: []string{"Invalid Form Body", "This field is required"},
 		},
 		"unmapped code is reported bare": {
 			status: http.StatusBadRequest,
@@ -757,7 +821,7 @@ func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			d := New(srv.URL+"/api/webhooks/1234567890/plainsegment", "node-1")
+			d := newTestNotifier(t, srv.URL+"/api/webhooks/1234567890/plainsegment", "node-1")
 			defer d.Close()
 
 			err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
@@ -808,7 +872,7 @@ func TestAttemptTimeoutIsRetried(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	d := New(srv.URL, "node-1")
+	d := newTestNotifier(t, srv.URL, "node-1")
 	t.Cleanup(d.Close)
 	// The seam is a test affordance, not the policy, so pin the production
 	// wiring BEFORE shortening it: a New that drops the assignment leaves the
@@ -825,7 +889,7 @@ func TestAttemptTimeoutIsRetried(t *testing.T) {
 	// still live, not how long it took to fire.
 	d.attemptTimeout = 100 * time.Millisecond
 
-	if err := d.post(t.Context(), "missing probe", "body"); err != nil {
+	if err := d.post(t.Context(), "missing probe", probeNotice()); err != nil {
 		t.Fatalf("post() after a retried attempt timeout = %v, want nil", err)
 	}
 	if got := hits.Load(); got != 2 {
@@ -850,7 +914,7 @@ func TestAttemptTimeoutIsRetried(t *testing.T) {
 func TestNewUsesProductionAttemptTimeout(t *testing.T) {
 	t.Parallel()
 
-	d := New("https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
+	d := newTestNotifier(t, "https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
 	t.Cleanup(d.Close)
 
 	if got, want := d.attemptTimeout, 10*time.Second; got != want {
@@ -869,7 +933,7 @@ func TestAttemptTimeoutReportsSafeDiagnostic(t *testing.T) {
 	// stays visible to errors.Is for knell's own callers, and no part of the
 	// webhook URL reaches the message.
 	const secret = "verysecrettimeouttoken"
-	d := New("https://discord.example/api/webhooks/1234567890/"+secret, "node-1")
+	d := newTestNotifier(t, "https://discord.example/api/webhooks/1234567890/"+secret, "node-1")
 	t.Cleanup(d.Close)
 	d.attemptTimeout = time.Millisecond
 	var hits atomic.Int32
@@ -879,7 +943,7 @@ func TestAttemptTimeoutReportsSafeDiagnostic(t *testing.T) {
 		return nil, r.Context().Err()
 	})
 
-	err := d.post(t.Context(), "missing probe", "body")
+	err := d.post(t.Context(), "missing probe", probeNotice())
 	if err == nil {
 		t.Fatal("post() with every attempt timing out = nil, want error")
 	}
@@ -922,7 +986,7 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 	// ceiling of 30s, of 30 minutes, or of 0 (httpx's own 60s fallback)
 	// identically.
 	var attempts atomic.Int64
-	d := New("https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
+	d := newTestNotifier(t, "https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
 	t.Cleanup(d.Close)
 	// The seam is a test affordance, not the policy, so pin the production
 	// wiring BEFORE shortening it: a New that drops either assignment leaves the
@@ -981,7 +1045,7 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	err := d.post(ctx, "missing probe", "body")
+	err := d.post(ctx, "missing probe", probeNotice())
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("post() against a permanent 429 = nil, want error")
@@ -1002,7 +1066,7 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 	// that cut attempt is a permanently dropped message.
 	d.sendBudget = ceiling + ceiling/2
 	attempts.Store(0)
-	err = d.post(t.Context(), "missing probe", "body")
+	err = d.post(t.Context(), "missing probe", probeNotice())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("post() against a permanent 429 under a %s budget = %v, want the budget's own expiry", d.sendBudget, err)
 	}
@@ -1012,8 +1076,11 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 }
 
 // TestNoticesEscapeDiscordMarkdownInConfiguredValues is the oracle for the
-// escaping every notice depends on. Without it, dropping escapeMarkdown at any
-// of the three call sites leaves the whole suite green.
+// escaping every notice depends on. Without it, dropping escapeMarkdown at
+// either of its two call sites (New for the node, message for the id) leaves
+// the whole suite green. It also pins the other half of the rule the embed
+// introduced: the escaped forms may occupy only a slot that RENDERS markdown,
+// so the title carries the RAW id and no backslash at all.
 func TestNoticesEscapeDiscordMarkdownInConfiguredValues(t *testing.T) {
 	t.Parallel()
 
@@ -1052,17 +1119,30 @@ func TestNoticesEscapeDiscordMarkdownInConfiguredValues(t *testing.T) {
 			rec := newWebhookRecorder(http.StatusNoContent)
 			srv := httptest.NewServer(rec.handler(t))
 			defer srv.Close()
-			d := New(srv.URL, node)
+			d := newTestNotifier(t, srv.URL, node)
 			defer d.Close()
 
 			if err := send(d); err != nil {
 				t.Fatalf("sending the %s notice: %v", name, err)
 			}
-			content := <-rec.contents
+			payload := <-rec.payloads
 			for _, want := range []string{wantID, wantNode} {
-				if !strings.Contains(content, want) {
-					t.Errorf("the %s notice = %q, want it to carry %q: Discord eats an unescaped markup character instead of styling it, so the operator cannot copy the beat id or the node name out of the notice", name, content, want)
+				if !strings.Contains(payload.Content, want) {
+					t.Errorf("the %s notice content = %q, want it to carry %q: Discord eats an unescaped markup character instead of styling it, so the operator cannot copy the beat id or the node name out of the notice", name, payload.Content, want)
 				}
+			}
+			if observer := payload.field(t, "Observer"); !strings.Contains(observer, wantNode) {
+				t.Errorf("the %s notice Observer field = %q, want it to carry %q: a field value renders markdown, so the escaped form belongs there", name, observer, wantNode)
+			}
+			// The title does NOT render markdown, so an escaped id there would
+			// publish the backslashes and the operator could not copy the beat
+			// id out of the card heading.
+			title := payload.onlyEmbed(t).Title
+			if !strings.Contains(title, id) {
+				t.Errorf("the %s notice title = %q, want the raw beat id %q", name, title, id)
+			}
+			if strings.Contains(title, `\`) {
+				t.Errorf("the %s notice title = %q, want no backslash: the title renders no markdown, so an escape there is published verbatim", name, title)
 			}
 		})
 	}
@@ -1103,13 +1183,13 @@ func TestBeatMissingEscapesEveryDiscordMarkdownCharacterInNodeName(t *testing.T)
 			srv := httptest.NewServer(rec.handler(t))
 			t.Cleanup(srv.Close)
 
-			d := New(srv.URL, tc.node)
+			d := newTestNotifier(t, srv.URL, tc.node)
 			t.Cleanup(d.Close)
 
 			if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
 				t.Fatalf("BeatMissing: %v", err)
 			}
-			content := <-rec.contents
+			content := (<-rec.payloads).Content
 			if want := "[knell " + tc.want + "]"; !strings.Contains(content, want) {
 				t.Errorf("BeatMissing node = %q, want %q", content, want)
 			}
@@ -1158,7 +1238,7 @@ func TestRequestBuildErrorNeverLeaksWebhookURL(t *testing.T) {
 	// A control character makes http.NewRequestWithContext reject the URL;
 	// the raw parse error embeds the full URL (with its secret path), so
 	// the returned error must be reduced to the cause only.
-	d := New("http://127.0.0.1:9/api/webhooks/1234567890/verysecrettoken\x00", "node-1")
+	d := newTestNotifier(t, "http://127.0.0.1:9/api/webhooks/1234567890/verysecrettoken\x00", "node-1")
 	defer d.Close()
 
 	err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
@@ -1198,7 +1278,7 @@ func TestCanceledDeliveryErrorIsCanceled(t *testing.T) {
 	defer srv.Close()
 	defer close(release)
 
-	d := New(srv.URL, "node-1")
+	d := newTestNotifier(t, srv.URL, "node-1")
 	defer d.Close()
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -1227,7 +1307,7 @@ func TestPlainServerErrorIsTerminalPerAttempt(t *testing.T) {
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
 
-	d := New(srv.URL, "node-1")
+	d := newTestNotifier(t, srv.URL, "node-1")
 	defer d.Close()
 
 	err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
@@ -1263,7 +1343,7 @@ func TestMethodChangingRedirectIsNotDelivery(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	d := New(srv.URL+"/start", "node-1")
+	d := newTestNotifier(t, srv.URL+"/start", "node-1")
 	defer d.Close()
 
 	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err == nil {
@@ -1306,7 +1386,7 @@ func TestCrossHostRedirectIsNotDelivery(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	d := New(origin.URL+secretPath, "node-1")
+	d := newTestNotifier(t, origin.URL+secretPath, "node-1")
 	defer d.Close()
 
 	err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
@@ -1353,7 +1433,7 @@ func TestSameHostRedirectIsFollowedAndDelivers(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	d := New(srv.URL+"/start", "node-1")
+	d := newTestNotifier(t, srv.URL+"/start", "node-1")
 	defer d.Close()
 
 	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
@@ -1383,7 +1463,7 @@ func TestDeliveryIdentifiesKnellToTheWebhookEdge(t *testing.T) {
 	// exact string is deliberately NOT compared against userAgent -- that
 	// assertion passes even when the constant is emptied.
 	var sent http.Header
-	d := New("https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
+	d := newTestNotifier(t, "https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
 	t.Cleanup(d.Close)
 	d.client.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		sent = r.Header.Clone()
@@ -1457,7 +1537,7 @@ func TestStatusBodyAtTheReadCapKeepsItsDiscordErrorCode(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			d := New(srv.URL+"/api/webhooks/1234567890/plainsegment", "node-1")
+			d := newTestNotifier(t, srv.URL+"/api/webhooks/1234567890/plainsegment", "node-1")
 			defer d.Close()
 
 			err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
@@ -1492,7 +1572,7 @@ func TestExhaustedDeliveryIsLoggedBelowAlarmLevel(t *testing.T) {
 
 	// Connection refused is transient, so all maxAttempts run and the
 	// exhausted line is emitted.
-	d := New("http://127.0.0.1:9/api/webhooks/1234567890/plainsegment", "node-1")
+	d := newTestNotifier(t, "http://127.0.0.1:9/api/webhooks/1234567890/plainsegment", "node-1")
 	t.Cleanup(d.Close)
 
 	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err == nil {
@@ -1521,6 +1601,10 @@ func TestExhaustedDeliveryIsLoggedBelowAlarmLevel(t *testing.T) {
 	}
 }
 
+// TestHistoryTimestampRendersUTCWhateverZoneTheProducerUsed pins both surfaces
+// a history notice reports the recovery point on: the human-readable
+// "Recovered at" field, and the embed's own ISO8601 timestamp slot, which
+// Discord renders in each reader's local zone.
 func TestHistoryTimestampRendersUTCWhateverZoneTheProducerUsed(t *testing.T) {
 	t.Parallel()
 
@@ -1528,7 +1612,7 @@ func TestHistoryTimestampRendersUTCWhateverZoneTheProducerUsed(t *testing.T) {
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
 
-	d := New(srv.URL, "node-1")
+	d := newTestNotifier(t, srv.URL, "node-1")
 	defer d.Close()
 
 	// The producer's instant carries a NON-UTC zone: main.go passes time.Now,
@@ -1540,11 +1624,22 @@ func TestHistoryTimestampRendersUTCWhateverZoneTheProducerUsed(t *testing.T) {
 	if err := d.BeatOutageHistory(t.Context(), "api", outages); err != nil {
 		t.Fatalf("BeatOutageHistory: %v", err)
 	}
-	content := <-rec.contents
-	// 18:37 +04:30 is 14:07 UTC; without the .UTC() conversion the notice
-	// renders "2026-07-23 18:37 +0430" and this fails.
-	if want := "recovered at 2026-07-23 14:07 UTC"; !strings.Contains(content, want) {
-		t.Errorf("content %q missing %q: historyMessage must convert the recovery point to UTC before formatting", content, want)
+	payload := <-rec.payloads
+	// 18:37 +04:30 is 14:07 UTC; without the .UTC() conversion the field
+	// renders "2026-07-23 18:37 +0430" and the slot "2026-07-23T18:37:00Z".
+	if got, want := payload.field(t, "Recovered at"), "2026-07-23 14:07 UTC"; got != want {
+		t.Errorf("the Recovered at field = %q, want %q: the recovery point is converted to UTC before formatting", got, want)
+	}
+	stamp := payload.onlyEmbed(t).Timestamp
+	if want := "2026-07-23T14:07:00Z"; stamp != want {
+		t.Errorf("the embed timestamp = %q, want %q", stamp, want)
+	}
+	parsed, err := time.Parse(time.RFC3339, stamp)
+	if err != nil {
+		t.Fatalf("the embed timestamp %q is not ISO8601, so Discord rejects the payload: %v", stamp, err)
+	}
+	if !parsed.Equal(recovered) {
+		t.Errorf("the embed timestamp %q is %s, want the fixture's own instant %s", stamp, parsed, recovered)
 	}
 }
 
@@ -1569,28 +1664,33 @@ func TestNoticesReportWholeSecondDurations(t *testing.T) {
 		Undelivered: true,
 	}
 	cases := map[string]struct {
-		send func(*Discord) error
-		want string
+		send  func(*Discord) error
+		field string
+		want  string
 	}{
 		"missing": {
-			send: func(d *Discord) error { return d.BeatMissing(t.Context(), "api", liveSilence(ragged)) },
-			want: "silent for 21m30s.",
+			send:  func(d *Discord) error { return d.BeatMissing(t.Context(), "api", liveSilence(ragged)) },
+			field: "Silent for",
+			want:  "21m30s",
 		},
 		"recovered": {
-			send: func(d *Discord) error { return d.BeatRecovered(t.Context(), "api", liveSilence(ragged)) },
-			want: "after 21m30s of silence",
+			send:  func(d *Discord) error { return d.BeatRecovered(t.Context(), "api", liveSilence(ragged)) },
+			field: "Silent for",
+			want:  "21m30s",
 		},
 		"history one": {
 			send: func(d *Discord) error {
 				return d.BeatOutageHistory(t.Context(), "api", []watch.Outage{short})
 			},
-			want: "was missing for 21m30s,",
+			field: "Was missing for",
+			want:  "21m30s",
 		},
 		"history several": {
 			send: func(d *Discord) error {
 				return d.BeatOutageHistory(t.Context(), "api", []watch.Outage{short, long})
 			},
-			want: "longest 47m0s,",
+			field: "Longest outage",
+			want:  "47m0s",
 		},
 	}
 	for name, tc := range cases {
@@ -1601,15 +1701,14 @@ func TestNoticesReportWholeSecondDurations(t *testing.T) {
 			srv := httptest.NewServer(rec.handler(t))
 			defer srv.Close()
 
-			d := New(srv.URL, "node-1")
+			d := newTestNotifier(t, srv.URL, "node-1")
 			defer d.Close()
 
 			if err := tc.send(d); err != nil {
 				t.Fatalf("sending the %s notice: %v", name, err)
 			}
-			content := <-rec.contents
-			if !strings.Contains(content, tc.want) {
-				t.Errorf("the %s notice = %q, want it to report %q: an untruncated span renders nanoseconds, and every production span carries them", name, content, tc.want)
+			if got := (<-rec.payloads).field(t, tc.field); got != tc.want {
+				t.Errorf("the %s notice %q field = %q, want %q: an untruncated span renders nanoseconds, and every production span carries them", name, tc.field, got, tc.want)
 			}
 		})
 	}
