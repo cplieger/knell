@@ -11,6 +11,10 @@ COPY internal/ internal/
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /knell .
+COPY LICENSE NOTICE ./
+COPY scripts/collect-licenses.sh scripts/
+RUN --mount=type=cache,target=/go/pkg/mod \
+    sh scripts/collect-licenses.sh --name knell .
 
 # Directory skeleton for the scratch stage: /tmp for the health marker. The
 # mode is deliberately NOT set here: COPY recreates the destination directory
@@ -27,6 +31,7 @@ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifi
 # user even when the compose tmpfs says mode=1777. Bake the 1777.
 COPY --from=builder --chmod=1777 /outfs/tmp /tmp
 COPY --from=builder --chmod=755 /knell /knell
+COPY --from=builder /out/usr/share/licenses /usr/share/licenses
 
 # Non-root numeric uid:gid (scratch has no /etc/passwd). knell binds a high
 # port and writes only its /tmp health marker, so it never needs root.

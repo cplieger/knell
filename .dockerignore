@@ -1,8 +1,13 @@
 # Minimize the Docker build context. The Dockerfile only needs go.mod,
-# go.sum, the root *.go files, and internal/. Deny everything, then allow
-# the build inputs back in.
+# go.sum, the root *.go files, internal/, the license files the image ships
+# under /usr/share/licenses, and the collector that builds that tree. Deny
+# everything, then allow the build inputs back in.
 *
 !go.mod
 !go.sum
 !*.go
 !internal/
+!LICENSE
+!NOTICE
+!THIRD_PARTY_NOTICES.md
+!scripts/collect-licenses.sh
