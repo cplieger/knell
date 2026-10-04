@@ -772,7 +772,7 @@ func TestLoadRejectsUnreadableBeatTokenFile(t *testing.T) {
 	if err == nil {
 		t.Fatal("Load() with unreadable BEAT_TOKEN_FILE = nil, want error (the secret file must not silently fall back to the environment value, which would arm the gate with the wrong token)")
 	}
-	if !strings.Contains(err.Error(), "could not be read (open failed)") {
+	if !strings.Contains(err.Error(), "could not be read because the open call failed") {
 		t.Errorf("error = %q, want the read-failure diagnosis naming the failed operation: envx embeds the path in its os.PathError and this sanitizer replaces it, so the operation plus the OS reason is all the operator has left to tell a missing mount from a permission problem", err)
 	}
 	if !strings.Contains(err.Error(), "BEAT_TOKEN") {

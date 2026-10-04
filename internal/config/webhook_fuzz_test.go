@@ -86,11 +86,11 @@ func FuzzParseWebhookURL(f *testing.F) {
 		// that leaks a slash-free secret fails here too.
 		switch err.Error() {
 		case "not a valid URL",
-			"scheme must be https (the webhook URL's own path is the credential, so plain http would send it in cleartext)",
+			"scheme must be https, because the webhook URL's own path is the credential and plain http would send it in cleartext",
 			"missing host",
 			"port must be between 1 and 65535",
-			"missing path (the webhook URL's own path carries the credential, so a host-only URL cannot deliver a notification)",
-			"contains a space or an invisible character (it is percent-encoded on every request, so the webhook host and path that reach the other end are not the configured ones; remove it, or percent-encode it yourself if it really belongs to the credential)":
+			"missing path. The webhook URL's own path carries the credential, so a host-only URL cannot deliver a notification",
+			"contains a space or an invisible character. It is percent-encoded on every request, so the webhook host and path that reach the other end are not the configured ones. If it really belongs to the credential, percent-encode it yourself, otherwise remove it":
 		default:
 			t.Fatalf("unexpected rejection message %q: a new message must be a fixed constant that cannot embed the operator-supplied URL", err)
 		}

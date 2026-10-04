@@ -336,7 +336,7 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 				"Delivery":       "2 refused, 1 never attempted",
 			},
 			want: []string{
-				"Delivery was delayed for 2 (check the webhook)", "1 had nothing attempted", webhookClause,
+				"Delivery was delayed for 2 of them, so check the webhook", "For the other 1, no delivery was ever attempted", webhookClause,
 			},
 			// No single-case clause may stand in for a mixed batch.
 			forbid: []string{delayedAll, noAttemptAll},

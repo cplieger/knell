@@ -246,7 +246,7 @@ func (d *Discord) BeatMissing(ctx context.Context, id string, live watch.Transit
 	return d.post(ctx, "missing "+id, &notice{
 		kind:     kindMissing,
 		id:       id,
-		guidance: "Nothing has pinged it in time: check the sender, its path to this observer, and that anything is pinging this beat id at all.",
+		guidance: "Nothing has pinged it in time, so check the sender, its path to this observer, and that anything is pinging this beat id at all.",
 		at:       live.Observed,
 		fields:   liveFields(live),
 	})
@@ -335,9 +335,9 @@ func escapeMarkdown(s string) string {
 // lateClause explains why one ended outage is reported after the fact.
 func lateClause(undelivered bool) string {
 	if undelivered {
-		return "This notice is late because delivery was delayed - check the webhook."
+		return "This notice is late because delivery was delayed, so check the webhook."
 	}
-	return "This notice is late because no delivery was ever attempted for it - the webhook is not the place to look."
+	return "This notice is late because no delivery was ever attempted for it, so the webhook is not the place to look."
 }
 
 // batchLateClause explains why a whole run of ended outages is reported after
@@ -346,12 +346,12 @@ func lateClause(undelivered bool) string {
 func batchLateClause(outages []watch.Outage) string {
 	switch total, undelivered := len(outages), countUndelivered(outages); undelivered {
 	case total:
-		return "Delivery was delayed for every outage - check the webhook."
+		return "Delivery was delayed for every outage, so check the webhook."
 	case 0:
-		return "No delivery was ever attempted for any of them - the webhook is not the place to look."
+		return "No delivery was ever attempted for any of them, so the webhook is not the place to look."
 	default:
 		return fmt.Sprintf(
-			"Delivery was delayed for %d (check the webhook); %d had nothing attempted.",
+			"Delivery was delayed for %d of them, so check the webhook. For the other %d, no delivery was ever attempted.",
 			undelivered, total-undelivered,
 		)
 	}
