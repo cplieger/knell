@@ -6,12 +6,12 @@ services:
     restart: unless-stopped
 
     environment:
-      BEATS: "cron-backup:26h,pipeline-watchdog:20m"  # id:deadline list, see README
-      DISCORD_WEBHOOK_URL: "https://discord.com/"  # invalid placeholder; replace with the full Discord webhook URL
-      BEAT_TOKEN: "CHANGEME"  # invalid placeholder; replace with: openssl rand -hex 16
-      NODE_NAME: "server-1"  # names this observer in notifications
+      BEATS: "cron-backup:26h,pipeline-watchdog:20m"  # one id:deadline pair per job you watch
+      DISCORD_WEBHOOK_URL: "https://discord.com/"  # replace with your full Discord webhook URL, or knell refuses to start
+      BEAT_TOKEN: "CHANGEME"  # replace with the output of "openssl rand -hex 16", or knell refuses to start
+      NODE_NAME: "server-1"  # names this instance in every notice
 
     ports:
-      # /metrics is unauthenticated and enumerates beats; set ALLOWED_HOSTS
-      # and restrict exposure -- see README "Configuration reference".
+      # /metrics needs no token and lists every beat. Publish this port only to a
+      # network you trust, see README "Security".
       - "9190:9190"
