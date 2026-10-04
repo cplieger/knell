@@ -97,7 +97,7 @@ knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext on eve
 
 The token gates `POST /beat/<id>` only. `/healthz` and `/metrics` answer anyone who can reach the port, and `/metrics` lists every beat with its last ping. Publish the port to a trusted network only, or put an authenticating proxy in front of `/metrics`. Set `ALLOWED_HOSTS` to the names you use, so a web page an operator opens cannot reach knell through a hostname an attacker controls.
 
-The image runs as the non-root user 65534 on `scratch`, and the webhook URL never appears in a log line or an error. [Security](docs/security.md) covers the startup check for `ALLOWED_HOSTS`, the proxy settings and the hardened compose profile.
+The image runs as the non-root user 65534 on `scratch`, and the webhook URL never appears in a log line or an error. [Security](docs/hardening.md) covers the startup check for `ALLOWED_HOSTS`, the proxy settings and the hardened compose profile.
 
 ## Troubleshooting
 
@@ -121,7 +121,7 @@ knell publishes Prometheus metrics on `/metrics` and writes logfmt logs to stand
 - [Configuration](docs/configuration.md) lists every setting, its limits, secret files and what stops startup.
 - [How knell works](docs/how-it-works.md) explains deadlines, notices, retries and every answer a ping can get.
 - [Monitoring and alerts](docs/monitoring.md) lists the log lines, the metrics and the alert rules.
-- [Security](docs/security.md) covers exposure, reverse proxies and the hardened compose profile.
+- [Security](docs/hardening.md) covers exposure, reverse proxies and the hardened compose profile.
 
 ## Contributing
 
