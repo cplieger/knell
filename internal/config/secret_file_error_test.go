@@ -58,7 +58,7 @@ func TestSecretFileErrorNamesEveryFailureClass(t *testing.T) {
 		},
 		"unreadable with no reachable PathError": {
 			err:      fmt.Errorf("%w: %s", envx.ErrSecretFileUnreadable, canary),
-			wantText: "could not be read: check that the path the variable names exists",
+			wantText: "could not be read. Check that the path the variable names exists",
 		},
 		"a class this envx version does not classify": {
 			err:      errors.New("envx: secret file refused for a new reason: " + canary),
@@ -97,7 +97,7 @@ func TestSecretFileErrorNamesEveryFailureClass(t *testing.T) {
 		if got == nil {
 			t.Fatal("secretFileError returned nil for an unreadable secret file")
 		}
-		if !strings.Contains(got.Error(), "(open failed)") {
+		if !strings.Contains(got.Error(), "the open call failed") {
 			t.Errorf("secretFileError = %q, want it to name the failed operation: without it a missing mount and a permission problem read identically", got)
 		}
 		if !strings.Contains(got.Error(), os.ErrPermission.Error()) {

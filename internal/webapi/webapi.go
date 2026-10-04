@@ -151,7 +151,7 @@ func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 // canonicalBeatPath refuses.
 func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
 	webhttp.WriteError(w, r, http.StatusNotFound, "unknown_beat",
-		"no beat at this URL: check the id against BEATS, and check the URL for extra or repeated path segments")
+		"no beat at this URL. Check the id against BEATS, and check the URL for extra or repeated path segments")
 }
 
 // drainBeatBody drains the deliberately ignored ping payload so keep-alive
@@ -245,7 +245,7 @@ func HostPolicyOptions() []webhttp.HostAllowlistOption {
 	return []webhttp.HostAllowlistOption{
 		webhttp.WithLoopbackExempt(true),
 		webhttp.WithHostAllowlistError(webhttp.ErrorCode(obs.RefusalHostNotAllowed),
-			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"),
+			"host not allowed. Add it to ALLOWED_HOSTS to serve this hostname"),
 	}
 }
 

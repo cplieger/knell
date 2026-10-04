@@ -143,7 +143,7 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...webhttp.HostAllowlistOption) (
 
 	rawBeats, err := envx.Require("BEATS")
 	if err != nil {
-		return cfg, fmt.Errorf("BEATS is required (e.g. \"api:20m,backup:26h\"): %w", err)
+		return cfg, fmt.Errorf("BEATS is required, for example \"api:20m,backup:26h\". %w", err)
 	}
 	beats, err := parseBeats(rawBeats)
 	if err != nil {
@@ -202,7 +202,7 @@ func nodeName(maxNodeNameBytes int) (string, error) {
 		return hostnameNode(), nil
 	}
 	if len(node) > maxNodeNameBytes {
-		return "", fmt.Errorf("NODE_NAME is %d bytes, maximum is %d: the node name prefixes every Discord notification, and the cap keeps every notice far inside Discord's 2000-character content limit (an unbounded name would make Discord reject them all)", len(node), maxNodeNameBytes)
+		return "", fmt.Errorf("NODE_NAME is %d bytes and the maximum is %d. The node name prefixes every Discord notification, and the cap keeps every notice far inside Discord's 2000-character content limit. An unbounded name would make Discord reject them all", len(node), maxNodeNameBytes)
 	}
 	return node, nil
 }
@@ -249,7 +249,7 @@ func allowedHosts(opts []webhttp.HostAllowlistOption) (*webhttp.HostPolicy, erro
 	policy, invalid := webhttp.ParseHostList(strings.Split(raw, ","), opts...)
 	if len(invalid) > 0 {
 		// %q escapes an invisible rune pasted in with the hostname.
-		return nil, fmt.Errorf("%s has %d entries no Host can ever match, so the allowlist knell would serve is not the one configured: %.64q; use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,10.0.0.5,knell.example.com — a lone port like :9190 belongs in LISTEN_ADDR", key, len(invalid), invalid[:min(len(invalid), 4)])
+		return nil, fmt.Errorf("%s has %d entries no Host can ever match, so the allowlist knell would serve is not the one configured: %.64q. Use bare hostnames or IPs only, with no scheme, path or CIDR, for example localhost,10.0.0.5,knell.example.com. A lone port like :9190 belongs in LISTEN_ADDR", key, len(invalid), invalid[:min(len(invalid), 4)])
 	}
 	return policy, nil
 }
@@ -284,7 +284,7 @@ func logLevel() slog.Level {
 // `_FILE` silently falls back to the plain variable instead.
 func rejectBlankFileVar(key envx.Key) error {
 	if envx.IsBlankSecretFilePath(key) {
-		return fmt.Errorf("%s_FILE is set but empty: unset it to configure %s directly, or point it at a secret file", key, key)
+		return fmt.Errorf("%s_FILE is set but empty. Unset it to configure %s directly, or point it at a secret file", key, key)
 	}
 	return nil
 }
@@ -296,23 +296,23 @@ func rejectBlankFileVar(key envx.Key) error {
 func secretFileError(key string, err error) error {
 	switch {
 	case errors.Is(err, envx.ErrBlankSecretFile):
-		return fmt.Errorf("%s_FILE points to a blank secret file: point it at a file containing the secret, or unset it to configure %s directly", key, key)
+		return fmt.Errorf("%s_FILE points to a blank secret file. Point it at a file containing the secret, or unset it to configure %s directly", key, key)
 	case errors.Is(err, envx.ErrSecretFilePathRejected):
-		return fmt.Errorf("%s_FILE does not name a usable path: it must be an already-clean path with no \"..\" segment, no doubled separator and no trailing slash, e.g. /run/secrets/%s; if the variable holds the secret itself rather than a path to it, unset %s_FILE and configure %s directly", key, strings.ToLower(key), key, key)
+		return fmt.Errorf("%s_FILE does not name a usable path. It must be an already-clean path with no \"..\" segment, no doubled separator and no trailing slash, for example /run/secrets/%s. If the variable holds the secret itself and not a path to it, unset %s_FILE and configure %s directly", key, strings.ToLower(key), key, key)
 	case errors.Is(err, envx.ErrSecretFileTooLarge):
 		// 1 MiB is envx's documented ceiling, restated because it is not exported.
-		return fmt.Errorf("%s_FILE points to a file larger than the 1 MiB secret-file limit, so it was refused instead of read: point it at a file holding only the secret (a few dozen bytes), not at a bundle, archive or log the mount picked up by mistake", key)
+		return fmt.Errorf("%s_FILE points to a file larger than the 1 MiB secret-file limit, so it was refused instead of read. Point it at a file holding only the secret, which is a few dozen bytes, and not at a bundle, archive or log the mount picked up by mistake", key)
 	case errors.Is(err, envx.ErrSecretFileGrew):
-		return fmt.Errorf("%s_FILE grew past the 1 MiB secret-file limit while it was being read, so the secret would have been silently truncated and every request using it would be rejected: have the writer create the file atomically (write a temporary file, then rename it into place) rather than appending to the mounted one, then restart knell", key)
+		return fmt.Errorf("%s_FILE grew past the 1 MiB secret-file limit while it was being read, so the secret would have been silently truncated and every request using it would be rejected. Have the writer create the file atomically by writing a temporary file and renaming it into place, instead of appending to the mounted one. Then restart knell", key)
 	case errors.Is(err, envx.ErrSecretFileUnreadable):
 		// envx keeps the *os.PathError reachable, so the syscall and its bare
 		// reason can be named while pathErr.Path stays out.
 		if pathErr, ok := errors.AsType[*os.PathError](err); ok {
-			return fmt.Errorf("%s_FILE could not be read (%s failed): %v: check that the path the variable names exists inside the container and is readable by knell's non-root user", key, pathErr.Op, pathErr.Err)
+			return fmt.Errorf("%s_FILE could not be read because the %s call failed with %v. Check that the path the variable names exists inside the container and is readable by knell's non-root user", key, pathErr.Op, pathErr.Err)
 		}
-		return fmt.Errorf("%s_FILE could not be read: check that the path the variable names exists inside the container and is readable by knell's non-root user", key)
+		return fmt.Errorf("%s_FILE could not be read. Check that the path the variable names exists inside the container and is readable by knell's non-root user", key)
 	}
-	return fmt.Errorf("%s_FILE could not be read or validated: point it at a clean path (no \"..\") naming a readable secret file of at most 1 MiB; a secret file holds a few dozen bytes", key)
+	return fmt.Errorf("%s_FILE could not be read or validated. Point it at a clean path without a \"..\" segment that names a readable secret file of at most 1 MiB. A secret file holds a few dozen bytes", key)
 }
 
 // warnPlainVarIgnored reports that KEY_FILE supplied the secret while the
@@ -333,7 +333,7 @@ func fileSourcedValueError(key string, src envx.SecretSource, err error) error {
 	if src != envx.SourceFile {
 		return err
 	}
-	return fmt.Errorf("%w (this value came from %s_FILE, not %s: fix the file's content, or the mount it points at)", err, key, key)
+	return fmt.Errorf("%w. This value came from %s_FILE, not %s, so fix the file's content or the mount it points at", err, key, key)
 }
 
 // resolveSecret reads one required credential through envx's KEY/KEY_FILE
@@ -375,7 +375,7 @@ func beatTokenFitsHeader(value string) bool {
 // and carries no value: resolveSecret returns it for the present-but-empty
 // variable, and loadWebhook for a value with nothing visible left after the
 // trim, so the two cannot describe one misconfiguration differently.
-var errWebhookSetButEmpty = errors.New("DISCORD_WEBHOOK_URL is set but empty: point it at the https webhook URL, or use DISCORD_WEBHOOK_URL_FILE")
+var errWebhookSetButEmpty = errors.New("DISCORD_WEBHOOK_URL is set but empty. Point it at the https webhook URL, or use DISCORD_WEBHOOK_URL_FILE")
 
 // errWebhookRequired is the refusal for a DISCORD_WEBHOOK_URL that was never
 // set; its present-but-empty twin is errWebhookSetButEmpty.
@@ -386,8 +386,8 @@ var errWebhookRequired = errors.New("DISCORD_WEBHOOK_URL is required")
 // Serving /beat/{id} with no credential is not one of the options: any client
 // that can reach the port would keep every beat reading fresh.
 var (
-	errBeatTokenSetButEmpty = fmt.Errorf("BEAT_TOKEN is set but empty: it is the only thing standing between a stranger who can reach this port and a forged ping, so there is no configuration in which knell serves /beat/{id} without it; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
-	errBeatTokenRequired    = fmt.Errorf("BEAT_TOKEN is required: it is the only gate on /beat/{id}, so without it any client that can reach this port can keep every beat reading fresh while the thing it watches is dead; set it to a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
+	errBeatTokenSetButEmpty = fmt.Errorf("BEAT_TOKEN is set but empty. It is the only thing standing between a stranger who can reach this port and a forged ping, so knell never serves /beat/{id} without it. Set it to a random token of at least %d bytes, for example the output of `openssl rand -hex 16`, or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
+	errBeatTokenRequired    = fmt.Errorf("BEAT_TOKEN is required. It is the only gate on /beat/{id}, so without it any client that can reach this port can keep every beat reading fresh while the thing it watches is dead. Set it to a random token of at least %d bytes, for example the output of `openssl rand -hex 16`, or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
 )
 
 // checkBeatToken validates a configured BEAT_TOKEN as the exact credential
@@ -397,16 +397,16 @@ var (
 // the value the operator holds.
 func checkBeatToken(token string) error {
 	if strings.Trim(token, asciiWhitespace) != token {
-		return errors.New("BEAT_TOKEN has leading or trailing ASCII whitespace: a trailing space or tab is stripped from the header value on the wire, and CR, LF, VT and FF cannot be sent in one at all, so such a token never reaches the verifier as configured and POST /beat/{id} would reject every ping while the endpoint reports itself gated; a leading space or tab is refused too, because it authenticates as part of the credential while being invisible in the value you read; knell will not silently rewrite a credential, so remove the surrounding whitespace")
+		return errors.New("BEAT_TOKEN has leading or trailing ASCII whitespace. A trailing space or tab is stripped from the header value on the wire, and CR, LF, VT and FF cannot be sent in one at all. Such a token never reaches the verifier as configured, and POST /beat/{id} would reject every ping while the endpoint reports itself gated. A leading space or tab is refused too, because it authenticates as part of the credential while being invisible in the value you read. knell will not silently rewrite a credential, so remove the surrounding whitespace")
 	}
 	if !beatTokenFitsHeader(token) {
-		return fmt.Errorf("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it; use a token of at least %d printable characters", minTokenLength)
+		return fmt.Errorf("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it. Use a token of at least %d printable characters", minTokenLength)
 	}
 	if len(token) < minTokenLength {
-		return fmt.Errorf("BEAT_TOKEN is shorter than the %d-byte minimum: it is the only gate on /beat/{id}, so a token short enough to guess lets a stranger who can reach this port keep every beat reading fresh while the thing it watches is dead; set a random token of at least %d bytes (e.g. `openssl rand -hex 16`)", minTokenLength, minTokenLength)
+		return fmt.Errorf("BEAT_TOKEN is shorter than the %d-byte minimum. It is the only gate on /beat/{id}, so a token short enough to guess lets a stranger who can reach this port keep every beat reading fresh while the thing it watches is dead. Set a random token of at least %d bytes, for example the output of `openssl rand -hex 16`", minTokenLength, minTokenLength)
 	}
 	if len(token) > maxTokenLength {
-		return fmt.Errorf("BEAT_TOKEN is longer than the %d-byte maximum: the maximum is the token's share of the %d-byte header block knell reads, so an accepted token always travels with %d bytes left over for the request line, the Host header and the \"Bearer \" prefix, and a longer one is refused at startup rather than left to eat that reserve until POST /beat/{id} answers 431 to every ping while reporting itself gated; a real credential is far shorter than the maximum, so set a random token of at least %d bytes (e.g. `openssl rand -hex 16`), or check that BEAT_TOKEN_FILE names the secret file itself rather than a bundle the mount picked up", maxTokenLength, MaxRequestHeaderBytes, headerOverheadAllowance, minTokenLength)
+		return fmt.Errorf("BEAT_TOKEN is longer than the %d-byte maximum. The maximum is the token's share of the %d-byte header block knell reads, so an accepted token always travels with %d bytes left over for the request line, the Host header and the \"Bearer \" prefix. A longer token is refused at startup, because it would eat that reserve until POST /beat/{id} answers 431 to every ping while reporting itself gated. A real credential is far shorter than the maximum, so set a random token of at least %d bytes, for example the output of `openssl rand -hex 16`, or check that BEAT_TOKEN_FILE names the secret file itself and not a bundle the mount picked up", maxTokenLength, MaxRequestHeaderBytes, headerOverheadAllowance, minTokenLength)
 	}
 	return nil
 }
@@ -489,26 +489,26 @@ func parseBeats(raw string) ([]Beat, error) {
 func parseBeatEntry(entry string, seen map[string]struct{}) (Beat, error) {
 	id, rawDeadline, found := strings.Cut(entry, ":")
 	if !found {
-		return Beat{}, fmt.Errorf("entry %.64q: expected \"id:deadline\"", entry)
+		return Beat{}, fmt.Errorf("entry %.64q is malformed because the expected form is \"id:deadline\"", entry)
 	}
 	id = strings.TrimSpace(id)
 	if !beatIDPattern.MatchString(id) {
-		return Beat{}, fmt.Errorf("entry %.64q: id must match %s", entry, beatIDPattern)
+		return Beat{}, fmt.Errorf("entry %.64q is invalid because its id must match %s", entry, beatIDPattern)
 	}
 	if _, dup := seen[id]; dup {
-		return Beat{}, fmt.Errorf("entry %.64q: duplicate id %.64q", entry, id)
+		return Beat{}, fmt.Errorf("entry %.64q has a duplicate id %.64q", entry, id)
 	}
 	rawDeadline = strings.TrimSpace(rawDeadline)
 	deadline, err := time.ParseDuration(rawDeadline)
 	if err != nil {
 		// The operand is stated here rather than through the stdlib message,
 		// which quotes it a second time unbounded.
-		return Beat{}, fmt.Errorf("entry %.64q: invalid deadline %.64q: use a Go duration "+
-			"with an explicit unit (s, m, h), e.g. 30s, 20m or 26h; there is no day "+
+		return Beat{}, fmt.Errorf("entry %.64q has invalid deadline %.64q. Use a Go duration "+
+			"with an explicit unit of s, m or h, for example 30s, 20m or 26h. There is no day "+
 			"unit, so a daily job is 26h", entry, rawDeadline)
 	}
 	if deadline < minDeadline {
-		return Beat{}, fmt.Errorf("entry %.64q: deadline below minimum %s", entry, minDeadline)
+		return Beat{}, fmt.Errorf("entry %.64q has a deadline below minimum %s", entry, minDeadline)
 	}
 	seen[id] = struct{}{}
 	return Beat{ID: id, Deadline: deadline}, nil
@@ -535,7 +535,7 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		return nil, errors.New("not a valid URL")
 	}
 	if u.Scheme != "https" {
-		return nil, errors.New("scheme must be https (the webhook URL's own path is the credential, so plain http would send it in cleartext)")
+		return nil, errors.New("scheme must be https, because the webhook URL's own path is the credential and plain http would send it in cleartext")
 	}
 	if u.Hostname() == "" {
 		// Hostname(), not Host: an authority carrying only a port has a
@@ -552,10 +552,10 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		}
 	}
 	if u.Path == "" || u.Path == "/" {
-		return nil, errors.New("missing path (the webhook URL's own path carries the credential, so a host-only URL cannot deliver a notification)")
+		return nil, errors.New("missing path. The webhook URL's own path carries the credential, so a host-only URL cannot deliver a notification")
 	}
 	if !utf8.ValidString(raw) || strings.ContainsFunc(raw, invisibleInURL) {
-		return nil, errors.New("contains a space or an invisible character (it is percent-encoded on every request, so the webhook host and path that reach the other end are not the configured ones; remove it, or percent-encode it yourself if it really belongs to the credential)")
+		return nil, errors.New("contains a space or an invisible character. It is percent-encoded on every request, so the webhook host and path that reach the other end are not the configured ones. If it really belongs to the credential, percent-encode it yourself, otherwise remove it")
 	}
 	return u, nil
 }
