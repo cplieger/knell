@@ -3,184 +3,129 @@
 [![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/knell/badges/size.json)](https://github.com/cplieger/knell/pkgs/container/knell) [![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)](https://github.com/cplieger/knell/pkgs/container/knell) [![base: scratch](https://img.shields.io/badge/base-scratch-000000)](https://github.com/cplieger/knell/blob/main/Dockerfile) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/knell/badges/mutation.json)](https://github.com/cplieger/knell/issues?q=label%3Agremlins-tracker) [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/knell/releases)
 
 <!-- hub-overview BEGIN -->
-A dead man's switch in a single tiny container: things ping it while they're alive, and when the pings stop, it rings a Discord webhook.
+knell is a dead man's switch for your scheduled jobs. It sends you a Discord message when a cron job, backup script or alerting pipeline stops pinging it over HTTP. It only listens and never runs them.
 
 ## What it does
 
-Monitoring tells you when something visibly breaks. It stays quiet when the thing that was supposed to run simply never ran: the cron job that silently stopped, the alerting pipeline that died along with its own ability to alert. knell watches for that silence.
+knell tells you when a scheduled job stops, in four ways:
 
-You configure named beats, each with a deadline. Anything that can send an HTTP request pings its beat (`POST /beat/<id>`); if a beat stays silent past its deadline, knell posts a missing notice to your Discord webhook, and a recovered notice when the pings return. Per-beat freshness is also exposed as Prometheus metrics, so a metrics stack can aggregate several knell instances into quorum views.
+- Posts once to Discord when a job stays quiet past its deadline, and again when it pings.
+- Counts each deadline from knell's start, so a job silent since a restart is still reported.
+- Tells you afterwards about an outage that ended before its message could go out.
+- Publishes each job's state as Prometheus metrics, so your metrics stack can combine several instances.
 
-- One binary on a `scratch` base: no shell, no libc, no dependencies to patch
-- Deadline clock starts at boot: a beat that never pings at all still alerts one deadline after start, so a restart never silently disarms the switch (the flip side: each restart re-arms full deadlines; see the restart-churn rule under Alerting)
-- One missing notice per live outage (delivery is retried every sweep until it succeeds), one recovered notice when the beat returns
-- Outages that were already over before anything could be sent are reported once, in the past tense, with the reason the notice is late, instead of arriving as apparent new failures
-- Unknown beat ids are rejected with 404 and never create metric series
+Each watched job is a beat. Its deadline is the longest silence allowed between two pings.
+
+## Who it is for
+
+knell is built for a home lab that gets its alerts in Discord and wants a small watchdog with no database or web page. It is one static binary set up from environment variables, keeps its state in memory and sends only to Discord or a Discord-compatible relay.
+
+You need a Discord webhook, a Docker host and jobs that can send an HTTP POST. Keep its port on a network you trust.
+
+Two projects suit a different setup:
+
+- Consider [Healthchecks](https://github.com/healthchecks/healthchecks) if you want a web dashboard, cron schedules and 25+ integrations.
+- Consider [Uptime Kuma](https://github.com/louislam/uptime-kuma) if you want status pages and active HTTP, DNS and ping checks.
+
+knell is free software under the GPL-3.0-or-later license.
 <!-- hub-overview END -->
 
 ## Quick start
 
-Images are published to GHCR (`ghcr.io/cplieger/knell`) and Docker Hub
-(`cplieger/knell`).
+The image is on GitHub Container Registry and Docker Hub, for `amd64` and `arm64`. This is the [`compose.yaml`](compose.yaml) in this repository.
 
 ```yaml
-# compose.yaml
 services:
   knell:
     image: ghcr.io/cplieger/knell:latest
     container_name: knell
     restart: unless-stopped
+
     environment:
-      BEATS: "cron-backup:26h,pipeline-watchdog:20m"
-      DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/..."
-      BEAT_TOKEN: "CHANGEME"  # invalid placeholder; required, min 16 bytes: openssl rand -hex 16
-      NODE_NAME: "server-1"
+      BEATS: "cron-backup:26h,pipeline-watchdog:20m"  # one id:deadline pair per job you watch
+      DISCORD_WEBHOOK_URL: "https://discord.com/"  # replace with your full Discord webhook URL, or knell refuses to start
+      BEAT_TOKEN: "CHANGEME"  # replace with the output of "openssl rand -hex 16", or knell refuses to start
+      NODE_NAME: "server-1"  # names this instance in every notice
+
     ports:
+      # /metrics needs no token and lists every beat. Publish this port only to a
+      # network you trust, see README "Security".
       - "9190:9190"
 ```
 
-Then ping a beat from the thing being watched, presenting the token:
+1. In Discord, open Server Settings, then Integrations, and create a webhook for the channel that should get the notices.
+2. Copy the webhook URL.
+3. Run `openssl rand -hex 16` and keep the output as your token.
+4. Save the file above as `compose.yaml`. Put the webhook URL in `DISCORD_WEBHOOK_URL`, the token in `BEAT_TOKEN`, and one `id:deadline` pair per job in `BEATS`.
+5. Run `docker compose up -d`.
+6. Add this line at the end of each job. Set `BEAT_TOKEN` in that job's environment to the same token, or paste the token in its place, and end the URL with the beat's id:
 
 ```sh
-# at the end of the daily backup script
-curl -fsS -X POST -H "Authorization: Bearer $BEAT_TOKEN" http://knell:9190/beat/cron-backup
+curl -fsS -X POST -H "Authorization: Bearer $BEAT_TOKEN" http://192.0.2.10:9190/beat/cron-backup
 ```
 
-Silence past the deadline rings the bell. Every notice is a one-line message plus a card carrying the figures:
+Replace `192.0.2.10` with the address of the host that runs knell, as other devices on your network reach it. A job that runs directly on that host, outside a container, can use `localhost:9190`.
 
-> 🚨 [knell server-1] beat **cron-backup** MISSING
->
-> **🚨 beat cron-backup MISSING**
-> Nothing has pinged it in time: check the sender, its path to this observer, and that anything is pinging this beat id at all.
->
-> **Silent for** 26h0m1s / **Silence began** 2026-07-22 10:00 UTC / **Observer** server-1
+Run `docker logs knell`. You should see a `configuration loaded` line and then `listening`. If it shows `knell exited with error` instead, its `error` field names the setting to fix, usually a placeholder you have not replaced yet.
+
+When a beat goes quiet past its deadline, the channel gets a message naming the beat, with how long it has been silent, when the silence began and which knell instance saw it.
 
 ## Configuration reference
 
-| Variable | Description | Default | Required |
-| --- | --- | --- | --- |
-| `BEATS` | comma-separated `id:deadline` list, for example `api:20m,backup:26h`; whitespace around an entry and around its colon is ignored, so `api:20m, backup:26h` is the same list. Ids match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; deadlines are Go durations of at least `30s`; at most 64 beats | _none_ | Yes |
-| `DISCORD_WEBHOOK_URL` | the webhook notifications post to. `https` only, and it must carry a path, since the path is the credential Discord issues (`/api/webhooks/{id}/{token}`); a host-only URL fails startup, and any other `https` path is accepted, so a Discord-compatible relay works too, provided it accepts Discord's `content` plus `embeds` message shape. `DISCORD_WEBHOOK_URL_FILE` reads it from a mounted secret file instead | _none_ | Yes |
-| `NODE_NAME` | names this observer in every notification; maximum 256 bytes, since it prefixes every notice and Discord caps a message at 2000 characters | container hostname | No |
-| `BEAT_TOKEN` | the bearer token every sender presents as `Authorization: Bearer <token>` on `POST /beat/{id}`, and the endpoint's only gate. Required, 16 to 512 bytes, and verified exactly as configured: generate one with `openssl rand -hex 16`. `BEAT_TOKEN_FILE` reads it from a mounted secret file instead | _none_ | Yes |
-| `LISTEN_ADDR` | TCP listen address (`host:port`) | `:9190` | No |
-| `ALLOWED_HOSTS` | comma-separated exact-match `Host` allowlist (bare hostnames or IPs with an optional port, no scheme or path), for example `knell.internal,10.0.0.5`. Unset accepts every `Host`; set, any other `Host` is refused 403 `host_not_allowed` on every endpoint, which is what blocks DNS rebinding from a browser inside your network. It covers `/healthz` and `/metrics` too, so list every name your probes and Prometheus scraper use, not just the browser-facing one. The baked `knell health` check reads a marker file and sends no request, so no allowlist can break it | _(unset)_ | No |
-| `TRUSTED_PROXIES` | comma-separated CIDRs or bare IPs of the reverse proxies in front of knell, for example `10.0.0.0/24,192.168.1.5`. Their `X-Forwarded-For` is believed, so the access line's `client_ip` names the real sender; unset honors no forwarded header. Set it when you put a TLS proxy in front, or every access line, including the 401s a token-guessing run writes, names the proxy instead of an address you can block. List exactly those hops: a range wider than your proxies lets anything inside it choose its own `client_ip`. Malformed entries are logged and dropped rather than failing startup | _(unset)_ | No |
-| `LOG_LEVEL` | `debug`/`info`/`warn`/`error`; unknown falls back to `info` | `info` | No |
+knell reads its settings from environment variables when it starts and never reloads them. An invalid value stops it at startup with an error naming the setting, instead of falling back to a default. [Configuration](docs/configuration.md) has the full rules for each setting.
 
-knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext on every ping. It is the only thing standing between a stranger who can reach the port and a forged heartbeat, and anything that can read one ping can replay it forever: put a TLS reverse proxy in front, or keep pings on a network you trust to that same standard.
-
-`BEAT_TOKEN` gates `/beat/{id}` only. `/healthz` and `/metrics` stay open on the same port so probes and scrapes keep working, and `/metrics` publishes every configured beat id with its last-seen timestamp and freshness, so anyone who can reach the port can enumerate the beats and see which one is about to fire, token or no token. Publish the port to a trusted network only (the compose example maps it on every host interface), or put an authenticating proxy in front of `/metrics`. A trusted network is not enough against a browser: a page an operator opens can make their browser reach knell under a hostname an attacker controls, which is what `ALLOWED_HOSTS` refuses. Check that it armed in the `configuration loaded` line knell logs at startup, where `allowed_hosts=allowlist(2)` names how many hosts the gate holds and `allowed_hosts=any` means every `Host` is accepted, which is also what a misspelled variable name looks like.
-
-Invalid configuration fails startup rather than falling back to a default, because a dead-man switch running with the wrong config is worse than one that refuses to start. That covers a `BEATS` entry that is not `id:deadline` with a valid id and a Go duration (blank segments between commas are skipped, so a trailing comma is fine), a webhook URL that is not `https` or carries no path, a `NODE_NAME` over 256 bytes, an `ALLOWED_HOSTS` entry no `Host` could ever match, and a `BEAT_TOKEN` no sender could present as written: unset, empty, outside the 16-to-512-byte bounds, carrying surrounding spaces or tabs, or carrying a control character HTTP forbids in a header value. Whitespace is refused rather than trimmed, since rewriting the token would arm the gate for a value you did not configure, reject every ping while reporting itself gated, then declare every beat missing one deadline later. A `_FILE` variable that is set but missing, unreadable, or empty fails startup too; only an unset one falls back to the plain variable.
-
-## Endpoints
-
-| Endpoint | Purpose |
-| -------- | ------- |
-| `POST /beat/{id}` | record a ping, with `Authorization: Bearer <BEAT_TOKEN>`; `{"ok":true}` on success, 401 without the token, 404 for unknown ids, 405 for any other method |
-| `GET /healthz` | liveness (`{"status":"OK"}`) |
-| `GET /metrics` | Prometheus exposition |
-
-Request bodies on `/beat/{id}` are ignored, so webhook-shaped senders (an Alertmanager `webhook_configs` target, a CI notification hook) can point at it unchanged. A payload over 1 MiB still records the ping and answers `{"ok":true}`; it logs one `warn` line and loses keep-alive on that connection, never its ping.
-
-Headers are bounded the other way round, because they are the part knell has to parse before it knows anything about the caller: at most 8704 bytes of request headers are read, and a request whose header block is larger is answered 431. A proxy that piles on `X-Forwarded-*`, tracing and cookie headers can deliver a block that large. If pings start failing that way, trim the headers the proxy adds.
-
-Only `POST` records. `GET` and `HEAD` are answered with 405 and never feed the switch, so nothing that merely fetches a URL (a chat client's link preview, a crawler, an uptime prober, an `<img>` on a page an operator opens) can keep a beat looking alive. Pings that present no valid token share one throttle budget and are answered 429 with a `Retry-After` hint once it is spent, which caps both guessing and the log flood a bad sender would write; a ping with the right token is never throttled, however many senders you run.
-
-`/healthz` and `/metrics` are logged as machine probes: a successful probe or scrape lands at `debug` (visible under `LOG_LEVEL=debug` when the question is whether the prober arrives at all), while one answering 4xx or 5xx lands at `warn`/`error`. So a scrape that stopped landing shows up in the log without raising the level.
-
-## Notification semantics
-
-A live incident and one that is already over are reported differently: nothing an operator reads should announce a resolved outage as a beat that is down right now.
-
-- **Missing**: sent once per live outage, when a beat first passes its deadline. A failed delivery (Discord outage, network) is retried on every 15s sweep until one succeeds; the beat is only marked notified after a delivered send.
-- **Recovered**: sent on the first accepted ping after a missing notice, best-effort. Delivery uses bounded retries with jittered backoff and honors `Retry-After` on rate limits. It is fire-once: the queued transition is consumed before the send, so a delivery that still fails has nothing left to retry from and that notice will never arrive. It therefore counts as `knell_notifications_dropped_total{kind="recovered"}`, not as a failure you can wait out.
-- **Ended outages**: an outage that starts while an earlier missing notice is still undelivered gets its own queued record instead of being collapsed into that earlier one and lost. Records whose outage has already ended by the time they can be delivered are reported once in the past tense, and the notice says why it is late, because the two reasons ask for different things:
-
-  > 🕓 [knell server-1] beat **cron-backup** outage history
-  >
-  > **🕓 beat cron-backup outage history**
-  > This notice is late because delivery was delayed - check the webhook.
-  >
-  > **Was missing for** 12m0s / **Silence began** 2026-07-23 13:55 UTC / **Recovered at** 2026-07-23 14:07 UTC / **Delivery** refused / **Observer** server-1
-
-  An outage nothing was ever attempted for (no sweep saw it before a ping ended it, or a sweep saw it and deferred it) says so instead and points at nothing to check. That wording is only used while nothing about the outage has failed to send: a past-tense notice that itself fails and is retried carries the webhook wording when it finally arrives, so it never vouches for a webhook that just refused it. Several ended outages become one summary card carrying the outage count, the longest outage, the last recovery point and the delivery split, and it states both counts ("Delivery was delayed for 2 (check the webhook); 1 had nothing attempted"). It is delivered in a single sweep, so a genuinely live outage queued behind a full backlog waits one sweep rather than one per stale record. Because the notice states the outages are over, no recovered notice follows for them.
-- **Queued outages**: each beat queues up to 8 records and reports them oldest first. When a beat's queue is full, the newest record is not queued, and the two cases differ in consequence:
-  - an outage a ping has already ended is **dropped for good**: its record was the last trace of it, so no notice for it will ever arrive. `knell_outage_records_dropped_total{beat}` increments and a warning is logged, once for that outage. Reconstruct the missed window from `knell_beat_last_seen_timestamp_seconds`.
-  - an outage still in progress **loses nothing**: it stays detected (`knell_beat_outages_total{beat}` already counted it), and it is queued and delivered once a slot opens. That is ordinary back-pressure while notifications are failing, so it is logged at debug level and moves no delivery counter.
-- The webhook URL is treated as a secret: it is never logged and never appears in error messages.
-
-## Metrics
-
-| Metric | Type | Notes |
-| ----- | ------- | ----- |
-| `knell_beat_fresh{beat}` | gauge | 1 = observed silence within deadline, 0 = overdue; silence runs from process start until the first ping, so a beat nothing has pinged reads 1 for its first deadline. The aggregation input for multi-observer quorum rules |
-| `knell_beat_last_seen_timestamp_seconds{beat}` | gauge | Unix time of the last accepted ping (process start until the first ping) |
-| `knell_beat_deadline_seconds{beat}` | gauge | the beat's configured silence deadline. Add it to the last-seen gauge to get when an overdue beat fires, and compare it across observers to catch a `BEATS` skew before one node alerts alone |
-| `knell_beats_received_total{beat}` | counter | accepted pings; unknown ids are rejected, not counted |
-| `knell_beat_outages_total{beat}` | counter | outages detected per beat, counted when the deadline is crossed and independent of any delivery. Count outages with this one, not with the notification counters |
-| `knell_outage_records_dropped_total{beat}` | counter | ended-outage records discarded per beat because the beat's queue was full, one per RECORD: no notice for that outage will ever arrive (see Notification semantics) |
-| `knell_notifications_sent_total{kind}` | counter | delivered webhook notifications (`missing`, `recovered`, `history`), one per delivered message: a `history` message covering several ended outages counts once |
-| `knell_notifications_failed_total{kind}` | counter | delivery attempts that failed after retries, one per failed message, with the record still queued: in practice `missing` and `history`, which the next sweep tries again |
-| `knell_notifications_dropped_total{kind}` | counter | notification messages that will never be delivered, one per lost message: in practice `recovered`, the one fire-once kind. Nothing retries a drop. A lost outage RECORD is counted on `knell_outage_records_dropped_total` instead, because a record is not a message |
-| `knell_pre_route_refusals_total{reason}` | counter | requests knell's own code refuses before any route ran, by cause: `non_canonical_beat_path` (a malformed `/beat` URL), `host_not_allowed` (a `Host` missing from `ALLOWED_HOSTS`, or a DNS-rebinding attempt), `auth_throttled` (failed authentication over the throttle's budget). A diagnostic, not an alert source; see below |
-| `knell_http_requests_total{method,path,status}` | counter | served requests, labelled by the matched route template (never the raw path) and a closed method set. The only view of a REFUSED ping: a 401, 404, 405 or 503 never reaches `knell_beats_received_total`. A refusal answered before routing has no template, so it lands under `path="unmatched"` |
-| `knell_http_request_duration_seconds` | histogram | served-request latency across the whole surface, deliberately unlabelled |
-
-Plus standard `go_*` / `process_*` runtime metrics.
-
-`knell_pre_route_refusals_total` deliberately has no alert rule of its own, and should not get one: a sender whose pings are refused is not feeding its beat, so that beat crosses its deadline and `KnellBeatOverdue` (below) fires anyway. Read it when a beat has gone missing and you need to know why the pings stopped landing: a malformed URL, a `Host` the deployment forgot to allow, or a rotated token throttling every sender. One refusal is missing from it by construction: a request whose header block exceeds the 8704-byte ceiling above is answered 431 by Go's HTTP server before knell sees the request at all, so it appears in no knell metric and no log line; a beat going missing with no refusal recorded, and no ping in `knell_http_requests_total`, is the signature of that case. Every reason is exposed at zero from startup, so `increase()` over it works from a cold start.
-
-## Alerting
-
-knell is itself the alert path for the things it watches, so alert rules about knell have to come from a second vantage point: your metrics stack scraping `/metrics`, and your log stack reading its container log. The rules ship as one file per expression language for that reason. The five PromQL rules in [`alerts/promql.yaml`](alerts/promql.yaml) go to Prometheus or the Mimir ruler; the three LogQL rules in [`alerts/logql.yaml`](alerts/logql.yaml) go to Loki's ruler. Load each half into its own ruler: neither ruler parses the other's expressions. The three log rules exist because their conditions leave no series to read at all: a switch that refuses its configuration exits before it binds a listener, so it publishes no metrics and a crash-looping container is never scraped.
-
-| Alert | Fires when | Severity |
+| Variable | Description | Default |
 | --- | --- | --- |
-| `KnellTargetDown` | `up{job="knell"} == 0` for 15m: knell is not being scraped, so every beat it watches is unmonitored | critical |
-| `KnellTargetAbsent` | `absent(up{job="knell"})` for 15m: knell is not a configured scrape target at all | critical |
-| `KnellBeatOverdue` | `knell_beat_fresh == 0` for 5m: a beat is overdue, and the missing notice may not have reached you | warning |
-| `KnellNotifyFailing` | a delivery failed after retries, or a notification or an outage record was dropped for good | warning |
-| `KnellRestartChurn` | knell restarted more than once inside a beat's deadline window | warning |
-| `KnellExitedWithError` | knell logged its own exit: a refused configuration, a listener it could not bind, an unknown command, or a stop that outlived its grace | critical |
-| `KnellNoticeLostForGood` | a log line reports a notice nothing will retry, including the queued records a stop discards, which move no counter | warning |
-| `KnellAcceptFailing` | the listener logged an accept failure, so pings stop landing while the process stays alive | critical |
+| `BEATS` | Comma-separated `id:deadline` list, such as `api:20m,backup:26h`. Deadlines are at least `30s`, at most 64 beats | required |
+| `DISCORD_WEBHOOK_URL` | The `https` webhook URL notices are posted to. `DISCORD_WEBHOOK_URL_FILE` reads it from a secret file instead | required |
+| `BEAT_TOKEN` | The token every ping presents as `Authorization: Bearer <token>`, 16 to 512 bytes. `BEAT_TOKEN_FILE` reads it from a secret file | required |
+| `NODE_NAME` | Names this instance in every notice, at most 256 bytes | container hostname |
+| `LISTEN_ADDR` | TCP listen address, `host:port` | `:9190` |
+| `ALLOWED_HOSTS` | Comma-separated exact-match `Host` names or IPs to serve. Unset accepts every `Host` | _(unset)_ |
+| `TRUSTED_PROXIES` | Comma-separated CIDRs or IPs of the reverse proxies whose `X-Forwarded-For` names the real sender | _(unset)_ |
+| `LOG_LEVEL` | `debug`, `info`, `warn` or `error`. An unknown value falls back to `info` | `info` |
 
-`KnellNotifyFailing` carries three `or` legs on purpose. `failed` means the notice is late and the 15s sweep retries it, so you wait. Either `dropped` means nothing will arrive and you reconstruct the window yourself from `knell_beat_last_seen_timestamp_seconds`. Drop the third leg and a permanently lost outage record pages nobody.
+| Port | Description |
+| --- | --- |
+| `9190` | Pings on `POST /beat/<id>`, the health endpoint `/healthz` and Prometheus metrics on `/metrics` |
 
-`KnellNoticeLostForGood` is the same question on the axis the counters cannot reach. It keys on the `retryable=false` field every notification-loss line carries, which covers the losses a stop causes: queued records and pending recovered notices die with the process and move no counter at all. Keep `LOG_LEVEL` at its `info` default for it to mean that, because those lines sit at `info` and `warn`.
-
-One caveat comes with the boot-armed clock: every restart re-arms each beat's full deadline, so an observer restarting more often than a beat's deadline never fires that beat's alert. That is what `KnellRestartChurn` covers; set its window to your longest beat deadline.
-
-Running several instances? Point each sender at all of them and aggregate: `sum by (beat) (knell_beat_fresh)` gives an N-of-M quorum view where one observer being down degrades the count instead of paging falsely.
-
-Thresholds and windows are starting points: set the churn window to your longest beat deadline, match the `job` selector to your scrape config, and route by whatever labels your Alertmanager uses.
-
-## Healthcheck
-
-The image bakes a shell-less healthcheck: `knell health` checks a marker file the server touches once its listener is bound and removes on shutdown. Nothing to configure; `docker ps` shows `healthy` once knell is serving.
+knell needs no volume.
 
 ## Security
 
-The image runs as a non-root numeric user (65534) on `scratch` and writes only its `/tmp` health marker. A hardened deployment profile:
+knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext on every ping, and anything that reads one ping can replay it. Put a TLS reverse proxy in front, or keep pings on a network you trust to the same standard.
 
-```yaml
-    read_only: true
-    cap_drop: [ALL]
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
-```
+The token gates `POST /beat/<id>` only. `/healthz` and `/metrics` answer anyone who can reach the port, and `/metrics` lists every beat with its last ping. Publish the port to a trusted network only, or put an authenticating proxy in front of `/metrics`. Set `ALLOWED_HOSTS` to the names you use, so a web page an operator opens cannot reach knell through a hostname an attacker controls.
 
-## Building from source
+The image runs as the non-root user 65534 on `scratch`, and the webhook URL never appears in a log line or an error. [Security](docs/security.md) covers the startup check for `ALLOWED_HOSTS`, the proxy settings and the hardened compose profile.
 
-```sh
-go build -trimpath -ldflags="-s -w" -o knell .
-# or
-docker build -t knell .
-```
+## Troubleshooting
+
+The image has a built-in healthcheck, `knell health`, which reads a marker file the server writes once its listener is up and removes when it stops. `docker ps` shows `healthy` while knell is serving. An unhealthy container is running but not serving, as happens while knell shuts down. A restarting one has exited. In both cases `docker logs knell` shows why.
+
+- If the container restarts in a loop with `knell exited with error`, the `error` field names the setting knell refused.
+- If a ping is answered `401`, the `Authorization` header does not match `BEAT_TOKEN` exactly.
+- If a ping is answered `404`, the id is not in `BEATS` or the URL has an extra path segment.
+- If a ping is answered `403` with `host_not_allowed`, add the name the sender uses to `ALLOWED_HOSTS`.
+- If a ping is answered `405`, the sender used `GET` or another method. Only `POST` records a ping.
+- If a beat that is down never alerts, check how often knell restarts. Each start resets every deadline, so restarts closer together than a beat's deadline keep it from ever firing.
+
+[How knell works](docs/how-it-works.md) explains the deadlines, retries and every answer a ping can get.
+
+## Monitoring
+
+knell publishes Prometheus metrics on `/metrics` and writes logfmt logs to standard error. If `knell_outage_records_dropped_total` rises, an ended outage was lost before a notice could be built. Rebuild that window from `knell_beat_last_seen_timestamp_seconds`. Eight alert rules that watch knell itself ship in the [`alerts/`](alerts/) folder, with five PromQL rules in [`alerts/promql.yaml`](alerts/promql.yaml) and three LogQL rules in [`alerts/logql.yaml`](alerts/logql.yaml). [Monitoring and alerts](docs/monitoring.md) lists the metrics and rules and shows how to load them.
+
+## Documentation
+
+- [Configuration](docs/configuration.md) lists every setting, its limits, secret files and what stops startup.
+- [How knell works](docs/how-it-works.md) explains deadlines, notices, retries and every answer a ping can get.
+- [Monitoring and alerts](docs/monitoring.md) lists the log lines, the metrics and the alert rules.
+- [Security](docs/security.md) covers exposure, reverse proxies and the hardened compose profile.
+
+## Contributing
+
+Issues and pull requests are welcome, see the [contributing guide](https://github.com/cplieger/.github/blob/main/CONTRIBUTING.md). Build the binary with `go build -trimpath -ldflags="-s -w" -o knell .` or the image with `docker build -t knell .`.
 
 ## Disclaimer
 
