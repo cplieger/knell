@@ -1,53 +1,16 @@
-# Recommended alert rules for knell, the LogQL half: the three rules a Loki
-# ruler evaluates. The other five are PromQL and live in alerts/promql.yaml,
-# because a dead-man switch that dies takes its own /metrics endpoint with it,
-# and every condition that leaves no series still leaves a log line. Load each
-# half into its own ruler: neither ruler parses the other's expressions.
+# Recommended alert rules for knell, the LogQL half: three rules for Loki's
+# ruler. The PromQL half is alerts/promql.yaml. Load each file into its own
+# ruler, because neither parses the other's expressions.
 #
-# These rules watch knell itself, so they must come from a second vantage point.
-# knell is the alert path for the things it watches, and an observer cannot
-# report its own silence.
-#
-# The three rules here (KnellExitedWithError, KnellNoticeLostForGood,
-# KnellAcceptFailing) read the container's log stream, because their conditions
-# have no series at all. A process that refuses its configuration exits before
-# it binds a listener, so it publishes no metrics and a crash-looping container
-# is never scraped. A notice queued when knell stops dies with the process and
-# moves no counter, which is why every notification-loss line carries a
-# `retryable` field instead. An accept failure produces no request, so nothing
-# request-scoped records it. Ship the container's logs to Loki and evaluate
-# these with Loki's ruler; firing alerts deliver through your Alertmanager
-# exactly like metric ones.
-#
-# Two prerequisites belong to these three rules. The ENCODING: knell writes
-# logfmt to stderr with no configuration, and Go renders the level UPPERCASE,
-# so the matchers read `level=ERROR` and never `level=error`. And the LEVEL:
-# KnellExitedWithError and KnellAcceptFailing key on ERROR and hold at every
-# LOG_LEVEL, but the loss lines KnellNoticeLostForGood reads sit at INFO, WARN
-# and ERROR, so LOG_LEVEL=warn hides the notices abandoned mid-send and
-# LOG_LEVEL=error hides the shutdown losses entirely, leaving that rule
-# covering only the one loss a counter already reports. Keep LOG_LEVEL at info
-# (the default) for it to mean what it says.
-#
-# Thresholds, the `for:` windows and the severity labels are starting points.
-# Adjust the `container` selector to whatever your collector sets (Grafana
-# Alloy's Docker log discovery sets `container` with no configuration; Promtail
-# and others may key on `job` or `service`), and route by whatever labels your
-# Alertmanager uses.
+# These rules read the container log, because their conditions leave no series.
+# Evaluate them from a second vantage point. Keep LOG_LEVEL at its info default.
+# The level renders UPPERCASE, so matchers read `level=ERROR`. Thresholds,
+# windows and severity labels are starting points. Set the `container` selector
+# to the label your collector sets. docs/monitoring.md explains each rule.
 groups:
   - name: knell
     rules:
-      # knell refused to run, or died. Startup fails fast on purpose (a
-      # dead-man switch with the wrong configuration is worse than none), so a
-      # `BEATS` entry that is not `id:deadline`, a webhook that is not https, a
-      # missing or unreadable BEAT_TOKEN file, a taken port and a mistyped
-      # container command all end here -- BEFORE the listener is bound. That is
-      # why no metric can carry it: the process publishes no /metrics at all,
-      # and a crash-looping container is never scraped, so every other rule in
-      # this group is silent for the one failure that leaves nothing watching
-      # anything. The two target rules do report the silence eventually, 15m
-      # later and without a cause; this line has the cause on its `error`
-      # attribute.
+      # Startup fails before the listener binds, so no metric can carry this.
       - alert: KnellExitedWithError
         expr: |
           sum by (container) (count_over_time(
@@ -60,23 +23,13 @@ groups:
         annotations:
           summary: "knell exited instead of watching its beats"
           description: >
-            knell logged its own exit: its configuration was refused, the
-            listener could not be bound, the container was given a command it
-            does not have, or a stop outlived its shutdown grace. Nothing is
-            watching any beat until it starts again, and every beat's deadline
-            re-arms from the next boot, so an outage in progress is not
-            reported for a further full deadline. Read the `error` attribute on
-            the line for the cause.
+            knell logged its own exit, so no beat is watched until it starts
+            again. Each deadline then re-arms from boot, which delays any
+            outage in progress by a full deadline. Read the line's `error`
+            attribute for the cause.
 
-      # A notice was lost for good, on the axis no counter reaches. Every
-      # notification-loss line carries retryable=false when nothing will retry
-      # it and retryable=true when the next sweep will, so this reads the
-      # CONSEQUENCE rather than the level or the message. The losses no counter
-      # can show are the ones a stop causes: ended-outage records and queued
-      # recovered notices die with the process, and a send cancelled mid-flight
-      # is in no counter and no tally either. It also matches the two losses
-      # KnellNotifyFailing reports, deliberately, because the log line names
-      # the beat and the counters cannot.
+      # Reads the consequence, not the level. Every notice-loss line carries
+      # `retryable`, and false means nothing will retry it.
       - alert: KnellNoticeLostForGood
         expr: |
           sum by (container) (count_over_time(
@@ -88,25 +41,12 @@ groups:
         annotations:
           summary: "knell lost a notification for good"
           description: >
-            Something knell owed an operator is gone with nothing left to
-            retry: a queued missing or history record a stop discarded, a
-            fire-once recovered notice whose send failed, a notice cancelled
-            mid-flight, or a teardown that outlived its grace and abandoned the
-            watch loop while it still held them. Read the matching lines for
-            the beats they name, then reconstruct each missed window from
-            knell_beat_last_seen_timestamp_seconds and treat those beats as
-            unreported for it rather than healthy.
+            A notice knell owed you is gone and nothing will retry it. Read the
+            matching lines for the beats they name. Rebuild each missed window
+            from knell_beat_last_seen_timestamp_seconds and treat those beats
+            as unreported, not healthy.
 
-      # knell could not accept a connection. net/http reports this on its own
-      # error log, which knell routes into slog at ERROR precisely so a
-      # level-based rule can see it; nothing else can, because a connection
-      # refused at accept produces no request and moves no request-scoped
-      # series. The usual cause is an exhausted file-descriptor budget, and the
-      # consequence here is total: an observer that cannot accept a connection
-      # accepts no pings, so every beat it watches crosses its deadline. Not
-      # covered by the target rules -- net/http retries the accept, so the
-      # scrape can keep succeeding and up{job="knell"} may never hold 0 for the
-      # 15m KnellTargetDown needs.
+      # net/http logs accept failures, which knell routes into slog at ERROR.
       - alert: KnellAcceptFailing
         expr: |
           sum by (container) (count_over_time(
@@ -119,8 +59,6 @@ groups:
           summary: "knell cannot accept connections"
           description: >
             The listener failed to accept a connection, so pings stop landing
-            while the process stays alive and keeps answering the scrapes it
-            already has. Check the container's file-descriptor limit and the
-            rate of incoming connections. Beats will report overdue while this
-            lasts, and a sender seeing a refused connection has no way to say
-            so.
+            while the process stays up. Beats will report overdue while this
+            lasts. Check the container's file-descriptor limit and the rate of
+            incoming connections.
