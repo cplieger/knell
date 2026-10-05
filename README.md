@@ -125,7 +125,7 @@ knell publishes Prometheus metrics on `/metrics` and writes logfmt logs to stand
 
 ## Contributing
 
-Issues and pull requests are welcome, see the [contributing guide](https://github.com/cplieger/.github/blob/main/CONTRIBUTING.md). Build the binary with `go build -trimpath -ldflags="-s -w" -o knell .` or the image with `docker build -t knell .`.
+Issues and pull requests are welcome. The [shared contributing rules](https://github.com/cplieger/.github/blob/main/CONTRIBUTING.md) apply.
 
 ## Disclaimer
 
