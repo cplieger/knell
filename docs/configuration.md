@@ -40,7 +40,7 @@ The 512-byte ceiling keeps the token inside the 8704-byte request-header limit w
 
 ## Secret files
 
-`DISCORD_WEBHOOK_URL_FILE` and `BEAT_TOKEN_FILE` read the same values from a file, such as a Docker secret under `/run/secrets/`.
+`DISCORD_WEBHOOK_URL_FILE` and `BEAT_TOKEN_FILE` read the same values from a file, such as [a Docker secret](https://github.com/cplieger/docs/blob/main/docs/hardening.md#secrets-in-files) under `/run/secrets/`.
 
 - A `_FILE` variable that is set but empty, names a missing or unreadable file, or names an empty file stops startup. Only an unset `_FILE` falls back to the plain variable.
 - The path must be clean, with no `..` segment, no doubled `/` and no trailing `/`.

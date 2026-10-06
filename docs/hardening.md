@@ -19,7 +19,7 @@ Pings with a wrong or missing token share one throttle budget. Once it is spent 
 
 ## Behind a reverse proxy
 
-Set `TRUSTED_PROXIES` to the addresses of your proxies. Otherwise every access line, including the `401` lines a token-guessing run writes, names the proxy instead of an address you can block. List exactly those hops, because a wider range lets anything inside it choose its own `client_ip`.
+[Running an app behind a reverse proxy](https://github.com/cplieger/docs/blob/main/docs/reverse-proxy.md) sets knell up behind Caddy, nginx, Traefik or Nginx Proxy Manager. Set `TRUSTED_PROXIES` to the addresses of your proxies. Otherwise every access line, including the `401` lines a token-guessing run writes, names the proxy instead of an address you can block. List only those hops, as [Telling the app about the proxy](https://github.com/cplieger/docs/blob/main/docs/reverse-proxy.md#telling-the-app-about-the-proxy) explains.
 
 A proxy that adds many headers can push a ping past knell's 8704-byte header limit, which answers `431`. Trim the headers the proxy adds if that happens.
 
@@ -49,3 +49,5 @@ Add these lines to the `knell` service to run it with a read-only root filesyste
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
 ```
+
+[The hardened example](https://github.com/cplieger/docs/blob/main/docs/hardening.md#the-hardened-example) runs knell with every setting, including secret files and resource limits.

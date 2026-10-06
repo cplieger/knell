@@ -93,7 +93,7 @@ knell needs no volume.
 
 ## Security
 
-knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext on every ping, and anything that reads one ping can replay it. Put a TLS reverse proxy in front, or keep pings on a network you trust to the same standard.
+knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext on every ping, and anything that reads one ping can replay it. Put a [TLS reverse proxy](https://github.com/cplieger/docs/blob/main/docs/reverse-proxy.md) in front, or keep pings on a network you trust to the same standard.
 
 The token gates `POST /beat/<id>` only. `/healthz` and `/metrics` answer anyone who can reach the port, and `/metrics` lists every beat with its last ping. Publish the port to a trusted network only, or put an authenticating proxy in front of `/metrics`. Set `ALLOWED_HOSTS` to the names you use, so a web page an operator opens cannot reach knell through a hostname an attacker controls.
 
