@@ -326,7 +326,7 @@ func logEndedOutageDropped(rec *overdueBeat) {
 	// The two instants go in as time.Time values, not RFC3339 strings: slog
 	// stores a time.Time as a typed Time attr, so the UTC pin holds, sub-second
 	// precision survives, and a future JSON handler emits a real timestamp. The
-	// kv form rather than slog.Time is the fleet's sloglint kv-only rule.
+	// kv form rather than slog.Time is the shared sloglint kv-only rule.
 	slog.Warn("pending missing queue full, ended outage dropped, its notification will never be delivered",
 		"beat", rec.id, "queued", missingQueueSize, "silence", rec.silence.DownFor().String(),
 		"since", rec.silence.Started.UTC(),

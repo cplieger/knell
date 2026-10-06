@@ -921,14 +921,12 @@ func TestEmptyBeatTokenFailsClosed(t *testing.T) {
 }
 
 // TestFailedAuthIsThrottledInAggregate pins the failed-auth throttle. The token
-// is the endpoint's only gate, so an unthrottled 401 path is both a guessing
-// oracle at wire speed and a log-flood vector (one access line per attempt).
-// The three halves that make the throttle safe are pinned together, because each
-// one alone is a plausible mis-implementation: bad bearers are capped, a VALID
-// ping never draws a token (so a healthy fleet cannot throttle itself, even
-// behind a flood), and no other route or method draws one either. The 429 is
-// also the one refusal knell answers outside webhttp.Logging, so the reason
-// counter asserted below is its only vantage point.
+// is the endpoint's only gate, so an unthrottled 401 path is a guessing oracle
+// and a log-flood vector. Its three halves are pinned together, because each
+// alone is a plausible mis-implementation: bad bearers are capped, a VALID ping
+// never draws a token (so healthy beats cannot throttle themselves behind a
+// flood), and no other route or method draws one. The 429 is the one refusal
+// outside webhttp.Logging, so the reason counter below is its only vantage point.
 func TestFailedAuthIsThrottledInAggregate(t *testing.T) {
 	badBearer := func(h http.Handler) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
@@ -995,7 +993,7 @@ func TestFailedAuthIsThrottledInAggregate(t *testing.T) {
 		}
 		for i := range authFailBurst + 5 {
 			if rec := beatRequest(t, h, http.MethodPost, "/beat/api"); rec.Code != http.StatusOK {
-				t.Fatalf("valid ping %d during a failed-auth flood = %d, want 200: the fleet's own senders must never be throttled (body %s)",
+				t.Fatalf("valid ping %d during a failed-auth flood = %d, want 200: valid beat senders must never be throttled (body %s)",
 					i+1, rec.Code, rec.Body.String())
 			}
 		}
@@ -1690,24 +1688,13 @@ func assertRequestSeriesVocabulary(t *testing.T, series, allowedMethods, allowed
 }
 
 // TestRequestMetricLabelsBoundedByTheRouteTable is the cardinality guard on the
-// request counter, and the reason knell hands webhttp.WithRecordRouteMetric the
-// job of deriving both labels instead of deriving them itself.
-// webhttp.Logging sits OUTSIDE the mux, so the route-metric hook fires before
-// beatHandler's token gate: the inputs below arrive from an UNAUTHENTICATED
-// caller, and a Prometheus series once minted is permanent for the process
-// lifetime here and in every observer scraping knell. So the label set must be
-// bounded by the ROUTE TABLE plus a closed method vocabulary, and by nothing
-// the caller sends.
-//
-// Two attack shapes, and knell is uniquely exposed to the second. The path is
-// the obvious one, and it collapses onto registered templates (or the single
-// "unmatched" marker). The METHOD is the one the fleet siblings do not face:
-// registry-stats and subflux register only method-bearing patterns, while knell
-// deliberately registers a method-agnostic /beat/{id} catch-all (so a 405 can
-// carry a truthful Allow), and net/http routes ANY valid token there — "XYZZY"
-// and friends reach it and answer 405. The bound is no longer a collapse of that
-// route's method but webhttp's closed set: the nine standard methods stay
-// themselves and every other token, at any length, buckets into "other".
+// request counter. webhttp.Logging sits OUTSIDE the mux, so the route-metric hook
+// fires before beatHandler's token gate: the inputs arrive UNAUTHENTICATED, and a
+// minted series is permanent. Labels must be bounded by the route table plus a
+// closed method set. The path collapses onto registered templates or "unmatched".
+// The METHOD is knell's own exposure: its method-agnostic /beat/{id} catch-all
+// (so a 405 carries a truthful Allow) receives ANY valid token, and webhttp keeps
+// the nine standard methods and buckets every other token into "other".
 func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 	// The complete label vocabulary knell's surface can produce: webhttp's
 	// closed method set (nine standard methods plus the "other" bucket) crossed

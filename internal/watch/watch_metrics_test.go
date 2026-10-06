@@ -1015,14 +1015,11 @@ func TestBudgetCutIsLoggedOncePerSweepWithTheDeferredCount(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, which every other test writes through.
 	//
-	// Cutting a sweep short is ordinary back-pressure while deliveries are
-	// slow, not a fault, so it is levelled exactly like the other
-	// back-pressure case (recordOngoingOutage's full-queue deferral) rather
-	// than as a warning that would page on a delivery outage knell is already
-	// reporting. One line per affected SWEEP, naming how many beats the next
-	// sweep must pick up: one line per deferred beat would bury real faults
-	// under 60 lines every 15s, and a line with no count leaves the operator
-	// unable to tell a one-beat overrun from a stalled fleet.
+	// Cutting a sweep short is back-pressure, not a fault, so it is levelled like
+	// recordOngoingOutage's full-queue deferral, not as a paging warning. One line
+	// per affected SWEEP with the deferred count: a line per beat would bury real
+	// faults, and a line without a count cannot tell a one-beat overrun from every
+	// beat stalled.
 	const (
 		total    = 12
 		perSend  = 2 * time.Second

@@ -890,24 +890,14 @@ func TestAllowedHostsGate(t *testing.T) {
 	}
 }
 
-// TestLoadTrustedProxiesDegradesRestrictively pins the TRUSTED_PROXIES contract,
-// and pins it through Load rather than through trustedProxies directly so the
-// assignment in Load is covered by the same table: a table over the parser alone
-// stays green if Load stops assigning the field, and the only other oracle on it
-// (TestConfigLogValueReportsEveryNonSecretField) builds Config by hand and never
-// runs the loader.
-//
-// The SAFE-DEFAULT half: unset, blank and all-entries-invalid must each yield an
-// EMPTY set, because that is what makes webapi's
-// webhttp.WithClientIP(cfg.TrustedProxies...) expand to the zero-argument call it
-// made before the variable existed — no forwarded header honored, client_ip on
-// the socket peer. The DIRECTION half: a malformed entry is warned about and
-// DROPPED rather than failing startup, which is legal only because dropping one
-// NARROWS whose X-Forwarded-For is believed (env-validation.md, "Restriction
-// LISTS"); a fallback that trusted everything when the value did not parse would
-// make client_ip spoofable with nothing failing. Contrast TestAllowedHostsGate,
-// where a dropped entry would refuse a caller the operator meant to admit, so
-// that list refuses startup instead.
+// TestLoadTrustedProxiesDegradesRestrictively pins the TRUSTED_PROXIES contract
+// through Load, so a Load that stops assigning the field fails too. Unset, blank
+// and all-entries-invalid each yield an EMPTY set, so webhttp.WithClientIP gets
+// no proxies and client_ip stays on the socket peer. A malformed entry is warned
+// about and DROPPED rather than failing startup, legal only because dropping one
+// NARROWS whose X-Forwarded-For is believed; a fallback that trusted everything
+// would make client_ip spoofable. TestAllowedHostsGate is the contrast: a
+// dropped entry there would refuse a wanted caller, so that list refuses startup.
 func TestLoadTrustedProxiesDegradesRestrictively(t *testing.T) {
 	tests := map[string]struct {
 		raw         string
@@ -1771,7 +1761,7 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		TrustedProxies: proxies,
 		WebhookURL:     "https://discord.example/hook",
 		WebhookSource:  envx.SourceFile,
-		Node:           "observer-borgcube",
+		Node:           "observer-1",
 		ListenAddr:     "127.0.0.1:19190",
 		BeatToken:      "unit-test-beat-token",
 		// The OTHER channel than the webhook's, deliberately: the two source
@@ -1793,7 +1783,7 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 
 	want := map[string]string{
 		"beats":       "2",
-		"node":        "observer-borgcube",
+		"node":        "observer-1",
 		"listen_addr": "127.0.0.1:19190",
 		// The rendered WORD, not string(envx.SourceFile): restating the constant
 		// would assert nothing about what an operator reads, and this attr's
