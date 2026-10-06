@@ -41,7 +41,7 @@ One refusal is missing from it by design. A request whose headers exceed the 870
 
 knell is the alert path for the things it watches, so rules about knell itself have to come from a second vantage point. That is your metrics stack scraping `/metrics` and your log stack reading its container log.
 
-The rules ship as one file per expression language, because neither ruler parses the other's expressions. The five PromQL rules in [`alerts/promql.yaml`](../alerts/promql.yaml) go to Prometheus or the Mimir ruler. The three LogQL rules in [`alerts/logql.yaml`](../alerts/logql.yaml) go to Loki's ruler. The three log rules exist because their conditions leave no series to read at all. A knell that refuses its configuration exits before it opens its port, so it publishes no metrics and a crash-looping container is never scraped.
+The five PromQL rules in [`alerts/promql.yaml`](../alerts/promql.yaml) go to Prometheus or the Mimir ruler, and the three LogQL rules in [`alerts/logql.yaml`](../alerts/logql.yaml) go to Loki's ruler. [Loading metric alert rules](https://github.com/cplieger/docs/blob/main/docs/monitoring.md#loading-metric-alert-rules) and [Loading an app's alert rules](https://github.com/cplieger/docs/blob/main/docs/monitoring.md#loading-an-apps-alert-rules) show how. The three log rules exist because their conditions leave no series to read at all. A knell that refuses its configuration exits before it opens its port, so it publishes no metrics and a crash-looping container is never scraped.
 
 | Alert | Fires when | Severity |
 | --- | --- | --- |
