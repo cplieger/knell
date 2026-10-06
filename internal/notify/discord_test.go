@@ -1222,9 +1222,9 @@ func TestEscapeMarkdownLeavesEveryOtherCharacterAlone(t *testing.T) {
 	}
 	// Whole values a deployment really configures, including the shapes the
 	// loop's single-character cases cannot show: a hyphenated beat id (every
-	// README example and both homelab beats) and a non-ASCII node name, since
-	// NODE_NAME is byte-capped only and arrives exactly as the operator
-	// supplied it.
+	// README example and both beats of a real deployment) and a non-ASCII node
+	// name, since NODE_NAME is byte-capped only and arrives exactly as the
+	// operator supplied it.
 	for _, in := range []string{"cron-backup", "watchdog-mimir", "caf\u00e9", "obs\u00a01"} {
 		if got := escapeMarkdown(in); got != in {
 			t.Errorf("escapeMarkdown(%q) = %q, want it unchanged: it carries no Discord markup character", in, got)

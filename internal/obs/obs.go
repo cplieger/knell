@@ -3,12 +3,9 @@
 // prefix "knell_". The registry and the collectors are unexported, so a caller
 // cannot register, rename or delete a series, nor write a raw label position.
 //
-// # Label-cardinality contract
-//
-// Cardinality is not structurally contained here: keeping the beat label
-// bounded is the CALLER's contract. internal/config validates every id
-// against [A-Za-z0-9][A-Za-z0-9_-]{0,63} and caps a fleet at 64 beats, and
-// internal/watch is the only production caller of the id-taking functions.
+// Keeping the beat label bounded is the CALLER's contract: internal/config
+// validates every id against [A-Za-z0-9][A-Za-z0-9_-]{0,63} and caps the beat
+// count at 64, and internal/watch is the only production caller.
 package obs
 
 import (

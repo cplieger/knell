@@ -1408,14 +1408,11 @@ func budgetProbeBeats(prefix string, n int, deadline time.Duration) []Beat {
 }
 
 // TestEveryBeatCanQueueItsRecoveryWithoutADrop pins the size New gives the
-// recovered-transition queue. It is sized from the beat count because each beat
-// can hold at most one pending recovery. That pairing is the closed capacity
-// proof Beat now ASSERTS on rather than degrades from: a short queue no longer
-// drops a recovered notice, it panics, so this test is the only thing standing
-// between a mis-sized channel and a fleet-wide ping storm (the fan-out source
-// coming back) taking the beat handler down with it. Every other recovery test
-// uses a single beat, where a capacity of 1 is indistinguishable from
-// len(beats).
+// recovered-transition queue: one slot per beat, since each beat holds at most
+// one pending recovery. Beat panics on a full queue rather than dropping a
+// recovered notice, so a smaller queue takes the beat handler down when every
+// beat recovers at once. Every other recovery test uses a single beat, where a
+// capacity of 1 equals len(beats).
 func TestEveryBeatCanQueueItsRecoveryWithoutADrop(t *testing.T) {
 	// Serial (no t.Parallel): drives the package-global metric registry through
 	// the same beat ids on every run.
@@ -1428,10 +1425,10 @@ func TestEveryBeatCanQueueItsRecoveryWithoutADrop(t *testing.T) {
 	n := &fakeNotifier{}
 	w := New(beats, n, clock.Now, clock.Now())
 	// Checked BEFORE any ping, because Beat PANICS on a full queue: a mis-sized
-	// channel would otherwise take the fleet-ping loop below down with a stack
+	// channel would otherwise take the every-beat ping loop below down with a stack
 	// trace out of the beat handler instead of naming the sizing this test pins.
 	if got := cap(w.recoveries); got != total {
-		t.Fatalf("cap(w.recoveries) = %d, want one slot per configured beat (%d): New must size the recovered-transition queue from the beat count, or Beat's capacity assertion fires on a fleet-wide ping storm", got, total)
+		t.Fatalf("cap(w.recoveries) = %d, want one slot per configured beat (%d): New must size the recovered-transition queue from the beat count, or Beat's capacity assertion fires on a ping storm across every beat", got, total)
 	}
 
 	// Alert every beat, so every ping below queues a recovered transition.
@@ -1441,7 +1438,7 @@ func TestEveryBeatCanQueueItsRecoveryWithoutADrop(t *testing.T) {
 		t.Fatalf("missing notices = %d, want one per beat (%d)", got, total)
 	}
 
-	// The whole fleet pings before the Run loop services anything: every one of
+	// Every beat pings before the Run loop services anything: every one of
 	// those recoveries must find a slot.
 	for _, b := range beats {
 		if !recordedBeat(w, b.ID) {
@@ -1516,7 +1513,7 @@ func TestSweepStopsAtItsSendBudgetAndDefersTheRest(t *testing.T) {
 	}
 
 	// One sweep with every beat overdue: the boot-armed clock arms them all
-	// from construction, so a single advance puts the whole fleet past its
+	// from construction, so a single advance puts every beat past its
 	// deadline at once -- the delivery storm this budget exists for.
 	clock.Advance(deadline + time.Minute)
 	slowSends(n, clock, perSend)
@@ -1813,7 +1810,7 @@ func TestHandleTickPrioritizesQueuedRecovery(t *testing.T) {
 	w, clock, n := newStormWatcher(t, "overrun-recovery-storm", recoverID, storm, stormWindow)
 
 	// The state the ticker arm sees when a send overran the tick: the whole
-	// storm fleet is due AND a recovery is already sitting in the queue.
+	// storm's beat set is due AND a recovery is already sitting in the queue.
 	if !recordedBeat(w, recoverID) {
 		t.Fatalf("Beat(%s) = false, want the ping recorded so its recovery is queued", recoverID)
 	}
