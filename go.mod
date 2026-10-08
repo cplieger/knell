@@ -3,7 +3,7 @@ module github.com/cplieger/knell
 go 1.27.1
 
 require (
-	github.com/cplieger/envx/v2 v2.0.3
+	github.com/cplieger/envx/v3 v3.0.0
 	github.com/cplieger/health v1.8.0
 	github.com/cplieger/httpx/v5 v5.0.3
 	github.com/cplieger/metrics/v4 v4.0.2
