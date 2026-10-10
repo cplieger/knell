@@ -41,19 +41,12 @@ const (
 type discordMessage struct {
 	// raw is the body as it went over the wire, for the assertions that are
 	// about a key's ABSENCE rather than its value.
-	raw             []byte
-	Content         string           `json:"content"`
-	Embeds          []discordEmbed   `json:"embeds"`
-	AllowedMentions *decodedMentions `json:"allowed_mentions"`
-}
-
-type decodedMentions struct {
-	Parse *[]string `json:"parse"`
+	raw     []byte
+	Content string         `json:"content"`
+	Embeds  []discordEmbed `json:"embeds"`
 }
 
 type discordEmbed struct {
-	Type        string              `json:"type"`
-	URL         string              `json:"url"`
 	Title       string              `json:"title"`
 	Description string              `json:"description"`
 	Timestamp   string              `json:"timestamp"`
@@ -64,9 +57,8 @@ type discordEmbed struct {
 }
 
 type discordEmbedField struct {
-	Name   string `json:"name"`
-	Value  string `json:"value"`
-	Inline bool   `json:"inline"`
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 type decodedFooter struct {
