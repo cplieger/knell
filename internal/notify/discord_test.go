@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -417,6 +418,14 @@ func TestPermanentFailureDoesNotRetry(t *testing.T) {
 	}
 }
 
+// webhookURLRemedies are the fragments a redirect diagnostic must carry:
+// DISCORD_WEBHOOK_URL holds the endpoint URL, DISCORD_WEBHOOK_URL_FILE names
+// the secret file holding it, so neither is told to "point at" the endpoint.
+var webhookURLRemedies = []string{
+	"in DISCORD_WEBHOOK_URL,",
+	"in the secret file named by DISCORD_WEBHOOK_URL_FILE",
+}
+
 func TestUnfollowedRedirectIsNotDelivery(t *testing.T) {
 	t.Parallel()
 
@@ -445,6 +454,11 @@ func TestUnfollowedRedirectIsNotDelivery(t *testing.T) {
 	// path). TestMethodChangingRedirectIsNotDelivery pins the policy itself.
 	if !strings.Contains(err.Error(), "nothing was delivered") {
 		t.Errorf("err = %v, want it to say nothing was delivered (a bare \"HTTP 300\" reads like a webhook-side rejection)", err)
+	}
+	for _, remedy := range webhookURLRemedies {
+		if !strings.Contains(err.Error(), remedy) {
+			t.Errorf("err = %v, want the remedy %q (each setting named with the value it takes)", err, remedy)
+		}
 	}
 	for _, wrong := range []string{"cross-origin", "method-changing"} {
 		if strings.Contains(err.Error(), wrong) {
@@ -1361,11 +1375,10 @@ func TestCrossHostRedirectIsNotDelivery(t *testing.T) {
 	t.Parallel()
 
 	// A 307 preserves the method, so WithPreserveMethod does not refuse it:
-	// the same-host rule is the only thing standing between a hijacked
-	// Location header and posting the notice to an origin the operator never
-	// named. The target listens on a different HOSTNAME, not just a
-	// different port, because httpx compares URL.Hostname() (a second
-	// 127.0.0.1 listener is the same host by design).
+	// the origin rule is what stands between a hijacked Location header and
+	// posting the notice to an origin the operator never named. The target
+	// listens on a different HOSTNAME; TestCrossPortRedirectIsNotDelivery
+	// covers the different-port case.
 	var targetHits atomic.Int64
 	ln, lnErr := net.Listen("tcp", "127.0.0.2:0")
 	if lnErr != nil {
@@ -1401,11 +1414,128 @@ func TestCrossHostRedirectIsNotDelivery(t *testing.T) {
 	}
 }
 
+func TestCrossPortRedirectIsNotDelivery(t *testing.T) {
+	t.Parallel()
+
+	// Both listeners are on 127.0.0.1, so WithSameHost alone follows this hop
+	// and re-POSTs the notice, with the credential path, to the other port.
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			t.Parallel()
+
+			var targetHits atomic.Int64
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				targetHits.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer target.Close()
+
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL+r.URL.Path, status)
+			}))
+			defer origin.Close()
+
+			d := newTestNotifier(t, origin.URL+"/api/webhooks/1234567890/verysecrettoken", "node-1")
+			defer d.Close()
+
+			err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
+			if err == nil {
+				t.Fatalf("BeatMissing through a cross-port %d = nil, want a delivery error", status)
+			}
+			if got := targetHits.Load(); got != 0 {
+				t.Errorf("cross-port redirect target hits = %d, want 0 (the notice and its credential path must not reach another origin)", got)
+			}
+			if !errors.Is(err, errCrossOriginRedirect) {
+				t.Errorf("BeatMissing through a cross-port %d = %v, want the origin refusal in its chain", status, err)
+			}
+			if !strings.Contains(err.Error(), "redirected to another origin") {
+				t.Errorf("refused-redirect error = %q, want it to name the cross-origin redirect", err)
+			}
+			for _, remedy := range webhookURLRemedies {
+				if !strings.Contains(err.Error(), remedy) {
+					t.Errorf("refused-redirect error = %q, want the remedy %q (each setting named with the value it takes)", err, remedy)
+				}
+			}
+			if strings.Contains(err.Error(), "verysecrettoken") {
+				t.Errorf("refused-redirect error leaks the webhook credential: %v", err)
+			}
+		})
+	}
+}
+
+func TestZoneChangingRedirectIsNotDelivery(t *testing.T) {
+	t.Parallel()
+
+	// Interface names match exactly (net.InterfaceByName), so a zone differing
+	// only in case can name another interface.
+	const rawURL = "https://[fe80::1%25eth0]/api/webhooks/1234567890/verysecrettoken"
+	var hits atomic.Int64
+	d := New(rawURL, "node-1")
+	defer d.Close()
+	d.client.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		hits.Add(1)
+		header := make(http.Header)
+		header.Set("Location", "https://[fe80::1%25ETH0]"+r.URL.Path)
+		return &http.Response{
+			StatusCode: http.StatusTemporaryRedirect,
+			Header:     header,
+			Body:       http.NoBody,
+			Request:    r,
+		}, nil
+	})
+
+	_, err := d.postAttempt(t.Context(), []byte(`{"content":"zone"}`))
+	if !errors.Is(err, errCrossOriginRedirect) {
+		t.Errorf("postAttempt through a zone-changing 307 = %v, want the origin refusal", err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("requests sent = %d, want 1 (the hop to another zone must not be sent)", got)
+	}
+}
+
+func TestSameOrigin(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name, from, to string
+		want           bool
+	}{
+		{"identical", "https://discord.example/a", "https://discord.example/b", true},
+		{"explicit https default port", "https://discord.example/a", "https://discord.example:443/b", true},
+		{"explicit http default port", "http://discord.example:80/a", "http://discord.example/b", true},
+		{"host case differs", "https://discord.example/a", "https://Discord.EXAMPLE/b", true},
+		{"other port", "https://discord.example/a", "https://discord.example:8443/b", false},
+		{"other port both explicit", "http://127.0.0.1:8080/a", "http://127.0.0.1:8081/b", false},
+		{"scheme upgrade", "http://discord.example/a", "https://discord.example/b", false},
+		{"scheme downgrade on the same port", "https://discord.example/a", "http://discord.example:443/b", false},
+		{"other host", "https://discord.example/a", "https://other.example/b", false},
+		{"non-ASCII fold is not a match", "https://k.example/a", "https://\u212a.example/b", false},
+		{"IPv6 spelling differs", "https://[2001:db8::a]/a", "https://[2001:DB8:0:0::A]:443/b", true},
+		{"other IPv6 address", "https://[::1]/a", "https://[::2]/b", false},
+		{"identical IPv6 zone", "https://[fe80::1%25eth0]/a", "https://[fe80::1%25eth0]/b", true},
+		{"IPv6 zone case differs", "https://[fe80::1%25eth0]/a", "https://[fe80::1%25ETH0]/b", false},
+		{"IPv6 zone dropped", "https://[fe80::1%25eth0]/a", "https://[fe80::1]/b", false},
+		{"IP literal against a name", "https://127.0.0.1/a", "https://localhost/b", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			from, fromErr := url.Parse(tc.from)
+			to, toErr := url.Parse(tc.to)
+			if fromErr != nil || toErr != nil {
+				t.Fatalf("parsing fixture URLs: %v, %v", fromErr, toErr)
+			}
+			if got := sameOrigin(from, to); got != tc.want {
+				t.Errorf("sameOrigin(%s, %s) = %v, want %v", tc.from, tc.to, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSameHostRedirectIsFollowedAndDelivers(t *testing.T) {
 	t.Parallel()
 
 	// The other half of the redirect contract: the policy must still FOLLOW
-	// the webhook's own same-host, method-preserving hop. Nothing else in
+	// the webhook's own same-origin, method-preserving hop. Nothing else in
 	// this package pins that -- dropping WithSameHost turns the policy into
 	// "refuse every redirect" (httpx returns a refuse-all policy when no host
 	// is allowed), which every other test here passes while a redirecting
@@ -1437,10 +1567,10 @@ func TestSameHostRedirectIsFollowedAndDelivers(t *testing.T) {
 	defer d.Close()
 
 	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
-		t.Fatalf("BeatMissing through a same-host 307 = %v, want delivery", err)
+		t.Fatalf("BeatMissing through a same-origin 307 = %v, want delivery", err)
 	}
 	if got := finishHits.Load(); got != 1 {
-		t.Errorf("redirect target hits = %d, want 1 (a same-host hop must be followed)", got)
+		t.Errorf("redirect target hits = %d, want 1 (a same-origin hop must be followed)", got)
 	}
 	if body, _ := finishBody.Load().(string); !strings.Contains(body, "MISSING") {
 		t.Errorf("followed hop body = %q, want the notification payload", body)
