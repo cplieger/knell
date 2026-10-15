@@ -7,7 +7,7 @@ require (
 	github.com/cplieger/health v1.8.2
 	github.com/cplieger/httpx/v5 v5.0.5
 	github.com/cplieger/metrics/v4 v4.2.1
-	github.com/cplieger/slogx v1.6.7
+	github.com/cplieger/slogx v1.7.0-dev.1
 	github.com/cplieger/webhttp/v3 v3.0.2
 )
 
