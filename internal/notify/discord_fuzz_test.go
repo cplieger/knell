@@ -290,23 +290,19 @@ func withQuotedForms(needles []string) []string {
 }
 
 // FuzzRedirectResponsesNeverCarryLocationText fuzzes the third channel remote
-// text can enter a delivery error by: a response HEADER. net/http writes two
-// of its transport causes from the Location header (a malformed one as `failed
-// to parse Location header "<header>"`, a policy refusal as httpx's `refusing
-// redirect to <host>`), so an endpoint answering a webhook POST with a
-// redirect that echoes the request URI would put the credential into the
-// returned error and into httpx.Do's attempt lines without ever sending a
-// body. This target is the class's only pin: it explores the whole header
-// space and the whole 3xx band, so the seed corpus committed here is the
-// durable coverage of the class (the weekly run's generated corpus is
-// discarded).
+// text can enter a delivery error by: a response HEADER. net/http writes the
+// Location into two causes (`failed to parse Location header "<header>"`, and
+// a *url.Error whose URL is the raw header on any redirect-policy refusal), so
+// a redirect echoing the request URI would put the credential into the error
+// and httpx.Do's attempt lines without ever sending a body. This target is
+// the class's only pin over the header space and 3xx band; its committed
+// seeds are the durable coverage.
 func FuzzRedirectResponsesNeverCarryLocationText(f *testing.F) {
-	// Seed Locations cover the shapes that reach a different cause: an
-	// unparseable header, a cross-host method-preserving hop (refused by
-	// policy, and the shape whose refusal text names the remote host), a
-	// scheme downgrade, a followed same-host hop, a host past any sane
-	// length, a non-HTTP scheme, a query-borne credential, and an empty
-	// header (a 3xx net/http cannot follow). They avoid secret-shaped
+	// Seed Locations cover the header shapes: an unparseable one, hops to
+	// another origin (other host, other port, scheme downgrade, an over-long
+	// host, an out-of-range port; all refused by sameOrigin), a followed
+	// same-origin hop, a non-HTTP scheme, a query-borne credential, and an
+	// empty header (a 3xx net/http cannot follow). They avoid secret-shaped
 	// keywords: a literal that looks like a credential trips the repo's
 	// secret scan even as fuzz seed data.
 	for _, seed := range []struct {
@@ -315,6 +311,7 @@ func FuzzRedirectResponsesNeverCarryLocationText(f *testing.F) {
 	}{
 		{"/api/webhooks/1234567890/plainsegment%zz", 2},
 		{"https://plainsegment.redirect.example/hooks/1", 7},
+		{"https://discord.example:8443/api/webhooks/1234567890/plainsegment", 8},
 		{"", 0},
 		{"/finish", 7},
 		{`\/api\/webhooks\/1234567890\/plainsegment`, 1},
@@ -330,11 +327,11 @@ func FuzzRedirectResponsesNeverCarryLocationText(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, location string, statusSeed uint8) {
-		// The whole redirect band: 301/302/303 are the method-changing hops
-		// WithPreserveMethod refuses, and it refuses them by surfacing the 3xx
+		// The whole redirect band: a same-origin 301/302/303 is a
+		// method-changing hop WithPreserveMethod refuses by surfacing the 3xx
 		// itself (http.ErrUseLastResponse, not an error); 307/308 preserve the
-		// method and are followed when same-host, so they produce a cause only
-		// through WithSameHost's hard refusal or the hop cap; 300/304/305/306
+		// method and are followed when same-origin, so they produce a cause
+		// only through an origin refusal or the hop cap; 300/304/305/306
 		// are not redirect statuses to net/http at all, so no Location is read.
 		status := 300 + int(statusSeed%9)
 		const rawURL = "https://discord.example/api/webhooks/1234567890/plainsegment"
