@@ -300,7 +300,7 @@ func withQuotedForms(needles []string) []string {
 func FuzzRedirectResponsesNeverCarryLocationText(f *testing.F) {
 	// Seed Locations cover the header shapes: an unparseable one, hops to
 	// another origin (other host, other port, scheme downgrade, an over-long
-	// host, an out-of-range port; all refused by sameOrigin), a followed
+	// host, an out-of-range port; all refused by the origin policy), a followed
 	// same-origin hop, a non-HTTP scheme, a query-borne credential, and an
 	// empty header (a 3xx net/http cannot follow). They avoid secret-shaped
 	// keywords: a literal that looks like a credential trips the repo's
