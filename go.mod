@@ -1,6 +1,6 @@
 module github.com/cplieger/knell
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/cplieger/envx/v2 v2.0.7
