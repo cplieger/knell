@@ -101,7 +101,7 @@ func run() error {
 	notifier := notify.New(cfg.WebhookURL, cfg.Node)
 	defer notifier.Close()
 
-	watcher := watch.New(watchBeats(cfg.Beats), notifier, time.Now, processStart)
+	watcher := watch.New(watchBeats(cfg.Beats, cfg.MissingRepeat), notifier, time.Now, processStart)
 
 	// The watcher is the single owner of beat admission, so the endpoint holds
 	// no lifecycle state and no context of its own.
@@ -197,10 +197,10 @@ func classifyBindError(ctx context.Context, addr string, err error) error {
 
 // watchBeats translates the config DTOs into the watch package's own input
 // type, so the state machine never depends on how configuration was parsed.
-func watchBeats(cfg []config.Beat) []watch.Beat {
+func watchBeats(cfg []config.Beat, repeat time.Duration) []watch.Beat {
 	beats := make([]watch.Beat, len(cfg))
 	for i, b := range cfg {
-		beats[i] = watch.Beat{ID: b.ID, Deadline: b.Deadline}
+		beats[i] = watch.Beat{ID: b.ID, Deadline: b.Deadline, Repeat: repeat}
 	}
 	return beats
 }

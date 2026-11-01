@@ -132,12 +132,15 @@ const DefaultTick = 15 * time.Second
 // flips only on a delivered send, so an unreached beat keeps its queued record.
 const sweepSendBudget = 5 * time.Second
 
-// Beat is one watched beat as the state machine needs it: an id and the silence
-// deadline that declares it missing. It is this package's own input type, so the
-// state machine does not depend on how the configuration was parsed.
+// Beat is one watched beat as the state machine needs it: an id, the silence
+// deadline that declares it missing, and Repeat, the interval at which a
+// delivered missing notice is sent again while the beat stays missing (zero
+// sends one per outage). It is this package's own input type, so the state
+// machine does not depend on how the configuration was parsed.
 type Beat struct {
 	ID       string
 	Deadline time.Duration
+	Repeat   time.Duration
 }
 
 // MaxHistoryBatch is the largest number of ended outages one BeatOutageHistory
@@ -176,6 +179,9 @@ type beatState struct {
 	// stamping it when the attempt STARTS is what bounds how long a
 	// continuously-due beat can wait.
 	lastAttempt time.Time
+	// notifiedAt is when the latest missing notice for the outage alerted
+	// marks was delivered, the instant the next reminder counts from.
+	notifiedAt time.Time
 	// pendingMissing is the FIFO of detected missing transitions whose
 	// notification is not yet delivered, oldest first. It retains the evidence
 	// of an outage so a ping cannot erase it by moving lastSeen, and detection
@@ -183,6 +189,7 @@ type beatState struct {
 	// while an earlier notice is queued keeps its own span.
 	pendingMissing []overdueBeat
 	deadline       time.Duration
+	repeat         time.Duration
 	alerted        bool
 	// recovering marks a recovered transition that is queued or in flight;
 	// sweep must not send another missing transition until it is
@@ -218,6 +225,14 @@ func (st *beatState) openMissing() *overdueBeat {
 		return tail
 	}
 	return nil
+}
+
+// reminderDue reports whether the delivered missing notice of the beat's open
+// outage is owed again at now. alerted holds only while that outage is open and
+// its queue is empty (markDelivered sets it, the ending ping clears it), so no
+// queued record or recovery can be waiting behind a reminder.
+func (st *beatState) reminderDue(now time.Time) bool {
+	return st.alerted && st.repeat > 0 && !now.Before(st.notifiedAt.Add(st.repeat))
 }
 
 // pushMissing appends a detected missing transition, reporting false when the
@@ -408,7 +423,7 @@ func New(beats []Beat, notifier Notifier, now func() time.Time, start time.Time)
 	// fresh then contributes a false vote to the quorum sum.
 	bootSilence := now().Sub(start)
 	for _, b := range beats {
-		w.beats[b.ID] = &beatState{lastSeen: start, deadline: b.Deadline}
+		w.beats[b.ID] = &beatState{lastSeen: start, deadline: b.Deadline, repeat: b.Repeat}
 		// InitBeat publishes the beat's boot-armed baseline and pre-mints its
 		// per-beat counters at zero, so increase() has an earlier sample.
 		obs.InitBeat(b.ID, b.Deadline, start)
@@ -735,16 +750,13 @@ func publishFreshness(id string, silence, deadline time.Duration) bool {
 	return fresh
 }
 
-// sweep checks every beat against its deadline and sends the one notification
-// each beat owes now. A failed send is not marked alerted, so the next sweep
-// retries it; the beat stays at one Discord message per live outage because
-// alerted flips only on a delivered send. Sending is bounded by sweepSendBudget,
-// and what the ORDER guarantees is precedence, not delivery on the immediately
-// following sweep: the worklist is least-recently-attempted first and every send
-// stamps the beat's attempt time before it starts, so a beat the budget did not
-// reach outranks every beat that took a turn and cannot be starved. It can still
-// wait up to one full rotation of the continuously due set, when each later
-// sweep spends the same budget before reaching it.
+// sweep sends the one notification each beat owes now. alerted flips only on a
+// delivered send, so a failed one is retried next sweep and a live outage gets
+// one missing notice plus one per Beat.Repeat. Sending is bounded by
+// sweepSendBudget, and the order guarantees precedence, not delivery on the next
+// sweep: the worklist is least-recently-attempted first and every send stamps
+// its attempt before it starts, so a beat the budget did not reach outranks every
+// beat that took a turn, though it can wait one rotation of the due set.
 func (w *Watcher) sweep(ctx context.Context) {
 	due := w.collectDue()
 	budget := w.now().Add(sweepSendBudget)
@@ -759,14 +771,19 @@ func (w *Watcher) sweep(ctx context.Context) {
 		// and a send that is slow, fails, or is abandoned mid-flight must not
 		// keep its place at the front of the next sweep's ordering.
 		w.markAttempted(due[i].beatID(), w.now())
-		if due[i].history != nil {
+		switch {
+		case due[i].history != nil:
 			if w.sendHistory(ctx, *due[i].history) {
 				return
 			}
-			continue
-		}
-		if w.sendMissing(ctx, due[i].live) {
-			return
+		case due[i].reminder:
+			if w.sendReminder(ctx, due[i].live) {
+				return
+			}
+		default:
+			if w.sendMissing(ctx, due[i].live) {
+				return
+			}
 		}
 	}
 }
@@ -795,9 +812,9 @@ type beatOutages struct {
 
 // dueNotice is the ONE notice a beat owes this sweep, carried with the keys
 // sweep orders the work by. Exactly one of history and live is set: the beat's
-// own queue head decides which (collectBeatDue), exactly as it always has.
-// What dueNotice adds is only that both shapes now share ONE ordering, so no
-// class of notice can starve the other.
+// own queue head decides which (collectBeatDue), or reminderDue sets live when
+// nothing is queued. All shapes share ONE ordering, so no class of notice can
+// starve another.
 type dueNotice struct {
 	// started is when the outage this notice reports began: the first outage
 	// of a history run, or the live record's own lastSeen anchor. It is the
@@ -814,6 +831,9 @@ type dueNotice struct {
 	// for a history notice. It points at the copy collectBeatDue took under
 	// the lock, never at a queued record.
 	live *overdueBeat
+	// reminder marks live as a repeat of the open outage's delivered missing
+	// notice (reminderDue), built from lastSeen because nothing is queued.
+	reminder bool
 }
 
 // beatID is the beat this notice belongs to, read from whichever payload the
@@ -863,9 +883,10 @@ func (w *Watcher) markAttempted(id string, at time.Time) {
 
 // collectDue publishes every beat's freshness gauge and returns this sweep's due
 // notifications in the order they must be attempted, at most one per beat: the
-// live missing notice when the queue head is an outage still in progress, or the
-// history notice when the head already ended. Only beats mid-recovery are held
-// back. The RETURNED ORDER is load-bearing: w.beats is a map, so byAttemptThenAge
+// live missing notice when the queue head is an outage still in progress, the
+// history notice when the head already ended, or a reminder when the open
+// outage's delivered notice is due again. Only beats mid-recovery are held back.
+// The RETURNED ORDER is load-bearing: w.beats is a map, so byAttemptThenAge
 // turns an arbitrary order into a total one keyed on each beat's attempt stamp.
 func (w *Watcher) collectDue() []dueNotice {
 	var due []dueNotice
@@ -889,6 +910,13 @@ func (w *Watcher) collectDue() []dueNotice {
 				started:     live.silence.Started,
 				lastAttempt: st.lastAttempt,
 				live:        live,
+			})
+		case st.reminderDue(now):
+			due = append(due, dueNotice{
+				started:     st.lastSeen,
+				lastAttempt: st.lastAttempt,
+				live:        &overdueBeat{id: id, silence: Transition{Started: st.lastSeen, Observed: now}},
+				reminder:    true,
 			})
 		}
 	}
@@ -994,6 +1022,41 @@ func (w *Watcher) sendMissing(ctx context.Context, beat *overdueBeat) bool {
 	return false
 }
 
+// sendReminder repeats the missing notice of an outage whose first notice was
+// delivered, and reports whether shutdown cancellation should stop the sweep. A
+// failure leaves notifiedAt alone, so the next sweep retries. Neither a failure
+// nor a cancellation logs retryable=false: the channel already holds a notice
+// for this outage, so nothing it lacks is lost.
+func (w *Watcher) sendReminder(ctx context.Context, beat *overdueBeat) bool {
+	if err := w.notifier.BeatMissing(ctx, beat.id, beat.silence); err != nil {
+		if errors.Is(err, context.Canceled) {
+			slog.Info("missing reminder abandoned, shutting down",
+				"beat", beat.id, "retryable", true)
+			return true
+		}
+		obs.RecordNotificationFailed(obs.KindMissing)
+		slog.Error("missing reminder failed, will retry next sweep",
+			"beat", beat.id, "silence", beat.silence.DownFor().String(), "error", err,
+			"retryable", true)
+		return false
+	}
+	obs.RecordNotificationSent(obs.KindMissing)
+	slog.Info("beat still missing, reminder notified", "beat", beat.id, "silence", beat.silence.DownFor().String())
+	w.markReminded(beat.id)
+	return false
+}
+
+// markReminded restarts the reminder interval from a delivered reminder. A ping
+// that raced the send has already cleared alerted and queued the recovery, so
+// the stamp is left for the next outage's first notice to set.
+func (w *Watcher) markReminded(id string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if st := w.beats[id]; st.alerted {
+		st.notifiedAt = w.now()
+	}
+}
+
 // sendHistory delivers one beat's collapsed history notice -- every outage that
 // had already ended when its turn came, in a single past-tense message -- and
 // reports whether shutdown cancellation should stop the sweep. The records stay
@@ -1058,6 +1121,7 @@ func (w *Watcher) markDelivered(id string) (recoveryEvent, bool) {
 	delivered := st.popMissing()
 	if delivered.recoveredAt.IsZero() {
 		st.alerted = true
+		st.notifiedAt = w.now()
 		return recoveryEvent{}, false
 	}
 	st.recovering = true

@@ -16,6 +16,16 @@ knell reads environment variables once, at startup, and has no config file and n
 
 The deadline is the silence knell tolerates. A job that runs once a day with a 26h deadline gets two hours of slack before it is reported missing.
 
+## Missing notice repeat
+
+`MISSING_REPEAT` sends a beat's missing notice again while the beat stays missing, such as `6h`. Unset, blank or `0`, knell sends one missing notice per outage.
+
+- It is a Go duration with an explicit unit, of at least `10m`. A shorter interval reposts one outage faster than anyone can act on it.
+- It applies to every beat in `BEATS`.
+- The interval counts from the last delivered missing notice. Each repeat reports the whole silence so far.
+- A repeat that fails to send is retried on the next sweep, like the first notice.
+- The first ping after the outage ends the repeats and sends the recovered notice.
+
 ## Webhook URL
 
 `DISCORD_WEBHOOK_URL` is the webhook every notice is posted to. Its path is the credential Discord issues, `/api/webhooks/<id>/<token>`, so knell accepts it only when:
@@ -81,7 +91,7 @@ The 512-byte ceiling keeps the token inside the 8704-byte request-header limit w
 
 ## Startup summary
 
-After the settings pass, knell logs one `watching beat` line per beat and one `configuration loaded` line. That line carries `beats`, `node`, `listen_addr`, `webhook` and `beat_token` as `env` or `file`, `allowed_hosts` as `any` or `allowlist(N)`, the `trusted_proxies` count and `log_level`. It never carries a credential. A misspelled `ALLOWED_HOSTS` looks the same as an unset one, `allowed_hosts=any`, so check that field after you set it.
+After the settings pass, knell logs one `watching beat` line per beat and one `configuration loaded` line. That line carries `beats`, `node`, `listen_addr`, `webhook` and `beat_token` as `env` or `file`, `allowed_hosts` as `any` or `allowlist(N)`, the `trusted_proxies` count, `log_level` and `missing_repeat` as a Go duration, `0s` when unset. It never carries a credential. A misspelled `ALLOWED_HOSTS` looks the same as an unset one, `allowed_hosts=any`, so check that field after you set it.
 
 ## What stops startup
 
@@ -89,6 +99,7 @@ knell refuses to start rather than run with a setting it cannot honor, because a
 
 - a `BEATS` entry that is not `id:deadline` with a valid id and a deadline of at least `30s`, a duplicate id, or more than 64 beats,
 - a webhook URL that is not `https`, has no host or no path, or holds a space or an invisible character,
+- a `MISSING_REPEAT` that is not a Go duration, is negative, or is above `0` and below `10m`,
 - a `NODE_NAME` over 256 bytes,
 - an `ALLOWED_HOSTS` entry no `Host` could match,
 - a `BEAT_TOKEN` that is unset, empty, outside 16 to 512 bytes, wrapped in whitespace or carrying a forbidden control character,
