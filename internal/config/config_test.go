@@ -44,6 +44,7 @@ func TestMain(m *testing.M) {
 		"DISCORD_WEBHOOK_URL_FILE",
 		"LISTEN_ADDR",
 		"LOG_LEVEL",
+		"MISSING_REPEAT",
 		"NODE_NAME",
 		"TRUSTED_PROXIES",
 	} {
@@ -304,6 +305,63 @@ func TestLoadRefusesWithoutAWebhook(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "set but empty") {
 		t.Errorf("error = %q uses the set-but-empty diagnosis for an unset variable; the two refusals deliberately ask for different next moves (supply a value vs fix the pipeline that delivered nothing)", err)
+	}
+}
+
+func TestLoadReadsMissingRepeat(t *testing.T) {
+	accepted := map[string]time.Duration{
+		"":       0,
+		"0":      0,
+		"0s":     0,
+		"6h":     6 * time.Hour,
+		" 6h ":   6 * time.Hour,
+		"10m":    10 * time.Minute,
+		"90m30s": 90*time.Minute + 30*time.Second,
+	}
+	for raw, want := range accepted {
+		t.Run("accepts "+raw, func(t *testing.T) {
+			setValidLoadEnv(t)
+			t.Setenv("MISSING_REPEAT", raw)
+			cfg, err := Load(maxNodeNameBytes)
+			if err != nil {
+				t.Fatalf("Load() with MISSING_REPEAT=%q error: %v", raw, err)
+			}
+			if cfg.MissingRepeat != want {
+				t.Errorf("MissingRepeat = %s, want %s", cfg.MissingRepeat, want)
+			}
+		})
+	}
+	t.Run("unset sends one missing notice per outage", func(t *testing.T) {
+		setValidLoadEnv(t)
+		unsetEnv(t, "MISSING_REPEAT")
+		cfg, err := Load(maxNodeNameBytes)
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if cfg.MissingRepeat != 0 {
+			t.Errorf("MissingRepeat = %s, want 0", cfg.MissingRepeat)
+		}
+	})
+
+	refused := map[string]string{
+		"6":    "not a Go duration",
+		"6d":   "not a Go duration",
+		"soon": "not a Go duration",
+		"-1h":  "below the minimum of 10m0s",
+		"9m":   "below the minimum of 10m0s",
+	}
+	for raw, wantMsg := range refused {
+		t.Run("refuses "+raw, func(t *testing.T) {
+			setValidLoadEnv(t)
+			t.Setenv("MISSING_REPEAT", raw)
+			_, err := Load(maxNodeNameBytes)
+			if err == nil {
+				t.Fatalf("Load() with MISSING_REPEAT=%q = nil, want a startup refusal", raw)
+			}
+			if !strings.Contains(err.Error(), "MISSING_REPEAT") || !strings.Contains(err.Error(), wantMsg) {
+				t.Errorf("error = %q, want it to name MISSING_REPEAT and say %q", err, wantMsg)
+			}
+		})
 	}
 }
 
@@ -1773,7 +1831,8 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 			{ID: "watchdog-mimir", Deadline: 20 * time.Minute},
 			{ID: "watchdog-loki", Deadline: 26 * time.Hour},
 		},
-		LogLevel: slog.LevelDebug,
+		MissingRepeat: 6 * time.Hour,
+		LogLevel:      slog.LevelDebug,
 	}
 
 	got := map[string]string{}
@@ -1799,6 +1858,7 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		// TRUSTED_PROXIES is indistinguishable from an unset one, so the number
 		// of ranges actually held is the state an operator checks this line for.
 		"trusted_proxies": "2",
+		"missing_repeat":  "6h0m0s",
 		"log_level":       "DEBUG",
 	}
 	if len(got) != len(want) {

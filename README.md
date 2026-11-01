@@ -9,7 +9,7 @@ knell is a dead man's switch for your scheduled jobs. It sends you a Discord mes
 
 knell tells you when a scheduled job stops, in four ways:
 
-- Posts once to Discord when a job stays quiet past its deadline, and again when it pings.
+- Posts to Discord when a job misses its deadline, optionally repeats the post, and again when it pings.
 - Counts each deadline from knell's start, so a job silent since a restart is still reported.
 - Tells you afterwards about an outage that ended before its message could go out.
 - Publishes each job's state as Prometheus metrics, so your metrics stack can combine several instances.
@@ -68,7 +68,7 @@ Replace `192.0.2.10` with the address of the host that runs knell, as other devi
 
 Run `docker logs knell`. You should see a `configuration loaded` line and then `listening`. If it shows `knell exited with error` instead, its `error` field names the setting to fix, usually a placeholder you have not replaced yet.
 
-When a beat goes quiet past its deadline, the channel gets a message naming the beat, with how long it has been silent, when the silence began and which knell instance saw it.
+When a beat goes quiet past its deadline, the channel gets a message naming the beat, with how long it has been silent, when the silence began and which knell instance saw it. Set `MISSING_REPEAT` to have that message sent again while the outage lasts.
 
 ## Configuration reference
 
@@ -83,6 +83,7 @@ knell reads its settings from environment variables when it starts and never rel
 | `LISTEN_ADDR` | TCP listen address, `host:port` | `:9190` |
 | `ALLOWED_HOSTS` | Comma-separated exact-match `Host` names or IPs to serve. Unset accepts every `Host` | _(unset)_ |
 | `TRUSTED_PROXIES` | Comma-separated CIDRs or IPs of the reverse proxies whose `X-Forwarded-For` names the real sender | _(unset)_ |
+| `MISSING_REPEAT` | Repeats a beat's missing notice at this interval while it stays missing, such as `6h`. At least `10m`. `0` sends one notice per outage | `0` |
 | `LOG_LEVEL` | `debug`, `info`, `warn` or `error`. An unknown value falls back to `info` | `info` |
 
 | Port | Description |

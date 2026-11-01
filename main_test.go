@@ -148,27 +148,28 @@ func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
 	}
 }
 
-// TestWatchBeatsCarriesEveryIDAndDeadlineIntoTheStateMachine pins the one
+// TestWatchBeatsCarriesEveryFieldIntoTheStateMachine pins the one
 // translation main owns between parsed configuration and the state machine.
 // The watch tests build their own []watch.Beat and the config tests stop at
-// []config.Beat, so a field dropped or crossed HERE is invisible to both: a
+// config.Config, so a field dropped or crossed HERE is invisible to both: a
 // lost deadline arms every beat at zero and fires a false missing notice on
-// every restart, and a lost id makes the configured beat 404 forever.
-func TestWatchBeatsCarriesEveryIDAndDeadlineIntoTheStateMachine(t *testing.T) {
+// every restart, a lost id makes the configured beat 404 forever, and a lost
+// repeat interval silently turns MISSING_REPEAT off.
+func TestWatchBeatsCarriesEveryFieldIntoTheStateMachine(t *testing.T) {
 	t.Parallel()
 
 	got := watchBeats([]config.Beat{
 		{ID: "api", Deadline: 20 * time.Minute},
 		{ID: "cron-backup", Deadline: 26 * time.Hour},
-	})
+	}, 6*time.Hour)
 	want := []watch.Beat{
-		{ID: "api", Deadline: 20 * time.Minute},
-		{ID: "cron-backup", Deadline: 26 * time.Hour},
+		{ID: "api", Deadline: 20 * time.Minute, Repeat: 6 * time.Hour},
+		{ID: "cron-backup", Deadline: 26 * time.Hour, Repeat: 6 * time.Hour},
 	}
 	if !slices.Equal(got, want) {
-		t.Errorf("watchBeats = %v, want %v: a dropped deadline arms every beat at zero, so the first freshness refresh reports it overdue and the next sweep fires a false missing notice on every restart; a dropped id makes the beat unpingable and 404 forever", got, want)
+		t.Errorf("watchBeats = %v, want %v: a dropped deadline arms every beat at zero, so the first freshness refresh reports it overdue and the next sweep fires a false missing notice on every restart; a dropped id makes the beat unpingable and 404 forever; a dropped repeat sends one notice per outage whatever MISSING_REPEAT says", got, want)
 	}
-	if beats := watchBeats(nil); len(beats) != 0 {
+	if beats := watchBeats(nil, 0); len(beats) != 0 {
 		t.Errorf("watchBeats(nil) = %v, want no beats", beats)
 	}
 }

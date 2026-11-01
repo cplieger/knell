@@ -20,7 +20,7 @@ Every line that reports a lost or delayed notice carries a `retryable` field. `r
 | `knell_beats_received_total{beat}` | counter | Accepted pings. Unknown ids are refused and not counted |
 | `knell_beat_outages_total{beat}` | counter | Outages detected, counted when the deadline passes and independent of delivery. Count outages with this one |
 | `knell_outage_records_dropped_total{beat}` | counter | Ended-outage records discarded because the beat's queue was full, one per record. No notice for that outage will ever arrive |
-| `knell_notifications_sent_total{kind}` | counter | Delivered notices by kind, `missing`, `recovered` or `history`, one per message. A history notice covering several outages counts once |
+| `knell_notifications_sent_total{kind}` | counter | Delivered notices by kind, `missing`, `recovered` or `history`, one per message, a repeat counting as `missing`. A history notice covering several outages counts once |
 | `knell_notifications_failed_total{kind}` | counter | Sends that failed after their retries, one per message, with the record still queued. In practice `missing` and `history`, which the next sweep retries |
 | `knell_notifications_dropped_total{kind}` | counter | Notices that will never be delivered, one per message. In practice `recovered`, the one kind sent once. Nothing retries a drop |
 | `knell_pre_route_refusals_total{reason}` | counter | Requests refused before routing: `non_canonical_beat_path`, `host_not_allowed` or `auth_throttled`. A diagnostic, see below |

@@ -15,7 +15,6 @@ import (
 	"maps"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -104,17 +103,12 @@ var _ watch.Notifier = (*Discord)(nil)
 func New(webhookURL, node string) *Discord {
 	client := httpx.NewClient(attemptTimeout + 5*time.Second)
 	// Follow only a same-origin hop, never one net/http would rewrite to another
-	// method: the webhook POST must not be replayed as a bodyless GET. The
-	// origin check is knell's own because WithSameHost ignores the port, and a
-	// hop to another port would re-POST the notice and the credential path to
-	// whatever listens there. Referer is deleted because net/http writes the
-	// previous request's full URL, the credential, there.
-	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithPreserveMethod(true))
+	// method: the webhook POST must not be replayed as a bodyless GET, nor sent
+	// with its credential path to another port. Referer is deleted because
+	// net/http writes the previous request's full URL, the credential, there.
+	policy := httpx.RedirectPolicyFunc(httpx.WithSameOrigin(true), httpx.WithPreserveMethod(true))
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		req.Header.Del("Referer")
-		if !sameOrigin(via[0].URL, req.URL) {
-			return errCrossOriginRedirect
-		}
 		return policy(req, via)
 	}
 	return &Discord{
@@ -125,61 +119,6 @@ func New(webhookURL, node string) *Discord {
 		rateLimitMaxWait: rateLimitMaxWait,
 		sendBudget:       sendBudget,
 	}
-}
-
-var errCrossOriginRedirect = errors.New("refusing cross-origin redirect")
-
-// sameOrigin reports whether a and b share scheme, host and effective port
-// (RFC 6454 §4), so https://h and https://h:443 match.
-func sameOrigin(a, b *url.URL) bool {
-	return a.Scheme == b.Scheme &&
-		sameHost(a.Hostname(), b.Hostname()) &&
-		effectivePort(a) == effectivePort(b)
-}
-
-// sameHost compares IP literals as addresses, so spelling is canonicalised but
-// an IPv6 zone stays exact: Go resolves a zone by exact interface name, and RFC
-// 9844 §3 leaves the mapping host-specific. Names fold ASCII case only, since a
-// Unicode fold equates hosts that resolve differently.
-func sameHost(a, b string) bool {
-	addrA, errA := netip.ParseAddr(a)
-	addrB, errB := netip.ParseAddr(b)
-	if errA == nil || errB == nil {
-		return errA == nil && errB == nil && addrA == addrB
-	}
-	return asciiEqualFold(a, b)
-}
-
-func effectivePort(u *url.URL) string {
-	if port := u.Port(); port != "" {
-		return port
-	}
-	switch u.Scheme {
-	case "https":
-		return "443"
-	case "http":
-		return "80"
-	}
-	return ""
-}
-
-func asciiEqualFold(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range len(a) {
-		ca, cb := a[i], b[i]
-		if 'A' <= ca && ca <= 'Z' {
-			ca += 'a' - 'A'
-		}
-		if 'A' <= cb && cb <= 'Z' {
-			cb += 'a' - 'A'
-		}
-		if ca != cb {
-			return false
-		}
-	}
-	return true
 }
 
 // Close releases idle connections. Call once on shutdown.
@@ -494,7 +433,8 @@ func safeTransportError(err error) error {
 	// it distinguishes a stalled dial (egress/DNS) from a stalled read (host
 	// went quiet after accepting).
 	phrase := "webhook transport failed"
-	if errors.Is(cause, errCrossOriginRedirect) {
+	if refused, ok := errors.AsType[*httpx.RedirectRefusedError](cause); ok &&
+		(refused.Reason == httpx.RedirectOtherOrigin || refused.Reason == httpx.RedirectDowngrade) {
 		phrase = "webhook redirected to another origin, not followed, nothing was delivered (put the URL of the endpoint that accepts the POST in DISCORD_WEBHOOK_URL, or in the secret file named by DISCORD_WEBHOOK_URL_FILE)"
 	} else if opErr, ok := errors.AsType[*net.OpError](cause); ok && opErr.Op != "" {
 		phrase += " during " + opErr.Op
