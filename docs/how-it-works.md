@@ -16,7 +16,9 @@ A live outage and one that is already over are reported differently. No notice a
 
 ### Missing
 
-knell sends a missing notice once per live outage, when a beat first passes its deadline. If delivery fails, because Discord or the network is down, the next sweep tries again, every 15 seconds until one send succeeds. The beat is marked notified only after a delivered send.
+knell sends a missing notice when a beat first passes its deadline. With `MISSING_REPEAT` unset, blank or 0, that is the only notice for the live outage. With a positive duration, the notice repeats as described below. If delivery fails, because Discord or the network is down, the next sweep tries again, every 15 seconds until one send succeeds. The beat is marked notified only after a delivered send.
+
+With `MISSING_REPEAT` set to a positive duration, knell sends the missing notice again each time that interval passes after the last delivered one, for as long as the beat stays missing. Each repeat shows the whole silence so far. A failed repeat is retried on the next sweep. A repeat lost to a shutdown is not logged as a lost notice, because the first notice for that outage was delivered.
 
 ### Recovered
 

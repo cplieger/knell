@@ -32,6 +32,10 @@ const maxBeats = 64
 // transient sender hiccups into alert spam.
 const minDeadline = 30 * time.Second
 
+// minRepeat is the shortest accepted MISSING_REPEAT. A shorter interval reposts
+// one outage faster than anyone acts on it, burying other beats' notices.
+const minRepeat = 10 * time.Minute
+
 // minTokenLength is the shortest BEAT_TOKEN knell will start with: the token
 // is the only thing standing between a stranger who can reach the port and a
 // forged ping, so a guessable value is refused rather than warned about.
@@ -105,7 +109,10 @@ type Config struct {
 	// without this the plain-only case -- the one with the exposure -- is silent.
 	BeatTokenSource envx.SecretSource
 	Beats           []Beat
-	LogLevel        slog.Level
+	// MissingRepeat is how often a delivered missing notice is sent again while
+	// its beat stays missing; zero sends one per outage.
+	MissingRepeat time.Duration
+	LogLevel      slog.Level
 }
 
 // LogValue implements slog.LogValuer so a Config can never publish its own
@@ -130,6 +137,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("beat_token", string(c.BeatTokenSource)),
 		slog.String("allowed_hosts", allowedHosts),
 		slog.Int("trusted_proxies", len(c.TrustedProxies)),
+		slog.String("missing_repeat", c.MissingRepeat.String()),
 		slog.String("log_level", c.LogLevel.String()),
 	)
 }
@@ -150,6 +158,12 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...webhttp.HostAllowlistOption) (
 		return cfg, fmt.Errorf("parsing BEATS: %w", err)
 	}
 	cfg.Beats = beats
+
+	repeat, err := missingRepeat()
+	if err != nil {
+		return cfg, err
+	}
+	cfg.MissingRepeat = repeat
 
 	webhook, webhookSource, err := loadWebhook()
 	if err != nil {
@@ -190,6 +204,28 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...webhttp.HostAllowlistOption) (
 	warnPlainVarIgnored("BEAT_TOKEN", "token", cfg.BeatTokenSource)
 
 	return cfg, nil
+}
+
+// missingRepeat parses MISSING_REPEAT. Unset, blank or a zero duration
+// disables the reminder; anything else must be a Go duration of at least
+// minRepeat, and a bad value fails startup like a bad deadline does.
+func missingRepeat() (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv("MISSING_REPEAT"))
+	if raw == "" {
+		return 0, nil
+	}
+	repeat, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("MISSING_REPEAT %.64q is not a Go duration. Use an explicit unit of m or h, "+
+			"for example 6h, or 0 to send one missing notice per outage", raw)
+	}
+	if repeat == 0 {
+		return 0, nil
+	}
+	if repeat < minRepeat {
+		return 0, fmt.Errorf("MISSING_REPEAT %s is below the minimum of %s. Use 0 to send one missing notice per outage", repeat, minRepeat)
+	}
+	return repeat, nil
 }
 
 // nodeName resolves the observer name: NODE_NAME when set to a non-empty
