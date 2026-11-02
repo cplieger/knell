@@ -7,13 +7,13 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 
 	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/knell/internal/watch"
-	"github.com/cplieger/webhttp/v3"
+	"github.com/cplieger/webhttp/v4"
 )
 
 // maxBeatBody caps how much of a ping request body is drained: draining keeps
@@ -55,7 +55,7 @@ type Deps struct {
 	BeatToken string
 	// TrustedProxies is the reverse-proxy CIDR set client_ip is resolved
 	// against. Empty honors no X-Forwarded-For, the spoof-proof default.
-	TrustedProxies []*net.IPNet
+	TrustedProxies []netip.Prefix
 }
 
 // New assembles the routed and middleware-wrapped root handler. The beat
@@ -103,6 +103,9 @@ func New(b Beater, deps Deps) http.Handler {
 			}),
 		),
 		webhttp.Recoverer(),
+		// The /metrics text exposition is the only body that reaches Gzip's
+		// 1 KiB floor; the JSON envelopes and probe answers stay under it.
+		webhttp.Gzip(webhttp.WithGzipTypes("text/plain")),
 		// Immediately outside the Host policy, so a pre-route 403 collapses
 		// onto the "unmatched" label.
 		countHostRefusals(deps.Hosts),

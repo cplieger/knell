@@ -1,6 +1,7 @@
 package webapi
 
 import (
+	"compress/gzip"
 	"context"
 	"io"
 	"log/slog"
@@ -16,7 +17,7 @@ import (
 	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/webhttp/v3"
+	"github.com/cplieger/webhttp/v4"
 )
 
 // fakeBeater accepts a fixed id set and records what was recorded. closed
@@ -485,6 +486,32 @@ func TestMetricsExposition(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("exposition missing %s", want)
 		}
+	}
+}
+
+func TestMetricsExpositionGzip(t *testing.T) {
+	obs.InitBeat("webapi-gzip-test", 20*time.Minute, time.Unix(0, 0))
+	h := newTestHandler(&fakeBeater{}, testBeatToken)
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /metrics = %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip for a scraper offering it", got)
+	}
+	zr, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("decompressing /metrics: %v", err)
+	}
+	if !strings.Contains(string(body), "knell_beats_received_total") {
+		t.Errorf("decompressed exposition missing knell_beats_received_total:\n%s", body)
 	}
 }
 

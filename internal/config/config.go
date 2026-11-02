@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -21,7 +21,7 @@ import (
 
 	"github.com/cplieger/envx/v2"
 	"github.com/cplieger/slogx"
-	"github.com/cplieger/webhttp/v3"
+	"github.com/cplieger/webhttp/v4"
 )
 
 // maxBeats caps how many beats one instance will watch, keeping the metric
@@ -95,7 +95,7 @@ type Config struct {
 	// TrustedProxies is the reverse-proxy CIDR set X-Forwarded-For is honored
 	// for. Empty (the default) keeps webhttp's spoof-proof behaviour: the
 	// access line's client_ip is the socket peer.
-	TrustedProxies []*net.IPNet
+	TrustedProxies []netip.Prefix
 	WebhookURL     string
 	// WebhookSource is the channel DISCORD_WEBHOOK_URL arrived through, as envx
 	// names it: the one non-secret FACT about the credential worth publishing at
@@ -294,7 +294,7 @@ func allowedHosts(opts []webhttp.HostAllowlistOption) (*webhttp.HostPolicy, erro
 // resolves client_ip against. A malformed entry is warned about and dropped
 // (narrowing trust is safe; widening it is not — contrast ALLOWED_HOSTS).
 // Unset or blank returns nil, meaning client_ip is the socket peer.
-func trustedProxies() []*net.IPNet {
+func trustedProxies() []netip.Prefix {
 	raw := os.Getenv("TRUSTED_PROXIES")
 	nets, invalid := webhttp.ParseCIDRs(strings.Split(raw, ","))
 	if len(invalid) > 0 {
