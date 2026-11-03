@@ -381,9 +381,8 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 func TestTransientFailureRetries(t *testing.T) {
 	t.Parallel()
 
-	// 503 is in httpx's transient set (502/503/504), so it retries within
-	// the call. A plain 500 is deliberately terminal here: the watch sweep
-	// retries the whole notification 15s later, which covers it.
+	// 503 is a status httpx.IsRetryableStatus accepts, so it retries
+	// within the call.
 	rec := newWebhookRecorder(http.StatusServiceUnavailable, http.StatusNoContent)
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
@@ -1310,14 +1309,34 @@ func TestCanceledDeliveryErrorIsCanceled(t *testing.T) {
 	}
 }
 
-func TestPlainServerErrorIsTerminalPerAttempt(t *testing.T) {
+func TestPlainServerErrorRetriesInCall(t *testing.T) {
 	t.Parallel()
 
-	// httpx's transient set is 502/503/504: a plain 500 is terminal for
-	// this delivery call by design; the watch sweep retries the whole
-	// notification 15s later. If 500 ever joined the in-call retry set,
-	// the second scripted status (204) would make this call succeed.
+	// httpx.IsRetryableStatus accepts a plain 500, so the second scripted
+	// status (204) delivers within the same call.
 	rec := newWebhookRecorder(http.StatusInternalServerError, http.StatusNoContent)
+	srv := httptest.NewServer(rec.handler(t))
+	defer srv.Close()
+
+	d := newTestNotifier(t, srv.URL, "node-1")
+	defer d.Close()
+
+	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
+		t.Fatalf("BeatMissing after a 500 then 204: %v", err)
+	}
+	if got := rec.hits.Load(); got != 2 {
+		t.Errorf("attempts = %d, want 2 (500 is retried within the call)", got)
+	}
+}
+
+func TestSettledServerErrorIsTerminalPerAttempt(t *testing.T) {
+	t.Parallel()
+
+	// A 501 repeats on every attempt, so httpx.IsRetryableStatus rejects it:
+	// the call fails at once and the watch sweep owns the retry. If 501 ever
+	// joined the in-call retry set, the second scripted status (204) would
+	// make this call succeed.
+	rec := newWebhookRecorder(http.StatusNotImplemented, http.StatusNoContent)
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
 
@@ -1326,10 +1345,10 @@ func TestPlainServerErrorIsTerminalPerAttempt(t *testing.T) {
 
 	err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
 	if err == nil {
-		t.Fatal("BeatMissing on 500 = nil, want error (sweep-level retry owns this failure)")
+		t.Fatal("BeatMissing on 501 = nil, want error (sweep-level retry owns this failure)")
 	}
 	if got := rec.hits.Load(); got != 1 {
-		t.Errorf("attempts = %d, want 1 (500 is not in the transient retry set)", got)
+		t.Errorf("attempts = %d, want 1 (501 is not in the retry set)", got)
 	}
 }
 

@@ -475,7 +475,8 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 
 // deliveryError reports what a response says about delivery: nil for success
 // (exactly 2xx), otherwise CheckHTTPStatus's typed error plus whatever knell
-// can safely add, so httpx.Do can still classify 502/503/504 and the 429 wait.
+// can safely add, so httpx.Do can still classify a retryable status and the
+// 429 wait.
 func deliveryError(resp *http.Response) error {
 	statusErr := httpx.CheckHTTPStatus(resp)
 	if statusErr == nil {
