@@ -11,16 +11,16 @@ import (
 	"net/netip"
 	"strings"
 
+	"github.com/cplieger/go/httpserver"
 	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/knell/internal/watch"
-	"github.com/cplieger/webhttp/v4"
 )
 
 // maxBeatBody caps how much of a ping request body is drained: draining keeps
 // connections reusable, the cap keeps a hostile body from tying up the handler.
 const maxBeatBody = 1 << 20
 
-// loggedPathCap tightens webhttp's 512-byte cap on the access line's path
+// loggedPathCap tightens httpserver's 512-byte cap on the access line's path
 // attribute; every path knell legitimately serves is short.
 const loggedPathCap = 128
 
@@ -49,7 +49,7 @@ type Deps struct {
 	// Hosts is the exact-match Host allowlist (ALLOWED_HOSTS). An inactive
 	// policy accepts every Host; an active one is what breaks DNS rebinding,
 	// since BeatToken gates the beat route only.
-	Hosts *webhttp.HostPolicy
+	Hosts *httpserver.HostPolicy
 	// BeatToken is the required bearer credential for POST /beat/{id}. An empty
 	// value fails CLOSED and every ping is refused, rather than opening a mode.
 	BeatToken string
@@ -79,9 +79,9 @@ func New(b Beater, deps Deps) http.Handler {
 	mux.Handle("GET /healthz", deps.Healthz)
 	mux.Handle("GET /metrics", obs.Handler())
 
-	return webhttp.Chain(mux,
-		webhttp.SecurityHeaders(),
-		webhttp.NoStore(),
+	return httpserver.Chain(mux,
+		httpserver.SecurityHeaders(),
+		httpserver.NoStore(),
 		// Outermost among the refusing middleware, ahead of the access logger:
 		// a request with no valid beat token is answered 429 without reaching
 		// Logging, so a guessing run cannot flood the log.
@@ -92,20 +92,20 @@ func New(b Beater, deps Deps) http.Handler {
 		// the only place a refused ping (401/404/405/503) becomes visible to a
 		// scrape, since none reach beatsReceived. The throttle's 429 is counted
 		// on the pre-route counter instead, outside this wrapper.
-		webhttp.Logging(
-			webhttp.ProbeLogLevel("/healthz", "/metrics"),
-			webhttp.WithMaxLoggedPath(loggedPathCap),
+		httpserver.Logging(
+			httpserver.ProbeLogLevel("/healthz", "/metrics"),
+			httpserver.WithMaxLoggedPath(loggedPathCap),
 			// Empty unless TRUSTED_PROXIES is set: trusting a forwarded header
 			// with no proxy in front is how the field becomes spoofable.
-			webhttp.WithClientIP(deps.TrustedProxies...),
-			webhttp.WithRecordRouteMetric(func(m webhttp.RequestMetric) {
+			httpserver.WithClientIP(deps.TrustedProxies...),
+			httpserver.WithRecordRouteMetric(func(m httpserver.RequestMetric) {
 				obs.RecordHTTP(m.Method, m.Path, m.Status, m.Latency)
 			}),
 		),
-		webhttp.Recoverer(),
+		httpserver.Recoverer(),
 		// The /metrics text exposition is the only body that reaches Gzip's
 		// 1 KiB floor; the JSON envelopes and probe answers stay under it.
-		webhttp.Gzip(webhttp.WithGzipTypes("text/plain")),
+		httpserver.Gzip(httpserver.WithGzipTypes("text/plain")),
 		// Immediately outside the Host policy, so a pre-route 403 collapses
 		// onto the "unmatched" label.
 		countHostRefusals(deps.Hosts),
@@ -124,7 +124,7 @@ func New(b Beater, deps Deps) http.Handler {
 func canonicalBeatPath(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw := r.URL.Path
-		clean, canonical := webhttp.CanonicalRequestPath(raw)
+		clean, canonical := httpserver.CanonicalRequestPath(raw)
 		if !canonical && (inBeatNamespace(raw) || inBeatNamespace(clean)) {
 			obs.RecordPreRouteRefusal(obs.RefusalNonCanonicalBeatPath)
 			writeUnknownBeat(w, r)
@@ -144,8 +144,8 @@ func inBeatNamespace(p string) bool {
 // writeMethodNotAllowed refuses a beat request whose method is not POST. GET
 // and HEAD are deliberately absent from the Allow set: neither records a beat.
 func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
-	webhttp.SetAllow(w, http.MethodPost)
-	webhttp.WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed",
+	httpserver.SetAllow(w, http.MethodPost)
+	httpserver.WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed",
 		"use POST to record a beat")
 }
 
@@ -153,7 +153,7 @@ func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 // every /beat path the route table matches and every non-canonical one
 // canonicalBeatPath refuses.
 func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
-	webhttp.WriteError(w, r, http.StatusNotFound, "unknown_beat",
+	httpserver.WriteError(w, r, http.StatusNotFound, "unknown_beat",
 		"no beat at this URL. Check the id against BEATS, and check the URL for extra or repeated path segments")
 }
 
@@ -163,28 +163,28 @@ func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
 // silently: the WARN below is the only channel through which an operator
 // learns a sender ships payloads knell refuses to read.
 func drainBeatBody(w http.ResponseWriter, r *http.Request) {
-	webhttp.LimitBody(w, r, maxBeatBody)
+	httpserver.LimitBody(w, r, maxBeatBody)
 	_, err := io.Copy(io.Discard, r.Body)
 	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 		slog.WarnContext(r.Context(), "beat body exceeded the cap and was not fully read",
 			"limit_bytes", maxBeatBody,
-			"request_id", webhttp.RequestIDFromContext(r.Context()))
+			"request_id", httpserver.RequestIDFromContext(r.Context()))
 	}
 }
 
 // beatTokenVerifier builds the constant-time verifier for the beat gate over
 // the whole expected field value, once and outside the request path.
-func beatTokenVerifier(token string) webhttp.StaticTokenVerifier {
+func beatTokenVerifier(token string) httpserver.StaticTokenVerifier {
 	if token == "" {
-		return webhttp.StaticTokenVerifier{}
+		return httpserver.StaticTokenVerifier{}
 	}
-	return webhttp.NewStaticTokenVerifier(bearerPrefix + token)
+	return httpserver.NewStaticTokenVerifier(bearerPrefix + token)
 }
 
 // presentsValidBeatToken reports whether r carries the configured beat
 // credential. Shared by the handler's gate and the throttle's predicate so the
 // two cannot drift apart.
-func presentsValidBeatToken(verifier webhttp.StaticTokenVerifier, r *http.Request) bool {
+func presentsValidBeatToken(verifier httpserver.StaticTokenVerifier, r *http.Request) bool {
 	return verifier.Verify(r.Header.Get("Authorization"))
 }
 
@@ -194,19 +194,19 @@ func presentsValidBeatToken(verifier webhttp.StaticTokenVerifier, r *http.Reques
 // so no local unescaping logic can drift from net/http's own. A non-canonical
 // spelling still draws a token: over-inclusion is harmless, under-inclusion is
 // a bypass.
-func failedBeatAuth(mux *http.ServeMux, verifier webhttp.StaticTokenVerifier, r *http.Request) bool {
+func failedBeatAuth(mux *http.ServeMux, verifier httpserver.StaticTokenVerifier, r *http.Request) bool {
 	_, pattern := mux.Handler(r)
 	return pattern == beatRoutePattern && !presentsValidBeatToken(verifier, r)
 }
 
 // beatAuthFailureLimiter throttles failed authentication on the beat endpoint
-// through one shared webhttp.FailedAuthRateLimit bucket, so a valid ping is
+// through one shared httpserver.FailedAuthRateLimit bucket, so a valid ping is
 // never throttled. The bucket is deliberately aggregate, with no per-client
 // identity: it caps the total failed-auth rate and the one-line-per-attempt
 // log flood, and per-client fairness would need a trusted identity knell does
 // not have.
-func beatAuthFailureLimiter(mux *http.ServeMux, verifier webhttp.StaticTokenVerifier) webhttp.Middleware {
-	limit := webhttp.FailedAuthRateLimit(nil, "too many failed beat token attempts")
+func beatAuthFailureLimiter(mux *http.ServeMux, verifier httpserver.StaticTokenVerifier) httpserver.Middleware {
+	limit := httpserver.FailedAuthRateLimit(nil, "too many failed beat token attempts")
 	return func(next http.Handler) http.Handler {
 		limited := limit(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -214,7 +214,7 @@ func beatAuthFailureLimiter(mux *http.ServeMux, verifier webhttp.StaticTokenVeri
 				next.ServeHTTP(w, r)
 				return
 			}
-			recorder := webhttp.NewStatusRecorder(w)
+			recorder := httpserver.NewStatusRecorder(w)
 			limited.ServeHTTP(recorder, r)
 			if recorder.Status() == http.StatusTooManyRequests {
 				obs.RecordPreRouteRefusal(obs.RefusalAuthThrottled)
@@ -226,7 +226,7 @@ func beatAuthFailureLimiter(mux *http.ServeMux, verifier webhttp.StaticTokenVeri
 // countHostRefusals counts an ALLOWED_HOSTS refusal by reason, reading the
 // verdict through the policy's own predicate rather than re-deriving it. An
 // inactive policy returns next unwrapped.
-func countHostRefusals(hosts *webhttp.HostPolicy) webhttp.Middleware {
+func countHostRefusals(hosts *httpserver.HostPolicy) httpserver.Middleware {
 	if !hosts.Active() {
 		return func(next http.Handler) http.Handler { return next }
 	}
@@ -244,17 +244,17 @@ func countHostRefusals(hosts *webhttp.HostPolicy) webhttp.Middleware {
 // loopback-exempt, with the ALLOWED_HOSTS-naming 403 envelope. WithLoopbackExempt
 // admits a request only when both the socket peer and the Host are loopback,
 // so a rebinding request never qualifies.
-func HostPolicyOptions() []webhttp.HostAllowlistOption {
-	return []webhttp.HostAllowlistOption{
-		webhttp.WithLoopbackExempt(true),
-		webhttp.WithHostAllowlistError(webhttp.ErrorCode(obs.RefusalHostNotAllowed),
+func HostPolicyOptions() []httpserver.HostAllowlistOption {
+	return []httpserver.HostAllowlistOption{
+		httpserver.WithLoopbackExempt(true),
+		httpserver.WithHostAllowlistError(httpserver.ErrorCode(obs.RefusalHostNotAllowed),
 			"host not allowed. Add it to ALLOWED_HOSTS to serve this hostname"),
 	}
 }
 
 // beatHandler records a ping and answers {"ok":true}, or 404 for an id that is
 // not configured. Unknown ids are never recorded or counted.
-func beatHandler(b Beater, verifier webhttp.StaticTokenVerifier) http.HandlerFunc {
+func beatHandler(b Beater, verifier httpserver.StaticTokenVerifier) http.HandlerFunc {
 	record := beatRecorder(b)
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Authorize before touching the body, so a rejected sender cannot hold
@@ -262,7 +262,7 @@ func beatHandler(b Beater, verifier webhttp.StaticTokenVerifier) http.HandlerFun
 		if !presentsValidBeatToken(verifier, r) {
 			// RFC 9110 §11.6.1: a 401 must name at least one challenge.
 			w.Header().Set("WWW-Authenticate", "Bearer")
-			webhttp.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
+			httpserver.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
 			return
 		}
 		record(w, r)
@@ -280,12 +280,12 @@ func beatRecorder(b Beater) http.HandlerFunc {
 		// the read.
 		switch b.Beat(id) {
 		case watch.BeatClosed:
-			webhttp.WriteError(w, r, http.StatusServiceUnavailable, "shutting_down",
+			httpserver.WriteError(w, r, http.StatusServiceUnavailable, "shutting_down",
 				"knell is shutting down and is no longer accepting beats")
 		case watch.BeatUnknown:
 			writeUnknownBeat(w, r)
 		case watch.BeatRecorded:
-			webhttp.Ok(w)
+			httpserver.Ok(w)
 		}
 	}
 }

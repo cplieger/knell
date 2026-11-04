@@ -14,10 +14,10 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/knell/internal/watch"
-	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/webhttp/v4"
 )
 
 // fakeBeater accepts a fixed id set and records what was recorded. closed
@@ -46,7 +46,7 @@ func (f *fakeBeater) Beat(id string) watch.BeatOutcome {
 const testBeatToken = "unit-test-beat-token"
 
 // authFailBurst mirrors the burst of the failed-auth token bucket knell's
-// throttle rides — webhttp.FailedAuthRateLimit's preset, not knell's own tuning
+// throttle rides — httpserver.FailedAuthRateLimit's preset, not knell's own tuning
 // any more (the library owns the numbers so the services guarding one static
 // bearer on one route cannot drift apart). It is unexported there, so the tests
 // that need to say HOW MANY attempts fit inside the burst carry this mirror.
@@ -438,7 +438,7 @@ func FuzzBeatPathNeverRedirectsOrRecordsNonCanonically(f *testing.F) {
 		// deliberately does not reach there. The cleaned spelling comes from the
 		// same library function the guard itself judges with, so this exemption
 		// cannot drift from the guard's own namespace test.
-		clean, _ := webhttp.CanonicalRequestPath(path)
+		clean, _ := httpserver.CanonicalRequestPath(path)
 		if !inBeatNamespace(path) && !inBeatNamespace(clean) {
 			return
 		}
@@ -570,7 +570,7 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			// Serial (no t.Parallel): capture.Default swaps the process-global
 			// slog default. It must be installed BEFORE New, because
-			// webhttp.Logging resolves slog.Default() when the chain is built.
+			// httpserver.Logging resolves slog.Default() when the chain is built.
 			rec := capture.Default(t)
 			h := newTestHandlerHealthz(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken, tt.healthzStatus)
 
@@ -629,7 +629,7 @@ func TestNoStoreOnEveryRoute(t *testing.T) {
 		})
 	}
 
-	// The throttle answers its 429 itself, ahead of webhttp.Logging, so the two
+	// The throttle answers its 429 itself, ahead of httpserver.Logging, so the two
 	// header baselines hoisted above it in the chain are the only thing that can
 	// give that refusal an envelope: every routed case above would still pass
 	// with them back inside the throttle.
@@ -664,7 +664,7 @@ func (panicBeater) Beat(string) watch.BeatOutcome { panic("beat exploded") }
 
 func TestPanicUnderBeatHandlerAnswers500AndIsLogged(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and it must be installed BEFORE New, because webhttp resolves
+	// default, and it must be installed BEFORE New, because httpserver resolves
 	// slog.Default() when the chain is built.
 	//
 	// Without the chain's Recoverer, a panic under the beat handler unwinds to
@@ -721,7 +721,7 @@ func TestBeatBodyDrainIsBounded(t *testing.T) {
 	//
 	// The exact-read oracle is one byte PAST the cap, and that byte is the
 	// point of the http.MaxBytesReader the drain is built on
-	// (webhttp.LimitBody): it is what distinguishes a body that ended exactly
+	// (httpserver.LimitBody): it is what distinguishes a body that ended exactly
 	// at the cap from one that runs past it, so the overrun can be detected
 	// instead of read as a clean end-of-body. A bare io.LimitReader stops at
 	// 1 MiB exactly and cannot tell the two apart.
@@ -746,7 +746,7 @@ func TestBeatBodyDrainIsBounded(t *testing.T) {
 
 // TestBeatOverLimitBodyWarnsAndStillRecords pins what an over-limit payload is
 // observable as, which is the whole reason the drain caps with
-// webhttp.LimitBody (http.MaxBytesReader) instead of io.LimitReader: the
+// httpserver.LimitBody (http.MaxBytesReader) instead of io.LimitReader: the
 // overrun becomes an *http.MaxBytesError the handler can report, where a
 // LimitReader would have ended the read as if the body simply stopped there and
 // nothing would ever say a sender is shipping payloads knell refuses to read.
@@ -953,7 +953,7 @@ func TestEmptyBeatTokenFailsClosed(t *testing.T) {
 // alone is a plausible mis-implementation: bad bearers are capped, a VALID ping
 // never draws a token (so healthy beats cannot throttle themselves behind a
 // flood), and no other route or method draws one. The 429 is the one refusal
-// outside webhttp.Logging, so the reason counter below is its only vantage point.
+// outside httpserver.Logging, so the reason counter below is its only vantage point.
 func TestFailedAuthIsThrottledInAggregate(t *testing.T) {
 	badBearer := func(h http.Handler) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
@@ -966,7 +966,7 @@ func TestFailedAuthIsThrottledInAggregate(t *testing.T) {
 	t.Run("bad bearers are capped at the burst", func(t *testing.T) {
 		b := &fakeBeater{known: map[string]bool{"api": true}}
 		h := newTestHandler(b, testBeatToken)
-		// The 429 is answered outside webhttp.Logging, so it reaches neither
+		// The 429 is answered outside httpserver.Logging, so it reaches neither
 		// the access log nor the request counter: this reason series is the
 		// only vantage point on it. Deltas against the singleton registry.
 		const reasonSeries = `knell_pre_route_refusals_total{reason="auth_throttled"}`
@@ -1113,12 +1113,12 @@ func TestEveryRejectedMethodAnswersTheSameRefusal(t *testing.T) {
 
 // FuzzLoggedPathIsBounded fuzzes the untrusted text the access line records as
 // its path. r.URL.Path is attacker-controlled, net/http accepts a megabyte of
-// it, and webhttp.Logging sits OUTSIDE the mux, so the access line is emitted
+// it, and httpserver.Logging sits OUTSIDE the mux, so the access line is emitted
 // before beatHandler's token gate and the bound is the only thing limiting an
 // unauthenticated caller's influence on knell's log lines -- the channel that
 // carries the undelivered-notice warnings no counter backs.
 //
-// The bound itself is webhttp's now, so what this pins is knell's WIRING of it:
+// The bound itself is httpserver's now, so what this pins is knell's WIRING of it:
 // that every request really does travel through a logger carrying
 // WithMaxLoggedPath(loggedPathCap), for arbitrary bytes as well as for the
 // shapes its committed seeds name -- the two probe endpoints and an ordinary
@@ -1145,7 +1145,7 @@ func FuzzLoggedPathIsBounded(f *testing.F) {
 	f.Fuzz(func(t *testing.T, path string) {
 		// Serial by construction (the fuzz function runs one input at a time):
 		// capture.Default swaps the process-global slog default, and the
-		// handler must be built after it because webhttp.Logging resolves
+		// handler must be built after it because httpserver.Logging resolves
 		// slog.Default() when the chain is built.
 		logs := capture.Default(t)
 		h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
@@ -1280,11 +1280,11 @@ func beatRequest(t *testing.T, h http.Handler, method, path string) *httptest.Re
 
 // newShutdownHarness builds the routed handler over the real state machine for
 // one beat, on a fake clock. The returned func closes beat admission the way
-// the composition root does at the start of the drain (webhttp's pre-drain hook
+// the composition root does at the start of the drain (httpserver's pre-drain hook
 // calls watch.Watcher.StopAccepting), and it is the only trigger the endpoint's
 // refusal keys on. Each caller passes its OWN beat id: the metrics registry is
 // a package-level singleton shared by the whole test binary. capture.Default is
-// installed before New because webhttp.Logging resolves slog.Default() when the
+// installed before New because httpserver.Logging resolves slog.Default() when the
 // chain is built; it swaps the process-global default, so every caller stays
 // serial (no t.Parallel).
 func newShutdownHarness(t *testing.T, id string) (http.Handler, func(), *fakeClock, time.Time) {
@@ -1572,7 +1572,7 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 		},
 		// PUT falls to the method-AGNOSTIC /beat/{id} route, which names no
 		// method — the case knell's own derivation used to collapse to
-		// "other". webhttp's derivation keeps a STANDARD method real (PUT is
+		// "other". httpserver's derivation keeps a STANDARD method real (PUT is
 		// one of nine) and buckets only a non-standard token, so a
 		// method-probing scanner stays bounded while an operator can still see
 		// which real method a sender is misconfigured to use. See
@@ -1715,15 +1715,15 @@ func assertRequestSeriesVocabulary(t *testing.T, series, allowedMethods, allowed
 }
 
 // TestRequestMetricLabelsBoundedByTheRouteTable is the cardinality guard on the
-// request counter. webhttp.Logging sits OUTSIDE the mux, so the route-metric hook
+// request counter. httpserver.Logging sits OUTSIDE the mux, so the route-metric hook
 // fires before beatHandler's token gate: the inputs arrive UNAUTHENTICATED, and a
 // minted series is permanent. Labels must be bounded by the route table plus a
 // closed method set. The path collapses onto registered templates or "unmatched".
 // The METHOD is knell's own exposure: its method-agnostic /beat/{id} catch-all
-// (so a 405 carries a truthful Allow) receives ANY valid token, and webhttp keeps
+// (so a 405 carries a truthful Allow) receives ANY valid token, and httpserver keeps
 // the nine standard methods and buckets every other token into "other".
 func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
-	// The complete label vocabulary knell's surface can produce: webhttp's
+	// The complete label vocabulary knell's surface can produce: httpserver's
 	// closed method set (nine standard methods plus the "other" bucket) crossed
 	// with this route table's templates plus the "unmatched" marker. Anything
 	// outside this is a caller-controlled value that reached a label.
@@ -1767,7 +1767,7 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 }
 
 // TestUnroutedRequestsAreCountedUnderTheCollapsedSeries pins the unmatched case
-// of webhttp's label derivation as knell wires it: a request that matched no
+// of httpserver's label derivation as knell wires it: a request that matched no
 // route is still counted, with its PATH collapsed onto the single "unmatched"
 // marker and its real method kept.
 // TestRequestMetricLabelsBoundedByTheRouteTable only proves such a request
@@ -1831,7 +1831,7 @@ func TestUnroutedRequestsAreCountedUnderTheCollapsedSeries(t *testing.T) {
 }
 
 // TestAccessLogMethodIsBoundedForRefusedRequests pins the access line's method
-// bound, which is webhttp's and carries no knob (its ceiling follows from the
+// bound, which is httpserver's and carries no knob (its ceiling follows from the
 // IANA method registry, whose longest entry is UPDATEREDIRECTREF at 17
 // characters, not from anything knell serves). The bound has to exist
 // somewhere: net/http accepts any RFC 9110 token as a method with no length cap
@@ -1839,11 +1839,11 @@ func TestUnroutedRequestsAreCountedUnderTheCollapsedSeries(t *testing.T) {
 // by default), so without it one unauthenticated caller writes ~1 MiB of its own
 // text into a single access line and pushes knell's permanently-lost-notice
 // WARNs out of the retained log window — the same consequence the path cap
-// exists to prevent, on a request the token gate never sees (webhttp.Logging
+// exists to prevent, on a request the token gate never sees (httpserver.Logging
 // sits outside the mux, ahead of beatHandler's token gate).
 func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and must be installed BEFORE New, because webhttp.Logging
+	// default, and must be installed BEFORE New, because httpserver.Logging
 	// resolves slog.Default() when the chain is built.
 	logs := capture.Default(t)
 	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
@@ -1888,8 +1888,8 @@ func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 }
 
 // TestAccessLogClientIPResolvesOnlyThroughTrustedProxies pins the wiring of
-// Deps.TrustedProxies into webhttp.WithClientIP. internal/config pins
-// TRUSTED_PROXIES parsing and webhttp pins ClientIP's spoof model, so neither can
+// Deps.TrustedProxies into httpserver.WithClientIP. internal/config pins
+// TRUSTED_PROXIES parsing and httpserver pins ClientIP's spoof model, so neither can
 // catch a Deps field that never reaches the option: an operator's TRUSTED_PROXIES
 // would then be parsed, reported as trusted_proxies=1 at startup, and silently
 // ignored, leaving every access line — including the 401s a token-guessing run
@@ -1906,11 +1906,11 @@ func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 // slogx.Setup, which replaces the capture a lifecycle test installs.
 func TestAccessLogClientIPResolvesOnlyThroughTrustedProxies(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and must be installed BEFORE New, because webhttp.Logging
+	// default, and must be installed BEFORE New, because httpserver.Logging
 	// resolves slog.Default() when the chain is built.
 	logs := capture.Default(t)
 
-	trusted, invalid := webhttp.ParseCIDRs([]string{"192.0.2.0/24"})
+	trusted, invalid := httpserver.ParseCIDRs([]string{"192.0.2.0/24"})
 	if len(invalid) > 0 {
 		t.Fatalf("ParseCIDRs rejected %v; the fixture must be a valid trusted-proxy set", invalid)
 	}
@@ -1945,7 +1945,7 @@ func TestAccessLogClientIPResolvesOnlyThroughTrustedProxies(t *testing.T) {
 	}
 }
 
-// The label and marker vocabulary webhttp produces, restated here because these
+// The label and marker vocabulary httpserver produces, restated here because these
 // tests assert on the exposition and the access line an operator reads. The
 // library exports the derivation (RouteMetricLabels), not the strings, so if a
 // version bump ever changed one of them, these assertions are where knell finds
@@ -1956,11 +1956,11 @@ const (
 	// unmatchedPathLabel is the path label for a request that matched no route.
 	// There is deliberately no method twin: only the path collapses.
 	unmatchedPathLabel = "unmatched"
-	// overlongMethodMarker replaces a method over webhttp's 24-byte log cap.
+	// overlongMethodMarker replaces a method over httpserver's 24-byte log cap.
 	// Unforgeable: parentheses are not token characters, so net/http answers a
 	// request line spelling it 400 before a handler runs.
 	overlongMethodMarker = "(overlong)"
-	// truncationMarker is what webhttp appends to a path its cap cut.
+	// truncationMarker is what httpserver appends to a path its cap cut.
 	truncationMarker = "...(truncated)"
 )
 
@@ -1968,9 +1968,9 @@ const (
 // (HostPolicyOptions), so this file exercises the policy shape knell
 // actually serves (loopback exempt, the ALLOWED_HOSTS-naming 403) rather than a
 // hand-copied twin that cannot fail when production's option set changes.
-func hostPolicy(t *testing.T, entries string) *webhttp.HostPolicy {
+func hostPolicy(t *testing.T, entries string) *httpserver.HostPolicy {
 	t.Helper()
-	policy, invalid := webhttp.ParseHostList(strings.Split(entries, ","), HostPolicyOptions()...)
+	policy, invalid := httpserver.ParseHostList(strings.Split(entries, ","), HostPolicyOptions()...)
 	if len(invalid) > 0 {
 		t.Fatalf("ParseHostList(%q) reported invalid entries %v; the fixture must be usable", entries, invalid)
 	}
@@ -2072,8 +2072,8 @@ func scrapeAs(t *testing.T, h http.Handler, host string) string {
 // the chain, which New's own comment claims but nothing checked: inside the
 // standard wrappers and outside canonicalBeatPath, so
 // the 403 still carries SecurityHeaders and Cache-Control: no-store, and still
-// rides webhttp.Logging -- so a rebinding attempt appears in the access log and
-// in the request counter. Hoisting the policy above webhttp.Logging keeps every
+// rides httpserver.Logging -- so a rebinding attempt appears in the access log and
+// in the request counter. Hoisting the policy above httpserver.Logging keeps every
 // other test green while the refusal becomes invisible to both vantage points,
 // which is the same alertability gap TestRefusedPingIsVisibleInTheRequestCounter
 // exists to close for the other 403.
@@ -2105,7 +2105,7 @@ func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 		t.Fatalf("status = %d, want 403 (body %s)", rec.Code, rec.Body.String())
 	}
 	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
-		t.Errorf("Cache-Control = %q, want no-store: the host refusal must stay INSIDE webhttp.NoStore", got)
+		t.Errorf("Cache-Control = %q, want no-store: the host refusal must stay INSIDE httpserver.NoStore", got)
 	}
 	if rec.Header().Get("X-Content-Type-Options") == "" {
 		t.Errorf("host refusal lost SecurityHeaders: %v", rec.Header())
@@ -2125,7 +2125,7 @@ func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 }
 
 // TestThrottledAuthFailureWritesNoAccessLine pins WHY beatAuthFailureLimiter
-// sits OUTSIDE webhttp.Logging: an over-budget attempt must be answered before
+// sits OUTSIDE httpserver.Logging: an over-budget attempt must be answered before
 // the access logger, so a guessing run at wire speed cannot write one
 // access line per attempt and push knell's permanently-lost-notice WARNs out of
 // the retained log window. Nothing else pins that ordering -- the throttle's
@@ -2135,7 +2135,7 @@ func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 // throttled ones leave none at all.
 func TestThrottledAuthFailureWritesNoAccessLine(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default, and must be installed BEFORE New, because webhttp.Logging
+	// default, and must be installed BEFORE New, because httpserver.Logging
 	// resolves slog.Default() when the chain is built.
 	logs := capture.Default(t)
 	h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
@@ -2167,7 +2167,7 @@ func TestThrottledAuthFailureWritesNoAccessLine(t *testing.T) {
 		}
 	}
 	if got := logs.CountExact("http"); got != authFailBurst {
-		t.Errorf("%d throttled attempts added %d access lines, want 0: the throttle must answer OUTSIDE webhttp.Logging, or a guessing run writes knell's log at wire speed",
+		t.Errorf("%d throttled attempts added %d access lines, want 0: the throttle must answer OUTSIDE httpserver.Logging, or a guessing run writes knell's log at wire speed",
 			flood, got-authFailBurst)
 	}
 }

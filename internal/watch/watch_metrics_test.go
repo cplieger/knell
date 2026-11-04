@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/obs"
-	"github.com/cplieger/slogx/capture"
 )
 
 // findLabeledValue scrapes the metrics exposition and returns the value token

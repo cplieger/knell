@@ -19,9 +19,9 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/cplieger/envx/v2"
-	"github.com/cplieger/slogx"
-	"github.com/cplieger/webhttp/v4"
+	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/slogx"
 )
 
 // maxBeats caps how many beats one instance will watch, keeping the metric
@@ -91,9 +91,9 @@ type Beat struct {
 type Config struct {
 	// AllowedHosts is the exact-match Host allowlist webapi applies. A nil or
 	// inactive policy accepts every Host (the documented default).
-	AllowedHosts *webhttp.HostPolicy
+	AllowedHosts *httpserver.HostPolicy
 	// TrustedProxies is the reverse-proxy CIDR set X-Forwarded-For is honored
-	// for. Empty (the default) keeps webhttp's spoof-proof behaviour: the
+	// for. Empty (the default) keeps httpserver's spoof-proof behaviour: the
 	// access line's client_ip is the socket peer.
 	TrustedProxies []netip.Prefix
 	WebhookURL     string
@@ -146,7 +146,7 @@ func (c Config) LogValue() slog.Value {
 // DISCORD_WEBHOOK_URL and BEAT_TOKEN are required. maxNodeNameBytes and
 // hostPolicyOpts are parameters so this package depends on neither notify
 // nor webapi directly.
-func Load(maxNodeNameBytes int, hostPolicyOpts ...webhttp.HostAllowlistOption) (Config, error) {
+func Load(maxNodeNameBytes int, hostPolicyOpts ...httpserver.HostAllowlistOption) (Config, error) {
 	var cfg Config
 
 	rawBeats, err := envx.Require("BEATS")
@@ -279,10 +279,10 @@ func listenAddr() string {
 // what breaks DNS rebinding on /metrics, which BEAT_TOKEN does not cover. Any
 // malformed entry fails startup, since dropping it would leave a partial
 // allowlist whose unlisted pings surface as false missing-beat alerts.
-func allowedHosts(opts []webhttp.HostAllowlistOption) (*webhttp.HostPolicy, error) {
+func allowedHosts(opts []httpserver.HostAllowlistOption) (*httpserver.HostPolicy, error) {
 	const key = "ALLOWED_HOSTS"
 	raw := os.Getenv(key)
-	policy, invalid := webhttp.ParseHostList(strings.Split(raw, ","), opts...)
+	policy, invalid := httpserver.ParseHostList(strings.Split(raw, ","), opts...)
 	if len(invalid) > 0 {
 		// %q escapes an invisible rune pasted in with the hostname.
 		return nil, fmt.Errorf("%s has %d entries no Host can ever match, so the allowlist knell would serve is not the one configured: %.64q. Use bare hostnames or IPs only, with no scheme, path or CIDR, for example localhost,10.0.0.5,knell.example.com. A lone port like :9190 belongs in LISTEN_ADDR", key, len(invalid), invalid[:min(len(invalid), 4)])
@@ -296,7 +296,7 @@ func allowedHosts(opts []webhttp.HostAllowlistOption) (*webhttp.HostPolicy, erro
 // Unset or blank returns nil, meaning client_ip is the socket peer.
 func trustedProxies() []netip.Prefix {
 	raw := os.Getenv("TRUSTED_PROXIES")
-	nets, invalid := webhttp.ParseCIDRs(strings.Split(raw, ","))
+	nets, invalid := httpserver.ParseCIDRs(strings.Split(raw, ","))
 	if len(invalid) > 0 {
 		slog.Warn("TRUSTED_PROXIES entries ignored, X-Forwarded-For is not honored for them",
 			"ignored", fmt.Sprintf("%.64q", invalid[:min(len(invalid), 4)]),
@@ -355,7 +355,7 @@ func secretFileError(key string, err error) error {
 // plain KEY was also set, so the plain variable was ignored. Call only once
 // the secret read succeeded and passed validation.
 func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
-	if src != envx.SourceFile || os.Getenv(key) == "" {
+	if src != envx.SecretSourceFile || os.Getenv(key) == "" {
 		return
 	}
 	slog.Warn("both the plain variable and its _FILE companion are set; the file wins and the plain variable is ignored, so unset it to keep the credential out of the process environment",
@@ -366,7 +366,7 @@ func warnPlainVarIgnored(key, subject string, src envx.SecretSource) {
 // value this package refused, so a `_FILE` pointing at the wrong file does
 // not crash-loop with a message naming a variable the operator never set.
 func fileSourcedValueError(key string, src envx.SecretSource, err error) error {
-	if src != envx.SourceFile {
+	if src != envx.SecretSourceFile {
 		return err
 	}
 	return fmt.Errorf("%w. This value came from %s_FILE, not %s, so fix the file's content or the mount it points at", err, key, key)
@@ -377,7 +377,7 @@ func fileSourcedValueError(key string, src envx.SecretSource, err error) error {
 // cannot be used fails startup and never falls back to the plain variable.
 func resolveSecret(key envx.Key, setButEmpty, missing error) (string, envx.SecretSource, error) {
 	if err := rejectBlankFileVar(key); err != nil {
-		return "", envx.SourceNone, err
+		return "", envx.SecretSourceNone, err
 	}
 	value, src, err := envx.SecretWithSource(key)
 	switch {

@@ -3,12 +3,12 @@ module github.com/cplieger/knell
 go 1.27.3
 
 require (
-	github.com/cplieger/envx/v2 v2.1.0
-	github.com/cplieger/health v1.10.0
-	github.com/cplieger/httpx/v5 v5.3.0
-	github.com/cplieger/metrics/v4 v4.3.0-dev.1
-	github.com/cplieger/slogx v1.8.0
-	github.com/cplieger/webhttp/v4 v4.1.0
+	github.com/cplieger/go/envx v1.0.0-dev.1
+	github.com/cplieger/go/health v1.0.0-dev.1
+	github.com/cplieger/go/httpclient v1.0.0-dev.2
+	github.com/cplieger/go/httpserver v1.0.0-dev.1
+	github.com/cplieger/go/measure v1.0.0-dev.1
+	github.com/cplieger/go/slogx v1.0.0-dev.1
 )
 
-require github.com/cplieger/pathinside/v2 v2.1.0 // indirect
+require github.com/cplieger/go/pathinside v1.0.0-dev.1 // indirect

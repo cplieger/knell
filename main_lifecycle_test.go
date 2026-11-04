@@ -21,10 +21,10 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/cplieger/health"
+	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/obs"
-	"github.com/cplieger/slogx/capture"
 )
 
 // stillRunningWarn is the message awaitWatchLoop logs when the watch loop
@@ -420,7 +420,7 @@ func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
 	conn, reader := startHeldBeatRequest(t, addr, beat, 1)
 
 	// Cancel the shared context. The marker flip happens in the pre-drain hook,
-	// which webhttp invokes only after cancellation, so waiting for the marker
+	// which httpserver invokes only after cancellation, so waiting for the marker
 	// to go makes the rest of this test deterministically post-cancellation.
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatalf("signalling self: %v", err)
@@ -723,7 +723,7 @@ func postBeat(t *testing.T, url, auth string) beatResponse {
 }
 
 // TestAwaitWatchLoopStaysSilentWhenTheLoopStoppedInsideAnExpiredGrace pins the
-// guard the teardown hook exists for. webhttp.Run derives the teardown context
+// guard the teardown hook exists for. httpserver.Run derives the teardown context
 // from the SAME deadline srv.Shutdown just spent, so a drain that used the whole
 // grace hands the hook an already-expired context: with the loop already stopped
 // AND the context already done, a single select over both would pick
@@ -823,7 +823,7 @@ func TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace(t *testing.T) {
 }
 
 // TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits pins the
-// non-graceful teardown: webhttp skips the drain hooks when Serve returns
+// non-graceful teardown: httpserver skips the drain hooks when Serve returns
 // before a signal, so this path is the only thing that closes beat admission,
 // the only thing that stops a dead process from reporting itself healthy, and
 // the only thing that cancels the watch loop. A dropped admission close lets a
@@ -868,7 +868,7 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	waited := time.Since(start)
 
 	if admissionClosed != 1 {
-		t.Errorf("admission closed %d times, want exactly 1: this path SKIPS webhttp's pre-drain hook, so nothing else closes beat admission, and a connection accepted just before the listener died could still record a ping behind the watch loop's tally", admissionClosed)
+		t.Errorf("admission closed %d times, want exactly 1: this path SKIPS httpserver's pre-drain hook, so nothing else closes beat admission, and a connection accepted just before the listener died could still record a ping behind the watch loop's tally", admissionClosed)
 	}
 	if stopCalls != 1 {
 		t.Errorf("stop() called %d times, want exactly 1: an uncancelled watcher keeps alerting behind a server that stopped serving", stopCalls)
@@ -1097,7 +1097,7 @@ func TestClassifyAbandonedWatchLoopDeniesACleanExitOverAnAbandonedLoop(t *testin
 // TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog pins the
 // server wirings nothing else in the suite can see. All are silent when
 // dropped: without the read/write bounds a trickled body or a client that never
-// reads /metrics holds a handler goroutine for as long as it likes (webhttp
+// reads /metrics holds a handler goroutine for as long as it likes (httpserver
 // leaves both unset by default, bounding only the headers), without
 // WithMaxHeaderBytes the header block falls back to net/http's 1 MiB default --
 // so one unauthenticated caller makes this process read a megabyte of header per
@@ -1120,23 +1120,23 @@ func TestClassifyAbandonedWatchLoopDeniesACleanExitOverAnAbandonedLoop(t *testin
 // deadline from the same instant as the header deadline and arms the write
 // deadline only once the headers are read, so the two chains are independent and
 // the longer one decides; that worst case has to leave awaitWatchLoop the 3s the
-// constants' comment reserves, inside the single shutdownGrace budget webhttp
+// constants' comment reserves, inside the single shutdownGrace budget httpserver
 // spends across pre-drain, srv.Shutdown and onShutdown), because otherwise a
 // later bump of any one constant silently re-creates the stop that exits
 // non-zero. The error-log half is behavioral -- the bridge is driven and
 // the resulting record's LEVEL is the assertion.
 func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *testing.T) {
-	// Serial (no t.Parallel): webhttp.WithSlogErrorLog resolves slog.Default()
+	// Serial (no t.Parallel): httpserver.WithSlogErrorLog resolves slog.Default()
 	// as NewServer applies it, so the capture must be the default first.
 	rec := capture.Default(t)
 
 	srv := newServer(http.NotFoundHandler())
 
 	if srv.ReadHeaderTimeout != requestHeaderTimeout {
-		t.Errorf("ReadHeaderTimeout = %s, want %s: net/http arms only the header deadline while the headers are being read (the whole-request read deadline is installed after they are parsed), so webhttp's 10s default is a live slowloris window the read bound never cuts short -- a header term on its own past the whole-request budget the grace-margin check below keeps inside shutdownGrace", srv.ReadHeaderTimeout, requestHeaderTimeout)
+		t.Errorf("ReadHeaderTimeout = %s, want %s: net/http arms only the header deadline while the headers are being read (the whole-request read deadline is installed after they are parsed), so httpserver's 10s default is a live slowloris window the read bound never cuts short -- a header term on its own past the whole-request budget the grace-margin check below keeps inside shutdownGrace", srv.ReadHeaderTimeout, requestHeaderTimeout)
 	}
 	if srv.ReadTimeout != requestReadTimeout {
-		t.Errorf("ReadTimeout = %s, want %s: webhttp leaves it unset by default, and an unbounded read lets a trickled beat body hold a handler goroutine indefinitely", srv.ReadTimeout, requestReadTimeout)
+		t.Errorf("ReadTimeout = %s, want %s: httpserver leaves it unset by default, and an unbounded read lets a trickled beat body hold a handler goroutine indefinitely", srv.ReadTimeout, requestReadTimeout)
 	}
 	if srv.WriteTimeout != requestWriteTimeout {
 		t.Errorf("WriteTimeout = %s, want %s: an unbounded write lets a client that requests /metrics and never reads the response pin the goroutine in Write", srv.WriteTimeout, requestWriteTimeout)

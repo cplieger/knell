@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 func TestMissingNoticeRepeatsWhileTheBeatStaysMissing(t *testing.T) {
