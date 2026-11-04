@@ -538,7 +538,7 @@ func (w *Watcher) Beat(id string) BeatOutcome {
 // between its admission check and its state change: that ordering is what makes
 // logUndelivered's tally complete rather than merely narrow. It is exported
 // because the shutdown SEQUENCE is the composition root's: main closes admission
-// from webhttp's pre-drain hook, before the HTTP drain. Run calls it too, and a
+// from httpserver's pre-drain hook, before the HTTP drain. Run calls it too, and a
 // second call is a no-op because it assigns a state rather than transitioning one.
 func (w *Watcher) StopAccepting() {
 	w.mu.Lock()

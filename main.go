@@ -17,13 +17,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cplieger/health"
+	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/slogx"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/knell/internal/webapi"
-	"github.com/cplieger/slogx"
-	"github.com/cplieger/webhttp/v4"
 )
 
 // shutdownGrace bounds the whole stop sequence: pre-drain, request drain and
@@ -33,7 +33,7 @@ import (
 const shutdownGrace = 8 * time.Second
 
 // The three request bounds must each fit inside shutdownGrace with margin for
-// teardown: webhttp spends one grace budget across pre-drain, srv.Shutdown and
+// teardown: httpserver spends one grace budget across pre-drain, srv.Shutdown and
 // onShutdown, so the worst-case active request (2s header + 3s read = 5s)
 // leaves at least 3s of the grace for awaitWatchLoop.
 const (
@@ -130,7 +130,7 @@ func run() error {
 	// The marker flip rides the pre-drain phase, not onShutdown: one budget
 	// covers pre-drain -> Shutdown -> onShutdown, so a later flip would let
 	// the `knell health` probe call a draining container healthy.
-	preDrain := webhttp.WithPreDrain(func(context.Context) {
+	preDrain := httpserver.WithPreDrain(func(context.Context) {
 		// Close beat admission first: a ping answered 200 after cancellation
 		// is a heartbeat with no sender behind it.
 		watcher.StopAccepting()
@@ -142,12 +142,12 @@ func run() error {
 	onShutdown := func(teardownCtx context.Context) {
 		watchLoopStopped = awaitWatchLoop(teardownCtx, watcherDone)
 	}
-	// The non-graceful exit where Serve returns before a signal: webhttp
+	// The non-graceful exit where Serve returns before a signal: httpserver
 	// invokes either this hook or the graceful ones, never both.
-	serveExit := webhttp.WithServeExit(func(exitCtx context.Context) {
+	serveExit := httpserver.WithServeExit(func(exitCtx context.Context) {
 		watchLoopStopped = teardownAfterServeExit(exitCtx, srv, marker, watcher.StopAccepting, stop, watcherDone)
 	})
-	err = webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
+	err = httpserver.Run(ctx, srv, ln, onShutdown, httpserver.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
 	return classifyAbandonedWatchLoop(classifyServeError(err), watchLoopStopped)
 }
 
@@ -155,19 +155,19 @@ func run() error {
 // listener. WithSlogErrorLog resolves slog.Default() as NewServer applies it,
 // so this must run after run() installs the process handler.
 func newServer(handler http.Handler) *http.Server {
-	return webhttp.NewServer(handler,
+	return httpserver.New(handler,
 		// Load-bearing for the shutdown-grace invariant: while headers are
 		// being read net/http has armed only the header deadline, so
-		// webhttp's 10s default would be a live slowloris window otherwise.
-		webhttp.WithReadHeaderTimeout(requestHeaderTimeout),
-		webhttp.WithReadTimeout(requestReadTimeout),
-		webhttp.WithWriteTimeout(requestWriteTimeout),
-		webhttp.WithMaxHeaderBytes(config.MaxRequestHeaderBytes),
-		webhttp.WithSlogErrorLog(slog.LevelError))
+		// httpserver's 10s default would be a live slowloris window otherwise.
+		httpserver.WithReadHeaderTimeout(requestHeaderTimeout),
+		httpserver.WithReadTimeout(requestReadTimeout),
+		httpserver.WithWriteTimeout(requestWriteTimeout),
+		httpserver.WithMaxHeaderBytes(config.MaxRequestHeaderBytes),
+		httpserver.WithSlogErrorLog(slog.LevelError))
 }
 
 // teardownAfterServeExit runs the teardown for the non-graceful exit where
-// Serve returns before a signal: webhttp skips the drain hooks there, so this
+// Serve returns before a signal: httpserver skips the drain hooks there, so this
 // is the only place that closes beat admission, marks the process unhealthy,
 // drains accepted handlers, cancels the watcher and waits for it. stop() runs
 // before srv.Shutdown so the loop tallies concurrently rather than behind the
@@ -188,7 +188,7 @@ func teardownAfterServeExit(exitCtx context.Context, srv *http.Server, marker *h
 // CausedByCancellation distinguishes that from a genuine bind failure (a port
 // conflict coinciding with a SIGTERM is still a port conflict).
 func classifyBindError(ctx context.Context, addr string, err error) error {
-	if webhttp.CausedByCancellation(ctx, err) {
+	if httpserver.CausedByCancellation(ctx, err) {
 		slog.Info("shutting down before the listener was bound")
 		return nil
 	}
@@ -205,10 +205,10 @@ func watchBeats(cfg []config.Beat, repeat time.Duration) []watch.Beat {
 	return beats
 }
 
-// classifyServeError turns webhttp.Run's outcome into run's own contract, so
+// classifyServeError turns httpserver.Run's outcome into run's own contract, so
 // the error names the grace constant instead of a bare expired context.
 func classifyServeError(err error) error {
-	if errors.Is(err, webhttp.ErrShutdownGraceExpired) {
+	if errors.Is(err, httpserver.ErrShutdownGraceExpired) {
 		return fmt.Errorf("the shutdown sequence outlived the %s shutdown grace (in-flight requests still draining, or a stalled pre-drain hook): %w", shutdownGrace, err)
 	}
 	return err
@@ -241,7 +241,7 @@ func beginTeardown(marker *health.Marker, msg string) {
 // stopped loop as hung about half the time.
 func awaitWatchLoop(teardownCtx context.Context, watcherDone <-chan struct{}) bool {
 	start := time.Now()
-	if webhttp.AwaitDone(teardownCtx, watcherDone) {
+	if httpserver.AwaitDone(teardownCtx, watcherDone) {
 		return true
 	}
 	slog.Warn("watch loop still running at the end of the shutdown grace",

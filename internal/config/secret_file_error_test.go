@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/envx/v2"
+	"github.com/cplieger/go/envx"
 )
 
 // TestSecretFileErrorNamesEveryFailureClass pins the per-class remedy

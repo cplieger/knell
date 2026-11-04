@@ -11,7 +11,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // fakeClock is a mutable test clock, safe for concurrent reads.
@@ -262,7 +262,7 @@ func TestBeatAfterAdmissionClosedRecordsNothing(t *testing.T) {
 
 // TestAdmissionClosedBeforeRunExitsStillTalliesUndeliveredWork pins the
 // double-close production now performs: the composition root closes admission in
-// webhttp's pre-drain hook, and Run closes it AGAIN when its ctx.Done arm runs.
+// httpserver's pre-drain hook, and Run closes it AGAIN when its ctx.Done arm runs.
 // Closing is an assignment, not a transition, so the second call must be an
 // inert no-op — and above all it must not cost the shutdown tally, which is the
 // operator's only trace of the notices this process will never send. A

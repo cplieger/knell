@@ -14,13 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/envx/v2"
-	"github.com/cplieger/health"
+	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/knell/internal/watch"
-	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/webhttp/v4"
 )
 
 // testWebhookSecret is the credential half of the webhook every boot test
@@ -179,7 +179,7 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	// slog default to inspect the startup summary.
 	cfg := config.Config{
 		WebhookURL:    testWebhookURL,
-		WebhookSource: envx.SourceEnv,
+		WebhookSource: envx.SecretSourceEnv,
 		Node:          "node-1",
 		ListenAddr:    ":9190",
 		Beats:         []config.Beat{{ID: "api", Deadline: 20 * time.Minute}},
@@ -319,7 +319,7 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 // address that was never the problem. The inverse matters just as much: a real
 // port conflict must still surface, or knell idles as a dead switch behind a
 // listener nothing can reach — including when it coincides with a signal, which
-// is why the classification turns on webhttp.CausedByCancellation PROVING the
+// is why the classification turns on httpserver.CausedByCancellation PROVING the
 // error is the cancellation rather than on the context merely being cancelled.
 func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
@@ -365,7 +365,7 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 }
 
 // TestClassifyServeErrorNamesADrainThatOutlivedTheGrace pins the one ERROR
-// line a container emits when its drain runs out of budget. webhttp.Run wraps
+// line a container emits when its drain runs out of budget. httpserver.Run wraps
 // that outcome in ErrShutdownGraceExpired, which is the only thing that
 // identifies WHICH deadline expired; classifyServeError is what turns it into a
 // line naming the drain and the grace constant that bounds it. If the branch
@@ -378,9 +378,9 @@ func TestClassifyServeErrorNamesADrainThatOutlivedTheGrace(t *testing.T) {
 	t.Parallel()
 
 	serveFailure := errors.New("accept tcp [::]:9190: use of closed network connection")
-	// The shape webhttp.Run returns for a grace expiry: the origin sentinel
+	// The shape httpserver.Run returns for a grace expiry: the origin sentinel
 	// wrapping the deadline that produced it.
-	graceExpired := fmt.Errorf("%w: %w", webhttp.ErrShutdownGraceExpired, context.DeadlineExceeded)
+	graceExpired := fmt.Errorf("%w: %w", httpserver.ErrShutdownGraceExpired, context.DeadlineExceeded)
 	tests := map[string]struct {
 		in        error
 		wantNamed bool
@@ -399,7 +399,7 @@ func TestClassifyServeErrorNamesADrainThatOutlivedTheGrace(t *testing.T) {
 			got := classifyServeError(tt.in)
 			if !tt.wantNamed {
 				if got != tt.in {
-					t.Errorf("classifyServeError(%v) = %v, want it returned unchanged: only a webhttp-reported grace expiry may be renamed, or an accept failure or a caller's own deadline is reported as a shutdown that never happened", tt.in, got)
+					t.Errorf("classifyServeError(%v) = %v, want it returned unchanged: only an httpserver-reported grace expiry may be renamed, or an accept failure or a caller's own deadline is reported as a shutdown that never happened", tt.in, got)
 				}
 				return
 			}
@@ -409,7 +409,7 @@ func TestClassifyServeErrorNamesADrainThatOutlivedTheGrace(t *testing.T) {
 			if !errors.Is(got, context.DeadlineExceeded) {
 				t.Errorf("classifyServeError(%v) = %v, want the deadline still unwrappable", tt.in, got)
 			}
-			if !errors.Is(got, webhttp.ErrShutdownGraceExpired) {
+			if !errors.Is(got, httpserver.ErrShutdownGraceExpired) {
 				t.Errorf("classifyServeError(%v) = %v, want the grace-expiry origin still unwrappable", tt.in, got)
 			}
 			if !strings.Contains(got.Error(), "shutdown grace") {

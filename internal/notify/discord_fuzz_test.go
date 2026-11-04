@@ -11,14 +11,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/httpx/v5"
+	"github.com/cplieger/go/httpclient"
 )
 
 // FuzzDeliveryErrorNeverCarriesWebhookURL checks that arbitrary response
 // statuses and bodies cannot place the configured webhook URL or a
 // credential-bearing path fragment in a delivery error, and that non-2xx
 // responses retain the typed errors retry classification depends on.
-// postAttempt is invoked directly because that is the exact error httpx.Do
+// postAttempt is invoked directly because that is the exact error httpclient.Do
 // logs, without retry backoff or rate-limit waits.
 func FuzzDeliveryErrorNeverCarriesWebhookURL(f *testing.F) {
 	// Seeds avoid secret-shaped keywords ("token", "secret", …): those trip
@@ -55,7 +55,7 @@ func FuzzDeliveryErrorNeverCarriesWebhookURL(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, tail string, statusSeed uint16, body string) {
 		// The whole HTTP status space including the informational and
-		// redirect bands, so the 3xx branch and CheckHTTPStatus's 1xx
+		// redirect bands, so the 3xx branch and CheckStatus's 1xx
 		// rejection are fuzzed alongside the body branches.
 		status := 100 + int(statusSeed%600)
 		for _, base := range []string{
@@ -188,27 +188,24 @@ func assertNoNeedleLeaked(t *testing.T, gotErr, controlErr error, needles []stri
 }
 
 // assertTypedStatusError checks the other half of the contract the status
-// branch must keep: every non-2xx keeps CheckHTTPStatus's typed error
-// reachable in its chain by %w, which is what lets httpx.Do classify
-// 502/503/504 as transient
-// and find the 429's *RateLimitError. A run where the request was never made
-// (an unusable fuzzed URL) reaches no status at all, and a 2xx is a delivery.
-//
-// Split out of assertDeliveryErrorHidesWebhookURL so the leak oracle and the
-// typed-chain oracle are one assertion each.
+// branch must keep: every non-2xx keeps CheckStatus's *StatusError, with the
+// response's code, reachable in its chain by %w, which is what lets
+// httpclient.Do classify a transient status and read a 429's Retry-After. A
+// run where the request was never made (an unusable fuzzed URL) reaches no
+// status at all, and a 2xx is a delivery.
 func assertTypedStatusError(t *testing.T, gotErr error, requested bool, status int) {
 	t.Helper()
 
 	if !requested || (status >= 200 && status < 300) {
 		return
 	}
-	var (
-		statusErr *httpx.HTTPStatusError
-		authErr   *httpx.AuthError
-		rateErr   *httpx.RateLimitError
-	)
-	if !errors.As(gotErr, &statusErr) && !errors.As(gotErr, &authErr) && !errors.As(gotErr, &rateErr) {
-		t.Errorf("delivery error for status %d = %v, want CheckHTTPStatus's typed error still in the chain", status, gotErr)
+	var statusErr *httpclient.StatusError
+	if !errors.As(gotErr, &statusErr) {
+		t.Errorf("delivery error for status %d = %v, want CheckStatus's *StatusError still in the chain", status, gotErr)
+		return
+	}
+	if statusErr.Code != status {
+		t.Errorf("delivery error's StatusError.Code = %d, want %d", statusErr.Code, status)
 	}
 }
 
@@ -294,7 +291,7 @@ func withQuotedForms(needles []string) []string {
 // Location into two causes (`failed to parse Location header "<header>"`, and
 // a *url.Error whose URL is the raw header on any redirect-policy refusal), so
 // a redirect echoing the request URI would put the credential into the error
-// and httpx.Do's attempt lines without ever sending a body. This target is
+// and httpclient.Do's attempt lines without ever sending a body. This target is
 // the class's only pin over the header space and 3xx band; its committed
 // seeds are the durable coverage.
 func FuzzRedirectResponsesNeverCarryLocationText(f *testing.F) {

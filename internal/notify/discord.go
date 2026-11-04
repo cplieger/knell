@@ -1,6 +1,6 @@
 // Package notify delivers knell's transition notifications to a Discord
 // webhook. It is the app's only outbound-network package and retries transient
-// delivery failures via httpx. internal/watch decides which transition
+// delivery failures via httpclient. internal/watch decides which transition
 // happened; this package decides how an operator reads it.
 package notify
 
@@ -21,11 +21,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cplieger/httpx/v5"
+	"github.com/cplieger/go/httpclient"
 	"github.com/cplieger/knell/internal/watch"
 )
 
-// attemptTimeout bounds each delivery attempt inside httpx's retry loop, so
+// attemptTimeout bounds each delivery attempt inside httpclient's retry loop, so
 // its expiry is retryable rather than extending the caller's own budget.
 const attemptTimeout = 10 * time.Second
 
@@ -34,7 +34,7 @@ const attemptTimeout = 10 * time.Second
 // unbounded value would make Discord reject all of them.
 const MaxNodeNameBytes = 256
 
-// maxAttempts is the total delivery attempts per notification (httpx
+// maxAttempts is the total delivery attempts per notification (httpclient
 // semantics: total, including the first).
 const maxAttempts = 3
 
@@ -101,12 +101,12 @@ var _ watch.Notifier = (*Discord)(nil)
 // observer instance in every message so multi-node deployments read as
 // distinct reports.
 func New(webhookURL, node string) *Discord {
-	client := httpx.NewClient(attemptTimeout + 5*time.Second)
+	client := httpclient.New(attemptTimeout + 5*time.Second)
 	// Follow only a same-origin hop, never one net/http would rewrite to another
 	// method: the webhook POST must not be replayed as a bodyless GET, nor sent
 	// with its credential path to another port. Referer is deleted because
 	// net/http writes the previous request's full URL, the credential, there.
-	policy := httpx.RedirectPolicyFunc(httpx.WithSameOrigin(true), httpx.WithPreserveMethod(true))
+	policy := httpclient.RedirectPolicyFunc(httpclient.WithSameOrigin(true), httpclient.WithPreserveMethod(true))
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		req.Header.Del("Referer")
 		return policy(req, via)
@@ -396,16 +396,16 @@ func countUndelivered(outages []watch.Outage) int {
 // package's own field names).
 func (d *Discord) post(ctx context.Context, label string, n *notice) error {
 	body, _ := json.Marshal(d.message(n))
-	ctx, cancel := httpx.ContextWithDefaultTimeout(ctx, d.sendBudget)
+	ctx, cancel := httpclient.ContextWithDefaultTimeout(ctx, d.sendBudget)
 	defer cancel()
-	_, err := httpx.Do(ctx, func(ctx context.Context) (struct{}, error) {
+	_, err := httpclient.Do(ctx, func(ctx context.Context) (struct{}, error) {
 		return d.postAttempt(ctx, body)
-	}, httpx.WithLabel("discord webhook "+label), httpx.WithMaxAttempts(maxAttempts),
-		// Retryable so httpx does not classify this bound's expiry as terminal.
-		httpx.WithAttemptTimeout(d.attemptTimeout),
-		httpx.WithRateLimitRetry(d.rateLimitMaxWait),
-		// watch already logs the terminal verdict; keep httpx's own line at Debug.
-		httpx.WithExhaustedLevel(slog.LevelDebug))
+	}, httpclient.WithLabel("discord webhook "+label), httpclient.WithMaxAttempts(maxAttempts),
+		// Retryable so httpclient does not classify this bound's expiry as terminal.
+		httpclient.WithAttemptTimeout(d.attemptTimeout),
+		httpclient.WithRateLimitRetry(d.rateLimitMaxWait),
+		// watch already logs the terminal verdict; keep httpclient's own line at Debug.
+		httpclient.WithExhaustedLevel(slog.LevelDebug))
 	if err != nil {
 		return fmt.Errorf("delivering %s notification: %w", label, err)
 	}
@@ -413,7 +413,7 @@ func (d *Discord) post(ctx context.Context, label string, n *notice) error {
 }
 
 // safeTransportError reports a failed transport call in knell's own words.
-// httpx.LogSafeError alone is not enough: two of net/http's causes are written
+// httpclient.LogSafeError alone is not enough: two of net/http's causes are written
 // from the response's Location header, so a redirecting endpoint could put the
 // webhook path into the logs. The cause is classified, never rendered, and
 // reachable only through Unwrap.
@@ -422,19 +422,19 @@ func safeTransportError(err error) error {
 	// returns what errors.As finds, so a nested one would unwrap past this
 	// wrapper otherwise. Bounded so a self-reducing value cannot spin forever.
 	const maxURLErrorDepth = 8
-	cause := httpx.LogSafeError(err)
+	cause := httpclient.LogSafeError(err)
 	for range maxURLErrorDepth {
 		if _, ok := errors.AsType[*url.Error](cause); !ok {
 			break
 		}
-		cause = httpx.LogSafeError(cause)
+		cause = httpclient.LogSafeError(cause)
 	}
 	// net.OpError's Op is one of net's own fixed verbs, so it is safe to print;
 	// it distinguishes a stalled dial (egress/DNS) from a stalled read (host
 	// went quiet after accepting).
 	phrase := "webhook transport failed"
-	if refused, ok := errors.AsType[*httpx.RedirectRefusedError](cause); ok &&
-		(refused.Reason == httpx.RedirectOtherOrigin || refused.Reason == httpx.RedirectDowngrade) {
+	if refused, ok := errors.AsType[*httpclient.RedirectRefusedError](cause); ok &&
+		(refused.Reason == httpclient.RedirectOtherOrigin || refused.Reason == httpclient.RedirectDowngrade) {
 		phrase = "webhook redirected to another origin, not followed, nothing was delivered (put the URL of the endpoint that accepts the POST in DISCORD_WEBHOOK_URL, or in the secret file named by DISCORD_WEBHOOK_URL_FILE)"
 	} else if opErr, ok := errors.AsType[*net.OpError](cause); ok && opErr.Op != "" {
 		phrase += " during " + opErr.Op
@@ -460,25 +460,25 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, d.url, bytes.NewReader(body))
 	if reqErr != nil {
 		// The raw error would embed the URL; report the cause only.
-		return struct{}{}, fmt.Errorf("building webhook request: %w", httpx.LogSafeError(reqErr))
+		return struct{}{}, fmt.Errorf("building webhook request: %w", httpclient.LogSafeError(reqErr))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", userAgent)
-	resp, doErr := d.client.Do(req) //nolint:bodyclose // closed via the deferred httpx.DrainClose below
+	resp, doErr := d.client.Do(req) //nolint:bodyclose // closed via the deferred httpclient.DrainClose below
 	if doErr != nil {
 		return struct{}{}, safeTransportError(doErr)
 	}
 	// Drain up to 64 KiB and close so the connection can be reused.
-	defer httpx.DrainClose(resp.Body)
+	defer httpclient.DrainClose(resp.Body)
 	return struct{}{}, deliveryError(resp)
 }
 
 // deliveryError reports what a response says about delivery: nil for success
-// (exactly 2xx), otherwise CheckHTTPStatus's typed error plus whatever knell
-// can safely add, so httpx.Do can still classify a retryable status and the
+// (exactly 2xx), otherwise CheckStatus's typed error plus whatever knell
+// can safely add, so httpclient.Do can still classify a retryable status and the
 // 429 wait.
 func deliveryError(resp *http.Response) error {
-	statusErr := httpx.CheckHTTPStatus(resp)
+	statusErr := httpclient.CheckStatus(resp)
 	if statusErr == nil {
 		return nil
 	}

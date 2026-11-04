@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/health"
+	"github.com/cplieger/go/health"
 )
 
 // TestMain re-executes the test binary as knell itself when the re-exec
@@ -248,7 +248,7 @@ func TestSignalledKnellLogsTheCleanStopAsItsLastLineAndExitsZero(t *testing.T) {
 // tests cannot inspect run()'s handler because run() replaces the default they
 // captured, so nothing outside a child process can catch it.
 //
-// The oracle is the /healthz access line, which webhttp logs at DEBUG for a
+// The oracle is the /healthz access line, which httpserver logs at DEBUG for a
 // healthy probe: absent at the INFO default, present only once the parsed level
 // has actually reached the handler.
 func TestConfiguredLogLevelReachesTheRunningProcess(t *testing.T) {
