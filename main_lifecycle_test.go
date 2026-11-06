@@ -1191,8 +1191,8 @@ func TestRunServesTheMarkerVerdictOnHealthz(t *testing.T) {
 	r := startLifecycleRun(t)
 	waitForMarkerWithin(t, true, 10*time.Second)
 
-	if status, body := getHealthz(t, addr); status != http.StatusOK || !strings.Contains(body, `"status":"OK"`) {
-		t.Errorf("/healthz on a serving switch = %d %s, want 200 with the OK verdict; a root that wires the wrong handler here reports liveness that is not the marker's",
+	if status, body := getHealthz(t, addr); status != http.StatusOK || !strings.Contains(body, `"status":"ok"`) {
+		t.Errorf("/healthz on a serving switch = %d %s, want 200 with the ok verdict; a root that wires the wrong handler here reports liveness that is not the marker's",
 			status, body)
 	}
 
