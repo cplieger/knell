@@ -96,7 +96,7 @@ func run(args []string) error {
 		return fmt.Errorf("%w %q: the only subcommand is health", errUnknownCommand, args[0])
 	}
 
-	// Clear any stale marker before the first exit path, so a rejected boot
+	// Clear any stale marker before the configuration gate, so a rejected boot
 	// does not leave the previous process's marker file.
 	marker := health.NewMarker(health.DefaultPath)
 	// Cleanup, not Set(false): Set treats the first call as a health

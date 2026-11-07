@@ -74,7 +74,7 @@ The 512-byte ceiling keeps the token inside the 8704-byte request-header limit w
 - It covers `/healthz` and `/metrics` too, so list every name your probes and your Prometheus scraper use.
 - A request from loopback to a loopback `Host` is always served.
 - An entry no `Host` could ever match stops startup, because a dropped entry would leave pings to that name refused.
-- The built-in `knell health` check asks `/healthz` over loopback, which `ALLOWED_HOSTS` always admits. When `LISTEN_ADDR` binds one address that is not loopback, the check asks that address instead, so list it in `ALLOWED_HOSTS`.
+- The built-in `knell health` check asks `/healthz` over loopback, which `ALLOWED_HOSTS` always admits. When `LISTEN_ADDR` binds one address that is neither loopback nor unspecified (`0.0.0.0`, `::`), the check asks that address instead, so when `ALLOWED_HOSTS` is set, list that address in it.
 
 ## Trusted proxies
 

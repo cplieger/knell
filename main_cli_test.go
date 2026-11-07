@@ -157,9 +157,10 @@ func startServingKnell(t *testing.T, env []string) *servingKnell {
 // TestHealthSubcommandAsksTheListenerWithoutBooting pins the Docker
 // healthcheck contract: `knell health` GETs /healthz on LISTEN_ADDR's port, on
 // loopback or on the one address LISTEN_ADDR names (which a set ALLOWED_HOSTS
-// must then list when it is not loopback), exits with that verdict, and never
-// falls through into the server. A marker on disk with nothing listening is
-// unhealthy, because the check has to prove the listener answers.
+// must then list when that address is neither loopback nor unspecified), exits
+// with that verdict, and never falls through into the server. A marker on disk
+// with nothing listening is unhealthy, because the check has to prove the
+// listener answers.
 func TestHealthSubcommandAsksTheListenerWithoutBooting(t *testing.T) {
 	t.Run("marker present, nothing listening", func(t *testing.T) {
 		plantHealthMarker(t)
