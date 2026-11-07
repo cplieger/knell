@@ -10,7 +10,7 @@ github.com/cplieger/go/measure v1.0.0-dev.4 h1:1uAbRO+jVZP+0wA6SE7Bhax0pzdKICs7a
 github.com/cplieger/go/measure v1.0.0-dev.4/go.mod h1:KY7f8SnaQkwhMKsmKIe+eIyYW7z0Xe6vE9AF02fMubw=
 github.com/cplieger/go/pathinside v1.0.0-dev.1 h1:iVkDRXYDDAgaTBm02ekQ+VH7KhXZTIpdpx8O9pGprY8=
 github.com/cplieger/go/pathinside v1.0.0-dev.1/go.mod h1:+Fj6L8z2GUfDFi/uvAzoxF1iIADDf83g4fMbrvelDUY=
-github.com/cplieger/go/slogx v1.0.0-dev.1 h1:oYkkLGxYkUHebk+OtaWVzD9NwPqTmq13HztG6NaArn4=
-github.com/cplieger/go/slogx v1.0.0-dev.1/go.mod h1:4v0aqEGWQ4ubxjIiddoMocANHMKB6SdYTgOWYaIUX6A=
+github.com/cplieger/go/slogx v1.0.0-dev.2 h1:hQqOH9v0i3l8NPBvSN8rts9LA+JXKINCyhW72Z+11X8=
+github.com/cplieger/go/slogx v1.0.0-dev.2/go.mod h1:4v0aqEGWQ4ubxjIiddoMocANHMKB6SdYTgOWYaIUX6A=
 pgregory.net/rapid v1.3.0 h1:vBvO0VSqti75J1jjYqpgPNBLKMd1+gxa9fYo7vk/Exc=
 pgregory.net/rapid v1.3.0/go.mod h1:dPlE4OBBxgXPqkP79flB6sJL1dx5azpI7HQ9MY9Z7uk=
