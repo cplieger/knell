@@ -146,11 +146,11 @@ func acceptErrorsValue(t *testing.T, series string) float64 {
 	t.Helper()
 	rendered, ok := rawSeriesValue(t, series)
 	if !ok {
-		t.Fatalf("%sis absent: increase() would miss the first accept failure", series)
+		t.Fatalf("%s is absent: increase() would miss the first accept failure", strings.TrimSpace(series))
 	}
 	value, err := strconv.ParseFloat(rendered, 64)
 	if err != nil {
-		t.Fatalf("parsing the %s sample %q: %v", series, rendered, err)
+		t.Fatalf("parsing the %s sample %q: %v", strings.TrimSpace(series), rendered, err)
 	}
 	return value
 }

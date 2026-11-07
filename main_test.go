@@ -143,7 +143,7 @@ func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
 		t.Fatalf("run() = %v, want the configuration gate to reject the boot", err)
 	}
 	if _, statErr := os.Stat(health.DefaultPath); !errors.Is(statErr, fs.ErrNotExist) {
-		t.Errorf("marker %s after a rejected boot: stat = %v, want it gone; a stale marker reports a crash-looping container healthy",
+		t.Errorf("marker %s after a rejected boot: stat = %v, want it gone; a rejected boot must not leave the previous process's marker file",
 			health.DefaultPath, statErr)
 	}
 }

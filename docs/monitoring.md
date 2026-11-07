@@ -145,7 +145,7 @@ With more than one ruler, give each its own always-firing rule, route and beat, 
 
 **What healthy means.** knell answers `/healthz` itself, so a `200` proves the listener accepts and serves requests. Nothing answers before the listener is up, and from the moment knell begins to shut down it answers `503` until the listener closes. It also answers `503` when it cannot write its health marker in `/tmp`, for example with `read_only: true` and no `tmpfs` on `/tmp`. Discord being unreachable never makes knell unhealthy: it shows on `knell_notifications_failed_total` and in the log.
 
-**Docker health.** The image checks itself every 30 seconds with `knell health`, which asks `/healthz` on the container's loopback and fails when no answer comes within 4 seconds. When `LISTEN_ADDR` names one address, the check asks that address, so list it in `ALLOWED_HOSTS`, or the check gets `403` and Docker marks knell unhealthy. Docker marks the container unhealthy after 3 failures, and allows 15 seconds after a start. Docker's health status notifies nobody on its own, and Docker does not restart an unhealthy container.
+**Docker health.** The image checks itself every 30 seconds with `knell health`, which asks `/healthz` on the container's loopback and fails when no answer comes within 4 seconds. When `LISTEN_ADDR` names one address that is not loopback, the check asks that address, so when `ALLOWED_HOSTS` is set, list that address in it, or the check gets `403` and Docker marks knell unhealthy. Docker marks the container unhealthy after 3 failures, and allows 15 seconds after a start. Docker's health status notifies nobody on its own, and Docker does not restart an unhealthy container.
 
 **Who is told.**
 

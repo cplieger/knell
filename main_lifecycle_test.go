@@ -196,14 +196,13 @@ func startHeldBeatRequest(t *testing.T, addr, beat string, contentLength int) (n
 }
 
 // TestRunTracksHealthMarkerAcrossServeAndDrain pins the full lifecycle of the
-// marker (the verdict /healthz reports to the baked `knell health` probe), including
-// the ordering the deferred marker.Cleanup hides: the marker becomes present
-// once the listener is serving (a dropped marker.Set(true) would leave the
-// container unhealthy forever while serving correctly), it becomes ABSENT
-// while run() is still draining a real in-flight /beat request (a deleted or
-// post-Shutdown marker.Set(false) would call a draining container healthy for
-// the whole stop window), and a SIGTERM returns run() with a nil error so the
-// container exits 0 instead of looking like a crash.
+// marker (the verdict /healthz reports to `knell health`), including its
+// ordering: the marker becomes present once the listener is serving (a dropped
+// marker.Set(true) would leave the container unhealthy forever while serving
+// correctly), it becomes ABSENT while run() is still draining a real in-flight
+// /beat request (a deleted or post-Shutdown marker.Set(false) would call a
+// draining container healthy for the whole stop window), and a SIGTERM returns
+// run() with a nil error so the container exits 0 instead of looking crashed.
 func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal, and the shared health-marker path.

@@ -2019,8 +2019,9 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		// request carries the attacker's hostname, and a remote client forging
 		// Host: 127.0.0.1 is not a loopback socket peer.
 		"loopback probe exempt": {host: "127.0.0.1:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
-		// When LISTEN_ADDR names one address the probe asks that address, which
-		// the carve-out does not cover, so the docs tell the user to list it.
+		// When LISTEN_ADDR names one non-loopback address the probe asks that
+		// address, which the carve-out does not cover, so the docs tell the user
+		// to list it.
 		"single-address probe refused when unlisted": {host: "192.0.2.10:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", wantStatus: http.StatusForbidden},
 		"forged loopback host refused":               {host: "127.0.0.1:9190", path: "/beat/api", remoteAddr: "203.0.113.7:44444", wantStatus: http.StatusForbidden},
 		"malformed host cannot match":                {host: "knell.example:notaport", path: "/beat/api", wantStatus: http.StatusForbidden},
