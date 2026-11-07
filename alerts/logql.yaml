@@ -1,6 +1,6 @@
 # Recommended alert rules for knell, the LogQL half: two rules for Loki's
-# ruler. The PromQL half is alerts/promql.yaml. Load each file into its own
-# ruler, because neither parses the other's expressions.
+# ruler, complementary to alerts/promql.yaml: load both, each into its own
+# ruler. No alert is in both files.
 #
 # These rules read the container log, because their conditions leave no series.
 # Evaluate them from a second vantage point. Keep LOG_LEVEL at its info default.

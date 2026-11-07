@@ -1093,8 +1093,8 @@ func TestClassifyAbandonedWatchLoopDeniesACleanExitOverAnAbandonedLoop(t *testin
 // bounding anything real -- and without WithSlogErrorLog net/http's own
 // connection-level lines -- above all "http: Accept error: ...; retrying", the
 // trace of an exhausted fd budget that stops every beat from being received --
-// fall back to the standard logger as unstructured, level-less text no
-// level-based rule can match.
+// fall back to the standard logger as unstructured, level-less text a person
+// cannot filter by level.
 //
 // The header assertion reads config.MaxRequestHeaderBytes rather than 8704: the
 // number is one decision made in one place (config derives it from the token
@@ -1148,7 +1148,7 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 		t.Errorf("MaxHeaderBytes = %d, want %d: the default is net/http's 1 MiB, so an unauthenticated caller can make this process read a megabyte of header per connection, and the BEAT_TOKEN maximum config enforces at startup stops bounding what a ping can actually carry", srv.MaxHeaderBytes, config.MaxRequestHeaderBytes)
 	}
 	if srv.ErrorLog == nil {
-		t.Fatal("ErrorLog is nil, so net/http's connection-level errors go to the standard logger: an accept failure -- a whole-service outage here -- arrives as an unstructured, level-less line no log rule matches")
+		t.Fatal("ErrorLog is nil, so net/http's connection-level errors go to the standard logger: an accept failure -- a whole-service outage here -- arrives as an unstructured, level-less line")
 	}
 
 	srv.ErrorLog.Print("http: Accept error: accept tcp [::]:9190: too many open files; retrying in 5ms")

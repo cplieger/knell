@@ -1,6 +1,7 @@
-# Recommended alert rules for knell, the PromQL half: six rules for a
-# Prometheus or Mimir ruler. The LogQL half is alerts/logql.yaml. Load each
-# file into its own ruler, because neither parses the other's expressions.
+# Recommended alert rules for knell, the PromQL half: six rules for
+# Prometheus, or any ruler that reads Prometheus rules, and one commented rule
+# for several instances. alerts/logql.yaml is complementary: load both, each
+# into its own ruler.
 #
 # These rules watch knell itself, so evaluate them from a second vantage point.
 # Every series they read is registered at startup and every counter starts at
