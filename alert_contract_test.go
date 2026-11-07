@@ -108,3 +108,42 @@ func TestKnellNoticeLostForGoodMatchesALostNoticeLine(t *testing.T) {
 		}
 	}
 }
+
+// TestQuorumFixtureIsTheCommentedRule keeps testdata/promql_quorum.yaml, which
+// alerts/promql_test.yaml tests, equal to the commented KnellBeatQuorumLow a
+// user uncomments in alerts/promql.yaml.
+func TestQuorumFixtureIsTheCommentedRule(t *testing.T) {
+	shipped, err := os.ReadFile("alerts/promql.yaml")
+	if err != nil {
+		t.Fatalf("reading the shipped PromQL rules: %v", err)
+	}
+	fixture, err := os.ReadFile("testdata/promql_quorum.yaml")
+	if err != nil {
+		t.Fatalf("reading the quorum fixture: %v", err)
+	}
+	const start = "# - alert: KnellBeatQuorumLow"
+	var commented []string
+	in := false
+	for line := range strings.Lines(string(shipped)) {
+		trimmed := strings.TrimSpace(line)
+		in = in || strings.HasPrefix(trimmed, start)
+		if !in {
+			continue
+		}
+		if !strings.HasPrefix(trimmed, "#") {
+			break
+		}
+		commented = append(commented, strings.Replace(strings.TrimRight(line, "\n"), "# ", "", 1))
+	}
+	if len(commented) == 0 {
+		t.Fatal("alerts/promql.yaml has no commented KnellBeatQuorumLow rule")
+	}
+	_, rule, found := strings.Cut(string(fixture), "      - alert: KnellBeatQuorumLow")
+	if !found {
+		t.Fatal("testdata/promql_quorum.yaml has no KnellBeatQuorumLow rule")
+	}
+	want := strings.TrimRight("      - alert: KnellBeatQuorumLow"+rule, "\n")
+	if got := strings.Join(commented, "\n"); got != want {
+		t.Errorf("uncommented rule in alerts/promql.yaml:\n%s\nwant the tested fixture:\n%s", got, want)
+	}
+}

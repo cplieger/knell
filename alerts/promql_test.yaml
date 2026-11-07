@@ -1,6 +1,7 @@
 # promtool test rules alerts/promql_test.yaml
 rule_files:
   - promql.yaml
+  - ../testdata/promql_quorum.yaml
 
 evaluation_interval: 1m
 
@@ -107,6 +108,10 @@ tests:
               beat: backup
             exp_annotations:
               summary: "beat backup is overdue on knell:9190"
+              description: >
+                In the healthy case this repeats knell's own Discord notice. It
+                exists for a wedged sender or a Discord outage, so route it to
+                a different receiver or drop it.
 
   - name: each of the three notification legs pages on its own
     interval: 1m
@@ -163,3 +168,45 @@ tests:
               instance: churn
             exp_annotations:
               summary: "knell on churn keeps restarting inside a beat deadline"
+
+  - name: the quorum rule pages when a second instance loses a beat, not the first
+    interval: 1m
+    input_series:
+      - series: 'knell_beat_fresh{job="knell", instance="a", beat="backup"}'
+        values: "1 0x20"
+      - series: 'knell_beat_fresh{job="knell", instance="b", beat="backup"}'
+        values: "1x10 0x10"
+      - series: 'knell_beat_fresh{job="knell", instance="c", beat="backup"}'
+        values: "1x20"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: KnellBeatQuorumLow
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: KnellBeatQuorumLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              beat: backup
+            exp_annotations:
+              summary: "fewer than 2 knell instances see beat backup on time"
+
+  - name: the quorum rule counts a stopped instance as not seeing the beat
+    interval: 1m
+    input_series:
+      - series: 'knell_beat_fresh{job="knell", instance="a", beat="backup"}'
+        values: "1x20"
+      - series: 'knell_beat_fresh{job="knell", instance="b", beat="backup"}'
+        values: "1x5 _x15"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: KnellBeatQuorumLow
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: KnellBeatQuorumLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              beat: backup
+            exp_annotations:
+              summary: "fewer than 2 knell instances see beat backup on time"

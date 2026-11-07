@@ -48,6 +48,22 @@ groups:
           severity: warning
         annotations:
           summary: "beat {{ $labels.beat }} is overdue on {{ $labels.instance }}"
+          description: >
+            In the healthy case this repeats knell's own Discord notice. It
+            exists for a wedged sender or a Discord outage, so route it to a
+            different receiver or drop it.
+
+      # With several knell instances, use this rule in place of
+      # KnellBeatOverdue: it pages when fewer than 2 instances see a beat on
+      # time, so one instance can stop without a page. Set 2 to the number of
+      # instances you require.
+      # - alert: KnellBeatQuorumLow
+      #   expr: sum by (beat) (knell_beat_fresh) < 2
+      #   for: 5m
+      #   labels:
+      #     severity: warning
+      #   annotations:
+      #     summary: "fewer than 2 knell instances see beat {{ $labels.beat }} on time"
 
       # Scrapes can keep landing between the listener's accept retries, so `up`
       # can stay 1 while pings are refused. The counter sees every failure.
