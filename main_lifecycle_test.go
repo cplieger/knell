@@ -196,7 +196,7 @@ func startHeldBeatRequest(t *testing.T, addr, beat string, contentLength int) (n
 }
 
 // TestRunTracksHealthMarkerAcrossServeAndDrain pins the full lifecycle of the
-// marker — the only thing the baked `knell health` probe looks at — including
+// marker (the verdict /healthz reports to the baked `knell health` probe), including
 // the ordering the deferred marker.Cleanup hides: the marker becomes present
 // once the listener is serving (a dropped marker.Set(true) would leave the
 // container unhealthy forever while serving correctly), it becomes ABSENT
@@ -862,7 +862,7 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 		t.Errorf("stop() called %d times, want exactly 1: an uncancelled watcher keeps alerting behind a server that stopped serving", stopCalls)
 	}
 	if marker.Healthy() {
-		t.Error("marker still healthy after the serve loop exited: the baked `knell health` probe would report a container with no listener as healthy")
+		t.Error("marker still healthy after the serve loop exited: /healthz would call a stopping process healthy")
 	}
 	if !rec.Contains("serve loop exited, tearing down") {
 		t.Errorf("messages = %v, want the non-graceful exit named; without it the watch loop's abandoned-delivery lines are read before anything says why", rec.Messages())

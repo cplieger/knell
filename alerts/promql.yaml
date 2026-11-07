@@ -55,9 +55,10 @@ groups:
             different receiver or drop it.
 
       # With several knell instances, use this rule in place of
-      # KnellBeatOverdue: it pages when fewer than 2 instances see a beat on
-      # time, so one instance can stop without a page. Set 2 to the number of
-      # instances you require.
+      # KnellBeatOverdue: it pages when fewer than 2 instances still see a beat
+      # on time. Set 2 to the number of instances you require. One instance can
+      # be down or overdue without a page only when you run more instances than
+      # that count.
       # - alert: KnellBeatQuorumLow
       #   expr: sum by (beat) (knell_beat_fresh) < 2
       #   for: 5m

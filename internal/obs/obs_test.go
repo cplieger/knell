@@ -118,19 +118,41 @@ func TestRecordPreRouteRefusalMovesOnlyItsOwnReason(t *testing.T) {
 	}
 }
 
+// acceptErrorsColdStartSeen records that the process-global accept counter
+// was already observed, since an unlabeled counter cannot be rewound to the
+// cold-start zero for `go test -count=2`.
+var acceptErrorsColdStartSeen bool
+
 // TestListenerAcceptErrorsIsBornAtZeroAndCountsEachFailure pins the series
 // KnellAcceptFailing reads: present at zero before the first failure, so
 // increase() sees that failure, and one step per recorded failure.
 func TestListenerAcceptErrorsIsBornAtZeroAndCountsEachFailure(t *testing.T) {
 	const series = "knell_listener_accept_errors_total "
-	assertExpositionLines(t, []string{"knell_listener_accept_errors_total 0"}, "at cold start")
-
-	RecordAcceptError()
-	RecordAcceptError()
-
-	if got, ok := rawSeriesValue(t, series); !ok || got != "2" {
-		t.Errorf("knell_listener_accept_errors_total after two failures = %q (present %v), want 2", got, ok)
+	if !acceptErrorsColdStartSeen {
+		acceptErrorsColdStartSeen = true
+		assertExpositionLines(t, []string{"knell_listener_accept_errors_total 0"}, "at cold start")
 	}
+	before := acceptErrorsValue(t, series)
+
+	RecordAcceptError()
+	RecordAcceptError()
+
+	if got := acceptErrorsValue(t, series); got-before != 2 {
+		t.Errorf("knell_listener_accept_errors_total moved by %v after two failures, want 2", got-before)
+	}
+}
+
+func acceptErrorsValue(t *testing.T, series string) float64 {
+	t.Helper()
+	rendered, ok := rawSeriesValue(t, series)
+	if !ok {
+		t.Fatalf("%sis absent: increase() would miss the first accept failure", series)
+	}
+	value, err := strconv.ParseFloat(rendered, 64)
+	if err != nil {
+		t.Fatalf("parsing the %s sample %q: %v", series, rendered, err)
+	}
+	return value
 }
 
 // refusalReasonValues reads every refusal reason's current sample, so a test can

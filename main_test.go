@@ -113,10 +113,10 @@ func plantHealthMarker(t *testing.T) {
 	t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
 }
 
-// TestRunClearsStaleHealthMarkerBeforeTheConfigGate pins the boot ordering a
-// crash-looping container depends on: the marker is cleared before the first
-// exit path, so a fail-fast config gate cannot leave the previous process's
-// marker on disk reporting the restart loop healthy. The case fails config
+// TestRunClearsStaleHealthMarkerBeforeTheConfigGate pins the boot ordering:
+// the marker is cleared before the first exit path, so the marker /healthz
+// reports is always one this boot wrote, and a fail-fast config gate cannot
+// leave the previous process's marker on disk. The case fails config
 // before run() reaches the listener bind, which is what makes run() reachable
 // from a test at all. The https-scheme rejection itself is pinned end to end
 // by TestRejectedConfigExitsOneWithoutLeakingTheWebhook (main_cli_test.go).

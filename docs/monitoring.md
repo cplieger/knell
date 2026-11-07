@@ -49,7 +49,7 @@ knell writes logfmt to standard error, so `docker logs knell` and any Docker log
 
 Every line that reports a lost or delayed notice carries a `retryable` field. `retryable=true` means the next sweep tries again, so the notice is late. `retryable=false` means nothing will retry it, so rebuild the missed window yourself.
 
-Two log lines are read by the LogQL rules: `knell exited with error`, the one line knell writes when it exits with an error, and the `retryable=false` field. Keep `LOG_LEVEL` at `info` for those rules.
+The LogQL rules read two things in the log: the `knell exited with error` line, which knell writes once when it exits with an error, and the `retryable=false` field. Keep `LOG_LEVEL` at `info` for those rules.
 
 ## Alerting
 
@@ -88,7 +88,7 @@ Keep `LOG_LEVEL` at its `info` default for `KnellNoticeLostForGood` to mean that
 
 Every restart re-arms each beat's full deadline, so an instance restarting more often than a beat's deadline never fires that beat's alert. `KnellRestartChurn` covers this. The shipped window is 26h, so set it to your longest beat deadline.
 
-With several instances, point each sender at all of them, then uncomment `KnellBeatQuorumLow` in `alerts/promql.yaml` and use it in place of `KnellBeatOverdue`. It alerts on `sum by (beat) (knell_beat_fresh)`, so one instance being down lowers the count instead of paging. Set its count to the number of instances you require.
+With several instances, point each sender at all of them, then uncomment `KnellBeatQuorumLow` in `alerts/promql.yaml` and use it in place of `KnellBeatOverdue`. It alerts when `sum by (beat) (knell_beat_fresh)`, the number of instances that still see a beat on time, falls below its count. Set the count to the number of instances you require. One instance can be down or overdue without an alert only when you run more instances than that count.
 
 Thresholds and windows are starting points. Set the churn window to your longest beat deadline, match the `job` selector to your scrape config, and change the `container` selector to the label your log collector sets. Grafana Alloy's Docker log discovery sets `container` with no configuration. Promtail and other collectors may use `job` or `service`.
 
@@ -145,7 +145,7 @@ With more than one ruler, give each its own always-firing rule, route and beat, 
 
 **What healthy means.** knell answers `/healthz` itself, so a `200` proves the listener accepts and serves requests. Nothing answers before the listener is up, and from the moment knell begins to shut down it answers `503` until the listener closes. It also answers `503` when it cannot write its health marker in `/tmp`, for example with `read_only: true` and no `tmpfs` on `/tmp`. Discord being unreachable never makes knell unhealthy: it shows on `knell_notifications_failed_total` and in the log.
 
-**Docker health.** The image checks itself every 30 seconds with `knell health`, which asks `/healthz` on the container's loopback and fails when no answer comes within 4 seconds. Docker marks the container unhealthy after 3 failures, and allows 15 seconds after a start. Docker's health status notifies nobody on its own, and Docker does not restart an unhealthy container.
+**Docker health.** The image checks itself every 30 seconds with `knell health`, which asks `/healthz` on the container's loopback and fails when no answer comes within 4 seconds. When `LISTEN_ADDR` names one address, the check asks that address, so list it in `ALLOWED_HOSTS`, or the check gets `403` and Docker marks knell unhealthy. Docker marks the container unhealthy after 3 failures, and allows 15 seconds after a start. Docker's health status notifies nobody on its own, and Docker does not restart an unhealthy container.
 
 **Who is told.**
 

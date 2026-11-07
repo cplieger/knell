@@ -65,10 +65,9 @@ func main() {
 // a hung listener fails the check with a written reason instead of a kill.
 const healthProbeTimeout = 4 * time.Second
 
-// notServingReason is what /healthz reports while the marker is absent: before
-// the listener is bound, from the start of a shutdown, and always when /tmp is
-// not writable.
-const notServingReason = "knell is not serving: it is starting or shutting down, or cannot write its health marker in /tmp"
+// notServingReason is what /healthz reports while the marker is absent: from
+// the start of a shutdown, and always when /tmp is not writable.
+const notServingReason = "knell is not serving: it is shutting down, or cannot write its health marker in /tmp"
 
 // errUnknownCommand is the usage error main exits 2 for; every other failure
 // exits 1.
@@ -97,9 +96,9 @@ func run(args []string) error {
 		return fmt.Errorf("%w %q: the only subcommand is health", errUnknownCommand, args[0])
 	}
 
-	// Clear any stale marker before the first exit path: config.Load fails
-	// fast, and a marker left on the tmpfs by the previous process would
-	// report a crash-looping container healthy for the whole restart loop.
+	// Clear any stale marker before the first exit path, so the marker
+	// /healthz reports is always one this boot wrote, even when config.Load
+	// fails fast.
 	marker := health.NewMarker(health.DefaultPath)
 	// Cleanup, not Set(false): Set treats the first call as a health
 	// transition and would WARN on every boot for a state that is only
