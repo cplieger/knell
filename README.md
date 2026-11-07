@@ -102,7 +102,7 @@ The image runs as the non-root user 65534 on `scratch`, and the webhook URL neve
 
 ## Troubleshooting
 
-The image checks itself with `knell health`, which asks `/healthz` over the container's loopback when `LISTEN_ADDR` is empty, `0.0.0.0` or `::`, and otherwise on the address it names, which `ALLOWED_HOSTS` must then list when it is set and that address is not loopback. `docker ps` shows `healthy` while knell is serving. An unhealthy container is running but not answering, as happens while knell shuts down. A restarting one has exited. In both cases `docker logs knell` shows why. An unhealthy knell notifies nobody, so a Docker-only user probes `/healthz` from outside. [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) shows how.
+The image checks itself with `knell health`, which asks `/healthz` over the container's loopback when the host part of `LISTEN_ADDR` is empty, `0.0.0.0` or `::` (the default `:9190`, `0.0.0.0:9190`, `[::]:9190`), and otherwise on the address it names, which `ALLOWED_HOSTS` must then list when it is set and that address is not loopback. `docker ps` shows `healthy` while knell is serving. An unhealthy container is running but not answering, as happens while knell shuts down. A restarting one has exited. In both cases `docker logs knell` shows why. An unhealthy knell notifies nobody, so a Docker-only user probes `/healthz` from outside. [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) shows how.
 
 - If the container restarts in a loop with `knell exited with error`, the `error` field names the setting knell refused.
 - If a ping is answered `401`, the `Authorization` header does not match `BEAT_TOKEN` exactly.
