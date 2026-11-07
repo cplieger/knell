@@ -1,4 +1,4 @@
-# Recommended alert rules for knell, the LogQL half: three rules for Loki's
+# Recommended alert rules for knell, the LogQL half: two rules for Loki's
 # ruler. The PromQL half is alerts/promql.yaml. Load each file into its own
 # ruler, because neither parses the other's expressions.
 #
@@ -15,7 +15,7 @@ groups:
         expr: |
           sum by (container) (count_over_time(
             {container="knell"} |= `level=ERROR`
-            |~ `msg="(knell exited with error|unknown command)"` [15m]
+            |= `msg="knell exited with error"` [15m]
           )) > 0
         for: 0m
         labels:
@@ -45,20 +45,3 @@ groups:
             matching lines for the beats they name. Rebuild each missed window
             from knell_beat_last_seen_timestamp_seconds and treat those beats
             as unreported, not healthy.
-
-      # net/http logs accept failures, which knell routes into slog at ERROR.
-      - alert: KnellAcceptFailing
-        expr: |
-          sum by (container) (count_over_time(
-            {container="knell"} |= `level=ERROR` |= `http: Accept error` [15m]
-          )) > 0
-        for: 0m
-        labels:
-          severity: critical
-        annotations:
-          summary: "knell cannot accept connections"
-          description: >
-            The listener failed to accept a connection, so pings stop landing
-            while the process stays up. Beats will report overdue while this
-            lasts. Check the container's file-descriptor limit and the rate of
-            incoming connections.

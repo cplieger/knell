@@ -187,17 +187,21 @@ func TestHealthSubcommandReportsTheMarkerVerdictWithoutBooting(t *testing.T) {
 
 // TestUnknownSubcommandExitsTwoWithoutBooting pins that an unrecognized argv
 // is a usage error, not an accidental boot: a mistyped healthcheck command
-// must not start a second switch behind the same marker.
+// must not start a second switch behind the same marker. It exits through the
+// one exit line every other failure uses, which KnellExitedWithError reads.
 func TestUnknownSubcommandExitsTwoWithoutBooting(t *testing.T) {
 	code, out := runMain(t, nil, "serve")
 	if code != 2 {
 		t.Errorf("knell serve = exit %d, want 2: %s", code, out)
 	}
-	if !strings.Contains(out, `level=ERROR msg="unknown command"`) {
-		t.Errorf("output = %q, want the usage failure as a level-carrying STRUCTURED line: a mistyped container command crash-loops while publishing no metrics at all, so this line is the only trace of the cause, and a bare stderr print still contains the words while carrying no level for the Loki rules that match every other knell failure", out)
+	if !strings.Contains(out, `level=ERROR msg="knell exited with error"`) {
+		t.Errorf("output = %q, want the usage failure on the one exit line: a mistyped container command crash-loops while publishing no metrics at all, so this line is the only trace of the cause", out)
 	}
-	if !strings.Contains(out, "command=serve") {
-		t.Errorf("output = %q, want the rejected command carried as an attribute; without it the line says a command was unknown but not which one, and there is no metric to identify it from", out)
+	if strings.Contains(out, `msg="unknown command"`) {
+		t.Errorf("output = %q, want no second exit message beside the one exit line", out)
+	}
+	if !strings.Contains(out, `unknown command \"serve\"`) {
+		t.Errorf("output = %q, want the error to name the rejected command; there is no metric to identify it from", out)
 	}
 	if strings.Contains(out, "listening") {
 		t.Errorf("an unknown subcommand booted the server: %s", out)

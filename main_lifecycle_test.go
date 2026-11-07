@@ -104,7 +104,7 @@ type lifecycleRun struct {
 func startLifecycleRun(t *testing.T) *lifecycleRun {
 	t.Helper()
 	r := &lifecycleRun{done: make(chan error, 1)}
-	go func() { r.done <- run() }()
+	go func() { r.done <- run(nil) }()
 	t.Cleanup(func() {
 		if r.stopped {
 			return

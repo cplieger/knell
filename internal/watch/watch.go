@@ -10,9 +10,10 @@
 // Notifications are split by whether the incident is still open: a live outage
 // gets the present-tense notices, while outages already over are reported once as
 // history, each carrying whether its own delivery was refused. Every log line reporting a
-// delivery failure or an abandoned notice carries a retryable attribute -- the
-// LEVEL is deliberately not that signal -- so a log rule can tell "wait for it"
-// from "reconstruct the window".
+// delivery failure or an abandoned notice carries a retryable attribute, which
+// tells the reader whether anything will retry it ("wait for it") or not
+// ("reconstruct the window"); the level is deliberately not that signal.
+// KnellNoticeLostForGood reads the field, bound by alert_contract_test.go.
 package watch
 
 import (

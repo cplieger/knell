@@ -135,7 +135,7 @@ func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
 	// Plant the marker a previous run would have left behind.
 	plantHealthMarker(t)
 
-	err := run()
+	err := run(nil)
 	if err == nil {
 		t.Fatal("run() = nil, want a configuration error")
 	}
@@ -276,7 +276,7 @@ func TestRunEnforcesTheNodeNameCapNotifyOwns(t *testing.T) {
 	t.Setenv("NODE_NAME", strings.Repeat("n", notify.MaxNodeNameBytes+1))
 	capture.Default(t)
 
-	err = run()
+	err = run(nil)
 	if err == nil {
 		t.Fatal("run() = nil, want a NODE_NAME over notify's cap to fail the boot; a name past the cap renders notices over Discord's content limit, so the switch arms and every notice is refused")
 	}
@@ -300,7 +300,7 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	installRunEnv(t, "api:20m", occupied.Addr().String())
 	capture.Default(t)
 
-	err = run()
+	err = run(nil)
 	if err == nil {
 		t.Fatal("run() = nil, want a bind error; an address already in use must fail the boot instead of leaving the watcher alerting behind a listener nothing can reach")
 	}

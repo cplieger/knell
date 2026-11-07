@@ -1,4 +1,4 @@
-# Recommended alert rules for knell, the PromQL half: five rules for a
+# Recommended alert rules for knell, the PromQL half: six rules for a
 # Prometheus or Mimir ruler. The LogQL half is alerts/logql.yaml. Load each
 # file into its own ruler, because neither parses the other's expressions.
 #
@@ -48,6 +48,21 @@ groups:
           severity: warning
         annotations:
           summary: "beat {{ $labels.beat }} is overdue on {{ $labels.instance }}"
+
+      # Scrapes can keep landing between the listener's accept retries, so `up`
+      # can stay 1 while pings are refused. The counter sees every failure.
+      - alert: KnellAcceptFailing
+        expr: increase(knell_listener_accept_errors_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "knell on {{ $labels.instance }} cannot accept connections"
+          description: >
+            The listener failed to accept a connection, so pings stop landing
+            while the process stays up. Beats will report overdue while this
+            lasts. Check the container's file-descriptor limit and the rate of
+            incoming connections.
 
       # Three legs, three consequences. `failed` means the notice is late and
       # retried. Either `dropped` means nothing will arrive. A full queue

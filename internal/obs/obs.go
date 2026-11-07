@@ -204,6 +204,13 @@ var httpRequests = measure.NewLabeledCounter(
 	[]string{methodLabel, pathLabel, statusLabel},
 )
 
+// listenerAcceptErrors counts failed accepts on the listener, which net/http
+// retries with backoff, so scrapes can keep landing while pings are refused.
+var listenerAcceptErrors = measure.NewCounter(
+	"listener_accept_errors_total",
+	"Failed accepts on the HTTP listener, which retries them; a shutdown's close is not counted.",
+)
+
 // httpDuration observes served-request latency across the whole surface. It
 // is deliberately unlabelled: a labelled histogram would multiply bucket
 // series per route for no operator question on a three-route surface.
@@ -229,6 +236,7 @@ func init() {
 		preRouteRefusals,
 		httpRequests,
 		httpDuration,
+		listenerAcceptErrors,
 	)
 	mintNotificationKinds()
 	mintRefusalReasons()
@@ -290,6 +298,11 @@ func RecordOutageRecordDropped(id string) {
 // pre-minted, so alert on the absolute value rather than increase().
 func RecordHTTP(method, path string, status int, d time.Duration) {
 	measure.RecordHTTP(httpRequests, httpDuration, d, method, path, strconv.Itoa(status))
+}
+
+// RecordAcceptError counts one failed accept on the HTTP listener.
+func RecordAcceptError() {
+	listenerAcceptErrors.Inc()
 }
 
 // RecordPreRouteRefusal counts one request refused before the mux routed it,
