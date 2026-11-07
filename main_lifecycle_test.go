@@ -1158,16 +1158,11 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 	}
 }
 
-// TestRunServesTheMarkerVerdictOnHealthz pins the composition root's wiring of
-// health.Handler(marker) into webapi.Deps.Healthz -- the HTTP liveness
-// endpoint the README documents and external monitoring probes. The webapi
-// tests inject staticHealthz, a fixed verdict, so they cannot catch a root that
-// wires the wrong handler here: with obs.Handler in that slot /healthz
-// answers 200 forever and an unhealthy switch is never reported, and with a nil
-// or absent route it answers 404/503 forever and a live switch is paged as
-// down. Removing the marker mid-run is what makes this a real oracle rather
-// than a 200 check: the endpoint has to FOLLOW the marker, which is what
-// Handler(marker) means.
+// TestRunServesTheMarkerVerdictOnHealthz pins the composition root's /healthz:
+// the fleet health body, following the marker. The webapi tests inject a fixed
+// verdict, so only this test sees the wiring: with obs.Handler in that slot
+// /healthz answers 200 forever, and an unwired route answers 404 forever.
+// Removing the marker mid-run proves the endpoint follows it.
 func TestRunServesTheMarkerVerdictOnHealthz(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal, and the shared health-marker path.
@@ -1179,19 +1174,16 @@ func TestRunServesTheMarkerVerdictOnHealthz(t *testing.T) {
 	r := startLifecycleRun(t)
 	waitForMarkerWithin(t, true, 10*time.Second)
 
-	if status, body := getHealthz(t, addr); status != http.StatusOK || !strings.Contains(body, `"status":"ok"`) {
-		t.Errorf("/healthz on a serving switch = %d %s, want 200 with the ok verdict; a root that wires the wrong handler here reports liveness that is not the marker's",
-			status, body)
+	if status, body := getHealthz(t, addr); status != http.StatusOK || body != `{"status":"ok"}`+"\n" {
+		t.Errorf("/healthz on a serving switch = %d %q, want 200 {\"status\":\"ok\"}", status, body)
 	}
 
-	// Drop the marker under the running server: Marker.Healthy stats the file
-	// per call, so a handler actually backed by it must now refuse.
 	if err := os.Remove(health.DefaultPath); err != nil {
 		t.Fatalf("removing the marker under the serving switch: %v", err)
 	}
-	if status, body := getHealthz(t, addr); status != http.StatusServiceUnavailable {
-		t.Errorf("/healthz with the marker gone = %d %s, want 503: an endpoint that keeps answering healthy without the marker cannot report an unhealthy switch at all",
-			status, body)
+	const want = `{"status":"unhealthy","reasons":["` + notServingReason + `"]}` + "\n"
+	if status, body := getHealthz(t, addr); status != http.StatusServiceUnavailable || body != want {
+		t.Errorf("/healthz with the marker gone = %d %q, want 503 %q", status, body, want)
 	}
 
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {

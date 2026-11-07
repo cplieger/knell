@@ -178,7 +178,7 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...httpserver.HostAllowlistOption
 	}
 	cfg.Node = node
 
-	cfg.ListenAddr = listenAddr()
+	cfg.ListenAddr = ListenAddr()
 
 	hosts, err := allowedHosts(hostPolicyOpts)
 	if err != nil {
@@ -262,10 +262,11 @@ func hostnameNode() string {
 	return host
 }
 
-// listenAddr resolves the listener address: LISTEN_ADDR when set to a
-// non-blank value, else defaultListenAddr. A blank value falls back to the
-// default rather than to "", which would bind an ephemeral port.
-func listenAddr() string {
+// ListenAddr resolves the listener address: LISTEN_ADDR when set to a
+// non-blank value, else the default :9190. A blank value falls back to the
+// default rather than to "", which would bind an ephemeral port. Load and the
+// `knell health` check both read it here, so they cannot disagree.
+func ListenAddr() string {
 	// TrimFunc with invisibleInURL, not TrimSpace: a pasted value can carry
 	// invisible runes TrimSpace keeps, which net.Listen then fails to resolve.
 	if addr := strings.TrimFunc(os.Getenv("LISTEN_ADDR"), invisibleInURL); addr != "" {

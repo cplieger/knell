@@ -47,10 +47,9 @@ const (
 var loadConfig = config.Load
 
 func main() {
-	// CLI liveness probe for the Docker healthcheck (scratch image: no shell,
-	// no curl). The marker is level-based boot state, so no freshness deadline.
+	// The Docker healthcheck: the scratch image has no shell and no curl.
 	if len(os.Args) > 1 && os.Args[1] == "health" {
-		health.RunProbe(health.DefaultPath)
+		os.Exit(probeHealth(os.Stderr, config.ListenAddr(), healthProbeTimeout))
 	}
 
 	if err := run(os.Args[1:]); err != nil {
@@ -61,6 +60,15 @@ func main() {
 	// identical logs without this line.
 	slog.Info("stopped")
 }
+
+// healthProbeTimeout sits inside the Dockerfile's 5s HEALTHCHECK --timeout, so
+// a hung listener fails the check with a written reason instead of a kill.
+const healthProbeTimeout = 4 * time.Second
+
+// notServingReason is what /healthz reports while the marker is absent: before
+// the listener is bound, from the start of a shutdown, and always when /tmp is
+// not writable.
+const notServingReason = "knell is not serving: it is starting or shutting down, or cannot write its health marker in /tmp"
 
 // errUnknownCommand is the usage error main exits 2 for; every other failure
 // exits 1.
@@ -117,7 +125,7 @@ func run(args []string) error {
 	// The watcher is the single owner of beat admission, so the endpoint holds
 	// no lifecycle state and no context of its own.
 	handler := webapi.New(watcher, webapi.Deps{
-		Healthz:        health.Handler(marker),
+		Healthz:        health.CheckHandler(health.Check{Signal: marker, Reason: notServingReason}),
 		BeatToken:      cfg.BeatToken,
 		Hosts:          cfg.AllowedHosts,
 		TrustedProxies: cfg.TrustedProxies,
