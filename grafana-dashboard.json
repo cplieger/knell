@@ -871,7 +871,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "knell_beat_fresh{instance=\"$instance\"}",
+                        "expr": "max by (beat) (knell_beat_fresh{instance=\"$instance\"})",
                         "legendFormat": "",
                         "instant": true,
                         "range": false,
@@ -893,7 +893,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "knell_beat_last_seen_timestamp_seconds{instance=\"$instance\"} * 1000",
+                        "expr": "max by (beat) (knell_beat_last_seen_timestamp_seconds{instance=\"$instance\"} * 1000)",
                         "legendFormat": "",
                         "instant": true,
                         "range": false,
@@ -915,7 +915,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "knell_beat_deadline_seconds{instance=\"$instance\"}",
+                        "expr": "max by (beat) (knell_beat_deadline_seconds{instance=\"$instance\"})",
                         "legendFormat": "",
                         "instant": true,
                         "range": false,
@@ -937,7 +937,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "clamp(1 - (time() - knell_beat_last_seen_timestamp_seconds{instance=\"$instance\"}) / knell_beat_deadline_seconds{instance=\"$instance\"}, 0, 1)",
+                        "expr": "max by (beat) (clamp(1 - (time() - knell_beat_last_seen_timestamp_seconds{instance=\"$instance\"}) / knell_beat_deadline_seconds{instance=\"$instance\"}, 0, 1))",
                         "legendFormat": "",
                         "instant": true,
                         "range": false,
@@ -959,7 +959,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "round(increase(knell_beat_outages_total{instance=\"$instance\"}[$__range]))",
+                        "expr": "sum by (beat) (round(increase(knell_beat_outages_total{instance=\"$instance\"}[$__range])))",
                         "legendFormat": "",
                         "instant": true,
                         "range": false,
@@ -985,10 +985,7 @@
                   "spec": {
                     "options": {
                       "excludeByName": {
-                        "Time": true,
-                        "instance": true,
-                        "job": true,
-                        "__name__": true
+                        "Time": true
                       },
                       "indexByName": {
                         "beat": 0,
