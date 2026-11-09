@@ -515,7 +515,7 @@ func TestMetricsExpositionGzip(t *testing.T) {
 	}
 }
 
-// TestProbePathAccessLogLevels pins the ProbeLogLevel policy on knell's two
+// TestProbePathAccessLogLevels pins the WithProbeLogLevel policy on knell's two
 // machine-probe endpoints. It carries forward the guard the former
 // WithSkipPaths("/healthz", "/metrics") existed for — routine probe traffic
 // must not pollute the log stream at the operating level, so no probe line may
@@ -1947,7 +1947,7 @@ func TestAccessLogClientIPResolvesOnlyThroughTrustedProxies(t *testing.T) {
 
 // The label and marker vocabulary httpserver produces, restated here because these
 // tests assert on the exposition and the access line an operator reads. The
-// library exports the derivation (RouteMetricLabels), not the strings, so if a
+// library applies the derivation (WithRecordRouteMetric), not exported strings, so if a
 // version bump ever changed one of them, these assertions are where knell finds
 // out — which is the point of naming them rather than inlining the literals.
 const (

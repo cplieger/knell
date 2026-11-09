@@ -180,7 +180,7 @@ func TestReminderLogsCarryTheirRetryability(t *testing.T) {
 			if got := rec.CountLevel(tc.level, tc.msg); got != 1 {
 				t.Fatalf("%q lines at %s = %d, want 1: %v", tc.msg, tc.level, got, rec.Messages())
 			}
-			if !rec.HasAttr(tc.msg, "retryable", "true") {
+			if !rec.HasAttr(capture.Message(tc.msg), "retryable", "true") {
 				t.Errorf("%q does not carry retryable=true: %v", tc.msg, rec.Records())
 			}
 		})
