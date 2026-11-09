@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/httpserver"
 	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/obs"
@@ -244,9 +245,9 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 
 // TestRunPublishesTheBootArmedBaselineFromProcessStart pins that every first
 // deadline counts from BEFORE configuration, so the time spent reading a
-// mounted secret is charged to the deadline rather than to the sender. A FIFO
-// holds config.Load across a whole-second boundary because the published
-// last-seen metric intentionally has second precision.
+// mounted secret is charged to the deadline rather than to the sender. The
+// loadConfig seam holds config.Load across a whole-second boundary because
+// the published last-seen metric intentionally has second precision.
 //
 // The oracle's reach is the config boundary, not the exact instruction: a
 // capture moved anywhere earlier than config.Load - to the slogx.Setup or
@@ -268,49 +269,36 @@ func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	// process-wide signal, and the shared health-marker path.
 	addr := prepareLifecycleRun(t, "api")
 
-	fifo := t.TempDir() + "/webhook"
-	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
-		t.Skipf("cannot create a FIFO to delay configuration loading: %v", err)
+	entered := make(chan struct{})
+	held := make(chan struct{})
+	release := sync.OnceFunc(func() { close(held) })
+	realLoad := loadConfig
+	loadConfig = func(maxNodeNameBytes int, opts ...httpserver.HostAllowlistOption) (config.Config, error) {
+		close(entered)
+		<-held
+		return realLoad(maxNodeNameBytes, opts...)
 	}
-	t.Setenv("DISCORD_WEBHOOK_URL_FILE", fifo)
+	t.Cleanup(func() { loadConfig = realLoad })
 	bootFloor := time.Now().Add(-2 * time.Second)
 	r := startLifecycleRun(t)
+	// Registered after startLifecycleRun so it runs first: a held load would
+	// keep run() from ever reaching the signal that cleanup sends.
+	t.Cleanup(release)
 
-	var secret *os.File
-	openDeadline := time.Now().Add(5 * time.Second)
-	for secret == nil {
-		f, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
-		switch {
-		case err == nil:
-			secret = f
-		case errors.Is(err, syscall.ENXIO):
-			select {
-			case runErr := <-r.done:
-				r.stopped = true
-				t.Fatalf("run() returned before reading the delayed webhook secret: %v", runErr)
-			default:
-			}
-			if time.Now().After(openDeadline) {
-				t.Fatal("run() never started reading the delayed webhook secret")
-			}
-			time.Sleep(5 * time.Millisecond)
-		default:
-			t.Fatalf("opening delayed webhook secret: %v", err)
-		}
+	select {
+	case <-entered:
+	case runErr := <-r.done:
+		r.stopped = true
+		t.Fatalf("run() returned before loading configuration: %v", runErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("run() never started loading configuration")
 	}
-	t.Cleanup(func() { _ = secret.Close() })
 
-	// The FIFO writer can open only after config.Load has opened its reader.
-	// Hold that read across this boundary so a baseline captured after config
-	// cannot fall on the process-start side of it.
+	// Hold configuration loading across this boundary so a baseline captured
+	// after config cannot fall on the process-start side of it.
 	configBoundary := time.Now().Truncate(time.Second).Add(time.Second)
 	time.Sleep(time.Until(configBoundary) + 10*time.Millisecond)
-	if _, err := secret.WriteString(testWebhookURL + "\n"); err != nil {
-		t.Fatalf("writing delayed webhook secret: %v", err)
-	}
-	if err := secret.Close(); err != nil {
-		t.Fatalf("closing delayed webhook secret: %v", err)
-	}
+	release()
 
 	waitForMarkerWithin(t, true, 10*time.Second)
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/metrics", nil)
@@ -1099,7 +1087,7 @@ func TestClassifyAbandonedWatchLoopDeniesACleanExitOverAnAbandonedLoop(t *testin
 // dropped: without the read/write bounds a trickled body or a client that never
 // reads /metrics holds a handler goroutine for as long as it likes (httpserver
 // leaves both unset by default, bounding only the headers), without
-// WithMaxHeaderBytes the header block falls back to net/http's 1 MiB default --
+// the MaxHeaderBytes cap the header block falls back to net/http's 1 MiB default --
 // so one unauthenticated caller makes this process read a megabyte of header per
 // connection, and the BEAT_TOKEN maximum config refuses startup over stops
 // bounding anything real -- and without WithSlogErrorLog net/http's own

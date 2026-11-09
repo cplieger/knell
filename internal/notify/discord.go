@@ -106,7 +106,7 @@ func New(webhookURL, node string) *Discord {
 	// method: the webhook POST must not be replayed as a bodyless GET, nor sent
 	// with its credential path to another port. Referer is deleted because
 	// net/http writes the previous request's full URL, the credential, there.
-	policy := httpclient.RedirectPolicyFunc(httpclient.WithSameOrigin(true), httpclient.WithPreserveMethod(true))
+	policy := httpclient.RedirectPolicy(httpclient.WithSameOrigin(true), httpclient.WithPreserveMethod(true))
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		req.Header.Del("Referer")
 		return policy(req, via)

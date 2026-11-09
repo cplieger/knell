@@ -42,6 +42,10 @@ const (
 	requestWriteTimeout  = 3 * time.Second
 )
 
+// loadConfig is a seam over config.Load so a test can hold configuration
+// loading open after run has captured its boot baseline.
+var loadConfig = config.Load
+
 func main() {
 	// CLI liveness probe for the Docker healthcheck (scratch image: no shell,
 	// no curl). The marker is level-based boot state, so no freshness deadline.
@@ -88,7 +92,7 @@ func run() error {
 	marker.Cleanup()
 	defer marker.Cleanup()
 
-	cfg, err := config.Load(notify.MaxNodeNameBytes, webapi.HostPolicyOptions()...)
+	cfg, err := loadConfig(notify.MaxNodeNameBytes, webapi.HostPolicyOptions()...)
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
 	}
@@ -147,7 +151,7 @@ func run() error {
 	serveExit := httpserver.WithServeExit(func(exitCtx context.Context) {
 		watchLoopStopped = teardownAfterServeExit(exitCtx, srv, marker, watcher.StopAccepting, stop, watcherDone)
 	})
-	err = httpserver.Run(ctx, srv, ln, onShutdown, httpserver.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
+	err = httpserver.Run(ctx, srv, ln, httpserver.WithTeardown(onShutdown), httpserver.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
 	return classifyAbandonedWatchLoop(classifyServeError(err), watchLoopStopped)
 }
 
@@ -155,15 +159,15 @@ func run() error {
 // listener. WithSlogErrorLog resolves slog.Default() as NewServer applies it,
 // so this must run after run() installs the process handler.
 func newServer(handler http.Handler) *http.Server {
-	return httpserver.New(handler,
-		// Load-bearing for the shutdown-grace invariant: while headers are
-		// being read net/http has armed only the header deadline, so
-		// httpserver's 10s default would be a live slowloris window otherwise.
-		httpserver.WithReadHeaderTimeout(requestHeaderTimeout),
-		httpserver.WithReadTimeout(requestReadTimeout),
-		httpserver.WithWriteTimeout(requestWriteTimeout),
-		httpserver.WithMaxHeaderBytes(config.MaxRequestHeaderBytes),
-		httpserver.WithSlogErrorLog(slog.LevelError))
+	srv := httpserver.New(handler, httpserver.WithSlogErrorLog(slog.LevelError))
+	// Load-bearing for the shutdown-grace invariant: while headers are
+	// being read net/http has armed only the header deadline, so
+	// httpserver's 10s default would be a live slowloris window otherwise.
+	srv.ReadHeaderTimeout = requestHeaderTimeout
+	srv.ReadTimeout = requestReadTimeout
+	srv.WriteTimeout = requestWriteTimeout
+	srv.MaxHeaderBytes = config.MaxRequestHeaderBytes
+	return srv
 }
 
 // teardownAfterServeExit runs the teardown for the non-graceful exit where

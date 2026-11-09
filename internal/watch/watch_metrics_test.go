@@ -418,7 +418,7 @@ func TestQueueFullDropKeepsTimestampAttrsTyped(t *testing.T) {
 		// assertable. The rendered accessors (AttrValue/HasAttr) cannot express
 		// this contract at all — slog.Time("since", t) and
 		// slog.String("since", t.String()) render identically.
-		value, ok := rec.Attr("pending missing queue full", key)
+		value, ok := rec.Attr("pending missing queue full", capture.AttrName(key))
 		if !ok {
 			t.Errorf("queue-full warning has no %s attribute: %v", key, rec.Records())
 			continue
