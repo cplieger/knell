@@ -23,8 +23,7 @@ type dashQuery struct {
 	Spec struct {
 		Query struct {
 			Spec struct {
-				Expr  string `json:"expr"`
-				Query string `json:"query"`
+				Expr string `json:"expr"`
 			} `json:"spec"`
 		} `json:"query"`
 	} `json:"spec"`
@@ -71,13 +70,15 @@ type conditionRule struct {
 	Spec struct {
 		Value    any    `json:"value"`
 		Variable string `json:"variable"`
+		Operator string `json:"operator"`
 	} `json:"spec"`
 }
 
 type conditionGroup struct {
 	Spec struct {
-		Condition string          `json:"condition"`
-		Items     []conditionRule `json:"items"`
+		Visibility string          `json:"visibility"`
+		Condition  string          `json:"condition"`
+		Items      []conditionRule `json:"items"`
 	} `json:"spec"`
 }
 
@@ -91,7 +92,6 @@ type gridItem struct {
 }
 
 type layoutNode struct {
-	Kind string `json:"kind"`
 	Spec struct {
 		Layout               *layoutNode     `json:"layout"`
 		ConditionalRendering *conditionGroup `json:"conditionalRendering"`
@@ -338,8 +338,9 @@ func TestDashboardOverviewMirrorsEveryShippedRule(t *testing.T) {
 	overview := tab(t, &d, "Overview")
 	attention := row(t, overview, "Needs attention")
 	gate := attention.Spec.ConditionalRendering
-	if gate == nil || len(gate.Spec.Items) != 1 || gate.Spec.Items[0].Kind != "ConditionalRenderingVariable" ||
-		gate.Spec.Items[0].Spec.Value != "^[1-9]" {
+	if gate == nil || gate.Spec.Visibility != "show" || len(gate.Spec.Items) != 1 ||
+		gate.Spec.Items[0].Kind != "ConditionalRenderingVariable" ||
+		gate.Spec.Items[0].Spec.Operator != "matches" || gate.Spec.Items[0].Spec.Value != "^[1-9]" {
 		t.Fatal("Needs attention is not shown by a variable matching ^[1-9]")
 	}
 	vars := d.variables()
@@ -355,10 +356,10 @@ func TestDashboardOverviewMirrorsEveryShippedRule(t *testing.T) {
 			}
 		}
 		slices.Sort(conds)
-		if cr == nil || cr.Spec.Condition != "or" ||
+		if cr == nil || cr.Spec.Visibility != "show" || cr.Spec.Condition != "or" ||
 			!slices.Equal(conds, []string{"ConditionalRenderingData", "ConditionalRenderingTimeRangeSize"}) ||
 			p.Spec.Data.Spec.QueryOptions.MaxDataPoints <= 0 {
-			t.Errorf("%q can show before its query answers: want a has-data rule or'ed with a 0s range rule and a maxDataPoints pin", p.Spec.Title)
+			t.Errorf("%q does not show exactly while its query answers: want a shown group or'ing a has-data rule with a 0s range rule, and a maxDataPoints pin", p.Spec.Title)
 		}
 		for _, e := range panelExprs(&p) {
 			if !strings.Contains(counted, "count("+e+")") {
