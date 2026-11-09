@@ -115,18 +115,18 @@ The image checks itself with `knell health`, which asks `/healthz` over the cont
 
 ## Monitoring
 
-knell publishes Prometheus metrics on `/metrics` and writes logfmt logs to standard error. Eight alert rules that watch knell ship in [`alerts/`](alerts/), six PromQL rules in `alerts/promql.yaml` and two LogQL rules in `alerts/logql.yaml` for the failures that leave no series. Load both. The image has a Docker healthcheck, and [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) says what it proves and who is told. [Monitoring and alerts](docs/monitoring.md) lists the metrics and rules, and shows how to make knell watch your alert pipeline.
+knell publishes Prometheus metrics on `/metrics` and writes logfmt logs to standard error. Eight alert rules that watch knell ship in [`alerts/`](alerts/), six PromQL rules in `alerts/promql.yaml` and two LogQL rules in `alerts/logql.yaml` for the failures that leave no series. Load both. A Grafana dashboard of every beat, its deadline and the firing alerts ships as [`grafana-dashboard.json`](grafana-dashboard.json) and needs Grafana 13.2 or newer. The image has a Docker healthcheck, and [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) says what it proves and who is told. [Monitoring and alerts](docs/monitoring.md) lists the metrics and rules, and shows how to make knell watch your alert pipeline.
 
 ## Documentation
 
 - [Configuration](docs/configuration.md) lists every setting, its limits, secret files and what stops startup.
 - [How knell works](docs/how-it-works.md) explains deadlines, notices, retries and every answer a ping can get.
-- [Monitoring and alerts](docs/monitoring.md) lists the log lines, the metrics and the alert rules, and shows how to make knell watch your alert pipeline.
+- [Monitoring and alerts](docs/monitoring.md) lists the log lines, the metrics, the alert rules and the dashboard, and shows how to make knell watch your alert pipeline.
 - [Security](docs/hardening.md) covers exposure, reverse proxies and the hardened compose profile.
 
 ## Contributing
 
-Issues and pull requests are welcome. The [shared contributing rules](https://github.com/cplieger/.github/blob/main/CONTRIBUTING.md) apply.
+Issues and pull requests are welcome. The [shared contributing rules](https://github.com/cplieger/.github/blob/main/CONTRIBUTING.md) apply, and [CONTRIBUTING.md](CONTRIBUTING.md) adds the rules for the dashboard.
 
 ## Disclaimer
 

@@ -1,12 +1,12 @@
 # Monitoring and alerts
 
-This page lists what knell logs and the metrics it publishes, how to load the alert rules that watch knell itself, and how to make knell watch your alert pipeline. It is for anyone who runs knell: the Discord notices need nothing else, and the rules below need a metric store or Loki.
+This page lists what knell logs and the metrics it publishes, how to load the alert rules that watch knell itself and its Grafana dashboard, and how to make knell watch your alert pipeline. It is for anyone who runs knell: the Discord notices need nothing else, and the rules below need a metric store or Loki.
 
 ## What you get
 
 | You run | You get | You set up |
 | --- | --- | --- |
-| Prometheus, Mimir or VictoriaMetrics, with Alertmanager | Every Discord notice, the six PromQL alerts about knell itself, `up` and graphs | A scrape job named `knell` for port `9190`, and [`alerts/promql.yaml`](../alerts/promql.yaml) on a ruler that does not run beside knell |
+| Prometheus, Mimir or VictoriaMetrics, with Alertmanager | Every Discord notice, the six PromQL alerts about knell itself, `up` and the [dashboard](#dashboard) | A scrape job named `knell` for port `9190`, and [`alerts/promql.yaml`](../alerts/promql.yaml) on a ruler that does not run beside knell |
 | Loki and Alertmanager, no metric store | Every Discord notice, and the two LogQL alerts: knell exited with an error, or a notice was lost for good | [`alerts/logql.yaml`](../alerts/logql.yaml) on Loki's ruler, with `LOG_LEVEL` at `info` |
 | Grafana-managed alerting only | The same rules, imported into Grafana | A Prometheus or Loki data source, and the rules |
 | Docker or Unraid only | Every Discord notice, and Docker health | An uptime prober on `/healthz`, because nothing else tells you that knell itself stopped |
@@ -135,6 +135,18 @@ knell can tell you when your alert pipeline itself stops: the rule evaluator, th
    The file holds your `BEAT_TOKEN`. knell ignores the request body, so Alertmanager's webhook payload is fine. With `ALLOWED_HOSTS` set, add the name in the URL, here `knell`.
 
 With more than one ruler, give each its own always-firing rule, route and beat, so the Discord notice names the ruler that went quiet.
+
+## Dashboard
+
+[`grafana-dashboard.json`](../grafana-dashboard.json) imports as the knell dashboard. It reads the metrics above from a Prometheus data source and needs Grafana 13.2 or newer. When you run more than one knell, the knell variable picks the instance to show. It has three tabs:
+
+- Overview counts the beats past their deadline and the beats watched, with the pings and outages in the selected range. Below them, a Needs attention row appears only while an alert from `alerts/promql.yaml` fires, with one tile per rule. The Beats table shows each beat as Fresh or Missing, when knell last accepted a ping for it, its deadline, the share of the deadline left and its outages in the range.
+- History charts the check-ins and outages per beat, when each beat was fresh or missing, and the notices sent, failed or lost.
+- knell health shows the scrape, the listener's accept errors, the requests refused before routing and why, when knell last started, and the request latency and status codes.
+
+The tiles and the count of beats past their deadline read each rule's `ALERTS` series, which Prometheus and the Mimir ruler store beside your metrics, so the Needs attention row stays hidden while those rules are not loaded. Without them, the count shows the beats that have been past their deadline for 7 minutes. The two LogQL rules read the log, so the dashboard has no tile for them.
+
+The dashboard is versioned with the image, and the `grafana-dashboard.json` of release `<tag>` matches the metrics that image serves. Each release attaches it with its checksum at `https://github.com/cplieger/knell/releases/download/<tag>/grafana-dashboard.json`, and each image publish pushes it as the OCI artifact `ghcr.io/cplieger/knell/dashboard:<tag>`. The file sets `metadata.name` to `knell`, which Grafana uses as the dashboard UID, so importing a newer copy over the old one updates it in place.
 
 ## Knowing the app is alive
 
