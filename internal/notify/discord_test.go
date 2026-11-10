@@ -381,20 +381,26 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 func TestTransientFailureRetries(t *testing.T) {
 	t.Parallel()
 
-	// 503 is a status httpclient.IsRetryableStatus accepts, so it retries
-	// within the call.
-	rec := newWebhookRecorder(http.StatusServiceUnavailable, http.StatusNoContent)
-	srv := httptest.NewServer(rec.handler(t))
-	defer srv.Close()
+	// The gateway answers (502, 503, 504) retry within the call, like an
+	// attempt timeout.
+	for _, code := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			t.Parallel()
 
-	d := newTestNotifier(t, srv.URL, "node-1")
-	defer d.Close()
+			rec := newWebhookRecorder(code, http.StatusNoContent)
+			srv := httptest.NewServer(rec.handler(t))
+			defer srv.Close()
 
-	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
-		t.Fatalf("BeatMissing after retry: %v", err)
-	}
-	if got := rec.hits.Load(); got != 2 {
-		t.Errorf("attempts = %d, want 2", got)
+			d := newTestNotifier(t, srv.URL, "node-1")
+			defer d.Close()
+
+			if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
+				t.Fatalf("BeatMissing after retry: %v", err)
+			}
+			if got := rec.hits.Load(); got != 2 {
+				t.Errorf("attempts = %d, want 2", got)
+			}
+		})
 	}
 }
 
@@ -1282,23 +1288,35 @@ func TestCanceledDeliveryErrorIsCanceled(t *testing.T) {
 	}
 }
 
-func TestPlainServerErrorRetriesInCall(t *testing.T) {
+func TestPlainServerErrorIsTerminalPerAttempt(t *testing.T) {
 	t.Parallel()
 
-	// httpclient.IsRetryableStatus accepts a plain 500, so the second scripted
-	// status (204) delivers within the same call.
-	rec := newWebhookRecorder(http.StatusInternalServerError, http.StatusNoContent)
-	srv := httptest.NewServer(rec.handler(t))
-	defer srv.Close()
+	// A 500, a 507 or an unregistered 5xx can come after Discord posted the
+	// message, and the webhook takes no idempotency key, so repeating the
+	// POST in the call can post the notice twice. Only the gateway answers
+	// (502, 503, 504) retry within the call; for the rest the call fails at
+	// once and the watch sweep owns the retry. If one of them joined the
+	// in-call retry set, the second scripted status (204) would make this
+	// call succeed.
+	for _, code := range []int{http.StatusInternalServerError, http.StatusInsufficientStorage, 520} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			t.Parallel()
 
-	d := newTestNotifier(t, srv.URL, "node-1")
-	defer d.Close()
+			rec := newWebhookRecorder(code, http.StatusNoContent)
+			srv := httptest.NewServer(rec.handler(t))
+			defer srv.Close()
 
-	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
-		t.Fatalf("BeatMissing after a 500 then 204: %v", err)
-	}
-	if got := rec.hits.Load(); got != 2 {
-		t.Errorf("attempts = %d, want 2 (500 is retried within the call)", got)
+			d := newTestNotifier(t, srv.URL, "node-1")
+			defer d.Close()
+
+			err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
+			if err == nil {
+				t.Fatalf("BeatMissing on %d = nil, want error (sweep-level retry owns this failure)", code)
+			}
+			if got := rec.hits.Load(); got != 1 {
+				t.Errorf("attempts = %d, want 1 (%d is not retried within the call)", got, code)
+			}
+		})
 	}
 }
 

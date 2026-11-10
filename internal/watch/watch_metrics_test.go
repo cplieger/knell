@@ -371,7 +371,7 @@ type mutexProbeHandler struct {
 	seen     int
 }
 
-func (h *mutexProbeHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (*mutexProbeHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h *mutexProbeHandler) Handle(_ context.Context, r slog.Record) error {
 	h.messages = append(h.messages, r.Message)
