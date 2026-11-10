@@ -466,27 +466,26 @@ func TestUnfollowedRedirectIsNotDelivery(t *testing.T) {
 	}
 }
 
-func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
+func TestSafeTransportErrorKeepsTheURLOutWithoutBreakingTheChain(t *testing.T) {
 	t.Parallel()
 
-	// httpclient.LogSafeError's whole remaining job, and the one that matters: the
-	// *url.Error net/http builds around a transport failure is the only error
-	// shape that embeds the full request URL, and for a webhook that URL's path
-	// IS the credential. Reducing it to its cause is what keeps the URL out of
-	// post's returned error and out of httpclient.Do's retry lines, and the reduction
-	// must not cost the errors.Is chain watch keys shutdown handling on
-	// (context.Canceled) and httpclient.Do keys transient classification on.
+	// The *url.Error net/http builds around a transport failure is the only
+	// error shape that embeds the full request URL, and for a webhook that
+	// URL's path IS the credential. safeTransportError is what postAttempt
+	// returns: it replaces the message entirely, so the chain it exposes
+	// through Unwrap is the only thing left for watch's shutdown exemption
+	// (errors.Is(err, context.Canceled), which decides whether a failed send is
+	// logged as an error or as a cancelled sweep) and for httpclient's
+	// transient classification to read.
 	//
 	// There is deliberately no text-matching backstop for an error that
 	// FORMATS a URL rendering into its own message: nothing in this package
 	// publishes remote text or interpolates d.url, so no such error exists to
-	// defend against, and pretending otherwise is what the two earlier leaks
-	// in this file's history were made of.
+	// defend against.
 	const secret = "verysecretchaintoken"
 	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
 
-	// Both POSITIONS, not both call sites: LogSafeError replaces a *url.Error
-	// wherever it sits in the chain, not only at the top.
+	// Both positions: the *url.Error at the top, and wrapped below another error.
 	for name, in := range map[string]error{
 		"bare url error":    &url.Error{Op: "Post", URL: rawURL, Err: context.Canceled},
 		"wrapped url error": fmt.Errorf("attempt 3 failed: %w", &url.Error{Op: "Post", URL: rawURL, Err: context.Canceled}),
@@ -494,24 +493,9 @@ func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			got := httpclient.LogSafeError(in)
 			if !strings.Contains(in.Error(), secret) {
 				t.Fatalf("setup: input %q does not carry the credential, the assertion would be vacuous", in)
 			}
-			for _, leak := range []string{secret, "/api/webhooks/", "discord.example"} {
-				if strings.Contains(got.Error(), leak) {
-					t.Errorf("httpclient.LogSafeError kept %q from the request URL: %v", leak, got)
-				}
-			}
-			if !errors.Is(got, context.Canceled) {
-				t.Errorf("httpclient.LogSafeError broke the errors.Is chain: %v", got)
-			}
-			// safeTransportError is what postAttempt actually returns, and it
-			// replaces the message entirely -- so the chain it exposes through
-			// Unwrap is the ONLY thing left for watch's shutdown exemption
-			// (errors.Is(err, context.Canceled), which decides whether a
-			// failed send is logged as an error or as a cancelled sweep) and
-			// for httpclient's transient classification to read.
 			safe := safeTransportError(in)
 			if !errors.Is(safe, context.Canceled) {
 				t.Errorf("safeTransportError broke the errors.Is chain: %v", safe)
@@ -580,32 +564,22 @@ func TestNestedURLErrorsAreFullyReducedBeforeClassification(t *testing.T) {
 	}
 }
 
-func TestLogSafeNeverReducesAFailureToNil(t *testing.T) {
+func TestSafeTransportErrorNeverReducesAFailureToNil(t *testing.T) {
 	t.Parallel()
 
-	// A *url.Error carrying a nil cause must not reduce to nil: postAttempt's
-	// return IS httpclient.Do's success signal, so a nil there would report an
-	// UNDELIVERED notification as delivered — watch would flip the beat to
-	// alerted and the missing notice this app exists to send would never be
-	// retried. httpclient v4.2.0 guarantees this at the source (LogSafeError
-	// substitutes a contentless, URL-free stand-in), which is why knell no
-	// longer carries its own fail-closed guard; this pins the contract knell
-	// depends on, so a regression in the library fails here rather than
-	// silently disarming the switch.
+	// postAttempt's return IS httpclient.Do's success signal, so a nil for a
+	// *url.Error carrying a nil cause would report an UNDELIVERED notification
+	// as delivered: watch would flip the beat to alerted and the missing
+	// notice this app exists to send would never be retried.
 	const secret = "verysecretclosedtoken"
 	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
 
-	got := httpclient.LogSafeError(&url.Error{Op: "Post", URL: rawURL})
+	got := safeTransportError(&url.Error{Op: "Post", URL: rawURL})
 	if got == nil {
-		t.Fatal("httpclient.LogSafeError(*url.Error with a nil cause) = nil, want an error (a nil reports an undelivered notification as delivered)")
+		t.Fatal("safeTransportError(*url.Error with a nil cause) = nil, want an error (a nil reports an undelivered notification as delivered)")
 	}
 	if strings.Contains(got.Error(), secret) {
 		t.Errorf("the reduced error leaks the webhook credential: %v", got)
-	}
-	// The nil-in/nil-out half of the contract: postAttempt reduces only on a
-	// real failure, so a nil must not become an error.
-	if got := httpclient.LogSafeError(nil); got != nil {
-		t.Errorf("httpclient.LogSafeError(nil) = %v, want nil", got)
 	}
 }
 
