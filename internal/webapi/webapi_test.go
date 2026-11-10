@@ -1215,15 +1215,15 @@ func (c *fakeClock) advance(d time.Duration) {
 // below assert on the exposition, which is the operator-visible ground truth.
 type deliveringNotifier struct{}
 
-func (n *deliveringNotifier) BeatMissing(context.Context, string, watch.Transition) error {
+func (*deliveringNotifier) BeatMissing(context.Context, string, watch.Transition) error {
 	return nil
 }
 
-func (n *deliveringNotifier) BeatRecovered(context.Context, string, watch.Transition) error {
+func (*deliveringNotifier) BeatRecovered(context.Context, string, watch.Transition) error {
 	return nil
 }
 
-func (n *deliveringNotifier) BeatOutageHistory(context.Context, string, []watch.Outage) error {
+func (*deliveringNotifier) BeatOutageHistory(context.Context, string, []watch.Outage) error {
 	return nil
 }
 

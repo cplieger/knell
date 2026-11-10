@@ -784,11 +784,11 @@ func (n *blockingNotifier) BeatMissing(ctx context.Context, _ string, _ Transiti
 	return ctx.Err()
 }
 
-func (n *blockingNotifier) BeatRecovered(context.Context, string, Transition) error {
+func (*blockingNotifier) BeatRecovered(context.Context, string, Transition) error {
 	return nil
 }
 
-func (n *blockingNotifier) BeatOutageHistory(context.Context, string, []Outage) error {
+func (*blockingNotifier) BeatOutageHistory(context.Context, string, []Outage) error {
 	return nil
 }
 
@@ -1661,9 +1661,9 @@ func (n *slowFailNotifier) BeatMissing(_ context.Context, id string, _ Transitio
 	return errors.New("webhook stalled")
 }
 
-func (n *slowFailNotifier) BeatRecovered(context.Context, string, Transition) error { return nil }
+func (*slowFailNotifier) BeatRecovered(context.Context, string, Transition) error { return nil }
 
-func (n *slowFailNotifier) BeatOutageHistory(context.Context, string, []Outage) error { return nil }
+func (*slowFailNotifier) BeatOutageHistory(context.Context, string, []Outage) error { return nil }
 
 func TestSweepStartsTheSendWhoseCheckLandsExactlyOnTheBudget(t *testing.T) {
 	t.Parallel()

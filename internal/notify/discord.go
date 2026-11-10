@@ -466,8 +466,31 @@ func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error
 // deliveryError reports what a response says about delivery: nil for success
 // (exactly 2xx), otherwise CheckStatus's typed error plus whatever knell
 // can safely add, so httpclient.Do can still classify a retryable status and the
-// 429 wait.
+// 429 wait. A 5xx other than a gateway answer (502, 503, 504) is marked
+// Permanent: it can come after Discord posted the message, and the webhook
+// takes no idempotency key, so the call does not repeat it and leaves the
+// re-send to the watch sweep.
 func deliveryError(resp *http.Response) error {
+	err := statusVerdict(resp)
+	if err != nil && resp.StatusCode >= 500 && !gatewayStatus(resp.StatusCode) {
+		return httpclient.Permanent(err)
+	}
+	return err
+}
+
+// gatewayStatus reports the 5xx answers knell retries within the call, as it
+// retries an attempt timeout.
+func gatewayStatus(code int) bool {
+	switch code {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// statusVerdict is deliveryError before the 5xx split: nil for exactly 2xx,
+// otherwise CheckStatus's typed error and knell's safe detail.
+func statusVerdict(resp *http.Response) error {
 	statusErr := httpclient.CheckStatus(resp)
 	if statusErr == nil {
 		return nil
