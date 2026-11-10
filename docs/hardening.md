@@ -39,7 +39,7 @@ The image is built on `scratch`. It holds the static knell binary, a CA certific
 
 ## Hardened compose profile
 
-Add these lines to the `knell` service to run it with a read-only root filesystem, no Linux capabilities and no privilege escalation. The `tmpfs` gives the health marker somewhere to live.
+Add these lines to the `knell` service to run it with a read-only root filesystem, no Linux capabilities and no privilege escalation. The `tmpfs` gives the health marker somewhere to live. Without it, `/healthz` and the healthcheck report knell unhealthy.
 
 ```yaml
     read_only: true

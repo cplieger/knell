@@ -67,7 +67,7 @@ func newTestHandler(b *fakeBeater, token string) http.Handler {
 }
 
 // newTestHandlerHealthz is newTestHandler with the liveness status under
-// test control, so a test can drive a FAILING probe: health.Handler answers 503
+// test control, so a test can drive a FAILING probe: /healthz answers 503
 // whenever the liveness marker is absent (boot, or after the pre-drain flip).
 func newTestHandlerHealthz(b *fakeBeater, token string, healthzStatus int) http.Handler {
 	return New(b, Deps{Healthz: staticHealthz(healthzStatus), BeatToken: token})
@@ -542,7 +542,7 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 			method: http.MethodGet, path: "/metrics", healthzStatus: http.StatusOK,
 			wantStatus: http.StatusOK, wantLevel: slog.LevelDebug,
 		},
-		// health.Handler answers 503 whenever the liveness marker is absent.
+		// /healthz answers 503 whenever the liveness marker is absent.
 		// That is the failing dead-man-switch signal, at Error.
 		"failing healthz probe": {
 			method: http.MethodGet, path: "/healthz", healthzStatus: http.StatusServiceUnavailable,
@@ -2013,17 +2013,19 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		"foreign host refused on healthz":                   {host: "attacker.example", path: "/healthz", wantStatus: http.StatusForbidden},
 		"allowed host serves metrics":                       {host: "knell.example", path: "/metrics", method: http.MethodGet, wantStatus: http.StatusOK},
 		"allowed host serves healthz":                       {host: "knell.example", path: "/healthz", method: http.MethodGet, wantStatus: http.StatusOK},
-		// The loopback carve-out is what keeps in-container HTTP clients (a
-		// localhost curl, a sidecar probe) working under an allowlist of
-		// browser-facing names; the baked `knell health` probe stats the
-		// marker file and never speaks HTTP, so it needs no exemption.
-		// Both halves must be loopback: a rebinding
+		// The loopback carve-out is what keeps the baked `knell health` probe,
+		// which GETs /healthz on loopback, working under an allowlist of
+		// browser-facing names. Both halves must be loopback: a rebinding
 		// request carries the attacker's hostname, and a remote client forging
 		// Host: 127.0.0.1 is not a loopback socket peer.
-		"loopback probe exempt":         {host: "127.0.0.1:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
-		"forged loopback host refused":  {host: "127.0.0.1:9190", path: "/beat/api", remoteAddr: "203.0.113.7:44444", wantStatus: http.StatusForbidden},
-		"malformed host cannot match":   {host: "knell.example:notaport", path: "/beat/api", wantStatus: http.StatusForbidden},
-		"bracketed hostname is refused": {host: "[knell.example]", path: "/beat/api", wantStatus: http.StatusForbidden},
+		"loopback probe exempt": {host: "127.0.0.1:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
+		// When LISTEN_ADDR names one address that is neither loopback nor
+		// unspecified the probe asks that address, which the carve-out does not
+		// cover, so the docs tell the user to list it.
+		"single-address probe refused when unlisted": {host: "192.0.2.10:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", wantStatus: http.StatusForbidden},
+		"forged loopback host refused":               {host: "127.0.0.1:9190", path: "/beat/api", remoteAddr: "203.0.113.7:44444", wantStatus: http.StatusForbidden},
+		"malformed host cannot match":                {host: "knell.example:notaport", path: "/beat/api", wantStatus: http.StatusForbidden},
+		"bracketed hostname is refused":              {host: "[knell.example]", path: "/beat/api", wantStatus: http.StatusForbidden},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {

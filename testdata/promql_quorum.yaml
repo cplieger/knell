@@ -1,0 +1,12 @@
+# The commented KnellBeatQuorumLow rule of alerts/promql.yaml, uncommented so
+# alerts/promql_test.yaml can test it. alert_contract_test.go keeps the two equal.
+groups:
+  - name: knell-quorum
+    rules:
+      - alert: KnellBeatQuorumLow
+        expr: sum by (beat) (knell_beat_fresh) < 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "fewer than 2 knell instances see beat {{ $labels.beat }} on time"

@@ -1,0 +1,212 @@
+# promtool test rules alerts/promql_test.yaml
+rule_files:
+  - promql.yaml
+  - ../testdata/promql_quorum.yaml
+
+evaluation_interval: 1m
+
+tests:
+  - name: an accept failure pages for the 15 minutes it stays in the window
+    interval: 1m
+    input_series:
+      - series: 'knell_listener_accept_errors_total{job="knell", instance="knell:9190"}'
+        values: "0 0 1 1x30"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: KnellAcceptFailing
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: KnellAcceptFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: knell
+              instance: knell:9190
+            exp_annotations:
+              summary: "knell on knell:9190 cannot accept connections"
+              description: >
+                The listener failed to accept a connection, so pings stop
+                landing while the process stays up. Beats will report overdue
+                while this lasts. Check the container's file-descriptor limit
+                and the rate of incoming connections.
+      - eval_time: 20m
+        alertname: KnellAcceptFailing
+        exp_alerts: []
+
+  - name: a listener with no failures never pages
+    interval: 1m
+    input_series:
+      - series: 'knell_listener_accept_errors_total{job="knell", instance="knell:9190"}'
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KnellAcceptFailing
+        exp_alerts: []
+
+  - name: a failing scrape pages after 15 minutes
+    interval: 1m
+    input_series:
+      - series: 'up{job="knell", instance="knell:9190"}'
+        values: "1 0x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KnellTargetDown
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: KnellTargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: knell
+              instance: knell:9190
+            exp_annotations:
+              summary: "knell is not being scraped successfully"
+              description: >
+                No successful scrape of knell for 15m, so every beat it watches
+                is unmonitored. Check whether the container is running, the
+                port is right and the network reaches it.
+      - eval_time: 17m
+        alertname: KnellTargetAbsent
+        exp_alerts: []
+
+  - name: a target that is gone pages after 15 minutes
+    interval: 1m
+    input_series:
+      - series: 'up{job="other", instance="other:80"}'
+        values: "1x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: KnellTargetAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: knell
+            exp_annotations:
+              summary: "knell has no scrape target at all"
+              description: >
+                There is no up{job="knell"} series, so knell is no longer a
+                configured target and every other rule here is blind. Check
+                for a dropped scrape target or config, or a deleted pod or
+                ServiceMonitor.
+
+  - name: an overdue beat pages after 5 minutes
+    interval: 1m
+    input_series:
+      - series: 'knell_beat_fresh{job="knell", instance="knell:9190", beat="backup"}'
+        values: "1 0x10"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: KnellBeatOverdue
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: KnellBeatOverdue
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: knell
+              instance: knell:9190
+              beat: backup
+            exp_annotations:
+              summary: "beat backup is overdue on knell:9190"
+              description: >
+                In the healthy case this repeats knell's own Discord notice. It
+                exists for a wedged sender or a Discord outage, so route it to
+                a different receiver or drop it.
+
+  - name: each of the three notification legs pages on its own
+    interval: 1m
+    input_series:
+      - series: 'knell_notifications_failed_total{job="knell", instance="a", kind="missing"}'
+        values: "0 1 1x30"
+      - series: 'knell_notifications_dropped_total{job="knell", instance="b", kind="recovered"}'
+        values: "0 1 1x30"
+      - series: 'knell_outage_records_dropped_total{job="knell", instance="c", beat="backup"}'
+        values: "0 1 1x30"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: KnellNotifyFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: knell
+              instance: a
+              kind: missing
+            exp_annotations:
+              summary: "knell on a failed or dropped a notification"
+          - exp_labels:
+              severity: warning
+              job: knell
+              instance: b
+              kind: recovered
+            exp_annotations:
+              summary: "knell on b failed or dropped a notification"
+          - exp_labels:
+              severity: warning
+              job: knell
+              instance: c
+              beat: backup
+            exp_annotations:
+              summary: "knell on c failed or dropped a notification"
+      - eval_time: 20m
+        alertname: KnellNotifyFailing
+        exp_alerts: []
+
+  - name: two restarts inside the window page, one does not
+    interval: 1h
+    input_series:
+      - series: 'process_start_time_seconds{job="knell", instance="churn"}'
+        values: "100 100 3700 3700 7300 7300"
+      - series: 'process_start_time_seconds{job="knell", instance="calm"}'
+        values: "100 100 3700 3700 3700 3700"
+    alert_rule_test:
+      - eval_time: 5h
+        alertname: KnellRestartChurn
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: knell
+              instance: churn
+            exp_annotations:
+              summary: "knell on churn keeps restarting inside a beat deadline"
+
+  - name: the quorum rule pages when a second instance loses a beat, not the first
+    interval: 1m
+    input_series:
+      - series: 'knell_beat_fresh{job="knell", instance="a", beat="backup"}'
+        values: "1 0x20"
+      - series: 'knell_beat_fresh{job="knell", instance="b", beat="backup"}'
+        values: "1x10 0x10"
+      - series: 'knell_beat_fresh{job="knell", instance="c", beat="backup"}'
+        values: "1x20"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: KnellBeatQuorumLow
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: KnellBeatQuorumLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              beat: backup
+            exp_annotations:
+              summary: "fewer than 2 knell instances see beat backup on time"
+
+  - name: the quorum rule counts a stopped instance as not seeing the beat
+    interval: 1m
+    input_series:
+      - series: 'knell_beat_fresh{job="knell", instance="a", beat="backup"}'
+        values: "1x20"
+      - series: 'knell_beat_fresh{job="knell", instance="b", beat="backup"}'
+        values: "1x5 _x15"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: KnellBeatQuorumLow
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: KnellBeatQuorumLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              beat: backup
+            exp_annotations:
+              summary: "fewer than 2 knell instances see beat backup on time"

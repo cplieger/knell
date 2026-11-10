@@ -10,11 +10,10 @@ import (
 // TestDockerfile_bakes_tmp_marker_mode pins the /tmp mode bake the health
 // marker depends on. A plain COPY recreates the destination directory 0755, and
 // engines that replicate the IMAGE dir's mode onto a tmpfs mount (Docker 24 on
-// DSM) then leave /tmp unwritable for USER 65534: health enters degraded mode,
-// where Set is a no-op and the probe still exits 0, so the container reports
-// healthy with a dead marker channel. Nothing else catches a dropped --chmod -
-// the build succeeds and the image-smoke run mounts its own mode=1777 tmpfs -
-// so this assertion is the guard.
+// DSM) then leave /tmp unwritable for USER 65534: the marker is never written,
+// so /healthz and the healthcheck report a serving switch unhealthy. Nothing
+// else catches a dropped --chmod - the build succeeds and the image-smoke run
+// mounts its own mode=1777 tmpfs - so this assertion is the guard.
 func TestDockerfile_bakes_tmp_marker_mode(t *testing.T) {
 	t.Parallel()
 	b, err := os.ReadFile("Dockerfile")

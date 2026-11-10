@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -12,8 +12,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/cplieger/go/health"
 )
 
 // TestMain re-executes the test binary as knell itself when the re-exec
@@ -156,48 +154,71 @@ func startServingKnell(t *testing.T, env []string) *servingKnell {
 	return child
 }
 
-// TestHealthSubcommandReportsTheMarkerVerdictWithoutBooting pins the Docker
-// healthcheck contract: `knell health` stats the marker and exits with the
-// probe's verdict, and never falls through into the server.
-func TestHealthSubcommandReportsTheMarkerVerdictWithoutBooting(t *testing.T) {
-	t.Run("marker absent", func(t *testing.T) {
-		// Skip rather than assert on a marker this process could not clear: a
-		// failed remove would otherwise be reported as a probe that did not fail
-		// closed, sending the reader after a healthcheck bug that is not there.
-		if err := os.Remove(health.DefaultPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			t.Skipf("cannot clear the marker at %s: %v", health.DefaultPath, err)
-		}
-		code, out := runMain(t, nil, "health")
+// TestHealthSubcommandAsksTheListenerWithoutBooting pins the Docker
+// healthcheck contract: `knell health` GETs /healthz on LISTEN_ADDR's port, on
+// loopback or on the one address LISTEN_ADDR names (which a set ALLOWED_HOSTS
+// must then list when that address is neither loopback nor unspecified), exits
+// with that verdict, and never falls through into the server. A marker on disk
+// with nothing listening is unhealthy, because the check has to prove the
+// listener answers.
+func TestHealthSubcommandAsksTheListenerWithoutBooting(t *testing.T) {
+	t.Run("marker present, nothing listening", func(t *testing.T) {
+		plantHealthMarker(t)
+		code, out := runMain(t, []string{"LISTEN_ADDR=" + unusedLoopbackAddr(t)}, "health")
 		if code != 1 {
-			t.Errorf("knell health without a marker = exit %d, want 1; the healthcheck must fail closed: %s", code, out)
+			t.Errorf("knell health with no listener = exit %d, want 1; a bound marker is not an answering listener: %s", code, out)
 		}
 		if strings.Contains(out, "listening") {
 			t.Errorf("knell health booted the server: %s", out)
 		}
 	})
 
-	t.Run("marker present", func(t *testing.T) {
-		plantHealthMarker(t)
-		code, out := runMain(t, nil, "health")
+	t.Run("serving knell", func(t *testing.T) {
+		addr := unusedLoopbackAddr(t)
+		startServingKnell(t, bootEnv("cli-health-probe:1m", addr))
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			t.Fatalf("split %q: %v", addr, err)
+		}
+		code, out := runMain(t, []string{"LISTEN_ADDR=:" + port}, "health")
 		if code != 0 {
-			t.Errorf("knell health with a marker = exit %d, want 0: %s", code, out)
+			t.Errorf("knell health against a serving knell = exit %d, want 0: %s", code, out)
 		}
 	})
 }
 
+// unusedLoopbackAddr reserves and releases a loopback port, for a child that
+// must be told its address before it binds.
+func unusedLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot reserve a port: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("releasing the reserved port: %v", err)
+	}
+	return addr
+}
+
 // TestUnknownSubcommandExitsTwoWithoutBooting pins that an unrecognized argv
 // is a usage error, not an accidental boot: a mistyped healthcheck command
-// must not start a second switch behind the same marker.
+// must not start a second switch behind the same marker. It exits through the
+// one exit line every other failure uses, which KnellExitedWithError reads.
 func TestUnknownSubcommandExitsTwoWithoutBooting(t *testing.T) {
 	code, out := runMain(t, nil, "serve")
 	if code != 2 {
 		t.Errorf("knell serve = exit %d, want 2: %s", code, out)
 	}
-	if !strings.Contains(out, `level=ERROR msg="unknown command"`) {
-		t.Errorf("output = %q, want the usage failure as a level-carrying STRUCTURED line: a mistyped container command crash-loops while publishing no metrics at all, so this line is the only trace of the cause, and a bare stderr print still contains the words while carrying no level for the Loki rules that match every other knell failure", out)
+	if !strings.Contains(out, `level=ERROR msg="knell exited with error"`) {
+		t.Errorf("output = %q, want the usage failure on the one exit line: a mistyped container command crash-loops while publishing no metrics at all, so this line is the only trace of the cause", out)
 	}
-	if !strings.Contains(out, "command=serve") {
-		t.Errorf("output = %q, want the rejected command carried as an attribute; without it the line says a command was unknown but not which one, and there is no metric to identify it from", out)
+	if strings.Contains(out, `msg="unknown command"`) {
+		t.Errorf("output = %q, want no second exit message beside the one exit line", out)
+	}
+	if !strings.Contains(out, `unknown command \"serve\"`) {
+		t.Errorf("output = %q, want the error to name the rejected command; there is no metric to identify it from", out)
 	}
 	if strings.Contains(out, "listening") {
 		t.Errorf("an unknown subcommand booted the server: %s", out)

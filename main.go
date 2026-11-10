@@ -47,32 +47,43 @@ const (
 var loadConfig = config.Load
 
 func main() {
-	// CLI liveness probe for the Docker healthcheck (scratch image: no shell,
-	// no curl). The marker is level-based boot state, so no freshness deadline.
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "health":
-			health.RunProbe(health.DefaultPath)
-		default:
-			// slog, not fmt: a level-less line matches none of the Loki rules.
-			slogx.Setup(slogx.Options{})
-			slog.Error("unknown command", "command", os.Args[1], "supported", "health")
-			os.Exit(2)
-		}
+	// The Docker healthcheck: the scratch image has no shell and no curl.
+	if len(os.Args) > 1 && os.Args[1] == "health" {
+		os.Exit(probeHealth(os.Stderr, config.ListenAddr(), healthProbeTimeout))
 	}
 
-	if err := run(); err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		slog.Error("knell exited with error", "error", err)
-		os.Exit(1)
+		os.Exit(exitCode(err))
 	}
 	// Logged before the drain, so a clean stop and a SIGKILLed one leave
 	// identical logs without this line.
 	slog.Info("stopped")
 }
 
+// healthProbeTimeout sits inside the Dockerfile's 5s HEALTHCHECK --timeout, so
+// a hung listener fails the check with a written reason instead of a kill.
+const healthProbeTimeout = 4 * time.Second
+
+// notServingReason is what /healthz reports while the marker is absent: from
+// the start of a shutdown, and always when /tmp is not writable.
+const notServingReason = "knell is not serving: it is shutting down, or cannot write its health marker in /tmp"
+
+// errUnknownCommand is the usage error main exits 2 for; every other failure
+// exits 1.
+var errUnknownCommand = errors.New("unknown command")
+
+func exitCode(err error) int {
+	if errors.Is(err, errUnknownCommand) {
+		return 2
+	}
+	return 1
+}
+
 // run wires the app and blocks until a shutdown signal or a serve error.
-// It returns nil on a clean signal-driven shutdown.
-func run() error {
+// It returns nil on a clean signal-driven shutdown. args are the command-line
+// arguments after the program name; any argument is an unknown command.
+func run(args []string) error {
 	// The boot-armed clock's baseline is process start: marker probing and
 	// mounted-secret reads delay the point watch.New is reached, and every
 	// beat's first deadline must count from here.
@@ -81,10 +92,12 @@ func run() error {
 	// Install the handler before config parsing so config warnings render
 	// through the configured handler; apply the parsed level after.
 	levelVar := slogx.Setup(slogx.Options{})
+	if len(args) > 0 {
+		return fmt.Errorf("%w %q: the only subcommand is health", errUnknownCommand, args[0])
+	}
 
-	// Clear any stale marker before the first exit path: config.Load fails
-	// fast, and a marker left on the tmpfs by the previous process would
-	// report a crash-looping container healthy for the whole restart loop.
+	// Clear any stale marker before the configuration gate, so a rejected boot
+	// does not leave the previous process's marker file.
 	marker := health.NewMarker(health.DefaultPath)
 	// Cleanup, not Set(false): Set treats the first call as a health
 	// transition and would WARN on every boot for a state that is only
@@ -110,7 +123,7 @@ func run() error {
 	// The watcher is the single owner of beat admission, so the endpoint holds
 	// no lifecycle state and no context of its own.
 	handler := webapi.New(watcher, webapi.Deps{
-		Healthz:        health.Handler(marker),
+		Healthz:        health.CheckHandler(health.Check{Signal: marker, Reason: notServingReason}),
 		BeatToken:      cfg.BeatToken,
 		Hosts:          cfg.AllowedHosts,
 		TrustedProxies: cfg.TrustedProxies,
@@ -122,6 +135,7 @@ func run() error {
 	if err != nil {
 		return classifyBindError(ctx, cfg.ListenAddr, err)
 	}
+	ln = countAcceptErrors(ln)
 	slog.Info("listening", "addr", ln.Addr().String())
 	marker.Set(true)
 

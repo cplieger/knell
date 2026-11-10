@@ -113,10 +113,10 @@ func plantHealthMarker(t *testing.T) {
 	t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
 }
 
-// TestRunClearsStaleHealthMarkerBeforeTheConfigGate pins the boot ordering a
-// crash-looping container depends on: the marker is cleared before the first
-// exit path, so a fail-fast config gate cannot leave the previous process's
-// marker on disk reporting the restart loop healthy. The case fails config
+// TestRunClearsStaleHealthMarkerBeforeTheConfigGate pins the boot ordering:
+// the marker is cleared before the first exit path, so the marker /healthz
+// reports is always one this boot wrote, and a fail-fast config gate cannot
+// leave the previous process's marker on disk. The case fails config
 // before run() reaches the listener bind, which is what makes run() reachable
 // from a test at all. The https-scheme rejection itself is pinned end to end
 // by TestRejectedConfigExitsOneWithoutLeakingTheWebhook (main_cli_test.go).
@@ -135,7 +135,7 @@ func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
 	// Plant the marker a previous run would have left behind.
 	plantHealthMarker(t)
 
-	err := run()
+	err := run(nil)
 	if err == nil {
 		t.Fatal("run() = nil, want a configuration error")
 	}
@@ -143,7 +143,7 @@ func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
 		t.Fatalf("run() = %v, want the configuration gate to reject the boot", err)
 	}
 	if _, statErr := os.Stat(health.DefaultPath); !errors.Is(statErr, fs.ErrNotExist) {
-		t.Errorf("marker %s after a rejected boot: stat = %v, want it gone; a stale marker reports a crash-looping container healthy",
+		t.Errorf("marker %s after a rejected boot: stat = %v, want it gone; a rejected boot must not leave the previous process's marker file",
 			health.DefaultPath, statErr)
 	}
 }
@@ -276,7 +276,7 @@ func TestRunEnforcesTheNodeNameCapNotifyOwns(t *testing.T) {
 	t.Setenv("NODE_NAME", strings.Repeat("n", notify.MaxNodeNameBytes+1))
 	capture.Default(t)
 
-	err = run()
+	err = run(nil)
 	if err == nil {
 		t.Fatal("run() = nil, want a NODE_NAME over notify's cap to fail the boot; a name past the cap renders notices over Discord's content limit, so the switch arms and every notice is refused")
 	}
@@ -300,7 +300,7 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	installRunEnv(t, "api:20m", occupied.Addr().String())
 	capture.Default(t)
 
-	err = run()
+	err = run(nil)
 	if err == nil {
 		t.Fatal("run() = nil, want a bind error; an address already in use must fail the boot instead of leaving the watcher alerting behind a listener nothing can reach")
 	}

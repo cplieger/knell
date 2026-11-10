@@ -104,7 +104,7 @@ type lifecycleRun struct {
 func startLifecycleRun(t *testing.T) *lifecycleRun {
 	t.Helper()
 	r := &lifecycleRun{done: make(chan error, 1)}
-	go func() { r.done <- run() }()
+	go func() { r.done <- run(nil) }()
 	t.Cleanup(func() {
 		if r.stopped {
 			return
@@ -196,14 +196,13 @@ func startHeldBeatRequest(t *testing.T, addr, beat string, contentLength int) (n
 }
 
 // TestRunTracksHealthMarkerAcrossServeAndDrain pins the full lifecycle of the
-// marker — the only thing the baked `knell health` probe looks at — including
-// the ordering the deferred marker.Cleanup hides: the marker becomes present
-// once the listener is serving (a dropped marker.Set(true) would leave the
-// container unhealthy forever while serving correctly), it becomes ABSENT
-// while run() is still draining a real in-flight /beat request (a deleted or
-// post-Shutdown marker.Set(false) would call a draining container healthy for
-// the whole stop window), and a SIGTERM returns run() with a nil error so the
-// container exits 0 instead of looking like a crash.
+// marker (the verdict /healthz reports to `knell health`), including its
+// ordering: the marker becomes present once the listener is serving (a dropped
+// marker.Set(true) would leave the container unhealthy forever while serving
+// correctly), it becomes ABSENT while run() is still draining a real in-flight
+// /beat request (a deleted or post-Shutdown marker.Set(false) would call a
+// draining container healthy for the whole stop window), and a SIGTERM returns
+// run() with a nil error so the container exits 0 instead of looking crashed.
 func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal, and the shared health-marker path.
@@ -862,7 +861,7 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 		t.Errorf("stop() called %d times, want exactly 1: an uncancelled watcher keeps alerting behind a server that stopped serving", stopCalls)
 	}
 	if marker.Healthy() {
-		t.Error("marker still healthy after the serve loop exited: the baked `knell health` probe would report a container with no listener as healthy")
+		t.Error("marker still healthy after the serve loop exited: /healthz would call a stopping process healthy")
 	}
 	if !rec.Contains("serve loop exited, tearing down") {
 		t.Errorf("messages = %v, want the non-graceful exit named; without it the watch loop's abandoned-delivery lines are read before anything says why", rec.Messages())
@@ -1093,8 +1092,8 @@ func TestClassifyAbandonedWatchLoopDeniesACleanExitOverAnAbandonedLoop(t *testin
 // bounding anything real -- and without WithSlogErrorLog net/http's own
 // connection-level lines -- above all "http: Accept error: ...; retrying", the
 // trace of an exhausted fd budget that stops every beat from being received --
-// fall back to the standard logger as unstructured, level-less text no
-// level-based rule can match.
+// fall back to the standard logger as unstructured, level-less text a person
+// cannot filter by level.
 //
 // The header assertion reads config.MaxRequestHeaderBytes rather than 8704: the
 // number is one decision made in one place (config derives it from the token
@@ -1148,7 +1147,7 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 		t.Errorf("MaxHeaderBytes = %d, want %d: the default is net/http's 1 MiB, so an unauthenticated caller can make this process read a megabyte of header per connection, and the BEAT_TOKEN maximum config enforces at startup stops bounding what a ping can actually carry", srv.MaxHeaderBytes, config.MaxRequestHeaderBytes)
 	}
 	if srv.ErrorLog == nil {
-		t.Fatal("ErrorLog is nil, so net/http's connection-level errors go to the standard logger: an accept failure -- a whole-service outage here -- arrives as an unstructured, level-less line no log rule matches")
+		t.Fatal("ErrorLog is nil, so net/http's connection-level errors go to the standard logger: an accept failure -- a whole-service outage here -- arrives as an unstructured, level-less line")
 	}
 
 	srv.ErrorLog.Print("http: Accept error: accept tcp [::]:9190: too many open files; retrying in 5ms")
@@ -1158,16 +1157,11 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 	}
 }
 
-// TestRunServesTheMarkerVerdictOnHealthz pins the composition root's wiring of
-// health.Handler(marker) into webapi.Deps.Healthz -- the HTTP liveness
-// endpoint the README documents and external monitoring probes. The webapi
-// tests inject staticHealthz, a fixed verdict, so they cannot catch a root that
-// wires the wrong handler here: with obs.Handler in that slot /healthz
-// answers 200 forever and an unhealthy switch is never reported, and with a nil
-// or absent route it answers 404/503 forever and a live switch is paged as
-// down. Removing the marker mid-run is what makes this a real oracle rather
-// than a 200 check: the endpoint has to FOLLOW the marker, which is what
-// Handler(marker) means.
+// TestRunServesTheMarkerVerdictOnHealthz pins the composition root's /healthz:
+// the fleet health body, following the marker. The webapi tests inject a fixed
+// verdict, so only this test sees the wiring: with obs.Handler in that slot
+// /healthz answers 200 forever, and an unwired route answers 404 forever.
+// Removing the marker mid-run proves the endpoint follows it.
 func TestRunServesTheMarkerVerdictOnHealthz(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal, and the shared health-marker path.
@@ -1179,19 +1173,16 @@ func TestRunServesTheMarkerVerdictOnHealthz(t *testing.T) {
 	r := startLifecycleRun(t)
 	waitForMarkerWithin(t, true, 10*time.Second)
 
-	if status, body := getHealthz(t, addr); status != http.StatusOK || !strings.Contains(body, `"status":"ok"`) {
-		t.Errorf("/healthz on a serving switch = %d %s, want 200 with the ok verdict; a root that wires the wrong handler here reports liveness that is not the marker's",
-			status, body)
+	if status, body := getHealthz(t, addr); status != http.StatusOK || body != `{"status":"ok"}`+"\n" {
+		t.Errorf("/healthz on a serving switch = %d %q, want 200 {\"status\":\"ok\"}", status, body)
 	}
 
-	// Drop the marker under the running server: Marker.Healthy stats the file
-	// per call, so a handler actually backed by it must now refuse.
 	if err := os.Remove(health.DefaultPath); err != nil {
 		t.Fatalf("removing the marker under the serving switch: %v", err)
 	}
-	if status, body := getHealthz(t, addr); status != http.StatusServiceUnavailable {
-		t.Errorf("/healthz with the marker gone = %d %s, want 503: an endpoint that keeps answering healthy without the marker cannot report an unhealthy switch at all",
-			status, body)
+	const want = `{"status":"unhealthy","reasons":["` + notServingReason + `"]}` + "\n"
+	if status, body := getHealthz(t, addr); status != http.StatusServiceUnavailable || body != want {
+		t.Errorf("/healthz with the marker gone = %d %q, want 503 %q", status, body, want)
 	}
 
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {

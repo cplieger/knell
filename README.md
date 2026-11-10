@@ -102,7 +102,7 @@ The image runs as the non-root user 65534 on `scratch`, and the webhook URL neve
 
 ## Troubleshooting
 
-The image has a built-in healthcheck, `knell health`, which reads a marker file the server writes once its listener is up and removes when it stops. `docker ps` shows `healthy` while knell is serving. An unhealthy container is running but not serving, as happens while knell shuts down. A restarting one has exited. In both cases `docker logs knell` shows why.
+The image checks itself with `knell health`, which asks `/healthz` over the container's loopback when the host part of `LISTEN_ADDR` is empty, `0.0.0.0` or `::` (the default `:9190`, `0.0.0.0:9190`, `[::]:9190`), and otherwise on the address it names, which `ALLOWED_HOSTS` must then list when it is set and that address is not loopback. `docker ps` shows `healthy` while knell is serving. An unhealthy container is running but not answering, as happens while knell shuts down. A restarting one has exited. In both cases `docker logs knell` shows why. An unhealthy knell notifies nobody, so a Docker-only user probes `/healthz` from outside. [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) shows how.
 
 - If the container restarts in a loop with `knell exited with error`, the `error` field names the setting knell refused.
 - If a ping is answered `401`, the `Authorization` header does not match `BEAT_TOKEN` exactly.
@@ -115,18 +115,18 @@ The image has a built-in healthcheck, `knell health`, which reads a marker file 
 
 ## Monitoring
 
-knell publishes Prometheus metrics on `/metrics` and writes logfmt logs to standard error. If `knell_outage_records_dropped_total` rises, an ended outage was lost before a notice could be built. Rebuild that window from `knell_beat_last_seen_timestamp_seconds`. Eight alert rules that watch knell itself ship in the [`alerts/`](alerts/) folder, with five PromQL rules in [`alerts/promql.yaml`](alerts/promql.yaml) and three LogQL rules in [`alerts/logql.yaml`](alerts/logql.yaml). [Monitoring and alerts](docs/monitoring.md) lists the metrics and rules and shows how to load them.
+knell publishes Prometheus metrics on `/metrics` and writes logfmt logs to standard error. Eight alert rules that watch knell ship in [`alerts/`](alerts/), six PromQL rules in `alerts/promql.yaml` and two LogQL rules in `alerts/logql.yaml` for the failures that leave no series. Load both. A Grafana dashboard of every beat, its deadline and the firing alerts ships as [`grafana-dashboard.json`](grafana-dashboard.json) and needs Grafana 13.2 or newer. The image has a Docker healthcheck, and [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) says what it proves and who is told. [Monitoring and alerts](docs/monitoring.md) lists the metrics and rules, and shows how to make knell watch your alert pipeline.
 
 ## Documentation
 
 - [Configuration](docs/configuration.md) lists every setting, its limits, secret files and what stops startup.
 - [How knell works](docs/how-it-works.md) explains deadlines, notices, retries and every answer a ping can get.
-- [Monitoring and alerts](docs/monitoring.md) lists the log lines, the metrics and the alert rules.
+- [Monitoring and alerts](docs/monitoring.md) lists the log lines, the metrics, the alert rules and the dashboard, and shows how to make knell watch your alert pipeline.
 - [Security](docs/hardening.md) covers exposure, reverse proxies and the hardened compose profile.
 
 ## Contributing
 
-Issues and pull requests are welcome. The [shared contributing rules](https://github.com/cplieger/.github/blob/main/CONTRIBUTING.md) apply.
+Issues and pull requests are welcome. The [shared contributing rules](https://github.com/cplieger/.github/blob/main/CONTRIBUTING.md) apply, and [CONTRIBUTING.md](CONTRIBUTING.md) adds the rules for the dashboard.
 
 ## Disclaimer
 
