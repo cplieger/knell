@@ -485,8 +485,8 @@ func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 	const secret = "verysecretchaintoken"
 	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
 
-	// Both POSITIONS, not both call sites: LogSafeError searches with errors.As
-	// rather than matching the top, which is what safeTransportError's loop rests on.
+	// Both POSITIONS, not both call sites: LogSafeError replaces a *url.Error
+	// wherever it sits in the chain, not only at the top.
 	for name, in := range map[string]error{
 		"bare url error":    &url.Error{Op: "Post", URL: rawURL, Err: context.Canceled},
 		"wrapped url error": fmt.Errorf("attempt 3 failed: %w", &url.Error{Op: "Post", URL: rawURL, Err: context.Canceled}),
@@ -525,17 +525,16 @@ func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 	}
 }
 
-// TestNestedURLErrorsAreFullyReducedBeforeClassification pins the loop in
-// safeTransportError that reduces until no *url.Error is left ANYWHERE in the
-// chain, not just at the top. httpclient.LogSafeError SEARCHES a chain with
-// errors.As and RETURNS what it finds, so one *url.Error still nested under
-// the cause lets it unwrap PAST transportError and render that error's own
-// text instead of knell's phrase — in post's returned error and in httpclient.Do's
-// per-attempt lines. net/http produces exactly this shape when a redirected
-// request fails: the *url.Error for the hop carries the *url.Error of the
-// inner request, whose cause is written from the response's Location header,
-// so the text that surfaces is remote-authored and can echo the webhook path
-// (which IS the credential).
+// TestNestedURLErrorsAreFullyReducedBeforeClassification pins that no
+// *url.Error is left ANYWHERE in the chain safeTransportError classifies, not
+// just at the top: one still nested under the cause would let
+// httpclient.LogSafeError unwrap PAST transportError and render that error's
+// own text instead of knell's phrase, in post's returned error and in
+// httpclient.Do's per-attempt lines. net/http produces exactly this shape when
+// a redirected request fails: the *url.Error for the hop carries the *url.Error
+// of the inner request, whose cause is written from the response's Location
+// header, so the text that surfaces is remote-authored and can echo the
+// webhook path (which IS the credential).
 func TestNestedURLErrorsAreFullyReducedBeforeClassification(t *testing.T) {
 	t.Parallel()
 

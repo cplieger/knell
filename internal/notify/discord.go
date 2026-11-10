@@ -15,7 +15,6 @@ import (
 	"maps"
 	"net"
 	"net/http"
-	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -413,22 +412,13 @@ func (d *Discord) post(ctx context.Context, label string, n *notice) error {
 }
 
 // safeTransportError reports a failed transport call in knell's own words.
-// httpclient.LogSafeError alone is not enough: two of net/http's causes are written
-// from the response's Location header, so a redirecting endpoint could put the
-// webhook path into the logs. The cause is classified, never rendered, and
-// reachable only through Unwrap.
+// httpclient.LogSafeError removes every *url.Error from the chain, but two of
+// net/http's causes are written from the response's Location header, so a
+// redirecting endpoint could still put the webhook path into the logs. The
+// reduced cause is classified, never rendered, and reachable only through
+// Unwrap.
 func safeTransportError(err error) error {
-	// Reduce until no *url.Error is left anywhere in the chain: LogSafeError
-	// returns what errors.As finds, so a nested one would unwrap past this
-	// wrapper otherwise. Bounded so a self-reducing value cannot spin forever.
-	const maxURLErrorDepth = 8
 	cause := httpclient.LogSafeError(err)
-	for range maxURLErrorDepth {
-		if _, ok := errors.AsType[*url.Error](cause); !ok {
-			break
-		}
-		cause = httpclient.LogSafeError(cause)
-	}
 	// net.OpError's Op is one of net's own fixed verbs, so it is safe to print;
 	// it distinguishes a stalled dial (egress/DNS) from a stalled read (host
 	// went quiet after accepting).
