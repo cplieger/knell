@@ -1,34 +1,60 @@
 package main
 
 import (
+	"net"
 	"os"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/cplieger/knell/internal/config"
 )
 
-// TestDockerfile_bakes_tmp_marker_mode pins the /tmp mode bake the health
-// marker depends on. A plain COPY recreates the destination directory 0755, and
-// engines that replicate the IMAGE dir's mode onto a tmpfs mount (Docker 24 on
-// DSM) then leave /tmp unwritable for USER 65534: the marker is never written,
-// so /healthz and the healthcheck report a serving switch unhealthy. Nothing
-// else catches a dropped --chmod - the build succeeds and the image-smoke run
-// mounts its own mode=1777 tmpfs - so this assertion is the guard.
-func TestDockerfile_bakes_tmp_marker_mode(t *testing.T) {
-	t.Parallel()
+// dockerfileInstructions returns the Dockerfile's instructions as fields, one
+// slice per line that starts an instruction.
+func dockerfileInstructions(t *testing.T) [][]string {
+	t.Helper()
 	b, err := os.ReadFile("Dockerfile")
 	if err != nil {
 		t.Fatalf("read Dockerfile: %v", err)
 	}
+	var out [][]string
 	for line := range strings.SplitSeq(string(b), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 0 || fields[0] != "COPY" || fields[len(fields)-1] != "/tmp" {
-			continue
+		if fields := strings.Fields(line); len(fields) > 0 && !strings.HasPrefix(fields[0], "#") {
+			out = append(out, fields)
 		}
-		if !slices.Contains(fields, "--chmod=1777") {
-			t.Fatalf("COPY into /tmp must bake mode 1777, got: %q", strings.TrimSpace(line))
-		}
-		return
 	}
-	t.Fatal("Dockerfile has no COPY instruction targeting /tmp: the health marker directory must be created with --chmod=1777")
+	return out
+}
+
+// TestDockerfileExposesTheDefaultListenPort pins EXPOSE to the port knell
+// binds when LISTEN_ADDR is unset, so `docker run -P` and tools that read the
+// image's ports find the listener.
+func TestDockerfileExposesTheDefaultListenPort(t *testing.T) {
+	t.Setenv("LISTEN_ADDR", "")
+	_, port, err := net.SplitHostPort(config.ListenAddr())
+	if err != nil {
+		t.Fatalf("default LISTEN_ADDR: %v", err)
+	}
+	for _, f := range dockerfileInstructions(t) {
+		if f[0] == "EXPOSE" {
+			if !slices.Contains(f[1:], port) {
+				t.Errorf("EXPOSE lists %v, want the default listen port %s", f[1:], port)
+			}
+			return
+		}
+	}
+	t.Errorf("Dockerfile has no EXPOSE, want EXPOSE %s", port)
+}
+
+// TestDockerfileShipsNoTmp pins that the image writes nothing to disk: the
+// health verdict is in memory, so a /tmp in the image would only invite a
+// tmpfs nobody needs.
+func TestDockerfileShipsNoTmp(t *testing.T) {
+	t.Parallel()
+	for _, f := range dockerfileInstructions(t) {
+		if f[0] == "COPY" && f[len(f)-1] == "/tmp" {
+			t.Errorf("Dockerfile copies a /tmp into the image: %q", strings.Join(f, " "))
+		}
+	}
 }

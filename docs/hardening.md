@@ -35,19 +35,17 @@ The webhook URL is a credential, because its path is the token Discord issued. k
 
 ## What the image contains
 
-The image is built on `scratch`. It holds the static knell binary, a CA certificate bundle for the HTTPS connection to Discord and an empty `/tmp` for the health marker. It also carries the license text of every bundled component under `/usr/share/licenses/`. It has no shell. knell runs as the numeric non-root user 65534 and writes only its health marker in `/tmp`.
+The image is built on `scratch`. It holds the static knell binary, and a CA certificate bundle for the HTTPS connection to Discord. It also carries the license text of every bundled component under `/usr/share/licenses/`. It has no shell. knell runs as the numeric non-root user 65534 and writes no file: its beats and its health verdict live in memory.
 
 ## Hardened compose profile
 
-Add these lines to the `knell` service to run it with a read-only root filesystem, no Linux capabilities and no privilege escalation. The `tmpfs` gives the health marker somewhere to live. Without it, `/healthz` and the healthcheck report knell unhealthy.
+Add these lines to the `knell` service to run it with a read-only root filesystem, no Linux capabilities and no privilege escalation. knell writes no file, so it needs no `tmpfs` or volume, and `/healthz` never depends on a writable folder.
 
 ```yaml
     read_only: true
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
 ```
 
 [The hardened example](https://github.com/cplieger/docs/blob/main/docs/hardening.md#the-hardened-example) runs knell with every setting, including secret files and resource limits.

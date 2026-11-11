@@ -88,16 +88,13 @@ func TestBeatFreshGaugeTracksOverdueAndRecovery(t *testing.T) {
 func TestBeatFreshGaugeAtConstructionMeasuresTheBootSilence(t *testing.T) {
 	t.Parallel()
 
-	// New publishes each beat's first freshness reading, and it must MEASURE
-	// now()-start rather than assume 0: main captures start at process entry,
-	// ahead of the marker probe and the mounted-secret reads, so wiring can
-	// reach New after a short deadline has already passed. A gauge that reports
-	// fresh in that window feeds a false vote into the quorum sum
-	// knell_beat_fresh exists to carry, and stays wrong until the first
-	// observeBeats one tick after Run starts. Every other construction in
-	// this package passes start == now, where a measured reading and a
-	// hardcoded 0 are indistinguishable.
-	//
+	// New must MEASURE now()-start for each beat's first freshness reading:
+	// main captures start before the config load, so New can run after a short
+	// deadline has passed, and a gauge reading fresh then feeds a false vote into
+	// the knell_beat_fresh quorum sum until the first observeBeats tick. Every
+	// other construction here passes start == now, where measuring and a
+	// hardcoded 0 look the same.
+
 	// Unique beat id: the metric registry is package-global, so a label value
 	// no other test uses keeps this test's series isolated under t.Parallel.
 	const id = "boot-silence-gauge-probe"
@@ -325,16 +322,12 @@ func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
 	}
 }
 
-// TestQueueFullLogsAreEmittedWithTheWatcherMutexReleased pins WHERE the two
-// queue-full lines are written, which the level and attribute assertions above
-// cannot see. slogx installs a synchronous stderr handler, so a record emitted
-// while w.mu is held blocks every other holder of that mutex — ping admission
-// (Beat), the freshness gauge the quorum rule reads (observeBeats) and the
-// pre-drain StopAccepting — for as long as a stalled container log driver holds
-// the write, while /healthz keeps passing off its marker file. Both lines were
-// emitted under the lock until this was fixed, and the content assertions above
-// stay green either way (the record is byte-identical from either position), so
-// this is the only guard against an inline that puts them back.
+// TestQueueFullLogsAreEmittedWithTheWatcherMutexReleased pins that the two
+// queue-full lines are written after w.mu is released. slogx's stderr handler
+// is synchronous, so a record written under the lock blocks Beat, observeBeats
+// and StopAccepting for as long as a stalled log driver holds the write, while
+// /healthz still passes. The record is the same from either position, so the
+// content assertions above cannot see this.
 func TestQueueFullLogsAreEmittedWithTheWatcherMutexReleased(t *testing.T) {
 	// Serial (no t.Parallel): swaps the process-global slog default.
 	const id = "missing-overflow-mutex-probe"

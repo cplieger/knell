@@ -156,8 +156,12 @@ tests:
     input_series:
       - series: 'process_start_time_seconds{job="knell", instance="churn"}'
         values: "100 100 3700 3700 7300 7300"
+      - series: 'knell_build_info{job="knell", instance="churn", version="v3.0.0"}'
+        values: "1x5"
       - series: 'process_start_time_seconds{job="knell", instance="calm"}'
         values: "100 100 3700 3700 3700 3700"
+      - series: 'knell_build_info{job="knell", instance="calm", version="v3.0.0"}'
+        values: "1x5"
     alert_rule_test:
       - eval_time: 5h
         alertname: KnellRestartChurn
@@ -168,6 +172,26 @@ tests:
               instance: churn
             exp_annotations:
               summary: "knell on churn keeps restarting inside a beat deadline"
+
+  - name: restart churn follows knell under any job name and ignores other targets
+    interval: 1h
+    input_series:
+      - series: 'process_start_time_seconds{job="switch", instance="renamed"}'
+        values: "100 100 3700 3700 7300 7300"
+      - series: 'knell_build_info{job="switch", instance="renamed", version="v3.0.0"}'
+        values: "1x5"
+      - series: 'process_start_time_seconds{job="node", instance="other"}'
+        values: "100 100 3700 3700 7300 7300"
+    alert_rule_test:
+      - eval_time: 5h
+        alertname: KnellRestartChurn
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: switch
+              instance: renamed
+            exp_annotations:
+              summary: "knell on renamed keeps restarting inside a beat deadline"
 
   - name: the quorum rule pages when a second instance loses a beat, not the first
     interval: 1m

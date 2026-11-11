@@ -10,27 +10,6 @@ import (
 	"time"
 )
 
-func TestHealthzURLTargetsLoopbackOnTheListenPort(t *testing.T) {
-	t.Parallel()
-	cases := map[string]string{
-		":9190":             "http://127.0.0.1:9190/healthz",
-		"0.0.0.0:9190":      "http://127.0.0.1:9190/healthz",
-		"[::]:9190":         "http://127.0.0.1:9190/healthz",
-		"127.0.0.1:8080":    "http://127.0.0.1:8080/healthz",
-		"192.0.2.10:9190":   "http://192.0.2.10:9190/healthz",
-		"[2001:db8::1]:900": "http://[2001:db8::1]:900/healthz",
-	}
-	for addr, want := range cases {
-		got, err := healthzURL(addr)
-		if err != nil || got != want {
-			t.Errorf("healthzURL(%q) = %q, %v; want %q", addr, got, err, want)
-		}
-	}
-	if _, err := healthzURL("9190"); err == nil {
-		t.Error("healthzURL(\"9190\") = nil error, want the malformed address refused")
-	}
-}
-
 // TestProbeHealthPassesOnlyAnAnsweringHealthyListener pins the image's
 // healthcheck verdict: 200 is healthy; a 503, a closed port, and a listener
 // that is bound but has stopped accepting are all unhealthy, the last because
@@ -62,6 +41,7 @@ func TestProbeHealthPassesOnlyAnAnsweringHealthyListener(t *testing.T) {
 		"unhealthy":                     {serving(http.StatusServiceUnavailable), 1},
 		"nothing listening":             {unusedLoopbackAddr(t), 1},
 		"bound but no longer accepting": {wedged.Addr().String(), 1},
+		"malformed LISTEN_ADDR":         {"9190", 1},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

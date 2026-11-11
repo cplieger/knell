@@ -1923,7 +1923,7 @@ func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
 		"interior space in path": {raw: "https://discord.example/api/webhooks/1/ab c", wantErr: "contains a space"},
 		// An authority made of nothing but a port has a NON-EMPTY url.Host
 		// (":443"), so a Host-based gate admits it: startup succeeds, the
-		// health marker goes ready, and every notice then fails as a transport
+		// health verdict turns healthy, and every notice then fails as a transport
 		// error for lack of any destination host. Hostname() is what tells the
 		// two apart.
 		"port-only authority": {raw: "https://:443/api/webhooks/1/abc", wantErr: "missing host"},

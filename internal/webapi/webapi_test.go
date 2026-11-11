@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -68,7 +69,7 @@ func newTestHandler(b *fakeBeater, token string) http.Handler {
 
 // newTestHandlerHealthz is newTestHandler with the liveness status under
 // test control, so a test can drive a FAILING probe: /healthz answers 503
-// whenever the liveness marker is absent (boot, or after the pre-drain flip).
+// whenever the health verdict is unhealthy (boot, or after the pre-drain flip).
 func newTestHandlerHealthz(b *fakeBeater, token string, healthzStatus int) http.Handler {
 	return New(b, Deps{Healthz: staticHealthz(healthzStatus), BeatToken: token})
 }
@@ -516,13 +517,9 @@ func TestMetricsExpositionGzip(t *testing.T) {
 }
 
 // TestProbePathAccessLogLevels pins the WithProbeLogLevel policy on knell's two
-// machine-probe endpoints. It carries forward the guard the former
-// WithSkipPaths("/healthz", "/metrics") existed for — routine probe traffic
-// must not pollute the log stream at the operating level, so no probe line may
-// land at Info — and adds the direction a skip list could not express: a probe
-// that FAILS has to be visible. /healthz and /metrics are the endpoints
-// carrying knell's quorum signal, so a scrape answering 4xx/5xx or a liveness
-// probe gone 503 must be greppable rather than silently dropped.
+// machine-probe endpoints: every request to them logs at Debug whatever its
+// status, so a standing 503 /healthz or a misaimed scraper never floods the
+// shipped stream, while every other path keeps its Info line.
 func TestProbePathAccessLogLevels(t *testing.T) {
 	tests := map[string]struct {
 		method        string
@@ -531,9 +528,6 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 		wantStatus    int
 		wantLevel     slog.Level
 	}{
-		// A liveness probe every 30s and a scrape every 15s are noise while
-		// they succeed: Debug keeps them out of the shipped stream but
-		// reachable under LOG_LEVEL=debug ("is the probe even arriving?").
 		"healthy healthz probe": {
 			method: http.MethodGet, path: "/healthz", healthzStatus: http.StatusOK,
 			wantStatus: http.StatusOK, wantLevel: slog.LevelDebug,
@@ -542,22 +536,17 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 			method: http.MethodGet, path: "/metrics", healthzStatus: http.StatusOK,
 			wantStatus: http.StatusOK, wantLevel: slog.LevelDebug,
 		},
-		// /healthz answers 503 whenever the liveness marker is absent.
-		// That is the failing dead-man-switch signal, at Error.
 		"failing healthz probe": {
 			method: http.MethodGet, path: "/healthz", healthzStatus: http.StatusServiceUnavailable,
-			wantStatus: http.StatusServiceUnavailable, wantLevel: slog.LevelError,
+			wantStatus: http.StatusServiceUnavailable, wantLevel: slog.LevelDebug,
 		},
-		// A prober or scraper aimed with the wrong method gets 405 from the
-		// mux: the "my scrape never lands" class, now at Warn instead of
-		// silence.
 		"wrong-method healthz probe": {
 			method: http.MethodPost, path: "/healthz", healthzStatus: http.StatusOK,
-			wantStatus: http.StatusMethodNotAllowed, wantLevel: slog.LevelWarn,
+			wantStatus: http.StatusMethodNotAllowed, wantLevel: slog.LevelDebug,
 		},
 		"wrong-method metrics scrape": {
 			method: http.MethodPost, path: "/metrics", healthzStatus: http.StatusOK,
-			wantStatus: http.StatusMethodNotAllowed, wantLevel: slog.LevelWarn,
+			wantStatus: http.StatusMethodNotAllowed, wantLevel: slog.LevelDebug,
 		},
 		// Everything off the probe list keeps the default Info access line.
 		"beat ping stays at info": {
@@ -595,8 +584,7 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 						lvl, got, want, tt.method, tt.path, tt.wantStatus)
 				}
 			}
-			// The line is only useful if it names what happened: an operator
-			// greps the Warn/Error probe line for its status.
+			// The line is only useful if it names what happened.
 			if !rec.HasAttr("http", "status", strconv.Itoa(tt.wantStatus)) {
 				t.Errorf("access line missing status=%d; records = %v", tt.wantStatus, rec.Records())
 			}
@@ -1998,6 +1986,7 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		path       string
 		method     string // empty = POST
 		remoteAddr string
+		localAddr  string // the listener address http.Server records; empty = none
 		wantStatus int
 		wantSeen   int
 	}{
@@ -2019,13 +2008,22 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		// request carries the attacker's hostname, and a remote client forging
 		// Host: 127.0.0.1 is not a loopback socket peer.
 		"loopback probe exempt": {host: "127.0.0.1:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
+		// LISTEN_ADDR=localhost:9190 makes the probe send Host localhost.
+		"localhost probe exempt": {host: "localhost:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
 		// When LISTEN_ADDR names one address that is neither loopback nor
-		// unspecified the probe asks that address, which the carve-out does not
-		// cover, so the docs tell the user to list it.
-		"single-address probe refused when unlisted": {host: "192.0.2.10:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", wantStatus: http.StatusForbidden},
-		"forged loopback host refused":               {host: "127.0.0.1:9190", path: "/beat/api", remoteAddr: "203.0.113.7:44444", wantStatus: http.StatusForbidden},
-		"malformed host cannot match":                {host: "knell.example:notaport", path: "/beat/api", wantStatus: http.StatusForbidden},
-		"bracketed hostname is refused":              {host: "[knell.example]", path: "/beat/api", wantStatus: http.StatusForbidden},
+		// unspecified, the probe connects from and to that address, so the
+		// carve-out admits a peer at the listener's own address whose Host is
+		// that address, without the address in ALLOWED_HOSTS.
+		"single-address probe exempt": {host: "192.0.2.10:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.10:9190", wantStatus: http.StatusOK},
+		// A peer that is not the listener's own address cannot borrow the
+		// carve-out by sending its own IP as Host.
+		"peer at another address refused": {host: "192.0.2.10:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.20:9190", wantStatus: http.StatusForbidden},
+		// A host-name LISTEN_ADDR makes the probe send that name as Host, and
+		// only an IP-literal Host is exempt, so the name must be listed.
+		"host-name probe refused when unlisted": {host: "knell.lan:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.10:9190", wantStatus: http.StatusForbidden},
+		"forged loopback host refused":          {host: "127.0.0.1:9190", path: "/beat/api", remoteAddr: "203.0.113.7:44444", wantStatus: http.StatusForbidden},
+		"malformed host cannot match":           {host: "knell.example:notaport", path: "/beat/api", wantStatus: http.StatusForbidden},
+		"bracketed hostname is refused":         {host: "[knell.example]", path: "/beat/api", wantStatus: http.StatusForbidden},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -2038,6 +2036,13 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 			req.Host = tt.host
 			if tt.remoteAddr != "" {
 				req.RemoteAddr = tt.remoteAddr
+			}
+			if tt.localAddr != "" {
+				local, err := net.ResolveTCPAddr("tcp", tt.localAddr)
+				if err != nil {
+					t.Fatalf("local address %q: %v", tt.localAddr, err)
+				}
+				req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey, local))
 			}
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)

@@ -156,17 +156,13 @@ func startServingKnell(t *testing.T, env []string) *servingKnell {
 
 // TestHealthSubcommandAsksTheListenerWithoutBooting pins the Docker
 // healthcheck contract: `knell health` GETs /healthz on LISTEN_ADDR's port, on
-// loopback or on the one address LISTEN_ADDR names (which a set ALLOWED_HOSTS
-// must then list when that address is neither loopback nor unspecified), exits
-// with that verdict, and never falls through into the server. A marker on disk
-// with nothing listening is unhealthy, because the check has to prove the
-// listener answers.
+// loopback or on the one address LISTEN_ADDR names, exits with that verdict,
+// and never falls through into the server.
 func TestHealthSubcommandAsksTheListenerWithoutBooting(t *testing.T) {
-	t.Run("marker present, nothing listening", func(t *testing.T) {
-		plantHealthMarker(t)
+	t.Run("nothing listening", func(t *testing.T) {
 		code, out := runMain(t, []string{"LISTEN_ADDR=" + unusedLoopbackAddr(t)}, "health")
 		if code != 1 {
-			t.Errorf("knell health with no listener = exit %d, want 1; a bound marker is not an answering listener: %s", code, out)
+			t.Errorf("knell health with no listener = exit %d, want 1: %s", code, out)
 		}
 		if strings.Contains(out, "listening") {
 			t.Errorf("knell health booted the server: %s", out)
@@ -204,7 +200,7 @@ func unusedLoopbackAddr(t *testing.T) string {
 
 // TestUnknownSubcommandExitsTwoWithoutBooting pins that an unrecognized argv
 // is a usage error, not an accidental boot: a mistyped healthcheck command
-// must not start a second switch behind the same marker. It exits through the
+// must not start a second switch on the same port. It exits through the
 // one exit line every other failure uses, which KnellExitedWithError reads.
 func TestUnknownSubcommandExitsTwoWithoutBooting(t *testing.T) {
 	code, out := runMain(t, nil, "serve")
