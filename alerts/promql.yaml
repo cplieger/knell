@@ -1,6 +1,7 @@
-# Recommended alert rules for knell, the PromQL half: five rules for a
-# Prometheus or Mimir ruler. The LogQL half is alerts/logql.yaml. Load each
-# file into its own ruler, because neither parses the other's expressions.
+# Recommended alert rules for knell, the PromQL half: six rules for
+# Prometheus, or any ruler that reads Prometheus rules, and one commented rule
+# for several instances. alerts/logql.yaml is complementary: load both, each
+# into its own ruler.
 #
 # These rules watch knell itself, so evaluate them from a second vantage point.
 # Every series they read is registered at startup and every counter starts at
@@ -48,6 +49,38 @@ groups:
           severity: warning
         annotations:
           summary: "beat {{ $labels.beat }} is overdue on {{ $labels.instance }}"
+          description: >
+            In the healthy case this repeats knell's own Discord notice. It
+            exists for a wedged sender or a Discord outage, so route it to a
+            different receiver or drop it.
+
+      # With several knell instances, use this rule in place of
+      # KnellBeatOverdue: it pages when fewer than 2 instances still see a beat
+      # on time. Set 2 to the number of instances you require. One instance can
+      # be down or overdue without a page only when you run more instances than
+      # that count.
+      # - alert: KnellBeatQuorumLow
+      #   expr: sum by (beat) (knell_beat_fresh) < 2
+      #   for: 5m
+      #   labels:
+      #     severity: warning
+      #   annotations:
+      #     summary: "fewer than 2 knell instances see beat {{ $labels.beat }} on time"
+
+      # Scrapes can keep landing between the listener's accept retries, so `up`
+      # can stay 1 while pings are refused. The counter sees every failure.
+      - alert: KnellAcceptFailing
+        expr: increase(knell_listener_accept_errors_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "knell on {{ $labels.instance }} cannot accept connections"
+          description: >
+            The listener failed to accept a connection, so pings stop landing
+            while the process stays up. Beats will report overdue while this
+            lasts. Check the container's file-descriptor limit and the rate of
+            incoming connections.
 
       # Three legs, three consequences. `failed` means the notice is late and
       # retried. Either `dropped` means nothing will arrive. A full queue
@@ -65,7 +98,9 @@ groups:
 
       # Set the window to your longest beat deadline (26h here).
       - alert: KnellRestartChurn
-        expr: changes(process_start_time_seconds{job="knell"}[26h]) > 1
+        expr: >
+          changes(process_start_time_seconds[26h]) > 1
+          and on (job, instance) knell_build_info
         for: 0m
         labels:
           severity: warning

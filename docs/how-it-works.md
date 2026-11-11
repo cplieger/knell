@@ -53,7 +53,7 @@ The webhook URL is treated as a credential. It never appears in a log line or an
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /beat/{id}` | Records a ping when it carries `Authorization: Bearer <BEAT_TOKEN>`, and answers `{"ok":true}` |
-| `GET /healthz` | Liveness, answers `{"status":"OK"}` |
+| `GET /healthz` | Liveness: `200 {"status":"ok"}` while the listener is up, `503 {"status":"unhealthy","reasons":[...]}` while knell shuts down. [Knowing the app is alive](monitoring.md#knowing-the-app-is-alive) has the details |
 | `GET /metrics` | Prometheus metrics |
 
 ### Answers a ping can get
@@ -81,8 +81,8 @@ Headers are limited the other way round, because knell must read them before it 
 
 ### Probe logging
 
-`/healthz` and `/metrics` are logged as machine probes. A successful probe or scrape is logged at `debug`, so set `LOG_LEVEL=debug` to confirm it reaches knell. An answered `4xx` is logged at `warn`, and an answered `5xx` at `error`. A scrape that never reaches knell produces no request log.
+`/healthz` and `/metrics` are logged as machine probes, at `debug` whatever the status, so set `LOG_LEVEL=debug` to confirm a probe or scrape reaches knell. knell logs `health state changed` once each time its health verdict changes, and a failed scrape shows as `up` 0 in Prometheus. A scrape that never reaches knell produces no request log.
 
 ## Several instances
 
-You can run knell on several hosts and point each sender at all of them. Each instance sends its own notices and publishes its own metrics. In your metrics stack, `sum by (beat) (knell_beat_fresh)` counts how many instances see each beat as on time. One instance going down then lowers the count instead of raising a false alarm.
+You can run knell on several hosts and point each sender at all of them. Each instance sends its own notices and publishes its own metrics. In your metrics stack, `sum by (beat) (knell_beat_fresh)` counts how many instances see each beat as on time. `KnellBeatQuorumLow`, commented in `alerts/promql.yaml`, alerts when that count falls below the number of instances you require. Run more instances than that number, and one instance going down or falling behind lowers the count without an alert.

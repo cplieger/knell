@@ -4,23 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
-	"github.com/cplieger/envx/v2"
-	"github.com/cplieger/health"
+	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/notify"
 	"github.com/cplieger/knell/internal/watch"
-	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/webhttp/v3"
 )
 
 // testWebhookSecret is the credential half of the webhook every boot test
@@ -81,73 +78,6 @@ func installRunEnv(t *testing.T, beats, addr string) {
 	t.Setenv("LISTEN_ADDR", addr)
 }
 
-// plantHealthMarker creates the marker a previous knell run would have left
-// behind, or skips the test when the fixed path cannot be planted.
-// O_EXCL|O_NOFOLLOW: health.DefaultPath is a fixed path in a world-writable
-// directory, so a plain os.WriteFile would follow a pre-planted symlink and
-// truncate its target as the test user. A marker left behind by an earlier
-// test (or by a knell running on this host) must not silently disable the
-// contract under test: drop it and retry with the same refusing flags, so a
-// symlink planted in the window is still refused.
-func plantHealthMarker(t *testing.T) {
-	t.Helper()
-	plant := func() (*os.File, error) {
-		return os.OpenFile(health.DefaultPath,
-			os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
-	}
-	f, plantErr := plant()
-	if errors.Is(plantErr, fs.ErrExist) {
-		if info, lerr := os.Lstat(health.DefaultPath); lerr == nil && info.Mode().IsRegular() {
-			if rerr := os.Remove(health.DefaultPath); rerr != nil {
-				t.Skipf("cannot clear a stale marker at %s: %v", health.DefaultPath, rerr)
-			}
-			f, plantErr = plant()
-		}
-	}
-	if plantErr != nil {
-		t.Skipf("cannot plant a health marker at %s: %v", health.DefaultPath, plantErr)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("closing planted marker: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
-}
-
-// TestRunClearsStaleHealthMarkerBeforeTheConfigGate pins the boot ordering a
-// crash-looping container depends on: the marker is cleared before the first
-// exit path, so a fail-fast config gate cannot leave the previous process's
-// marker on disk reporting the restart loop healthy. The case fails config
-// before run() reaches the listener bind, which is what makes run() reachable
-// from a test at all. The https-scheme rejection itself is pinned end to end
-// by TestRejectedConfigExitsOneWithoutLeakingTheWebhook (main_cli_test.go).
-func TestRunClearsStaleHealthMarkerBeforeTheConfigGate(t *testing.T) {
-	// Serial (no t.Parallel): t.Setenv, plus run() installs a
-	// process-global slog default of its own.
-	t.Setenv("BEATS", "api-without-a-deadline")
-	// Unset, not blanked: a present-but-empty _FILE variable now
-	// fails startup, and this only needs the ambient secret gone so
-	// it cannot satisfy the webhook gate.
-	unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
-	// Installs a fresh recorder and restores the previous default at
-	// test end; run() replaces the default with its own handler.
-	capture.Default(t)
-
-	// Plant the marker a previous run would have left behind.
-	plantHealthMarker(t)
-
-	err := run()
-	if err == nil {
-		t.Fatal("run() = nil, want a configuration error")
-	}
-	if !strings.Contains(err.Error(), "configuration") {
-		t.Fatalf("run() = %v, want the configuration gate to reject the boot", err)
-	}
-	if _, statErr := os.Stat(health.DefaultPath); !errors.Is(statErr, fs.ErrNotExist) {
-		t.Errorf("marker %s after a rejected boot: stat = %v, want it gone; a stale marker reports a crash-looping container healthy",
-			health.DefaultPath, statErr)
-	}
-}
-
 // TestWatchBeatsCarriesEveryFieldIntoTheStateMachine pins the one
 // translation main owns between parsed configuration and the state machine.
 // The watch tests build their own []watch.Beat and the config tests stop at
@@ -179,7 +109,7 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	// slog default to inspect the startup summary.
 	cfg := config.Config{
 		WebhookURL:    testWebhookURL,
-		WebhookSource: envx.SourceEnv,
+		WebhookSource: envx.SecretSourceEnv,
 		Node:          "node-1",
 		ListenAddr:    ":9190",
 		Beats:         []config.Beat{{ID: "api", Deadline: 20 * time.Minute}},
@@ -276,7 +206,7 @@ func TestRunEnforcesTheNodeNameCapNotifyOwns(t *testing.T) {
 	t.Setenv("NODE_NAME", strings.Repeat("n", notify.MaxNodeNameBytes+1))
 	capture.Default(t)
 
-	err = run()
+	err = run(nil)
 	if err == nil {
 		t.Fatal("run() = nil, want a NODE_NAME over notify's cap to fail the boot; a name past the cap renders notices over Discord's content limit, so the switch arms and every notice is refused")
 	}
@@ -290,7 +220,7 @@ func TestRunEnforcesTheNodeNameCapNotifyOwns(t *testing.T) {
 
 func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, plus run() installs a process-global
-	// slog default and touches the shared health-marker path.
+	// slog default.
 	occupied, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Skipf("cannot bind a probe listener: %v", err)
@@ -300,7 +230,7 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	installRunEnv(t, "api:20m", occupied.Addr().String())
 	capture.Default(t)
 
-	err = run()
+	err = run(nil)
 	if err == nil {
 		t.Fatal("run() = nil, want a bind error; an address already in use must fail the boot instead of leaving the watcher alerting behind a listener nothing can reach")
 	}
@@ -319,7 +249,7 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 // address that was never the problem. The inverse matters just as much: a real
 // port conflict must still surface, or knell idles as a dead switch behind a
 // listener nothing can reach — including when it coincides with a signal, which
-// is why the classification turns on webhttp.CausedByCancellation PROVING the
+// is why the classification turns on httpserver.CausedByCancellation PROVING the
 // error is the cancellation rather than on the context merely being cancelled.
 func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
@@ -365,7 +295,7 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 }
 
 // TestClassifyServeErrorNamesADrainThatOutlivedTheGrace pins the one ERROR
-// line a container emits when its drain runs out of budget. webhttp.Run wraps
+// line a container emits when its drain runs out of budget. httpserver.Run wraps
 // that outcome in ErrShutdownGraceExpired, which is the only thing that
 // identifies WHICH deadline expired; classifyServeError is what turns it into a
 // line naming the drain and the grace constant that bounds it. If the branch
@@ -378,9 +308,9 @@ func TestClassifyServeErrorNamesADrainThatOutlivedTheGrace(t *testing.T) {
 	t.Parallel()
 
 	serveFailure := errors.New("accept tcp [::]:9190: use of closed network connection")
-	// The shape webhttp.Run returns for a grace expiry: the origin sentinel
+	// The shape httpserver.Run returns for a grace expiry: the origin sentinel
 	// wrapping the deadline that produced it.
-	graceExpired := fmt.Errorf("%w: %w", webhttp.ErrShutdownGraceExpired, context.DeadlineExceeded)
+	graceExpired := fmt.Errorf("%w: %w", httpserver.ErrShutdownGraceExpired, context.DeadlineExceeded)
 	tests := map[string]struct {
 		in        error
 		wantNamed bool
@@ -399,7 +329,7 @@ func TestClassifyServeErrorNamesADrainThatOutlivedTheGrace(t *testing.T) {
 			got := classifyServeError(tt.in)
 			if !tt.wantNamed {
 				if got != tt.in {
-					t.Errorf("classifyServeError(%v) = %v, want it returned unchanged: only a webhttp-reported grace expiry may be renamed, or an accept failure or a caller's own deadline is reported as a shutdown that never happened", tt.in, got)
+					t.Errorf("classifyServeError(%v) = %v, want it returned unchanged: only an httpserver-reported grace expiry may be renamed, or an accept failure or a caller's own deadline is reported as a shutdown that never happened", tt.in, got)
 				}
 				return
 			}
@@ -409,7 +339,7 @@ func TestClassifyServeErrorNamesADrainThatOutlivedTheGrace(t *testing.T) {
 			if !errors.Is(got, context.DeadlineExceeded) {
 				t.Errorf("classifyServeError(%v) = %v, want the deadline still unwrappable", tt.in, got)
 			}
-			if !errors.Is(got, webhttp.ErrShutdownGraceExpired) {
+			if !errors.Is(got, httpserver.ErrShutdownGraceExpired) {
 				t.Errorf("classifyServeError(%v) = %v, want the grace-expiry origin still unwrappable", tt.in, got)
 			}
 			if !strings.Contains(got.Error(), "shutdown grace") {

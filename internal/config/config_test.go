@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/envx/v2"
+	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/notify"
-	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/webhttp/v3"
 )
 
 // maxNodeNameBytes is the NODE_NAME bound the composition root passes to Load
@@ -390,7 +390,7 @@ func TestLoadRejectsPlainHTTPWebhook(t *testing.T) {
 		t.Errorf("error = %q, want DISCORD_WEBHOOK_URL context", err)
 	}
 	// The mirror of the file-borne case below: the channel clause fires only on
-	// envx.SourceFile, so a plain-variable refusal must not send the operator to
+	// envx.SecretSourceFile, so a plain-variable refusal must not send the operator to
 	// a mount they never configured.
 	if strings.Contains(err.Error(), "came from DISCORD_WEBHOOK_URL_FILE") {
 		t.Errorf("error = %q blames DISCORD_WEBHOOK_URL_FILE for a value the plain variable supplied", err)
@@ -683,7 +683,7 @@ func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 		wantErr bool
 		check   func(t *testing.T, cfg Config)
 	}{
-		// envx reports SourceFile together with its error on a failed file read,
+		// envx reports SecretSourceFile together with its error on a failed file read,
 		// so a call made before the loader's error gate warns "the file wins and
 		// the plain variable is ignored" on a startup that is aborting because the
 		// file supplied nothing. Both loaders are pinned because they are
@@ -783,7 +783,7 @@ func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 			},
 		},
 		// The ordinary plain-variable-only deployment, which no other row reaches:
-		// src is not envx.SourceFile, so dropping the src check tells that operator,
+		// src is not envx.SecretSourceFile, so dropping the src check tells that operator,
 		// on every startup, to unset the variable that is actually supplying the
 		// credential — advice that leaves /beat/{id} ungated and the next start
 		// failing on a missing credential entirely.
@@ -904,10 +904,10 @@ func TestAllowedHostsGate(t *testing.T) {
 		"all entries unusable refuses": {set: true, raw: ":9190", wantErr: ":9190"},
 		// A PADDED blank is the same compose accident as the empty one above
 		// (ALLOWED_HOSTS="${HOSTS} " with HOSTS undefined), and which of the two
-		// outcomes it lands on is decided inside webhttp, not here: if
+		// outcomes it lands on is decided inside httpserver, not here: if
 		// ParseHostList ever stopped trimming an entry, "   " would become a
 		// non-blank unusable entry and startup would refuse instead of accepting
-		// every Host. Pinned so a webhttp bump has to fail here rather than in
+		// every Host. Pinned so a httpserver bump has to fail here rather than in
 		// production.
 		"padded blank never engages": {set: true, raw: "   ", wantActive: false},
 	}
@@ -950,7 +950,7 @@ func TestAllowedHostsGate(t *testing.T) {
 
 // TestLoadTrustedProxiesDegradesRestrictively pins the TRUSTED_PROXIES contract
 // through Load, so a Load that stops assigning the field fails too. Unset, blank
-// and all-entries-invalid each yield an EMPTY set, so webhttp.WithClientIP gets
+// and all-entries-invalid each yield an EMPTY set, so httpserver.WithClientIP gets
 // no proxies and client_ip stays on the socket peer. A malformed entry is warned
 // about and DROPPED rather than failing startup, legal only because dropping one
 // NARROWS whose X-Forwarded-For is believed; a fallback that trusted everything
@@ -989,7 +989,7 @@ func TestLoadTrustedProxiesDegradesRestrictively(t *testing.T) {
 				t.Fatalf("Load() with TRUSTED_PROXIES=%q error = %v, want nil: a malformed restriction list degrades, it does not refuse startup", tt.raw, err)
 			}
 			if len(cfg.TrustedProxies) != tt.wantCount {
-				t.Errorf("cfg.TrustedProxies holds %d ranges %v, want %d: webapi spreads this field into webhttp.WithClientIP, so a range lost here is a proxy whose X-Forwarded-For stops being believed, and one gained is a caller that can choose the client_ip knell attributes its 401s to", len(cfg.TrustedProxies), cfg.TrustedProxies, tt.wantCount)
+				t.Errorf("cfg.TrustedProxies holds %d ranges %v, want %d: webapi spreads this field into httpserver.WithClientIP, so a range lost here is a proxy whose X-Forwarded-For stops being believed, and one gained is a caller that can choose the client_ip knell attributes its 401s to", len(cfg.TrustedProxies), cfg.TrustedProxies, tt.wantCount)
 			}
 			if tt.wantDropped == "" {
 				if rec.Contains("TRUSTED_PROXIES") {
@@ -1013,7 +1013,7 @@ func TestLoadTrustedProxiesDegradesRestrictively(t *testing.T) {
 // (internal/webapi's HostPolicyOptions, passed by the composition root). Every
 // other Load call in this suite passes none, webapi's tests build the policy
 // from HostPolicyOptions directly, and the lifecycle test's host_not_allowed
-// assertion matches webhttp's DEFAULT code — so without this, a Load that
+// assertion matches httpserver's DEFAULT code — so without this, a Load that
 // forwards nothing keeps the whole suite green while the shipped allowlist 403s
 // the in-container `curl http://127.0.0.1:9190/healthz` the README promises
 // keeps working.
@@ -1031,7 +1031,7 @@ func TestLoadThreadsTheHostPolicyOptionsThrough(t *testing.T) {
 		return r
 	}
 
-	exempt, err := Load(maxNodeNameBytes, webhttp.WithLoopbackExempt(true))
+	exempt, err := Load(maxNodeNameBytes, httpserver.WithLoopbackExempt(true))
 	if err != nil {
 		t.Fatalf("Load() with the loopback exemption: %v", err)
 	}
@@ -1044,7 +1044,7 @@ func TestLoadThreadsTheHostPolicyOptionsThrough(t *testing.T) {
 		t.Fatalf("Load() with no options: %v", err)
 	}
 	if bare.AllowedHosts.Allows(loopback()) {
-		t.Error("the same request is admitted with NO options passed, so the assertion above pins webhttp's default rather than the parameter Load forwards; pick an option whose effect the default does not already give")
+		t.Error("the same request is admitted with NO options passed, so the assertion above pins httpserver's default rather than the parameter Load forwards; pick an option whose effect the default does not already give")
 	}
 }
 
@@ -1207,7 +1207,7 @@ func TestLoadRejectsAPaddedPlainBeatToken(t *testing.T) {
 				t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which variable to fix", err)
 			}
 			// The mirror of the file-borne case: the clause fires only on
-			// envx.SourceFile, so a plain-variable refusal must not send the
+			// envx.SecretSourceFile, so a plain-variable refusal must not send the
 			// operator to a mount they never configured.
 			if strings.Contains(err.Error(), "came from BEAT_TOKEN_FILE") {
 				t.Errorf("error = %q blames BEAT_TOKEN_FILE for a value the plain variable supplied", err)
@@ -1679,11 +1679,11 @@ func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 	)
 	cfg := Config{
 		WebhookURL:      secretHook,
-		WebhookSource:   envx.SourceEnv,
+		WebhookSource:   envx.SecretSourceEnv,
 		Node:            "node-a",
 		ListenAddr:      ":9190",
 		BeatToken:       secretToken,
-		BeatTokenSource: envx.SourceFile,
+		BeatTokenSource: envx.SecretSourceFile,
 		Beats:           []Beat{{ID: "api", Deadline: time.Hour}},
 		LogLevel:        slog.LevelInfo,
 	}
@@ -1697,11 +1697,11 @@ func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 			t.Errorf("LogValue attr %s = %q carries a secret verbatim: logging a Config would publish the Discord credential and the /beat/{id} gate into the log store", key, value)
 		}
 	}
-	if got["webhook"] != string(envx.SourceEnv) {
-		t.Errorf("webhook = %q, want %q: the attr reports the channel that supplied the credential, never the credential", got["webhook"], envx.SourceEnv)
+	if got["webhook"] != string(envx.SecretSourceEnv) {
+		t.Errorf("webhook = %q, want %q: the attr reports the channel that supplied the credential, never the credential", got["webhook"], envx.SecretSourceEnv)
 	}
-	if got["beat_token"] != string(envx.SourceFile) {
-		t.Errorf("beat_token = %q, want %q: the attr reports the channel that supplied the token, never the token", got["beat_token"], envx.SourceFile)
+	if got["beat_token"] != string(envx.SecretSourceFile) {
+		t.Errorf("beat_token = %q, want %q: the attr reports the channel that supplied the token, never the token", got["beat_token"], envx.SecretSourceFile)
 	}
 	if _, reported := got["beat_auth"]; reported {
 		t.Errorf("LogValue renders beat_auth = %q; the token is required, so a presence attr can only ever say \"required\" and reports no state — its CHANNEL is the state, and beat_token publishes that", got["beat_auth"])
@@ -1736,19 +1736,19 @@ func TestConfigLogValueReportsEachCredentialSource(t *testing.T) {
 	}{
 		"the plain webhook variable leaves the credential in the environment": {
 			key: "DISCORD_WEBHOOK_URL", value: url, attr: "webhook",
-			field: func(cfg Config) string { return cfg.WebhookURL }, want: envx.SourceEnv,
+			field: func(cfg Config) string { return cfg.WebhookURL }, want: envx.SecretSourceEnv,
 		},
 		"the webhook _FILE companion keeps it out of the environment": {
 			key: "DISCORD_WEBHOOK_URL", value: url, file: true, attr: "webhook",
-			field: func(cfg Config) string { return cfg.WebhookURL }, want: envx.SourceFile,
+			field: func(cfg Config) string { return cfg.WebhookURL }, want: envx.SecretSourceFile,
 		},
 		"the plain token variable leaves the token in the environment": {
 			key: "BEAT_TOKEN", value: token, attr: "beat_token",
-			field: func(cfg Config) string { return cfg.BeatToken }, want: envx.SourceEnv,
+			field: func(cfg Config) string { return cfg.BeatToken }, want: envx.SecretSourceEnv,
 		},
 		"the token _FILE companion keeps it out of the environment": {
 			key: "BEAT_TOKEN", value: token, file: true, attr: "beat_token",
-			field: func(cfg Config) string { return cfg.BeatToken }, want: envx.SourceFile,
+			field: func(cfg Config) string { return cfg.BeatToken }, want: envx.SecretSourceFile,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1802,11 +1802,11 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 	// Two entries, so allowed_hosts pins the SIZE rather than merely "active":
 	// an allowlist state rendered from the wrong side of the policy (a hardcoded
 	// 1, or Active() read as the count) still reads plausible in a log line.
-	policy, invalid := webhttp.ParseHostList([]string{"knell.internal", "10.0.0.5"})
+	policy, invalid := httpserver.ParseHostList([]string{"knell.internal", "10.0.0.5"})
 	if len(invalid) > 0 {
 		t.Fatalf("ParseHostList rejected %v; the fixture must be a valid allowlist", invalid)
 	}
-	proxies, invalidCIDRs := webhttp.ParseCIDRs([]string{"10.0.0.0/24", "192.168.1.5"})
+	proxies, invalidCIDRs := httpserver.ParseCIDRs([]string{"10.0.0.0/24", "192.168.1.5"})
 	if len(invalidCIDRs) > 0 {
 		t.Fatalf("ParseCIDRs rejected %v; the fixture must be a valid trusted-proxy set", invalidCIDRs)
 	}
@@ -1818,7 +1818,7 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		// would assert nothing, and 1 cannot be told apart from a boolean.
 		TrustedProxies: proxies,
 		WebhookURL:     "https://discord.example/hook",
-		WebhookSource:  envx.SourceFile,
+		WebhookSource:  envx.SecretSourceFile,
 		Node:           "observer-1",
 		ListenAddr:     "127.0.0.1:19190",
 		BeatToken:      "unit-test-beat-token",
@@ -1826,7 +1826,7 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		// attrs are the only pair in this fixture that share a value domain, so
 		// an attr wired to the wrong source field would otherwise render exactly
 		// what the right one does and pass.
-		BeatTokenSource: envx.SourceEnv,
+		BeatTokenSource: envx.SecretSourceEnv,
 		Beats: []Beat{
 			{ID: "watchdog-mimir", Deadline: 20 * time.Minute},
 			{ID: "watchdog-loki", Deadline: 26 * time.Hour},
@@ -1844,7 +1844,7 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		"beats":       "2",
 		"node":        "observer-1",
 		"listen_addr": "127.0.0.1:19190",
-		// The rendered WORD, not string(envx.SourceFile): restating the constant
+		// The rendered WORD, not string(envx.SecretSourceFile): restating the constant
 		// would assert nothing about what an operator reads, and this attr's
 		// whole job is to name a channel legibly in the startup line.
 		"webhook": "file",
@@ -1878,12 +1878,12 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 func TestConfigLogValueReportsTheHostAllowlistState(t *testing.T) {
 	t.Parallel()
 
-	blank, invalid := webhttp.ParseHostList([]string{""})
+	blank, invalid := httpserver.ParseHostList([]string{""})
 	if len(invalid) > 0 {
 		t.Fatalf("ParseHostList rejected blank input: %v", invalid)
 	}
 
-	for name, policy := range map[string]*webhttp.HostPolicy{
+	for name, policy := range map[string]*httpserver.HostPolicy{
 		"unset leaves every Host accepted":   nil,
 		"blank value never engages the gate": blank,
 	} {
@@ -1923,7 +1923,7 @@ func TestParseWebhookURLRejectsUndeliverableShapes(t *testing.T) {
 		"interior space in path": {raw: "https://discord.example/api/webhooks/1/ab c", wantErr: "contains a space"},
 		// An authority made of nothing but a port has a NON-EMPTY url.Host
 		// (":443"), so a Host-based gate admits it: startup succeeds, the
-		// health marker goes ready, and every notice then fails as a transport
+		// health verdict turns healthy, and every notice then fails as a transport
 		// error for lack of any destination host. Hostname() is what tells the
 		// two apart.
 		"port-only authority": {raw: "https://:443/api/webhooks/1/abc", wantErr: "missing host"},

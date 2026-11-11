@@ -9,10 +9,10 @@
 //
 // Notifications are split by whether the incident is still open: a live outage
 // gets the present-tense notices, while outages already over are reported once as
-// history, each carrying whether its own delivery was refused. Every log line reporting a
-// delivery failure or an abandoned notice carries a retryable attribute -- the
-// LEVEL is deliberately not that signal -- so a log rule can tell "wait for it"
-// from "reconstruct the window".
+// history, each carrying whether its own delivery was refused. Every line reporting a
+// delivery failure or an abandoned notice carries a retryable attribute, which tells
+// the reader whether anything will retry it ("wait") or not ("reconstruct the
+// window"), not the level; KnellNoticeLostForGood reads it (alert_contract_test.go).
 package watch
 
 import (
@@ -538,7 +538,7 @@ func (w *Watcher) Beat(id string) BeatOutcome {
 // between its admission check and its state change: that ordering is what makes
 // logUndelivered's tally complete rather than merely narrow. It is exported
 // because the shutdown SEQUENCE is the composition root's: main closes admission
-// from webhttp's pre-drain hook, before the HTTP drain. Run calls it too, and a
+// from httpserver's pre-drain hook, before the HTTP drain. Run calls it too, and a
 // second call is a no-op because it assigns a state rather than transitioning one.
 func (w *Watcher) StopAccepting() {
 	w.mu.Lock()

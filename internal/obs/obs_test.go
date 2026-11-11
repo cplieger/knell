@@ -118,6 +118,43 @@ func TestRecordPreRouteRefusalMovesOnlyItsOwnReason(t *testing.T) {
 	}
 }
 
+// acceptErrorsColdStartSeen records that the process-global accept counter
+// was already observed, since an unlabeled counter cannot be rewound to the
+// cold-start zero for `go test -count=2`.
+var acceptErrorsColdStartSeen bool
+
+// TestListenerAcceptErrorsIsBornAtZeroAndCountsEachFailure pins the series
+// KnellAcceptFailing reads: present at zero before the first failure, so
+// increase() sees that failure, and one step per recorded failure.
+func TestListenerAcceptErrorsIsBornAtZeroAndCountsEachFailure(t *testing.T) {
+	const series = "knell_listener_accept_errors_total "
+	if !acceptErrorsColdStartSeen {
+		acceptErrorsColdStartSeen = true
+		assertExpositionLines(t, []string{"knell_listener_accept_errors_total 0"}, "at cold start")
+	}
+	before := acceptErrorsValue(t, series)
+
+	RecordAcceptError()
+	RecordAcceptError()
+
+	if got := acceptErrorsValue(t, series); got-before != 2 {
+		t.Errorf("knell_listener_accept_errors_total moved by %v after two failures, want 2", got-before)
+	}
+}
+
+func acceptErrorsValue(t *testing.T, series string) float64 {
+	t.Helper()
+	rendered, ok := rawSeriesValue(t, series)
+	if !ok {
+		t.Fatalf("%s is absent: increase() would miss the first accept failure", strings.TrimSpace(series))
+	}
+	value, err := strconv.ParseFloat(rendered, 64)
+	if err != nil {
+		t.Fatalf("parsing the %s sample %q: %v", strings.TrimSpace(series), rendered, err)
+	}
+	return value
+}
+
 // refusalReasonValues reads every refusal reason's current sample, so a test can
 // assert that one reason moved and the others did not.
 func refusalReasonValues(t *testing.T) map[Refusal]float64 {
@@ -401,4 +438,12 @@ func rawSeriesValue(t *testing.T, prefix string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// TestSetBuildInfoServesTheVersionAtOne pins the build_info pattern a rule
+// joins on: one series whose version label is the build's version, set to 1.
+func TestSetBuildInfoServesTheVersionAtOne(t *testing.T) {
+	SetBuildInfo("v9.8.7-dev.6")
+	t.Cleanup(func() { buildInfo.Delete("v9.8.7-dev.6") })
+	assertExpositionLines(t, []string{`knell_build_info{version="v9.8.7-dev.6"} 1`}, "after SetBuildInfo")
 }

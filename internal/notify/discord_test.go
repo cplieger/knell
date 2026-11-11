@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v5"
+	"github.com/cplieger/go/httpclient"
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/watch"
-	"github.com/cplieger/slogx/capture"
 )
 
 // webhookRecorder captures posted payloads and serves scripted status codes.
@@ -59,7 +59,7 @@ func (rec *webhookRecorder) handler(t *testing.T) http.HandlerFunc {
 }
 
 // newTestNotifier builds a notifier whose connection pool is its own.
-// httpx.NewClient leaves Transport nil, so every notifier here would otherwise
+// httpclient.New leaves Transport nil, so every notifier here would otherwise
 // share http.DefaultTransport's process-wide idle pool, and two mechanisms then
 // make one test fail because of another: Close calls CloseIdleConnections on
 // that shared transport, closing every other notifier's idle connections, and a
@@ -76,7 +76,7 @@ func newTestNotifier(t *testing.T, webhookURL, node string) *Discord {
 
 // captureDeliveryLogs captures slog.Default()'s records for the duration of
 // the test and restores the previous default afterwards, so a test can assert
-// on httpx.Do's per-attempt and exhausted lines. Records are asserted at the
+// on httpclient.Do's per-attempt and exhausted lines. Records are asserted at the
 // record level (message and raw attribute values) rather than through a
 // handler's rendered text, so an assertion does not depend on a rendering step
 // production may not use. slog.Default() is process-global, so a caller must
@@ -86,16 +86,16 @@ func captureDeliveryLogs(t *testing.T) *capture.Recorder {
 	return capture.Default(t)
 }
 
-// requireLogged fails the test when httpx.Do's delivery lines are absent: every
+// requireLogged fails the test when httpclient.Do's delivery lines are absent: every
 // absence assertion against the log surface is vacuous if the records it scans
 // were never emitted.
 func requireLogged(t *testing.T, rec *capture.Recorder) {
 	t.Helper()
-	// Both of httpx.Do's lines, not just "something logged": the per-attempt
+	// Both of httpclient.Do's lines, not just "something logged": the per-attempt
 	// retry line and the exhausted line are the surface these leak assertions
 	// scan, so a run that emitted neither would satisfy them vacuously.
 	if rec.Count("failed, retrying") == 0 || rec.Count("retries exhausted") == 0 {
-		t.Fatalf("delivery logs missing httpx's retry/exhausted lines, the leak assertion would be vacuous; records = %v", rec.Records())
+		t.Fatalf("delivery logs missing httpclient's retry/exhausted lines, the leak assertion would be vacuous; records = %v", rec.Records())
 	}
 }
 
@@ -381,21 +381,26 @@ func TestBeatOutageHistoryStatesTheTrueReasonForALateNotice(t *testing.T) {
 func TestTransientFailureRetries(t *testing.T) {
 	t.Parallel()
 
-	// 503 is in httpx's transient set (502/503/504), so it retries within
-	// the call. A plain 500 is deliberately terminal here: the watch sweep
-	// retries the whole notification 15s later, which covers it.
-	rec := newWebhookRecorder(http.StatusServiceUnavailable, http.StatusNoContent)
-	srv := httptest.NewServer(rec.handler(t))
-	defer srv.Close()
+	// The gateway answers (502, 503, 504) retry within the call, like an
+	// attempt timeout.
+	for _, code := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			t.Parallel()
 
-	d := newTestNotifier(t, srv.URL, "node-1")
-	defer d.Close()
+			rec := newWebhookRecorder(code, http.StatusNoContent)
+			srv := httptest.NewServer(rec.handler(t))
+			defer srv.Close()
 
-	if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
-		t.Fatalf("BeatMissing after retry: %v", err)
-	}
-	if got := rec.hits.Load(); got != 2 {
-		t.Errorf("attempts = %d, want 2", got)
+			d := newTestNotifier(t, srv.URL, "node-1")
+			defer d.Close()
+
+			if err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour)); err != nil {
+				t.Fatalf("BeatMissing after retry: %v", err)
+			}
+			if got := rec.hits.Load(); got != 2 {
+				t.Errorf("attempts = %d, want 2", got)
+			}
+		})
 	}
 }
 
@@ -430,7 +435,7 @@ func TestUnfollowedRedirectIsNotDelivery(t *testing.T) {
 	t.Parallel()
 
 	// A final 3xx (a redirect the client did not follow, here a bare 300
-	// with no Location) means the webhook was NOT accepted: httpx accepts
+	// with no Location) means the webhook was NOT accepted: httpclient accepts
 	// only a 2xx as success, so postAttempt reports an error and the sweep
 	// keeps retrying delivery.
 	rec := newWebhookRecorder(http.StatusMultipleChoices)
@@ -467,27 +472,26 @@ func TestUnfollowedRedirectIsNotDelivery(t *testing.T) {
 	}
 }
 
-func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
+func TestSafeTransportErrorKeepsTheURLOutWithoutBreakingTheChain(t *testing.T) {
 	t.Parallel()
 
-	// httpx.LogSafeError's whole remaining job, and the one that matters: the
-	// *url.Error net/http builds around a transport failure is the only error
-	// shape that embeds the full request URL, and for a webhook that URL's path
-	// IS the credential. Reducing it to its cause is what keeps the URL out of
-	// post's returned error and out of httpx.Do's retry lines, and the reduction
-	// must not cost the errors.Is chain watch keys shutdown handling on
-	// (context.Canceled) and httpx.Do keys transient classification on.
+	// The *url.Error net/http builds around a transport failure is the only
+	// error shape that embeds the full request URL, and for a webhook that
+	// URL's path IS the credential. safeTransportError is what postAttempt
+	// returns: it replaces the message entirely, so the chain it exposes
+	// through Unwrap is the only thing left for watch's shutdown exemption
+	// (errors.Is(err, context.Canceled), which decides whether a failed send is
+	// logged as an error or as a cancelled sweep) and for httpclient's
+	// transient classification to read.
 	//
 	// There is deliberately no text-matching backstop for an error that
 	// FORMATS a URL rendering into its own message: nothing in this package
 	// publishes remote text or interpolates d.url, so no such error exists to
-	// defend against, and pretending otherwise is what the two earlier leaks
-	// in this file's history were made of.
+	// defend against.
 	const secret = "verysecretchaintoken"
 	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
 
-	// Both POSITIONS, not both call sites: LogSafeError searches with errors.As
-	// rather than matching the top, which is what safeTransportError's loop rests on.
+	// Both positions: the *url.Error at the top, and wrapped below another error.
 	for name, in := range map[string]error{
 		"bare url error":    &url.Error{Op: "Post", URL: rawURL, Err: context.Canceled},
 		"wrapped url error": fmt.Errorf("attempt 3 failed: %w", &url.Error{Op: "Post", URL: rawURL, Err: context.Canceled}),
@@ -495,24 +499,9 @@ func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			got := httpx.LogSafeError(in)
 			if !strings.Contains(in.Error(), secret) {
 				t.Fatalf("setup: input %q does not carry the credential, the assertion would be vacuous", in)
 			}
-			for _, leak := range []string{secret, "/api/webhooks/", "discord.example"} {
-				if strings.Contains(got.Error(), leak) {
-					t.Errorf("httpx.LogSafeError kept %q from the request URL: %v", leak, got)
-				}
-			}
-			if !errors.Is(got, context.Canceled) {
-				t.Errorf("httpx.LogSafeError broke the errors.Is chain: %v", got)
-			}
-			// safeTransportError is what postAttempt actually returns, and it
-			// replaces the message entirely -- so the chain it exposes through
-			// Unwrap is the ONLY thing left for watch's shutdown exemption
-			// (errors.Is(err, context.Canceled), which decides whether a
-			// failed send is logged as an error or as a cancelled sweep) and
-			// for httpx's transient classification to read.
 			safe := safeTransportError(in)
 			if !errors.Is(safe, context.Canceled) {
 				t.Errorf("safeTransportError broke the errors.Is chain: %v", safe)
@@ -526,17 +515,16 @@ func TestLogSafeReducesTransportErrorsWithoutBreakingTheChain(t *testing.T) {
 	}
 }
 
-// TestNestedURLErrorsAreFullyReducedBeforeClassification pins the loop in
-// safeTransportError that reduces until no *url.Error is left ANYWHERE in the
-// chain, not just at the top. httpx.LogSafeError SEARCHES a chain with
-// errors.As and RETURNS what it finds, so one *url.Error still nested under
-// the cause lets it unwrap PAST transportError and render that error's own
-// text instead of knell's phrase — in post's returned error and in httpx.Do's
-// per-attempt lines. net/http produces exactly this shape when a redirected
-// request fails: the *url.Error for the hop carries the *url.Error of the
-// inner request, whose cause is written from the response's Location header,
-// so the text that surfaces is remote-authored and can echo the webhook path
-// (which IS the credential).
+// TestNestedURLErrorsAreFullyReducedBeforeClassification pins that no
+// *url.Error is left ANYWHERE in the chain safeTransportError classifies, not
+// just at the top: one still nested under the cause would let
+// httpclient.LogSafeError unwrap PAST transportError and render that error's
+// own text instead of knell's phrase, in post's returned error and in
+// httpclient.Do's per-attempt lines. net/http produces exactly this shape when
+// a redirected request fails: the *url.Error for the hop carries the *url.Error
+// of the inner request, whose cause is written from the response's Location
+// header, so the text that surfaces is remote-authored and can echo the
+// webhook path (which IS the credential).
 func TestNestedURLErrorsAreFullyReducedBeforeClassification(t *testing.T) {
 	t.Parallel()
 
@@ -560,10 +548,10 @@ func TestNestedURLErrorsAreFullyReducedBeforeClassification(t *testing.T) {
 		t.Errorf("safeTransportError(nested *url.Error).Error() = %q, want knell's own phrase", got.Error())
 	}
 	// Two surfaces, failing independently: the error itself, and the reduction
-	// httpx.Do's own attempt lines put it through.
+	// httpclient.Do's own attempt lines put it through.
 	for surface, rendered := range map[string]error{
-		"transport error":                got,
-		"reduced error as httpx logs it": httpx.LogSafeError(got),
+		"transport error":                     got,
+		"reduced error as httpclient logs it": httpclient.LogSafeError(got),
 	} {
 		if rendered == nil {
 			t.Errorf("%s = nil, want an error (a nil reports an undelivered notification as delivered)", surface)
@@ -576,38 +564,28 @@ func TestNestedURLErrorsAreFullyReducedBeforeClassification(t *testing.T) {
 		}
 	}
 	// The reduction must not cost the chain: watch keys its shutdown exemption
-	// and httpx keys transient classification on errors.Is/As.
+	// and httpclient keys transient classification on errors.Is/As.
 	if !errors.Is(got, remote) {
 		t.Errorf("safeTransportError dropped the cause from the chain: %v", got)
 	}
 }
 
-func TestLogSafeNeverReducesAFailureToNil(t *testing.T) {
+func TestSafeTransportErrorNeverReducesAFailureToNil(t *testing.T) {
 	t.Parallel()
 
-	// A *url.Error carrying a nil cause must not reduce to nil: postAttempt's
-	// return IS httpx.Do's success signal, so a nil there would report an
-	// UNDELIVERED notification as delivered — watch would flip the beat to
-	// alerted and the missing notice this app exists to send would never be
-	// retried. httpx v4.2.0 guarantees this at the source (LogSafeError
-	// substitutes a contentless, URL-free stand-in), which is why knell no
-	// longer carries its own fail-closed guard; this pins the contract knell
-	// depends on, so a regression in the library fails here rather than
-	// silently disarming the switch.
+	// postAttempt's return IS httpclient.Do's success signal, so a nil for a
+	// *url.Error carrying a nil cause would report an UNDELIVERED notification
+	// as delivered: watch would flip the beat to alerted and the missing
+	// notice this app exists to send would never be retried.
 	const secret = "verysecretclosedtoken"
 	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
 
-	got := httpx.LogSafeError(&url.Error{Op: "Post", URL: rawURL})
+	got := safeTransportError(&url.Error{Op: "Post", URL: rawURL})
 	if got == nil {
-		t.Fatal("httpx.LogSafeError(*url.Error with a nil cause) = nil, want an error (a nil reports an undelivered notification as delivered)")
+		t.Fatal("safeTransportError(*url.Error with a nil cause) = nil, want an error (a nil reports an undelivered notification as delivered)")
 	}
 	if strings.Contains(got.Error(), secret) {
 		t.Errorf("the reduced error leaks the webhook credential: %v", got)
-	}
-	// The nil-in/nil-out half of the contract: postAttempt reduces only on a
-	// real failure, so a nil must not become an error.
-	if got := httpx.LogSafeError(nil); got != nil {
-		t.Errorf("httpx.LogSafeError(nil) = %v, want nil", got)
 	}
 }
 
@@ -615,7 +593,7 @@ func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 	// Deliberately NOT t.Parallel: slog.Default() is process-global.
 	//
 	// The returned-error assertions cannot cover the LOG surface: postAttempt
-	// constructs the returned error URL-free, while httpx.Do's per-attempt retry
+	// constructs the returned error URL-free, while httpclient.Do's per-attempt retry
 	// and exhausted lines (both Debug here, via WithExhaustedLevel) log the RAW
 	// attempt error through the type-based LogSafeError only. This pins that
 	// surface end to end.
@@ -648,7 +626,7 @@ func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
 	// matching strings inside remote text.
 	//
 	// Both surfaces are asserted because they fail independently: post's
-	// returned error, and httpx.Do's retry/exhausted lines, which log the
+	// returned error, and httpclient.Do's retry/exhausted lines, which log the
 	// ATTEMPT error through the type-based LogSafeError alone (post's own
 	// reduction runs too late for them). What survives is the status, which is
 	// what keeps "the webhook answered and rejected us" apart from "nothing
@@ -704,7 +682,7 @@ func TestSuccessfulResponsesAreDrainedForConnectionReuse(t *testing.T) {
 	// oracle is the consequence -- an undrained body makes net/http discard the
 	// connection, so two notices open two connections instead of reusing one,
 	// and every notice pays a fresh TLS handshake. Driving the public
-	// BeatMissing keeps httpx.DrainClose's own bound and read-then-close order
+	// BeatMissing keeps httpclient.DrainClose's own bound and read-then-close order
 	// the library's business to test, and pins only what knell depends on.
 	var connections atomic.Int64
 	var requests atomic.Int64
@@ -859,9 +837,9 @@ func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 func TestAttemptTimeoutIsRetried(t *testing.T) {
 	t.Parallel()
 
-	// A per-attempt deadline is a retryable condition, but httpx.IsTransient
+	// A per-attempt deadline is a retryable condition, but httpclient.IsTransient
 	// rejects a bare context.DeadlineExceeded as terminal caller cancellation
-	// before it consults the Transient interface. httpx.WithAttemptTimeout is
+	// before it consults the Transient interface. httpclient.WithAttemptTimeout is
 	// what tells it apart: the retry loop installs the bound itself and marks
 	// an expiry that fired while the CALLER's context was still live. Without
 	// the option every notification silently reduces to one attempt, and a
@@ -890,13 +868,13 @@ func TestAttemptTimeoutIsRetried(t *testing.T) {
 	t.Cleanup(d.Close)
 	// The seam is a test affordance, not the policy, so pin the production
 	// wiring BEFORE shortening it: a New that drops the assignment leaves the
-	// field zero, which httpx reads as the option's ABSENCE (no per-attempt
+	// field zero, which httpclient reads as the option's ABSENCE (no per-attempt
 	// bound at all), so a stalled webhook is bounded only by the client
 	// timeout and its expiry is classified terminal instead of retryable.
 	// Nothing below notices, because the assertions run against this
 	// notifier's shortened deadline.
 	if d.attemptTimeout != attemptTimeout {
-		t.Fatalf("New() attemptTimeout = %s, want %s: a non-positive bound is httpx's option-absent path, so no attempt deadline is applied", d.attemptTimeout, attemptTimeout)
+		t.Fatalf("New() attemptTimeout = %s, want %s: a non-positive bound is httpclient's option-absent path, so no attempt deadline is applied", d.attemptTimeout, attemptTimeout)
 	}
 	// Shorten only this notifier's per-attempt deadline: the branch under
 	// test cares that the ATTEMPT's bound fired while the caller's budget is
@@ -940,9 +918,9 @@ func TestAttemptTimeoutReportsSafeDiagnostic(t *testing.T) {
 	t.Parallel()
 
 	// The exhausted attempt timeout is the whole incident record an operator
-	// reads (httpx.Do returns it verbatim, watch logs it at Error). Four
+	// reads (httpclient.Do returns it verbatim, watch logs it at Error). Four
 	// properties keep it useful and safe, and only driving the real retry loop
-	// exercises them: knell's own phrase is carried, httpx classifies it
+	// exercises them: knell's own phrase is carried, httpclient classifies it
 	// transient (so every attempt is spent, not just the first), the deadline
 	// stays visible to errors.Is for knell's own callers, and no part of the
 	// webhook URL reaches the message.
@@ -971,11 +949,11 @@ func TestAttemptTimeoutReportsSafeDiagnostic(t *testing.T) {
 	if !strings.Contains(err.Error(), "webhook transport failed") {
 		t.Errorf("timeout error = %q, want it to contain knell's own phrase", err)
 	}
-	if !httpx.IsAttemptTimeout(err) {
-		t.Errorf("httpx.IsAttemptTimeout(%v) = false, want the per-attempt bound to be marked", err)
+	if !httpclient.IsAttemptTimeout(err) {
+		t.Errorf("httpclient.IsAttemptTimeout(%v) = false, want the per-attempt bound to be marked", err)
 	}
-	if !httpx.IsTransient(err) {
-		t.Errorf("httpx.IsTransient(%v) = false, want a retryable attempt timeout", err)
+	if !httpclient.IsTransient(err) {
+		t.Errorf("httpclient.IsTransient(%v) = false, want a retryable attempt timeout", err)
 	}
 	// The mark WRAPS instead of replacing, so the timeout stays legible to
 	// knell's own callers. The old hand-rolled error deliberately hid this to
@@ -997,19 +975,19 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 	// bound the park: this ceiling caps ONE wait (and IS the wait when no
 	// Retry-After header parses), and sendBudget caps the delivery. Nothing else
 	// in the package pins either -- every other assertion here is satisfied by a
-	// ceiling of 30s, of 30 minutes, or of 0 (httpx's own 60s fallback)
+	// ceiling of 30s, of 30 minutes, or of 0 (httpclient's own 60s fallback)
 	// identically.
 	var attempts atomic.Int64
 	d := newTestNotifier(t, "https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
 	t.Cleanup(d.Close)
 	// The seam is a test affordance, not the policy, so pin the production
 	// wiring BEFORE shortening it: a New that drops either assignment leaves the
-	// field zero, which is httpx's option-absent path -- its own 60s cap for the
+	// field zero, which is httpclient's option-absent path -- its own 60s cap for the
 	// ceiling, and no budget at all for the delivery. Neither shows up in the
 	// timing assertions below, which run against this notifier's shortened
 	// values.
 	if d.rateLimitMaxWait != rateLimitMaxWait {
-		t.Fatalf("New() rateLimitMaxWait = %s, want %s: httpx falls back to its own 60s cap for a non-positive ceiling", d.rateLimitMaxWait, rateLimitMaxWait)
+		t.Fatalf("New() rateLimitMaxWait = %s, want %s: httpclient falls back to its own 60s cap for a non-positive ceiling", d.rateLimitMaxWait, rateLimitMaxWait)
 	}
 	if d.sendBudget != sendBudget {
 		t.Fatalf("New() sendBudget = %s, want %s: a non-positive budget is ContextWithDefaultTimeout's pass-through path, so the delivery keeps whatever the caller brought -- for watch's ctx, no deadline at all", d.sendBudget, sendBudget)
@@ -1018,7 +996,7 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 		t.Errorf("rateLimitMaxWait = %s gives sendBudget = %s, want a positive ceiling whose delivery budget stays within four %s sweep ticks: the sweep is the single sender, so the budget is what holds every other beat's notice", rateLimitMaxWait, sendBudget, watch.DefaultTick)
 	}
 	// That upper bound has a floor to clear, and the floor is the schedule the
-	// budget is derived from rather than the derivation itself: httpx parks up
+	// budget is derived from rather than the derivation itself: httpclient parks up
 	// to rateLimitMaxWait before a retry and then spends up to attemptTimeout
 	// running it, so a budget that cannot fit one park plus one attempt is
 	// spent on the first attempt alone. maxAttempts would then read as 3 and
@@ -1053,7 +1031,7 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 
 	// The caller's budget is bounded so an UNCAPPED wait fails this test in
 	// seconds instead of hanging the package for the hour the response asked
-	// for: httpx observes the dead context before its next retry, so the
+	// for: httpclient observes the dead context before its next retry, so the
 	// attempt count below is what reports the regression. That deadline is also
 	// what the door defers to, so this half measures the ceiling alone.
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -1313,11 +1291,43 @@ func TestCanceledDeliveryErrorIsCanceled(t *testing.T) {
 func TestPlainServerErrorIsTerminalPerAttempt(t *testing.T) {
 	t.Parallel()
 
-	// httpx's transient set is 502/503/504: a plain 500 is terminal for
-	// this delivery call by design; the watch sweep retries the whole
-	// notification 15s later. If 500 ever joined the in-call retry set,
-	// the second scripted status (204) would make this call succeed.
-	rec := newWebhookRecorder(http.StatusInternalServerError, http.StatusNoContent)
+	// A 500, a 507 or an unregistered 5xx can come after Discord posted the
+	// message, and the webhook takes no idempotency key, so repeating the
+	// POST in the call can post the notice twice. Only the gateway answers
+	// (502, 503, 504) retry within the call; for the rest the call fails at
+	// once and the watch sweep owns the retry. If one of them joined the
+	// in-call retry set, the second scripted status (204) would make this
+	// call succeed.
+	for _, code := range []int{http.StatusInternalServerError, http.StatusInsufficientStorage, 520} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			t.Parallel()
+
+			rec := newWebhookRecorder(code, http.StatusNoContent)
+			srv := httptest.NewServer(rec.handler(t))
+			defer srv.Close()
+
+			d := newTestNotifier(t, srv.URL, "node-1")
+			defer d.Close()
+
+			err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
+			if err == nil {
+				t.Fatalf("BeatMissing on %d = nil, want error (sweep-level retry owns this failure)", code)
+			}
+			if got := rec.hits.Load(); got != 1 {
+				t.Errorf("attempts = %d, want 1 (%d is not retried within the call)", got, code)
+			}
+		})
+	}
+}
+
+func TestSettledServerErrorIsTerminalPerAttempt(t *testing.T) {
+	t.Parallel()
+
+	// A 501 repeats on every attempt, so httpclient.IsRetryableStatus rejects it:
+	// the call fails at once and the watch sweep owns the retry. If 501 ever
+	// joined the in-call retry set, the second scripted status (204) would
+	// make this call succeed.
+	rec := newWebhookRecorder(http.StatusNotImplemented, http.StatusNoContent)
 	srv := httptest.NewServer(rec.handler(t))
 	defer srv.Close()
 
@@ -1326,10 +1336,10 @@ func TestPlainServerErrorIsTerminalPerAttempt(t *testing.T) {
 
 	err := d.BeatMissing(t.Context(), "api", liveSilence(time.Hour))
 	if err == nil {
-		t.Fatal("BeatMissing on 500 = nil, want error (sweep-level retry owns this failure)")
+		t.Fatal("BeatMissing on 501 = nil, want error (sweep-level retry owns this failure)")
 	}
 	if got := rec.hits.Load(); got != 1 {
-		t.Errorf("attempts = %d, want 1 (500 is not in the transient retry set)", got)
+		t.Errorf("attempts = %d, want 1 (501 is not in the retry set)", got)
 	}
 }
 
@@ -1417,7 +1427,7 @@ func TestCrossHostRedirectIsNotDelivery(t *testing.T) {
 func TestCrossPortRedirectIsNotDelivery(t *testing.T) {
 	t.Parallel()
 
-	// Both listeners are on 127.0.0.1, so a host-only rule (httpx.WithSameHost)
+	// Both listeners are on 127.0.0.1, so a host-only rule (httpclient.WithSameHost)
 	// follows this hop and re-POSTs the notice, with the credential path, to
 	// the other port.
 	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
@@ -1446,8 +1456,8 @@ func TestCrossPortRedirectIsNotDelivery(t *testing.T) {
 			if got := targetHits.Load(); got != 0 {
 				t.Errorf("cross-port redirect target hits = %d, want 0 (the notice and its credential path must not reach another origin)", got)
 			}
-			if refused, ok := errors.AsType[*httpx.RedirectRefusedError](err); !ok || refused.Reason != httpx.RedirectOtherOrigin {
-				t.Errorf("BeatMissing through a cross-port %d = %v, want httpx's RedirectOtherOrigin refusal in its chain", status, err)
+			if refused, ok := errors.AsType[*httpclient.RedirectRefusedError](err); !ok || refused.Reason != httpclient.RedirectOtherOrigin {
+				t.Errorf("BeatMissing through a cross-port %d = %v, want httpclient's RedirectOtherOrigin refusal in its chain", status, err)
 			}
 			if !strings.Contains(err.Error(), "redirected to another origin") {
 				t.Errorf("refused-redirect error = %q, want it to name the cross-origin redirect", err)
@@ -1527,8 +1537,8 @@ func TestOtherOriginRedirectIsNotSent(t *testing.T) {
 			if sent != 1 {
 				t.Errorf("requests sent = %d, want 1 (the hop to another origin must not be sent)", sent)
 			}
-			if _, ok := errors.AsType[*httpx.RedirectRefusedError](err); !ok {
-				t.Errorf("postAttempt through a 307 from %s to %s = %v, want httpx's redirect refusal in its chain", tc.from, tc.to, err)
+			if _, ok := errors.AsType[*httpclient.RedirectRefusedError](err); !ok {
+				t.Errorf("postAttempt through a 307 from %s to %s = %v, want httpclient's redirect refusal in its chain", tc.from, tc.to, err)
 			}
 			if err == nil || !strings.Contains(err.Error(), "redirected to another origin") {
 				t.Errorf("postAttempt through a 307 from %s to %s = %v, want it to name the refused redirect", tc.from, tc.to, err)
@@ -1545,8 +1555,8 @@ func TestZoneChangingRedirectIsNotDelivery(t *testing.T) {
 	sent, err := redirectOnce(t,
 		"https://[fe80::1%25eth0]/api/webhooks/1234567890/verysecrettoken",
 		"https://[fe80::1%25ETH0]/api/webhooks/1234567890/verysecrettoken")
-	if refused, ok := errors.AsType[*httpx.RedirectRefusedError](err); !ok || refused.Reason != httpx.RedirectOtherOrigin {
-		t.Errorf("postAttempt through a zone-changing 307 = %v, want httpx's RedirectOtherOrigin refusal in its chain", err)
+	if refused, ok := errors.AsType[*httpclient.RedirectRefusedError](err); !ok || refused.Reason != httpclient.RedirectOtherOrigin {
+		t.Errorf("postAttempt through a zone-changing 307 = %v, want httpclient's RedirectOtherOrigin refusal in its chain", err)
 	}
 	if sent != 1 {
 		t.Errorf("requests sent = %d, want 1 (the hop to another zone must not be sent)", sent)
@@ -1559,7 +1569,7 @@ func TestSameOriginRedirectIsFollowedAndDelivers(t *testing.T) {
 	// The other half of the redirect contract: the policy must still FOLLOW
 	// the webhook's own same-origin, method-preserving hop. Nothing else in
 	// this package pins that -- dropping WithSameOrigin turns the policy into
-	// "refuse every redirect" (httpx returns a refuse-all policy when no host
+	// "refuse every redirect" (httpclient returns a refuse-all policy when no host
 	// is allowed), which every other test here passes while a redirecting
 	// webhook silently stops receiving notices.
 	var finishHits atomic.Int64
@@ -1714,10 +1724,10 @@ func TestExhaustedDeliveryIsLoggedBelowAlarmLevel(t *testing.T) {
 	// Deliberately NOT t.Parallel: slog.Default() is process-global.
 	//
 	// watch already publishes the terminal verdict for a failed delivery at
-	// Error (with the beat, the silence and the retry plan), so httpx's own
+	// Error (with the beat, the silence and the retry plan), so httpclient's own
 	// exhaustion line is a second, thinner record of the SAME event.
 	// WithExhaustedLevel demotes it to Debug; dropping the option restores
-	// httpx's default Warn and every failed notification then raises two
+	// httpclient's default Warn and every failed notification then raises two
 	// alarm-level lines, which is exactly the duplicate an operator reading
 	// the log during a Discord outage has to reconcile.
 	rec := captureDeliveryLogs(t)
@@ -1731,11 +1741,11 @@ func TestExhaustedDeliveryIsLoggedBelowAlarmLevel(t *testing.T) {
 		t.Fatal("BeatMissing against a refused connection = nil, want error")
 	}
 	requireLogged(t, rec)
-	// Both lines must still say WHICH notice failed. httpx builds them as
+	// Both lines must still say WHICH notice failed. httpclient builds them as
 	// "<label> failed, retrying" and "<label> retries exhausted" from post's
 	// WithLabel; with the option dropped they read "operation ...", so the
 	// per-attempt record during a webhook outage names neither the
-	// notification kind nor the beat. requireLogged matches httpx's own words
+	// notification kind nor the beat. requireLogged matches httpclient's own words
 	// only, so nothing else in this package notices.
 	const label = "discord webhook missing api"
 	for _, line := range []string{label + " failed, retrying", label + " retries exhausted"} {
