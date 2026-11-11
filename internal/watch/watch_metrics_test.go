@@ -90,7 +90,7 @@ func TestBeatFreshGaugeAtConstructionMeasuresTheBootSilence(t *testing.T) {
 
 	// New publishes each beat's first freshness reading, and it must MEASURE
 	// now()-start rather than assume 0: main captures start at process entry,
-	// ahead of the marker probe and the mounted-secret reads, so wiring can
+	// ahead of the config load and the mounted-secret reads, so wiring can
 	// reach New after a short deadline has already passed. A gauge that reports
 	// fresh in that window feeds a false vote into the quorum sum
 	// knell_beat_fresh exists to carry, and stays wrong until the first
@@ -331,7 +331,7 @@ func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
 // while w.mu is held blocks every other holder of that mutex — ping admission
 // (Beat), the freshness gauge the quorum rule reads (observeBeats) and the
 // pre-drain StopAccepting — for as long as a stalled container log driver holds
-// the write, while /healthz keeps passing off its marker file. Both lines were
+// the write, while /healthz keeps passing off its in-memory verdict. Both lines were
 // emitted under the lock until this was fixed, and the content assertions above
 // stay green either way (the record is byte-identical from either position), so
 // this is the only guard against an inline that puts them back.
