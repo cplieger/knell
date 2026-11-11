@@ -98,7 +98,9 @@ groups:
 
       # Set the window to your longest beat deadline (26h here).
       - alert: KnellRestartChurn
-        expr: changes(process_start_time_seconds{job="knell"}[26h]) > 1
+        expr: >
+          changes(process_start_time_seconds[26h]) > 1
+          and on (job, instance) knell_build_info
         for: 0m
         labels:
           severity: warning

@@ -219,6 +219,14 @@ var httpDuration = measure.NewHistogram(
 	"Served HTTP request duration in seconds.",
 )
 
+// buildInfo is the build_info series a rule joins on to scope a family every
+// target serves (process_*, go_*) to knell without naming its job.
+var buildInfo = measure.NewLabeledGauge(
+	"build_info",
+	"Always 1; the version label is the version of the running knell build.",
+	[]string{"version"},
+)
+
 func init() {
 	// MustRegister: init-time registration has no caller to hand an error to.
 	// metrics v4 captures a construction error into the metric value rather
@@ -237,6 +245,7 @@ func init() {
 		httpRequests,
 		httpDuration,
 		listenerAcceptErrors,
+		buildInfo,
 	)
 	mintNotificationKinds()
 	mintRefusalReasons()
@@ -298,6 +307,11 @@ func RecordOutageRecordDropped(id string) {
 // pre-minted, so alert on the absolute value rather than increase().
 func RecordHTTP(method, path string, status int, d time.Duration) {
 	measure.RecordHTTP(httpRequests, httpDuration, d, method, path, strconv.Itoa(status))
+}
+
+// SetBuildInfo publishes knell_build_info{version} at 1. Call it once at start.
+func SetBuildInfo(version string) {
+	buildInfo.Set(1, version)
 }
 
 // RecordAcceptError counts one failed accept on the HTTP listener.

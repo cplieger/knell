@@ -439,3 +439,11 @@ func rawSeriesValue(t *testing.T, prefix string) (string, bool) {
 	}
 	return "", false
 }
+
+// TestSetBuildInfoServesTheVersionAtOne pins the build_info pattern a rule
+// joins on: one series whose version label is the build's version, set to 1.
+func TestSetBuildInfoServesTheVersionAtOne(t *testing.T) {
+	SetBuildInfo("v9.8.7-dev.6")
+	t.Cleanup(func() { buildInfo.Delete("v9.8.7-dev.6") })
+	assertExpositionLines(t, []string{`knell_build_info{version="v9.8.7-dev.6"} 1`}, "after SetBuildInfo")
+}

@@ -22,6 +22,7 @@ import (
 	"github.com/cplieger/go/slogx"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/notify"
+	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/knell/internal/watch"
 	"github.com/cplieger/knell/internal/webapi"
 )
@@ -41,6 +42,10 @@ const (
 	requestReadTimeout   = 3 * time.Second
 	requestWriteTimeout  = 3 * time.Second
 )
+
+// version is the release this binary was built as, set with
+// -ldflags "-X main.version=<tag>"; a build without it reports "dev".
+var version = "dev"
 
 // loadConfig is a seam over config.Load so a test can hold configuration
 // loading open after run has captured its boot baseline.
@@ -102,6 +107,7 @@ func run(args []string) error {
 	}
 	levelVar.Set(cfg.LogLevel)
 	logConfig(&cfg)
+	obs.SetBuildInfo(version)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

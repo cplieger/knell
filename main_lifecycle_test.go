@@ -1150,7 +1150,8 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 // TestRunServesTheHealthVerdictOnHealthz pins the composition root's /healthz
 // wiring: the webapi tests inject a fixed verdict, so only this test sees that
 // run() puts the health handler in that slot. With obs.Handler there /healthz
-// answers 200 with the wrong body, and an unwired route answers 404.
+// answers 200 with the wrong body, and an unwired route answers 404. It also
+// pins that run() publishes knell_build_info, which KnellRestartChurn joins on.
 func TestRunServesTheHealthVerdictOnHealthz(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal.
@@ -1164,6 +1165,9 @@ func TestRunServesTheHealthVerdictOnHealthz(t *testing.T) {
 
 	if status, body := getHealthz(t, addr); status != http.StatusOK || body != `{"status":"ok"}`+"\n" {
 		t.Errorf("/healthz on a serving switch = %d %q, want 200 {\"status\":\"ok\"}", status, body)
+	}
+	if got := scrapeCounter(t, `knell_build_info{version="`+version+`"}`); got != 1 {
+		t.Errorf("knell_build_info{version=%q} = %v, want 1: a rule joining on it drops a running knell", version, got)
 	}
 
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
