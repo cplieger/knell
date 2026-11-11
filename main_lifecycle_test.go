@@ -242,25 +242,13 @@ func TestRunTracksHealthAcrossServeAndDrain(t *testing.T) {
 	r.waitForReturn(t, 10*time.Second, "after the active request drained")
 }
 
-// TestRunPublishesTheBootArmedBaselineFromProcessStart pins that every first
-// deadline counts from BEFORE configuration, so the time spent reading a
-// mounted secret is charged to the deadline rather than to the sender. The
-// loadConfig seam holds config.Load across a whole-second boundary because
-// the published last-seen metric intentionally has second precision.
-//
-// The oracle's reach is the config boundary, not the exact instruction: a
-// capture moved anywhere earlier than config.Load, to the slogx.Setup line,
-// still lands on the process-start side and still passes.
-//
-// This is the one half of knell's boot-armed clock that main owns: the
-// processStart baseline run() captures BEFORE config parsing and hands to
-// watch.New, which publishes it as every beat's initial last-seen sample. If
-// that argument degrades - dropped, zeroed, replaced by a far-past value, or
-// re-captured after configuration - the first deadline no longer covers the
-// whole boot, and in the degraded-baseline cases every configured beat boots
-// already overdue and the first sweep fires a false missing notice on every
-// container restart. The watch package's own tests supply their own start
-// value, so nothing outside main can catch it.
+// TestRunPublishesTheBootArmedBaselineFromProcessStart pins that run captures
+// processStart before config.Load and hands it to watch.New, so every first
+// deadline covers the whole boot, mounted-secret reads included. A baseline
+// dropped, zeroed or re-captured after configuration boots every beat overdue
+// and fires a false missing notice on each restart; watch's own tests pass
+// their own start, so only main can catch it. The loadConfig seam holds
+// config.Load across a second boundary because last-seen has second precision.
 func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal.
@@ -809,24 +797,11 @@ func TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace(t *testing.T) {
 }
 
 // TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits pins the
-// non-graceful teardown: httpserver skips the drain hooks when Serve returns
-// before a signal, so this path is the only thing that closes beat admission,
-// the only thing that stops a dead process from reporting itself healthy, and
-// the only thing that cancels the watch loop. A dropped admission close lets a
-// connection accepted just before the listener died record a ping behind the
-// tally the watch loop is about to take; a dropped verdict flip leaves
-// `knell health` calling a container with no listener healthy until it is
-// killed; a missing stop() leaves the watcher alerting behind a server that no
-// longer answers, and makes the teardown burn the whole grace on a loop nobody
-// asked to stop.
-//
-// The stop func closes watcherDone: the wait can only finish if cancellation
-// happened FIRST, so a teardown that waits before cancelling fails here
-// instead of only being slow in production.
-//
-// It passes a never-started server, so srv.Shutdown returns immediately over
-// zero connections and this test cannot see the drain at all;
-// TestTeardownAfterServeExitDrainsAcceptedHandlers owns that half.
+// teardown when Serve returns before a signal: httpserver then skips the drain
+// hooks, so this path alone closes beat admission, drains the health verdict
+// and cancels the watch loop. The stop func closes watcherDone, so a teardown
+// that waits before cancelling fails here. The server never starts, so
+// TestTeardownAfterServeExitDrainsAcceptedHandlers owns the handler drain.
 func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default.
