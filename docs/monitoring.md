@@ -153,7 +153,7 @@ The dashboard is versioned with the image, and the `grafana-dashboard.json` of r
 
 | Route | Method | Port | Login | Answers |
 | --- | --- | --- | --- | --- |
-| `/healthz` | `GET`, `HEAD` | `LISTEN_ADDR`, `9190` by default | none. `ALLOWED_HOSTS` applies, except to knell's own `knell health` check, unless `LISTEN_ADDR` names a host name | `200 {"status":"ok"}`, or `503 {"status":"unhealthy","reasons":[...]}` |
+| `/healthz` | `GET`, `HEAD` | `LISTEN_ADDR`, `9190` by default | none. `ALLOWED_HOSTS` applies, except to knell's own `knell health` check, unless `LISTEN_ADDR` names a host other than `localhost` | `200 {"status":"ok"}`, or `503 {"status":"unhealthy","reasons":[...]}` |
 | `/metrics` | `GET` | the same port | none. Keep the port on your network | Prometheus text format |
 
 **What healthy means.** knell answers `/healthz` itself, so a `200` proves the listener accepts and serves requests. Nothing answers before the listener is up, and from the moment knell begins to shut down it answers `503` until the listener closes. knell keeps this verdict in memory, so a read-only root filesystem never makes it unhealthy. Discord being unreachable never makes knell unhealthy: it shows on `knell_notifications_failed_total` and in the log.

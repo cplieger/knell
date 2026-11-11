@@ -2008,6 +2008,8 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		// request carries the attacker's hostname, and a remote client forging
 		// Host: 127.0.0.1 is not a loopback socket peer.
 		"loopback probe exempt": {host: "127.0.0.1:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
+		// LISTEN_ADDR=localhost:9190 makes the probe send Host localhost.
+		"localhost probe exempt": {host: "localhost:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
 		// When LISTEN_ADDR names one address that is neither loopback nor
 		// unspecified, the probe connects from and to that address, so the
 		// carve-out admits a peer at the listener's own address whose Host is
