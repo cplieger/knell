@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -1985,6 +1986,7 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		path       string
 		method     string // empty = POST
 		remoteAddr string
+		localAddr  string // the listener address http.Server records; empty = none
 		wantStatus int
 		wantSeen   int
 	}{
@@ -2007,12 +2009,16 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		// Host: 127.0.0.1 is not a loopback socket peer.
 		"loopback probe exempt": {host: "127.0.0.1:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
 		// When LISTEN_ADDR names one address that is neither loopback nor
-		// unspecified the probe asks that address, which the carve-out does not
-		// cover, so the docs tell the user to list it.
-		"single-address probe refused when unlisted": {host: "192.0.2.10:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", wantStatus: http.StatusForbidden},
-		"forged loopback host refused":               {host: "127.0.0.1:9190", path: "/beat/api", remoteAddr: "203.0.113.7:44444", wantStatus: http.StatusForbidden},
-		"malformed host cannot match":                {host: "knell.example:notaport", path: "/beat/api", wantStatus: http.StatusForbidden},
-		"bracketed hostname is refused":              {host: "[knell.example]", path: "/beat/api", wantStatus: http.StatusForbidden},
+		// unspecified, the probe connects from and to that address, so the
+		// carve-out admits a peer at the listener's own address whose Host is
+		// that address, without the address in ALLOWED_HOSTS.
+		"single-address probe exempt": {host: "192.0.2.10:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.10:9190", wantStatus: http.StatusOK},
+		// A peer that is not the listener's own address cannot borrow the
+		// carve-out by sending its own IP as Host.
+		"peer at another address refused": {host: "192.0.2.10:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.20:9190", wantStatus: http.StatusForbidden},
+		"forged loopback host refused":    {host: "127.0.0.1:9190", path: "/beat/api", remoteAddr: "203.0.113.7:44444", wantStatus: http.StatusForbidden},
+		"malformed host cannot match":     {host: "knell.example:notaport", path: "/beat/api", wantStatus: http.StatusForbidden},
+		"bracketed hostname is refused":   {host: "[knell.example]", path: "/beat/api", wantStatus: http.StatusForbidden},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -2025,6 +2031,13 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 			req.Host = tt.host
 			if tt.remoteAddr != "" {
 				req.RemoteAddr = tt.remoteAddr
+			}
+			if tt.localAddr != "" {
+				local, err := net.ResolveTCPAddr("tcp", tt.localAddr)
+				if err != nil {
+					t.Fatalf("local address %q: %v", tt.localAddr, err)
+				}
+				req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey, local))
 			}
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)

@@ -239,10 +239,9 @@ func countHostRefusals(hosts *httpserver.HostPolicy) httpserver.Middleware {
 	}
 }
 
-// HostPolicyOptions is the ALLOWED_HOSTS policy shape knell ships:
-// loopback-exempt, with the ALLOWED_HOSTS-naming 403 envelope. WithLoopbackExempt
-// admits a request only when both the socket peer and the Host are loopback,
-// so a rebinding request never qualifies.
+// HostPolicyOptions is the ALLOWED_HOSTS policy shape knell ships: exempt for
+// knell's own probe (httpserver.WithLoopbackExempt), with the
+// ALLOWED_HOSTS-naming 403 envelope.
 func HostPolicyOptions() []httpserver.HostAllowlistOption {
 	return []httpserver.HostAllowlistOption{
 		httpserver.WithLoopbackExempt(true),

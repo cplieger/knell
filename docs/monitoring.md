@@ -153,12 +153,12 @@ The dashboard is versioned with the image, and the `grafana-dashboard.json` of r
 
 | Route | Method | Port | Login | Answers |
 | --- | --- | --- | --- | --- |
-| `/healthz` | `GET`, `HEAD` | `LISTEN_ADDR`, `9190` by default | none. `ALLOWED_HOSTS` applies, loopback always admitted | `200 {"status":"ok"}`, or `503 {"status":"unhealthy","reasons":[...]}` |
+| `/healthz` | `GET`, `HEAD` | `LISTEN_ADDR`, `9190` by default | none. `ALLOWED_HOSTS` applies, except to knell's own `knell health` check | `200 {"status":"ok"}`, or `503 {"status":"unhealthy","reasons":[...]}` |
 | `/metrics` | `GET` | the same port | none. Keep the port on your network | Prometheus text format |
 
 **What healthy means.** knell answers `/healthz` itself, so a `200` proves the listener accepts and serves requests. Nothing answers before the listener is up, and from the moment knell begins to shut down it answers `503` until the listener closes. It also answers `503` when it cannot write its health marker in `/tmp`, for example with `read_only: true` and no `tmpfs` on `/tmp`. Discord being unreachable never makes knell unhealthy: it shows on `knell_notifications_failed_total` and in the log.
 
-**Docker health.** The image checks itself every 30 seconds with `knell health`, which asks `/healthz` on the container's loopback and fails when no answer comes within 4 seconds. When `LISTEN_ADDR` names one address that is neither loopback nor unspecified (`0.0.0.0`, `::`), the check asks that address, so when `ALLOWED_HOSTS` is set, list that address in it, or the check gets `403` and Docker marks knell unhealthy. Docker marks the container unhealthy after 3 failures, and allows 15 seconds after a start. Docker's health status notifies nobody on its own, and Docker does not restart an unhealthy container.
+**Docker health.** The image checks itself every 30 seconds with `knell health`, which asks `/healthz` on the container's loopback and fails when no answer comes within 4 seconds. When `LISTEN_ADDR` names one address that is neither loopback nor unspecified (`0.0.0.0`, `::`), the check asks that address. Docker marks the container unhealthy after 3 failures, and allows 15 seconds after a start. Docker's health status notifies nobody on its own, and Docker does not restart an unhealthy container.
 
 **Who is told.**
 
