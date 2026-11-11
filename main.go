@@ -116,10 +116,10 @@ func run(args []string) error {
 	defer notifier.Close()
 
 	watcher := watch.New(watchBeats(cfg.Beats, cfg.MissingRepeat), notifier, time.Now, processStart)
+	st := health.NewStatus()
 
 	// The watcher is the single owner of beat admission, so the endpoint holds
 	// no lifecycle state and no context of its own.
-	st := health.NewStatus()
 	handler := webapi.New(watcher, webapi.Deps{
 		Healthz:        healthzHandler(st),
 		BeatToken:      cfg.BeatToken,
@@ -167,7 +167,6 @@ func run(args []string) error {
 	return classifyAbandonedWatchLoop(classifyServeError(err), watchLoopStopped)
 }
 
-// healthzHandler serves st as /healthz.
 func healthzHandler(st *health.Status) http.Handler {
 	return health.CheckHandler(health.Check{Signal: st, Reason: notServingReason})
 }

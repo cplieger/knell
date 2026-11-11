@@ -74,7 +74,7 @@ The 512-byte ceiling keeps the token inside the 8704-byte request-header limit w
 - It covers `/healthz` and `/metrics` too, so list every name your probes and your Prometheus scraper use.
 - knell's own requests are always served: a request from loopback to a loopback `Host`, and one from the address `LISTEN_ADDR` binds to that same address as `Host`.
 - An entry no `Host` could ever match stops startup, because a dropped entry would leave pings to that name refused.
-- The built-in `knell health` check is one of those requests, so it passes whatever `ALLOWED_HOSTS` lists.
+- The built-in `knell health` check is one of those requests when the host in `LISTEN_ADDR` is empty, `0.0.0.0`, `::` or an IP address. When `LISTEN_ADDR` names a host such as `knell.lan:9190`, the check sends that name as `Host`, so list it in `ALLOWED_HOSTS`.
 
 ## Trusted proxies
 

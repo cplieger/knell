@@ -2016,9 +2016,12 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		// A peer that is not the listener's own address cannot borrow the
 		// carve-out by sending its own IP as Host.
 		"peer at another address refused": {host: "192.0.2.10:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.20:9190", wantStatus: http.StatusForbidden},
-		"forged loopback host refused":    {host: "127.0.0.1:9190", path: "/beat/api", remoteAddr: "203.0.113.7:44444", wantStatus: http.StatusForbidden},
-		"malformed host cannot match":     {host: "knell.example:notaport", path: "/beat/api", wantStatus: http.StatusForbidden},
-		"bracketed hostname is refused":   {host: "[knell.example]", path: "/beat/api", wantStatus: http.StatusForbidden},
+		// A host-name LISTEN_ADDR makes the probe send that name as Host, and
+		// only an IP-literal Host is exempt, so the name must be listed.
+		"host-name probe refused when unlisted": {host: "knell.lan:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.10:9190", wantStatus: http.StatusForbidden},
+		"forged loopback host refused":          {host: "127.0.0.1:9190", path: "/beat/api", remoteAddr: "203.0.113.7:44444", wantStatus: http.StatusForbidden},
+		"malformed host cannot match":           {host: "knell.example:notaport", path: "/beat/api", wantStatus: http.StatusForbidden},
+		"bracketed hostname is refused":         {host: "[knell.example]", path: "/beat/api", wantStatus: http.StatusForbidden},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
