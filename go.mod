@@ -1,11 +1,11 @@
 module github.com/cplieger/knell
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/cplieger/envx/v2 v2.1.0
 	github.com/cplieger/health v1.10.0
-	github.com/cplieger/httpx/v5 v5.2.0
+	github.com/cplieger/httpx/v5 v5.3.0
 	github.com/cplieger/metrics/v4 v4.2.2
 	github.com/cplieger/slogx v1.8.0
 	github.com/cplieger/webhttp/v3 v3.0.3
