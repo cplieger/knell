@@ -68,7 +68,7 @@ func newTestHandler(b *fakeBeater, token string) http.Handler {
 
 // newTestHandlerHealthz is newTestHandler with the liveness status under
 // test control, so a test can drive a FAILING probe: /healthz answers 503
-// whenever the liveness marker is absent (boot, or after the pre-drain flip).
+// whenever the health verdict is unhealthy (boot, or after the pre-drain flip).
 func newTestHandlerHealthz(b *fakeBeater, token string, healthzStatus int) http.Handler {
 	return New(b, Deps{Healthz: staticHealthz(healthzStatus), BeatToken: token})
 }

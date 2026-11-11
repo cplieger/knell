@@ -1,7 +1,7 @@
 // Package main is the knell entry point: a dead-man switch that listens for
 // heartbeat pings and rings a Discord webhook when a beat falls silent.
 // main.go is the composition root plus what only the process boundary owns:
-// the `knell health` probe dispatch, the health marker lifecycle, and
+// the `knell health` probe dispatch, the health verdict lifecycle, and
 // shutdown/exit-code classification; everything else lives in internal/*.
 package main
 
@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/health/v2"
 	"github.com/cplieger/go/httpserver"
 	"github.com/cplieger/go/slogx"
 	"github.com/cplieger/knell/internal/config"
@@ -65,9 +65,9 @@ func main() {
 // a hung listener fails the check with a written reason instead of a kill.
 const healthProbeTimeout = 4 * time.Second
 
-// notServingReason is what /healthz reports while the marker is absent: from
-// the start of a shutdown, and always when /tmp is not writable.
-const notServingReason = "knell is not serving: it is shutting down, or cannot write its health marker in /tmp"
+// notServingReason is what /healthz reports while the verdict is unhealthy:
+// before the listener is bound and from the start of a shutdown.
+const notServingReason = "knell is starting or shutting down"
 
 // errUnknownCommand is the usage error main exits 2 for; every other failure
 // exits 1.
@@ -84,9 +84,9 @@ func exitCode(err error) int {
 // It returns nil on a clean signal-driven shutdown. args are the command-line
 // arguments after the program name; any argument is an unknown command.
 func run(args []string) error {
-	// The boot-armed clock's baseline is process start: marker probing and
-	// mounted-secret reads delay the point watch.New is reached, and every
-	// beat's first deadline must count from here.
+	// The boot-armed clock's baseline is process start: mounted-secret reads
+	// delay the point watch.New is reached, and every beat's first deadline
+	// must count from here.
 	processStart := time.Now()
 
 	// Install the handler before config parsing so config warnings render
@@ -95,15 +95,6 @@ func run(args []string) error {
 	if len(args) > 0 {
 		return fmt.Errorf("%w %q: the only subcommand is health", errUnknownCommand, args[0])
 	}
-
-	// Clear any stale marker before the configuration gate, so a rejected boot
-	// does not leave the previous process's marker file.
-	marker := health.NewMarker(health.DefaultPath)
-	// Cleanup, not Set(false): Set treats the first call as a health
-	// transition and would WARN on every boot for a state that is only
-	// "not booted yet".
-	marker.Cleanup()
-	defer marker.Cleanup()
 
 	cfg, err := loadConfig(notify.MaxNodeNameBytes, webapi.HostPolicyOptions()...)
 	if err != nil {
@@ -122,8 +113,9 @@ func run(args []string) error {
 
 	// The watcher is the single owner of beat admission, so the endpoint holds
 	// no lifecycle state and no context of its own.
+	st := health.NewStatus()
 	handler := webapi.New(watcher, webapi.Deps{
-		Healthz:        health.CheckHandler(health.Check{Signal: marker, Reason: notServingReason}),
+		Healthz:        healthzHandler(st),
 		BeatToken:      cfg.BeatToken,
 		Hosts:          cfg.AllowedHosts,
 		TrustedProxies: cfg.TrustedProxies,
@@ -137,7 +129,7 @@ func run(args []string) error {
 	}
 	ln = countAcceptErrors(ln)
 	slog.Info("listening", "addr", ln.Addr().String())
-	marker.Set(true)
+	st.Set(true)
 
 	watcherDone := make(chan struct{})
 	go func() {
@@ -145,14 +137,14 @@ func run(args []string) error {
 		watcher.Run(ctx, watch.DefaultTick)
 	}()
 
-	// The marker flip rides the pre-drain phase, not onShutdown: one budget
+	// The verdict flip rides the pre-drain phase, not onShutdown: one budget
 	// covers pre-drain -> Shutdown -> onShutdown, so a later flip would let
 	// the `knell health` probe call a draining container healthy.
 	preDrain := httpserver.WithPreDrain(func(context.Context) {
 		// Close beat admission first: a ping answered 200 after cancellation
 		// is a heartbeat with no sender behind it.
 		watcher.StopAccepting()
-		beginTeardown(marker, "shutting down")
+		beginTeardown(st, "shutting down")
 	})
 	// Both teardown paths report whether the watch loop actually finished, so
 	// the exit cannot claim a clean stop over an abandoned loop.
@@ -163,10 +155,15 @@ func run(args []string) error {
 	// The non-graceful exit where Serve returns before a signal: httpserver
 	// invokes either this hook or the graceful ones, never both.
 	serveExit := httpserver.WithServeExit(func(exitCtx context.Context) {
-		watchLoopStopped = teardownAfterServeExit(exitCtx, srv, marker, watcher.StopAccepting, stop, watcherDone)
+		watchLoopStopped = teardownAfterServeExit(exitCtx, srv, st, watcher.StopAccepting, stop, watcherDone)
 	})
 	err = httpserver.Run(ctx, srv, ln, httpserver.WithTeardown(onShutdown), httpserver.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
 	return classifyAbandonedWatchLoop(classifyServeError(err), watchLoopStopped)
+}
+
+// healthzHandler serves st as /healthz.
+func healthzHandler(st *health.Status) http.Handler {
+	return health.CheckHandler(health.Check{Signal: st, Reason: notServingReason})
 }
 
 // newServer builds knell's HTTP server in one place a test can build without a
@@ -190,9 +187,9 @@ func newServer(handler http.Handler) *http.Server {
 // drains accepted handlers, cancels the watcher and waits for it. stop() runs
 // before srv.Shutdown so the loop tallies concurrently rather than behind the
 // drain.
-func teardownAfterServeExit(exitCtx context.Context, srv *http.Server, marker *health.Marker, closeAdmission func(), stop context.CancelFunc, watcherDone <-chan struct{}) bool {
+func teardownAfterServeExit(exitCtx context.Context, srv *http.Server, st *health.Status, closeAdmission func(), stop context.CancelFunc, watcherDone <-chan struct{}) bool {
 	closeAdmission()
-	beginTeardown(marker, "serve loop exited, tearing down")
+	beginTeardown(st, "serve loop exited, tearing down")
 	stop()
 	if err := srv.Shutdown(exitCtx); err != nil {
 		slog.Warn("accepted requests were still in flight at the end of the shutdown grace, so a handler's own loss diagnostic may never have been logged",
@@ -246,8 +243,8 @@ func classifyAbandonedWatchLoop(err error, watchLoopStopped bool) error {
 // Order is load-bearing: a blocked container log driver can stall inside
 // slog.Info, so flipping first makes the `knell health` probe fail closed
 // even if the announcement then blocks.
-func beginTeardown(marker *health.Marker, msg string) {
-	marker.Set(false)
+func beginTeardown(st *health.Status, msg string) {
+	st.BeginDrain()
 	slog.Info(msg)
 }
 

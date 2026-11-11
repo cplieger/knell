@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -21,7 +20,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/health/v2"
 	"github.com/cplieger/go/httpserver"
 	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/config"
@@ -33,27 +32,41 @@ import (
 // fails the tests that assert on it rather than silently matching nothing.
 const stillRunningWarn = "watch loop still running at the end of the shutdown grace"
 
-// waitForMarkerWithin blocks until the health marker reaches the wanted
-// presence, or fails the test. A Stat error other than fs.ErrNotExist is a
-// hard failure, never evidence of presence: a marker the probe cannot stat
-// is not a healthy switch, and swallowing the error turned the oracle into
-// "any error means absent".
-func waitForMarkerWithin(t *testing.T, present bool, timeout time.Duration) {
+// waitForHealthyWithin blocks until /healthz at addr answers 200, or fails
+// the test. A refused connection is not yet serving, so it keeps polling.
+func waitForHealthyWithin(t *testing.T, addr string, timeout time.Duration) {
 	t.Helper()
+	client := &http.Client{Timeout: time.Second}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		_, err := os.Stat(health.DefaultPath)
-		switch {
-		case err == nil && present:
-			return
-		case errors.Is(err, fs.ErrNotExist) && !present:
-			return
-		case err != nil && !errors.Is(err, fs.ErrNotExist):
-			t.Fatalf("stat marker %s: %v", health.DefaultPath, err)
+		resp, err := client.Get("http://" + addr + "/healthz")
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("marker %s presence never became %v within %s", health.DefaultPath, present, timeout)
+	t.Fatalf("/healthz at %s never answered 200 within %s", addr, timeout)
+}
+
+// drainLine is the line the health verdict logs when shutdown turns it
+// unhealthy. The listener closes once the drain starts, so this line is the
+// only observable of the verdict flipping before run() returns.
+const drainLine = `msg="health state changed" healthy=false draining=true`
+
+// waitForLogWithin blocks until logs holds line, or fails the test.
+func waitForLogWithin(t *testing.T, logs *runLog, line string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strings.Contains(logs.String(), line) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("no %q line within %s; log:\n%s", line, timeout, logs.String())
 }
 
 // prepareLifecycleRun installs the one process-global contract every full
@@ -62,10 +75,7 @@ func waitForMarkerWithin(t *testing.T, present bool, timeout time.Duration) {
 // chooses it), installs a complete beat/webhook environment with the _FILE and
 // token variables explicitly cleared (a leaked one from another test changes
 // what run() reads), swaps in a fresh slog default that is restored at test
-// end, and establishes marker ABSENCE before the boot: a marker left by a
-// previous failed run or another knell process would satisfy a presence wait
-// immediately and let a caller signal itself before run() installed its signal
-// context. It is deliberately separate from startLifecycleRun, so a test can
+// end. It is deliberately separate from startLifecycleRun, so a test can
 // still observe state (e.g. a boot floor) between this setup and the boot.
 func prepareLifecycleRun(t *testing.T, beat string) string {
 	t.Helper()
@@ -80,10 +90,6 @@ func prepareLifecycleRun(t *testing.T, beat string) string {
 
 	installRunEnv(t, beat+":1m", addr)
 	capture.Default(t)
-	if err := os.Remove(health.DefaultPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		t.Skipf("cannot clear health marker at %s: %v", health.DefaultPath, err)
-	}
-	t.Cleanup(func() { _ = os.Remove(health.DefaultPath) })
 	return addr
 }
 
@@ -97,9 +103,8 @@ type lifecycleRun struct {
 // startLifecycleRun boots run() in the background and registers the guard
 // every full-lifecycle test needs: a t.Fatalf between the boot and the test's
 // own SIGTERM leaves run() serving, and a surviving run reacts to the NEXT
-// test's self-signal by flipping the SHARED health marker under it — so one
-// real failure makes a later test's marker oracle attributable to the wrong
-// process. Both registrations receive a process-wide SIGTERM, so a surviving
+// test's self-signal too, so one real failure makes a later test's oracle
+// attributable to the wrong process. Both registrations receive a process-wide SIGTERM, so a surviving
 // run steals nothing; the damage is the interference.
 func startLifecycleRun(t *testing.T) *lifecycleRun {
 	t.Helper()
@@ -195,21 +200,21 @@ func startHeldBeatRequest(t *testing.T, addr, beat string, contentLength int) (n
 	return conn, reader
 }
 
-// TestRunTracksHealthMarkerAcrossServeAndDrain pins the full lifecycle of the
-// marker (the verdict /healthz reports to `knell health`), including its
-// ordering: the marker becomes present once the listener is serving (a dropped
-// marker.Set(true) would leave the container unhealthy forever while serving
-// correctly), it becomes ABSENT while run() is still draining a real in-flight
-// /beat request (a deleted or post-Shutdown marker.Set(false) would call a
-// draining container healthy for the whole stop window), and a SIGTERM returns
-// run() with a nil error so the container exits 0 instead of looking crashed.
-func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
-	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
-	// process-wide signal, and the shared health-marker path.
+// TestRunTracksHealthAcrossServeAndDrain pins the verdict /healthz reports to
+// `knell health` across a run: healthy once the listener is serving (a dropped
+// Set(true) would leave the container unhealthy forever while serving
+// correctly), unhealthy while run() is still draining a real in-flight /beat
+// request (a missing or post-Shutdown BeginDrain would call a draining
+// container healthy for the whole stop window), and a SIGTERM returns run()
+// with a nil error so the container exits 0 instead of looking crashed.
+func TestRunTracksHealthAcrossServeAndDrain(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, a process-global slog default and
+	// os.Stderr, and a process-wide signal.
 	addr := prepareLifecycleRun(t, "api")
+	logs := captureRunLog(t)
 
 	r := startLifecycleRun(t)
-	waitForMarkerWithin(t, true, 10*time.Second)
+	waitForHealthyWithin(t, addr, 10*time.Second)
 
 	// Hold one real request open across the shutdown so the interval between
 	// pre-drain and the deferred cleanup becomes observable. Expect:
@@ -223,7 +228,7 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatalf("signalling self: %v", err)
 	}
-	waitForMarkerWithin(t, false, time.Second)
+	waitForLogWithin(t, logs, drainLine, time.Second)
 	select {
 	case err := <-r.done:
 		r.stopped = true
@@ -235,11 +240,6 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 		t.Fatalf("release slow beat request: %v", err)
 	}
 	r.waitForReturn(t, 10*time.Second, "after the active request drained")
-
-	if _, err := os.Stat(health.DefaultPath); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("marker %s after shutdown: stat = %v, want it gone; a stopped switch must not report healthy",
-			health.DefaultPath, err)
-	}
 }
 
 // TestRunPublishesTheBootArmedBaselineFromProcessStart pins that every first
@@ -249,10 +249,8 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 // the published last-seen metric intentionally has second precision.
 //
 // The oracle's reach is the config boundary, not the exact instruction: a
-// capture moved anywhere earlier than config.Load - to the slogx.Setup or
-// marker-probe lines - still lands on the process-start side and still passes.
-// Covering the marker probe too would need a second controllable delay at
-// health.DefaultPath, which is a fixed path this test cannot gate.
+// capture moved anywhere earlier than config.Load, to the slogx.Setup line,
+// still lands on the process-start side and still passes.
 //
 // This is the one half of knell's boot-armed clock that main owns: the
 // processStart baseline run() captures BEFORE config parsing and hands to
@@ -265,7 +263,7 @@ func TestRunTracksHealthMarkerAcrossServeAndDrain(t *testing.T) {
 // value, so nothing outside main can catch it.
 func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
-	// process-wide signal, and the shared health-marker path.
+	// process-wide signal.
 	addr := prepareLifecycleRun(t, "api")
 
 	entered := make(chan struct{})
@@ -299,7 +297,7 @@ func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	time.Sleep(time.Until(configBoundary) + 10*time.Millisecond)
 	release()
 
-	waitForMarkerWithin(t, true, 10*time.Second)
+	waitForHealthyWithin(t, addr, 10*time.Second)
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/metrics", nil)
 	if err != nil {
 		t.Fatalf("building the /metrics request: %v", err)
@@ -388,17 +386,18 @@ func scrapeCounter(t *testing.T, series string) float64 {
 // only pass if acceptance is closed on the far side of the body read too, not
 // merely at handler entry.
 func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
-	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
-	// process-wide signal, and the shared health-marker path.
+	// Serial (no t.Parallel): t.Setenv, a process-global slog default and
+	// os.Stderr, and a process-wide signal.
 	//
 	// A beat id no other test in this package pings, since the metrics
 	// registry is a package-level singleton shared by the whole test binary.
 	const beat = "drain-guard"
 	addr := prepareLifecycleRun(t, beat)
+	logs := captureRunLog(t)
 
 	received := `knell_beats_received_total{beat="` + beat + `"}`
 	r := startLifecycleRun(t)
-	waitForMarkerWithin(t, true, 10*time.Second)
+	waitForHealthyWithin(t, addr, 10*time.Second)
 	before := scrapeCounter(t, received)
 
 	// Admit the ping while the app is live, then hold it inside the handler's
@@ -406,13 +405,13 @@ func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
 	// is reading: net/http emits it on the first Read of the body.
 	conn, reader := startHeldBeatRequest(t, addr, beat, 1)
 
-	// Cancel the shared context. The marker flip happens in the pre-drain hook,
-	// which httpserver invokes only after cancellation, so waiting for the marker
-	// to go makes the rest of this test deterministically post-cancellation.
+	// Cancel the shared context. The verdict flips in the pre-drain hook,
+	// which httpserver invokes only after cancellation, so waiting for its line
+	// makes the rest of this test deterministically post-cancellation.
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatalf("signalling self: %v", err)
 	}
-	waitForMarkerWithin(t, false, 5*time.Second)
+	waitForLogWithin(t, logs, drainLine, 5*time.Second)
 
 	// Complete the body: the handler leaves its read and decides, now, whether
 	// to record a ping the watch loop can no longer account for.
@@ -465,7 +464,7 @@ func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
 // actually carried: refused unauthenticated, refused wrong, admitted correct.
 func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
-	// process-wide signal, and the shared health-marker path.
+	// process-wide signal.
 	//
 	// A beat id no other test in this package pings, since the metrics
 	// registry is a package-level singleton shared by the whole test binary.
@@ -479,7 +478,7 @@ func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 	t.Setenv("BEAT_TOKEN", token)
 
 	r := startLifecycleRun(t)
-	waitForMarkerWithin(t, true, 10*time.Second)
+	waitForHealthyWithin(t, addr, 10*time.Second)
 
 	url := "http://" + addr + "/beat/" + beat
 	unauthorized := postBeat(t, url, "")
@@ -518,14 +517,14 @@ func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 // reports allowlist(1).
 func TestRunAppliesConfiguredHostAllowlist(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
-	// process-wide signal, and the shared health-marker path.
+	// process-wide signal.
 	addr := prepareLifecycleRun(t, "host-gate")
 	// Every other lifecycle boot leaves ALLOWED_HOSTS unset (the policy is
 	// then inactive and admits any Host), so this is the variable under test.
 	t.Setenv("ALLOWED_HOSTS", "knell.internal")
 
 	r := startLifecycleRun(t)
-	waitForMarkerWithin(t, true, 10*time.Second)
+	waitForHealthyWithin(t, addr, 10*time.Second)
 
 	blockedStatus, blockedBody := getHealthzAsHost(t, addr, "attacker.example")
 	if blockedStatus != http.StatusForbidden {
@@ -562,7 +561,7 @@ func TestRunAppliesConfiguredHostAllowlist(t *testing.T) {
 // handler it installs.
 func TestRunResolvesClientIPThroughConfiguredTrustedProxies(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default and
-	// os.Stderr, a process-wide signal, and the shared health-marker path.
+	// os.Stderr, and a process-wide signal.
 	//
 	// A beat id no other test in this package pings, since the metrics registry
 	// is a package-level singleton shared by the whole test binary.
@@ -577,7 +576,7 @@ func TestRunResolvesClientIPThroughConfiguredTrustedProxies(t *testing.T) {
 	logs := captureRunLog(t)
 
 	r := startLifecycleRun(t)
-	waitForMarkerWithin(t, true, 10*time.Second)
+	waitForHealthyWithin(t, addr, 10*time.Second)
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+addr+"/beat/"+beat, nil)
 	if err != nil {
@@ -815,7 +814,7 @@ func TestAwaitWatchLoopWaitsForALoopThatStopsInsideTheGrace(t *testing.T) {
 // the only thing that stops a dead process from reporting itself healthy, and
 // the only thing that cancels the watch loop. A dropped admission close lets a
 // connection accepted just before the listener died record a ping behind the
-// tally the watch loop is about to take; a dropped marker flip leaves
+// tally the watch loop is about to take; a dropped verdict flip leaves
 // `knell health` calling a container with no listener healthy until it is
 // killed; a missing stop() leaves the watcher alerting behind a server that no
 // longer answers, and makes the teardown burn the whole grace on a loop nobody
@@ -833,11 +832,8 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	// default.
 	rec := capture.Default(t)
 
-	marker := health.NewMarker(t.TempDir() + "/healthy")
-	marker.Set(true)
-	if !marker.Healthy() {
-		t.Skip("cannot plant a health marker in the test temp dir")
-	}
+	st := health.NewStatus()
+	st.Set(true)
 
 	exitCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
@@ -851,7 +847,7 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	}
 
 	start := time.Now()
-	teardownAfterServeExit(exitCtx, newServer(http.NewServeMux()), marker, closeAdmission, stop, watcherDone)
+	teardownAfterServeExit(exitCtx, newServer(http.NewServeMux()), st, closeAdmission, stop, watcherDone)
 	waited := time.Since(start)
 
 	if admissionClosed != 1 {
@@ -860,8 +856,8 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	if stopCalls != 1 {
 		t.Errorf("stop() called %d times, want exactly 1: an uncancelled watcher keeps alerting behind a server that stopped serving", stopCalls)
 	}
-	if marker.Healthy() {
-		t.Error("marker still healthy after the serve loop exited: /healthz would call a stopping process healthy")
+	if st.Healthy() {
+		t.Error("verdict still healthy after the serve loop exited: /healthz would call a stopping process healthy")
 	}
 	if !rec.Contains("serve loop exited, tearing down") {
 		t.Errorf("messages = %v, want the non-graceful exit named; without it the watch loop's abandoned-delivery lines are read before anything says why", rec.Messages())
@@ -886,11 +882,8 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 func TestTeardownAfterServeExitDrainsAcceptedHandlers(t *testing.T) {
 	// Serial (no t.Parallel): the teardown logs through the process-global slog
 	// default.
-	marker := health.NewMarker(t.TempDir() + "/healthy")
-	marker.Set(true)
-	if !marker.Healthy() {
-		t.Skip("cannot plant a health marker in the test temp dir")
-	}
+	st := health.NewStatus()
+	st.Set(true)
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -939,7 +932,7 @@ func TestTeardownAfterServeExitDrainsAcceptedHandlers(t *testing.T) {
 	defer cancel()
 	returned := make(chan struct{})
 	go func() {
-		teardownAfterServeExit(exitCtx, srv, marker, func() {}, func() { close(watcherDone) }, watcherDone)
+		teardownAfterServeExit(exitCtx, srv, st, func() {}, func() { close(watcherDone) }, watcherDone)
 		close(returned)
 	}()
 	select {
@@ -984,11 +977,8 @@ func TestTeardownAfterServeExitWarnsWhenTheDrainOutlivesTheGrace(t *testing.T) {
 	// default.
 	rec := capture.Default(t)
 
-	marker := health.NewMarker(t.TempDir() + "/healthy")
-	marker.Set(true)
-	if !marker.Healthy() {
-		t.Skip("cannot plant a health marker in the test temp dir")
-	}
+	st := health.NewStatus()
+	st.Set(true)
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1033,7 +1023,7 @@ func TestTeardownAfterServeExitWarnsWhenTheDrainOutlivesTheGrace(t *testing.T) {
 	<-exitCtx.Done()
 
 	watcherDone := make(chan struct{})
-	teardownAfterServeExit(exitCtx, srv, marker, func() {}, func() { close(watcherDone) }, watcherDone)
+	teardownAfterServeExit(exitCtx, srv, st, func() {}, func() { close(watcherDone) }, watcherDone)
 
 	const inFlightWarn = "accepted requests were still in flight"
 	if n := rec.CountLevel(slog.LevelWarn, inFlightWarn); n != 1 {
@@ -1157,38 +1147,56 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 	}
 }
 
-// TestRunServesTheMarkerVerdictOnHealthz pins the composition root's /healthz:
-// the fleet health body, following the marker. The webapi tests inject a fixed
-// verdict, so only this test sees the wiring: with obs.Handler in that slot
-// /healthz answers 200 forever, and an unwired route answers 404 forever.
-// Removing the marker mid-run proves the endpoint follows it.
-func TestRunServesTheMarkerVerdictOnHealthz(t *testing.T) {
+// TestRunServesTheHealthVerdictOnHealthz pins the composition root's /healthz
+// wiring: the webapi tests inject a fixed verdict, so only this test sees that
+// run() puts the health handler in that slot. With obs.Handler there /healthz
+// answers 200 with the wrong body, and an unwired route answers 404.
+func TestRunServesTheHealthVerdictOnHealthz(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
-	// process-wide signal, and the shared health-marker path.
+	// process-wide signal.
 	//
 	// A beat id no other test in this package pings, since the metrics
 	// registry is a package-level singleton shared by the whole test binary.
 	addr := prepareLifecycleRun(t, "healthz-probe")
 
 	r := startLifecycleRun(t)
-	waitForMarkerWithin(t, true, 10*time.Second)
+	waitForHealthyWithin(t, addr, 10*time.Second)
 
 	if status, body := getHealthz(t, addr); status != http.StatusOK || body != `{"status":"ok"}`+"\n" {
 		t.Errorf("/healthz on a serving switch = %d %q, want 200 {\"status\":\"ok\"}", status, body)
-	}
-
-	if err := os.Remove(health.DefaultPath); err != nil {
-		t.Fatalf("removing the marker under the serving switch: %v", err)
-	}
-	const want = `{"status":"unhealthy","reasons":["` + notServingReason + `"]}` + "\n"
-	if status, body := getHealthz(t, addr); status != http.StatusServiceUnavailable || body != want {
-		t.Errorf("/healthz with the marker gone = %d %q, want 503 %q", status, body, want)
 	}
 
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatalf("signalling self: %v", err)
 	}
 	r.waitForReturn(t, 10*time.Second, "after a shutdown signal")
+}
+
+// TestHealthzHandlerFollowsTheVerdict pins what /healthz answers for each
+// state of the verdict run() keeps: unhealthy before the listener is up,
+// healthy once it serves, and unhealthy for good once shutdown begins.
+func TestHealthzHandlerFollowsTheVerdict(t *testing.T) {
+	t.Parallel()
+	const unhealthy = `{"status":"unhealthy","reasons":["` + notServingReason + `"]}` + "\n"
+	st := health.NewStatus(health.WithLogger(slog.New(slog.DiscardHandler)))
+	h := healthzHandler(st)
+	answer := func() (int, string) {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", nil))
+		return w.Code, w.Body.String()
+	}
+	if code, body := answer(); code != http.StatusServiceUnavailable || body != unhealthy {
+		t.Errorf("before Set(true) = %d %q, want 503 %q", code, body, unhealthy)
+	}
+	st.Set(true)
+	if code, body := answer(); code != http.StatusOK || body != `{"status":"ok"}`+"\n" {
+		t.Errorf("serving = %d %q, want 200 {\"status\":\"ok\"}", code, body)
+	}
+	st.BeginDrain()
+	st.Set(true)
+	if code, body := answer(); code != http.StatusServiceUnavailable || body != unhealthy {
+		t.Errorf("after BeginDrain = %d %q, want 503 %q", code, body, unhealthy)
+	}
 }
 
 // getHealthz probes the liveness endpoint of a serving knell, returning the
