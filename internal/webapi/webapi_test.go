@@ -516,13 +516,9 @@ func TestMetricsExpositionGzip(t *testing.T) {
 }
 
 // TestProbePathAccessLogLevels pins the WithProbeLogLevel policy on knell's two
-// machine-probe endpoints. It carries forward the guard the former
-// WithSkipPaths("/healthz", "/metrics") existed for — routine probe traffic
-// must not pollute the log stream at the operating level, so no probe line may
-// land at Info — and adds the direction a skip list could not express: a probe
-// that FAILS has to be visible. /healthz and /metrics are the endpoints
-// carrying knell's quorum signal, so a scrape answering 4xx/5xx or a liveness
-// probe gone 503 must be greppable rather than silently dropped.
+// machine-probe endpoints: every request to them logs at Debug whatever its
+// status, so a standing 503 /healthz or a misaimed scraper never floods the
+// shipped stream, while every other path keeps its Info line.
 func TestProbePathAccessLogLevels(t *testing.T) {
 	tests := map[string]struct {
 		method        string
@@ -531,9 +527,6 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 		wantStatus    int
 		wantLevel     slog.Level
 	}{
-		// A liveness probe every 30s and a scrape every 15s are noise while
-		// they succeed: Debug keeps them out of the shipped stream but
-		// reachable under LOG_LEVEL=debug ("is the probe even arriving?").
 		"healthy healthz probe": {
 			method: http.MethodGet, path: "/healthz", healthzStatus: http.StatusOK,
 			wantStatus: http.StatusOK, wantLevel: slog.LevelDebug,
@@ -542,22 +535,17 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 			method: http.MethodGet, path: "/metrics", healthzStatus: http.StatusOK,
 			wantStatus: http.StatusOK, wantLevel: slog.LevelDebug,
 		},
-		// /healthz answers 503 whenever the liveness marker is absent.
-		// That is the failing dead-man-switch signal, at Error.
 		"failing healthz probe": {
 			method: http.MethodGet, path: "/healthz", healthzStatus: http.StatusServiceUnavailable,
-			wantStatus: http.StatusServiceUnavailable, wantLevel: slog.LevelError,
+			wantStatus: http.StatusServiceUnavailable, wantLevel: slog.LevelDebug,
 		},
-		// A prober or scraper aimed with the wrong method gets 405 from the
-		// mux: the "my scrape never lands" class, now at Warn instead of
-		// silence.
 		"wrong-method healthz probe": {
 			method: http.MethodPost, path: "/healthz", healthzStatus: http.StatusOK,
-			wantStatus: http.StatusMethodNotAllowed, wantLevel: slog.LevelWarn,
+			wantStatus: http.StatusMethodNotAllowed, wantLevel: slog.LevelDebug,
 		},
 		"wrong-method metrics scrape": {
 			method: http.MethodPost, path: "/metrics", healthzStatus: http.StatusOK,
-			wantStatus: http.StatusMethodNotAllowed, wantLevel: slog.LevelWarn,
+			wantStatus: http.StatusMethodNotAllowed, wantLevel: slog.LevelDebug,
 		},
 		// Everything off the probe list keeps the default Info access line.
 		"beat ping stays at info": {
@@ -595,8 +583,7 @@ func TestProbePathAccessLogLevels(t *testing.T) {
 						lvl, got, want, tt.method, tt.path, tt.wantStatus)
 				}
 			}
-			// The line is only useful if it names what happened: an operator
-			// greps the Warn/Error probe line for its status.
+			// The line is only useful if it names what happened.
 			if !rec.HasAttr("http", "status", strconv.Itoa(tt.wantStatus)) {
 				t.Errorf("access line missing status=%d; records = %v", tt.wantStatus, rec.Records())
 			}

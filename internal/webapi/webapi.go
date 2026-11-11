@@ -86,9 +86,8 @@ func New(b Beater, deps Deps) http.Handler {
 		// a request with no valid beat token is answered 429 without reaching
 		// Logging, so a guessing run cannot flood the log.
 		beatAuthFailureLimiter(mux, verifier),
-		// /healthz and /metrics are machine probes, so they ride WithProbeLogLevel
-		// rather than a skip list, which would silence failures too on the two
-		// endpoints carrying knell's quorum signal. WithRecordRouteMetric is
+		// /healthz and /metrics log at Debug: the health verdict logs its own
+		// changes, and a failed scrape shows as up == 0. WithRecordRouteMetric is
 		// the only place a refused ping (401/404/405/503) becomes visible to a
 		// scrape, since none reach beatsReceived. The throttle's 429 is counted
 		// on the pre-route counter instead, outside this wrapper.
