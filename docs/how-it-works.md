@@ -81,7 +81,7 @@ Headers are limited the other way round, because knell must read them before it 
 
 ### Probe logging
 
-`/healthz` and `/metrics` are logged as machine probes, at `debug` whatever the status, so set `LOG_LEVEL=debug` to confirm a probe or scrape reaches knell. knell logs `health state changed` once each time its health verdict changes, and a failed scrape shows as `up` 0 in Prometheus. A scrape that never reaches knell produces no request log.
+`/healthz` and `/metrics` are logged as machine probes, at `debug` whatever the status. Set `LOG_LEVEL=debug` to confirm a probe or scrape reaches knell. knell logs `health state changed` once each time its health verdict changes, and a failed scrape shows as `up` 0 in Prometheus. A scrape that never reaches knell produces no request log.
 
 ## Several instances
 

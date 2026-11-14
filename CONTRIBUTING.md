@@ -2,7 +2,7 @@
 
 The [shared rules](https://github.com/cplieger/.github/blob/main/CONTRIBUTING.md) for commits, releases, synced files and checks apply here.
 
-## Dashboard
+## Rules
 
 - `grafana-dashboard.json` reads series names and labels as text. A test in `internal/obs` fails when a panel reads a series or a label knell does not serve, or when a rule in `alerts/promql.yaml` has no Overview tile. Update the dashboard with any rename.
 - Save a dashboard change made in the Grafana UI with Export, then Export as code, choosing the V2 Resource model.

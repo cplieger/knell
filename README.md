@@ -3,22 +3,23 @@
 [![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/knell/badges/size.json)](https://github.com/cplieger/knell/pkgs/container/knell) [![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)](https://github.com/cplieger/knell/pkgs/container/knell) [![base: scratch](https://img.shields.io/badge/base-scratch-000000)](https://github.com/cplieger/knell/blob/main/Dockerfile) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/knell/badges/mutation.json)](https://github.com/cplieger/knell/issues?q=label%3Agremlins-tracker) [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/knell/releases)
 
 <!-- hub-overview BEGIN -->
-knell is a dead man's switch for your scheduled jobs. It sends you a Discord message when a cron job, backup script or alerting pipeline stops pinging it over HTTP. It only listens and never runs them.
+knell sends you a Discord message when a cron job, backup script or alerting pipeline stops checking in. Each job pings knell over HTTP. knell never runs the jobs.
 
 ## What it does
 
-knell tells you when a scheduled job stops, in four ways:
+knell tells you when a scheduled job stops running:
 
-- Posts to Discord when a job misses its deadline, optionally repeats the post, and again when it pings.
-- Counts each deadline from knell's start, so a job silent since a restart is still reported.
-- Tells you afterwards about an outage that ended before its message could go out.
-- Publishes each job's state as Prometheus metrics, so your metrics stack can combine several instances.
+- Posts to Discord when a job misses its deadline, and again when it checks in.
+- Can repeat that post while the job stays silent.
+- Reports a job that never checks in at all, one deadline after knell starts.
+- Reports an outage that ended while Discord was down, once Discord answers again.
+- Publishes each job's state as Prometheus metrics.
 
 Each watched job is a beat. Its deadline is the longest silence allowed between two pings.
 
 ## Who it is for
 
-knell is built for a home lab that gets its alerts in Discord and wants a small watchdog with no database or web page. It is one static binary set up from environment variables, keeps its state in memory and sends only to Discord or a Discord-compatible relay.
+knell is built for a home lab that gets its alerts in Discord and wants a small watchdog with no database or web page. It sends only to a Discord webhook or a relay that accepts Discord's message format. It keeps its state in memory, so a restart starts every deadline over.
 
 You need a Discord webhook, a Docker host and jobs that can send an HTTP POST. Keep its port on a network you trust.
 
@@ -58,7 +59,8 @@ services:
 3. Run `openssl rand -hex 16` and keep the output as your token.
 4. Save the file above as `compose.yaml`. Put the webhook URL in `DISCORD_WEBHOOK_URL`, the token in `BEAT_TOKEN`, and one `id:deadline` pair per job in `BEATS`.
 5. Run `docker compose up -d`.
-6. Add this line at the end of each job. Set `BEAT_TOKEN` in that job's environment to the same token, or paste the token in its place, and end the URL with the beat's id:
+6. Set `BEAT_TOKEN` to the same token in each job's environment, or paste the token in place of `$BEAT_TOKEN` below.
+7. Add this line at the end of each job, after the commands that must succeed, and end the URL with the beat's id. A job that fails earlier sends no ping, and knell never learns why:
 
 ```sh
 curl -fsS -X POST -H "Authorization: Bearer $BEAT_TOKEN" http://192.0.2.10:9190/beat/cron-backup
@@ -68,11 +70,11 @@ Replace `192.0.2.10` with the address of the host that runs knell, as other devi
 
 Run `docker logs knell`. You should see a `configuration loaded` line and then `listening`. If it shows `knell exited with error` instead, its `error` field names the setting to fix, usually a placeholder you have not replaced yet.
 
-When a beat goes quiet past its deadline, the channel gets a message naming the beat, with how long it has been silent, when the silence began and which knell instance saw it. Set `MISSING_REPEAT` to have that message sent again while the outage lasts.
+When a beat goes quiet past its deadline, the channel gets a message naming the beat, how long it has been silent, when the silence began and which knell instance saw it. When the beat pings again, a recovered message follows.
 
 ## Configuration reference
 
-knell reads its settings from environment variables when it starts and never reloads them. An invalid value stops it at startup with an error naming the setting, instead of falling back to a default. [Configuration](docs/configuration.md) has the full rules for each setting.
+knell reads its settings from environment variables when it starts and never reloads them. An invalid value stops it at startup with an error naming the setting. The two exceptions are `LOG_LEVEL`, which falls back to `info`, and `TRUSTED_PROXIES`, which logs and drops a malformed entry. [Configuration](docs/configuration.md) has the full rules for each setting.
 
 | Variable | Description | Default |
 | --- | --- | --- |
@@ -96,37 +98,39 @@ knell needs no volume.
 
 knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext on every ping, and anything that reads one ping can replay it. Put a [TLS reverse proxy](https://github.com/cplieger/docs/blob/main/docs/reverse-proxy.md) in front, or keep pings on a network you trust to the same standard.
 
-The token gates `POST /beat/<id>` only. `/healthz` and `/metrics` answer anyone who can reach the port, and `/metrics` lists every beat with its last ping. Publish the port to a trusted network only, or put an authenticating proxy in front of `/metrics`. Set `ALLOWED_HOSTS` to the names you use, so a web page an operator opens cannot reach knell through a hostname an attacker controls.
+One token gates `POST /beat/<id>` for every beat, so any job that holds it can ping any beat. `/healthz` and `/metrics` answer anyone who can reach the port, and `/metrics` lists every beat with its last ping. Publish the port to a trusted network only, or put an authenticating proxy in front of `/metrics`. Set `ALLOWED_HOSTS` to the names you use to reach knell. Then a web page in your browser cannot read `/metrics` through a domain an attacker points at knell.
 
-The image runs as the non-root user 65534 on `scratch`, and the webhook URL never appears in a log line or an error. [Security](docs/hardening.md) covers the startup check for `ALLOWED_HOSTS`, the proxy settings and the hardened compose profile.
+The image runs as the non-root user 65534 on `scratch`, and the webhook URL never appears in a log line or an error. [Security](docs/hardening.md) covers reverse proxies, `ALLOWED_HOSTS` and the hardened compose profile.
 
 ## Troubleshooting
 
-The image checks itself with `knell health`, which asks `/healthz` on the container's loopback, or on the address `LISTEN_ADDR` names. `docker ps` shows `healthy` while knell is serving. An unhealthy container is running but not answering, as happens while knell shuts down. A restarting one has exited. In both cases `docker logs knell` shows why. An unhealthy knell notifies nobody, so a Docker-only user probes `/healthz` from outside. [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) shows how.
+The image checks itself every 30 seconds with `knell health`, which asks `/healthz` inside the container. `docker ps` shows `healthy` while knell is serving. Unhealthy means knell is running but not answering, as happens while it shuts down. A restarting container has exited, and `docker logs knell` shows why. Docker health alerts nobody, so to hear that knell stopped, check `/healthz` from another machine as [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) shows.
 
-- If the container restarts in a loop with `knell exited with error`, the `error` field names the setting knell refused.
 - If a ping is answered `401`, the `Authorization` header does not match `BEAT_TOKEN` exactly.
 - If a ping is answered `404`, the id is not in `BEATS` or the URL has an extra path segment.
 - If a ping is answered `403` with `host_not_allowed`, add the name the sender uses to `ALLOWED_HOSTS`.
 - If a ping is answered `405`, the sender used `GET` or another method. Only `POST` records a ping.
-- If a beat that is down never alerts, check how often knell restarts. Each start resets every deadline, so restarts closer together than a beat's deadline keep it from ever firing.
+- If a down beat never alerts, check whether knell keeps restarting. Each start gives every beat a full deadline, so a beat never fires while knell restarts more often than that.
+- If Discord or the network is down, knell retries a missing notice every 15 seconds until Discord takes it.
 
-[How knell works](docs/how-it-works.md) explains the deadlines, retries and every answer a ping can get.
+[How knell works](docs/how-it-works.md) has the retry rules and every answer a ping can get.
 
 ## Monitoring
 
-knell publishes Prometheus metrics on `/metrics` and writes logfmt logs to standard error. Eight alert rules that watch knell ship in [`alerts/`](alerts/), six PromQL rules in `alerts/promql.yaml` and two LogQL rules in `alerts/logql.yaml` for the failures that leave no series. Load both. A Grafana dashboard of every beat, its deadline and the firing alerts ships as [`grafana-dashboard.json`](grafana-dashboard.json) and needs Grafana 13.2 or newer. The image has a Docker healthcheck, and [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) says what it proves and who is told. [Monitoring and alerts](docs/monitoring.md) lists the metrics and rules, and shows how to make knell watch your alert pipeline.
+knell publishes Prometheus metrics on `/metrics` and writes logfmt logs, one `key=value` line per event, to standard error. Eight alert rules that watch knell ship in [`alerts/`](alerts/), six in `alerts/promql.yaml` and two in `alerts/logql.yaml`. Load both. The [Grafana dashboard](docs/dashboard.md), shipped as [`grafana-dashboard.json`](grafana-dashboard.json), needs Grafana 13.2 or newer. [Monitoring and alerts](docs/monitoring.md) lists the metrics and rules, and says who is told when knell itself stops.
 
 ## Documentation
 
 - [Configuration](docs/configuration.md) lists every setting, its limits, secret files and what stops startup.
 - [How knell works](docs/how-it-works.md) explains deadlines, notices, retries and every answer a ping can get.
-- [Monitoring and alerts](docs/monitoring.md) lists the log lines, the metrics, the alert rules and the dashboard, and shows how to make knell watch your alert pipeline.
+- [Monitoring and alerts](docs/monitoring.md) lists the log lines, the metrics and the alert rules.
+- [The Grafana dashboard](docs/dashboard.md) describes each tab and how to update it.
+- [Watching your alert pipeline](docs/alert-pipeline.md) makes knell tell you when Alertmanager goes quiet.
 - [Security](docs/hardening.md) covers exposure, reverse proxies and the hardened compose profile.
 
 ## Contributing
 
-Issues and pull requests are welcome. The [shared contributing rules](https://github.com/cplieger/.github/blob/main/CONTRIBUTING.md) apply, and [CONTRIBUTING.md](CONTRIBUTING.md) adds the rules for the dashboard.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Disclaimer
 
