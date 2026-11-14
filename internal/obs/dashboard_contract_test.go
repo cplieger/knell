@@ -23,7 +23,8 @@ type dashQuery struct {
 	Spec struct {
 		Query struct {
 			Spec struct {
-				Expr string `json:"expr"`
+				Expr         string `json:"expr"`
+				LegendFormat string `json:"legendFormat"`
 			} `json:"spec"`
 		} `json:"query"`
 	} `json:"spec"`
@@ -522,15 +523,20 @@ func TestDashboardMergedTablesJoinEachRowOnItsKey(t *testing.T) {
 	}
 }
 
-// TestDashboardRowHeadersFoldTwoPanels fails when a row shows a header over
-// fewer than two always-shown panels, which costs a click and hides nothing.
-// A row of tiles shown only with data needs two of them, since it lights
-// several.
-func TestDashboardRowHeadersFoldTwoPanels(t *testing.T) {
+// TestDashboardRowHeadersSeparateTheirPanels fails when a row's header costs
+// a click and hides nothing, or when a row's panels read as part of the row
+// above. A titled row folds two panels of one kind (always shown, or shown
+// only with data), unless a titled row is above it: a headerless row there
+// reads as that row's panels, so only a tab's opening rows may hide theirs.
+func TestDashboardRowHeadersSeparateTheirPanels(t *testing.T) {
 	d := loadDashboard(t)
 	for _, tb := range d.Spec.Layout.Spec.Tabs {
+		titledAbove := ""
 		for _, r := range tb.Spec.Layout.Spec.Rows {
 			if r.Spec.HideHeader {
+				if titledAbove != "" {
+					t.Errorf("tab %q row %q hides its header below row %q, so its panels read as that row's", tb.Spec.Title, r.Spec.Title, titledAbove)
+				}
 				continue
 			}
 			shown, gated := 0, 0
@@ -541,11 +547,95 @@ func TestDashboardRowHeadersFoldTwoPanels(t *testing.T) {
 					gated++
 				}
 			}
-			if shown < 2 && (shown > 0 || gated < 2) {
+			if titledAbove == "" && shown < 2 && (shown > 0 || gated < 2) {
 				t.Errorf("tab %q row %q shows a header over %d always-shown panels and %d shown only with data, want two of one kind or hideHeader",
 					tb.Spec.Title, r.Spec.Title, shown, gated)
 			}
+			titledAbove = r.Spec.Title
 		}
+	}
+}
+
+// aggregated reports whether expr's outermost operation, looking through
+// round(), is an aggregation, which leaves one series per group.
+func aggregated(expr string) bool {
+	rest := strings.TrimSpace(expr)
+	for {
+		inner, ok := strings.CutPrefix(rest, "round")
+		if !ok {
+			break
+		}
+		inner = strings.TrimSpace(inner)
+		end := closingParen(inner)
+		if end < 0 || strings.TrimSpace(inner[end+1:]) != "" {
+			break
+		}
+		rest = strings.TrimSpace(inner[1:end])
+	}
+	return aggregationRe.MatchString(rest)
+}
+
+// TestDashboardCountsEachBeatOnce fails when a query about the beats reads a
+// per-beat series without aggregating it by beat. Several knells can share one
+// scrape instance, each holding its own copy of every beat, so a bare selector
+// shows or counts a beat once per knell. The Notices row is left out: each
+// knell sends and loses its own notices, so their sum is the real count.
+func TestDashboardCountsEachBeatOnce(t *testing.T) {
+	served := servedSeries(t)
+	d := loadDashboard(t)
+	checked := 0
+	for _, title := range []string{"Overview", "History"} {
+		for _, r := range tab(t, &d, title).Spec.Layout.Spec.Rows {
+			if r.Spec.Title == "Notices" {
+				continue
+			}
+			for _, it := range r.Spec.Layout.Spec.Items {
+				p := d.Spec.Elements[it.Spec.Element.Name]
+				for i, e := range panelExprs(&p) {
+					perBeat := slices.ContainsFunc(seriesIn(e), func(name string) bool {
+						return slices.Contains(served[name], "beat")
+					})
+					if !perBeat {
+						continue
+					}
+					checked++
+					if !regexp.MustCompile(`\bby\s*\(\s*beat\s*\)`).MatchString(e) {
+						t.Errorf("tab %q %q query %d reads a per-beat series without aggregating by beat: %s", title, p.Spec.Title, i, e)
+					}
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Error("no query reads a per-beat series; the check no longer reads the dashboard")
+	}
+}
+
+// TestDashboardHealthTilesNameEachKnell fails when a knell health stat panel
+// that shows one value per knell has no legend, since Grafana then names each
+// tile by its whole label set.
+func TestDashboardHealthTilesNameEachKnell(t *testing.T) {
+	d := loadDashboard(t)
+	checked := 0
+	for _, r := range tab(t, &d, "knell health").Spec.Layout.Spec.Rows {
+		for _, it := range r.Spec.Layout.Spec.Items {
+			p := d.Spec.Elements[it.Spec.Element.Name]
+			if p.Spec.VizConfig.Group != "stat" {
+				continue
+			}
+			for i, q := range p.Spec.Data.Spec.Queries {
+				if aggregated(q.Spec.Query.Spec.Expr) {
+					continue
+				}
+				checked++
+				if strings.TrimSpace(q.Spec.Query.Spec.LegendFormat) == "" {
+					t.Errorf("%q query %d shows one tile per knell with no legend", p.Spec.Title, i)
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Error("no knell health tile shows one value per knell; the check no longer reads the dashboard")
 	}
 }
 
