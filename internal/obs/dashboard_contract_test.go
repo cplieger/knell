@@ -356,9 +356,13 @@ func TestDashboardMatchesOnlyTheSelectedInstance(t *testing.T) {
 			}
 		}
 		series := seriesIn(expr)
+		named := 0
 		for _, m := range selectorAtRe.FindAllStringSubmatch(expr, -1) {
 			if !slices.Contains(series, m[1]) {
 				continue
+			}
+			if m[2] != "" {
+				named++
 			}
 			if where == "variable instance" {
 				continue
@@ -371,16 +375,23 @@ func TestDashboardMatchesOnlyTheSelectedInstance(t *testing.T) {
 				t.Errorf("%s reads %s without instance=\"$instance\": %s", where, m[1], expr)
 			}
 		}
+		if groups := len(matchersRe.FindAllString(quotedRe.ReplaceAllString(expr, `""`), -1)); groups != named {
+			t.Errorf("%s has a selector with no series name before its braces, which these checks cannot read: %s", where, expr)
+		}
 	}
 	if checked == 0 {
 		t.Error("no query reads a series; the check no longer reads the dashboard")
 	}
 }
 
+// knellJoinRe is the join that keeps only knell's series: and on (job,
+// instance) to knell_build_info, the shape KnellRestartChurn uses.
+var knellJoinRe = regexp.MustCompile(`\band\s+on\s*\(\s*(?:job\s*,\s*instance|instance\s*,\s*job)\s*\)\s*(?:last_over_time\s*\(\s*)?knell_build_info\b`)
+
 // TestDashboardScopesSharedFamiliesToKnell fails when a query reads up or a
-// process_ or go_ family without joining knell_build_info. Every target on a
-// shared instance writes those families, so instance="$instance" alone also
-// shows the other jobs there.
+// process_ or go_ family without and on (job, instance) knell_build_info.
+// Every target on a shared instance writes those families, so
+// instance="$instance" alone also shows the other jobs there.
 func TestDashboardScopesSharedFamiliesToKnell(t *testing.T) {
 	d := loadDashboard(t)
 	checked := 0
@@ -393,8 +404,8 @@ func TestDashboardScopesSharedFamiliesToKnell(t *testing.T) {
 			continue
 		}
 		checked++
-		if !slices.Contains(series, "knell_build_info") {
-			t.Errorf("%s reads a family every target writes without joining knell_build_info: %s", where, expr)
+		if !knellJoinRe.MatchString(expr) {
+			t.Errorf("%s reads a family every target writes without and on (job, instance) knell_build_info: %s", where, expr)
 		}
 	}
 	if checked == 0 {
