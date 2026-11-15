@@ -1380,7 +1380,7 @@
         "spec": {
           "id": 33,
           "title": "Notices sent",
-          "description": "Notices knell delivered, by kind, as bars over the selected range. Missing is a beat that crossed its deadline, Recovered one that pinged again, and History a summary of outages that ended. No bars means knell sent nothing.",
+          "description": "Notices knell delivered, by kind, as bars over the selected range. Missing is a beat that crossed its deadline, Recovered one that pinged again, and History a summary of outages that ended. No bars means knell sent nothing. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1397,7 +1397,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "label_replace(label_replace(label_replace(round(sum by (kind) (increase(knell_notifications_sent_total{instance=\"$instance\"}[$__interval]))), \"kind\", \"Missing\", \"kind\", \"missing\"), \"kind\", \"Recovered\", \"kind\", \"recovered\"), \"kind\", \"History\", \"kind\", \"history\")",
+                        "expr": "label_replace(label_replace(label_replace(sum by (kind) (((knell_notifications_sent_total{instance=\"$instance\"} - knell_notifications_sent_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_notifications_sent_total{instance=\"$instance\"}[$__interval]) < knell_notifications_sent_total{instance=\"$instance\"} offset $__interval) or (resets(knell_notifications_sent_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_notifications_sent_total{instance=\"$instance\"} and ((min_over_time(knell_notifications_sent_total{instance=\"$instance\"}[$__interval]) < knell_notifications_sent_total{instance=\"$instance\"} offset $__interval) or (resets(knell_notifications_sent_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_notifications_sent_total{instance=\"$instance\"} - min_over_time(knell_notifications_sent_total{instance=\"$instance\"}[$__interval]))), \"kind\", \"Missing\", \"kind\", \"missing\"), \"kind\", \"Recovered\", \"kind\", \"recovered\"), \"kind\", \"History\", \"kind\", \"history\")",
                         "legendFormat": "{{kind}}"
                       }
                     },
@@ -1468,7 +1468,7 @@
         "spec": {
           "id": 34,
           "title": "Notices failed or lost",
-          "description": "Notices that failed after their retries and will be tried again, notices that will never be sent, and outage records knell had to discard, as bars over the selected range. Any bar here means a notice was late or lost. The container log says why.",
+          "description": "Notices that failed after their retries and will be tried again, notices that will never be sent, and outage records knell had to discard, as bars over the selected range. Any bar here means a notice was late or lost. The container log says why. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1485,7 +1485,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "label_replace(label_replace(label_replace(round(sum by (kind) (increase(knell_notifications_failed_total{instance=\"$instance\"}[$__interval]))), \"kind\", \"Missing\", \"kind\", \"missing\"), \"kind\", \"Recovered\", \"kind\", \"recovered\"), \"kind\", \"History\", \"kind\", \"history\")",
+                        "expr": "label_replace(label_replace(label_replace(sum by (kind) (((knell_notifications_failed_total{instance=\"$instance\"} - knell_notifications_failed_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_notifications_failed_total{instance=\"$instance\"}[$__interval]) < knell_notifications_failed_total{instance=\"$instance\"} offset $__interval) or (resets(knell_notifications_failed_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_notifications_failed_total{instance=\"$instance\"} and ((min_over_time(knell_notifications_failed_total{instance=\"$instance\"}[$__interval]) < knell_notifications_failed_total{instance=\"$instance\"} offset $__interval) or (resets(knell_notifications_failed_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_notifications_failed_total{instance=\"$instance\"} - min_over_time(knell_notifications_failed_total{instance=\"$instance\"}[$__interval]))), \"kind\", \"Missing\", \"kind\", \"missing\"), \"kind\", \"Recovered\", \"kind\", \"recovered\"), \"kind\", \"History\", \"kind\", \"history\")",
                         "legendFormat": "Failed, {{kind}}"
                       }
                     },
@@ -1504,7 +1504,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "label_replace(label_replace(label_replace(round(sum by (kind) (increase(knell_notifications_dropped_total{instance=\"$instance\"}[$__interval]))), \"kind\", \"Missing\", \"kind\", \"missing\"), \"kind\", \"Recovered\", \"kind\", \"recovered\"), \"kind\", \"History\", \"kind\", \"history\")",
+                        "expr": "label_replace(label_replace(label_replace(sum by (kind) (((knell_notifications_dropped_total{instance=\"$instance\"} - knell_notifications_dropped_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_notifications_dropped_total{instance=\"$instance\"}[$__interval]) < knell_notifications_dropped_total{instance=\"$instance\"} offset $__interval) or (resets(knell_notifications_dropped_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_notifications_dropped_total{instance=\"$instance\"} and ((min_over_time(knell_notifications_dropped_total{instance=\"$instance\"}[$__interval]) < knell_notifications_dropped_total{instance=\"$instance\"} offset $__interval) or (resets(knell_notifications_dropped_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_notifications_dropped_total{instance=\"$instance\"} - min_over_time(knell_notifications_dropped_total{instance=\"$instance\"}[$__interval]))), \"kind\", \"Missing\", \"kind\", \"missing\"), \"kind\", \"Recovered\", \"kind\", \"recovered\"), \"kind\", \"History\", \"kind\", \"history\")",
                         "legendFormat": "Never sent, {{kind}}"
                       }
                     },
@@ -1523,7 +1523,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "round(sum(increase(knell_outage_records_dropped_total{instance=\"$instance\"}[$__interval])))",
+                        "expr": "sum(((knell_outage_records_dropped_total{instance=\"$instance\"} - knell_outage_records_dropped_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_outage_records_dropped_total{instance=\"$instance\"}[$__interval]) < knell_outage_records_dropped_total{instance=\"$instance\"} offset $__interval) or (resets(knell_outage_records_dropped_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_outage_records_dropped_total{instance=\"$instance\"} and ((min_over_time(knell_outage_records_dropped_total{instance=\"$instance\"}[$__interval]) < knell_outage_records_dropped_total{instance=\"$instance\"} offset $__interval) or (resets(knell_outage_records_dropped_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_outage_records_dropped_total{instance=\"$instance\"} - min_over_time(knell_outage_records_dropped_total{instance=\"$instance\"}[$__interval])))",
                         "legendFormat": "Outage records discarded"
                       }
                     },
@@ -1948,7 +1948,7 @@
         "spec": {
           "id": 44,
           "title": "Refusals by reason",
-          "description": "Requests knell refused before reading them, by reason, as bars over the selected range. Host not allowed means a job addresses knell by a name missing from ALLOWED_HOSTS. No bars means knell refused nothing.",
+          "description": "Requests knell refused before reading them, by reason, as bars over the selected range. Host not allowed means a job addresses knell by a name missing from ALLOWED_HOSTS. No bars means knell refused nothing. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1965,7 +1965,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "label_replace(label_replace(label_replace(round(sum by (reason) (increase(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]))), \"reason\", \"Beat path spelled oddly\", \"reason\", \"non_canonical_beat_path\"), \"reason\", \"Host not allowed\", \"reason\", \"host_not_allowed\"), \"reason\", \"Sign-in throttled\", \"reason\", \"auth_throttled\")",
+                        "expr": "label_replace(label_replace(label_replace(sum by (reason) (((knell_pre_route_refusals_total{instance=\"$instance\"} - knell_pre_route_refusals_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) < knell_pre_route_refusals_total{instance=\"$instance\"} offset $__interval) or (resets(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_pre_route_refusals_total{instance=\"$instance\"} and ((min_over_time(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) < knell_pre_route_refusals_total{instance=\"$instance\"} offset $__interval) or (resets(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_pre_route_refusals_total{instance=\"$instance\"} - min_over_time(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]))), \"reason\", \"Beat path spelled oddly\", \"reason\", \"non_canonical_beat_path\"), \"reason\", \"Host not allowed\", \"reason\", \"host_not_allowed\"), \"reason\", \"Sign-in throttled\", \"reason\", \"auth_throttled\")",
                         "legendFormat": "{{reason}}"
                       }
                     },
@@ -2151,7 +2151,7 @@
         "spec": {
           "id": 46,
           "title": "Requests by status",
-          "description": "Requests knell answered, by HTTP status, as bars over the selected range. 200 is an accepted ping or scrape, 401 a ping with a wrong token and 404 an unknown beat. No bars means knell served no request.",
+          "description": "Requests knell answered, by HTTP status, as bars over the selected range. 200 is an accepted ping or scrape, 401 a ping with a wrong token and 404 an unknown beat. No bars means knell served no request. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -2168,7 +2168,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "round(sum by (status) (increase(knell_http_requests_total{instance=\"$instance\"}[$__interval])))",
+                        "expr": "sum by (status) (((knell_http_requests_total{instance=\"$instance\"} - knell_http_requests_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_http_requests_total{instance=\"$instance\"}[$__interval]) < knell_http_requests_total{instance=\"$instance\"} offset $__interval) or (resets(knell_http_requests_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_http_requests_total{instance=\"$instance\"} and ((min_over_time(knell_http_requests_total{instance=\"$instance\"}[$__interval]) < knell_http_requests_total{instance=\"$instance\"} offset $__interval) or (resets(knell_http_requests_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_http_requests_total{instance=\"$instance\"} - min_over_time(knell_http_requests_total{instance=\"$instance\"}[$__interval])))",
                         "legendFormat": "{{status}}"
                       }
                     },
