@@ -313,6 +313,68 @@ func TestDashboardReadsOnlySeriesKnellServes(t *testing.T) {
 	}
 }
 
+var (
+	// selectorAtRe is a name and the matchers after it, quoted values kept.
+	selectorAtRe = regexp.MustCompile(`([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(\{(?:[^{}"]|"(?:[^"\\]|\\.)*")*\})?`)
+	instanceRe   = regexp.MustCompile(`\binstance\s*=\s*"\$instance"`)
+	alertNameRe  = regexp.MustCompile(`\balertname\s*=\s*"(\w+)"`)
+	absentRuleRe = regexp.MustCompile(`(?m)^\s*- alert: (\w+)\n\s*expr: absent\(`)
+)
+
+// TestDashboardMatchesOnlyTheSelectedInstance fails when a series a query
+// reads is not narrowed to instance="$instance", or when a query matches on
+// job, hostname or container, labels each user names in their own scrape
+// config. An absent() rule's alert carries only the labels of its equality
+// matchers, so its ALERTS series has no instance to match:
+// https://prometheus.io/docs/prometheus/latest/querying/functions/#absent
+func TestDashboardMatchesOnlyTheSelectedInstance(t *testing.T) {
+	d := loadDashboard(t)
+	raw, err := os.ReadFile(promqlRules)
+	if err != nil {
+		t.Fatalf("reading %s: %v", promqlRules, err)
+	}
+	var instanceless []string
+	for _, m := range absentRuleRe.FindAllStringSubmatch(string(raw), -1) {
+		instanceless = append(instanceless, m[1])
+	}
+	queries := map[string]string{}
+	for name, v := range d.variables() {
+		queries["variable "+name] = variableQuery(&v)
+	}
+	for name, p := range d.Spec.Elements {
+		for i, e := range panelExprs(&p) {
+			queries[fmt.Sprintf("%s %s query %d", name, p.Spec.Title, i)] = e
+		}
+	}
+	checked := 0
+	for where, expr := range queries {
+		series := seriesIn(expr)
+		for _, m := range selectorAtRe.FindAllStringSubmatch(expr, -1) {
+			if !slices.Contains(series, m[1]) {
+				continue
+			}
+			for _, mm := range matcherNameRe.FindAllStringSubmatch(quotedRe.ReplaceAllString(m[2], `""`), -1) {
+				if slices.Contains([]string{"job", "hostname", "container"}, mm[1]) {
+					t.Errorf("%s matches %s on %s, a label each user names: %s", where, m[1], mm[1], expr)
+				}
+			}
+			if where == "variable instance" {
+				continue
+			}
+			checked++
+			if a := alertNameRe.FindStringSubmatch(m[2]); m[1] == "ALERTS" && a != nil && slices.Contains(instanceless, a[1]) {
+				continue
+			}
+			if !instanceRe.MatchString(m[2]) {
+				t.Errorf("%s reads %s without instance=\"$instance\": %s", where, m[1], expr)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Error("no query reads a series; the check no longer reads the dashboard")
+	}
+}
+
 func shippedRules(t *testing.T) []string {
 	t.Helper()
 	raw, err := os.ReadFile(promqlRules)

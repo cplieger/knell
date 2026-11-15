@@ -1594,7 +1594,7 @@
         "spec": {
           "id": 40,
           "title": "Scrape",
-          "description": "Whether the last scrape of each knell succeeded, one tile per knell, the up series your scraper writes for the job knell. Down means the container is stopped or the scraper cannot reach it, and KnellTargetDown follows. A tile is named by the scrape's hostname label when it sets one. No value means no scrape in the last few minutes.",
+          "description": "Whether the last scrape of each knell succeeded, one tile per knell, the up series your scraper writes for the selected instance. Down means the container is stopped or the scraper cannot reach it, and KnellTargetDown follows. A tile is named by the scrape's hostname label when it sets one. No value means no scrape in the last few minutes.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1611,7 +1611,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "up{job=\"knell\", instance=\"$instance\"}",
+                        "expr": "up{instance=\"$instance\"}",
                         "legendFormat": "{{hostname}}",
                         "instant": true,
                         "range": false
@@ -1881,7 +1881,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "process_start_time_seconds{job=\"knell\", instance=\"$instance\"} * 1000",
+                        "expr": "process_start_time_seconds{instance=\"$instance\"} * 1000",
                         "legendFormat": "{{hostname}}",
                         "instant": true,
                         "range": false
