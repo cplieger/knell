@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cplieger/go/measure"
+	"github.com/cplieger/go/measure/v2"
 )
 
 // beatLabel names the watched beat on per-beat metrics; kindLabel names the
@@ -102,8 +102,8 @@ func mintRefusalReasons() {
 	}
 }
 
-// registry serves every registered metric plus process metrics on /metrics;
-// Handler is its only exported view.
+// registry serves every registered metric plus the Go and process metrics on
+// /metrics; Handler is its only exported view.
 var registry = measure.NewRegistry("knell")
 
 // beatFresh reports per beat whether its observed silence is within its
@@ -112,6 +112,7 @@ var registry = measure.NewRegistry("knell")
 var beatFresh = measure.NewLabeledGauge(
 	"beat_fresh",
 	"Whether the beat's observed silence is within its deadline (1 = fresh, 0 = overdue; silence runs from process start until the first ping).",
+	measure.UnitNone,
 	[]string{beatLabel},
 )
 
@@ -120,6 +121,7 @@ var beatFresh = measure.NewLabeledGauge(
 var beatLastSeen = measure.NewLabeledGauge(
 	"beat_last_seen_timestamp_seconds",
 	"Unix timestamp of the beat's last accepted ping (process start until the first ping).",
+	measure.UnitSeconds,
 	[]string{beatLabel},
 )
 
@@ -129,6 +131,7 @@ var beatLastSeen = measure.NewLabeledGauge(
 var beatDeadline = measure.NewLabeledGauge(
 	"beat_deadline_seconds",
 	"Configured silence deadline per beat, in seconds.",
+	measure.UnitSeconds,
 	[]string{beatLabel},
 )
 
@@ -137,6 +140,7 @@ var beatDeadline = measure.NewLabeledGauge(
 var beatsReceived = measure.NewLabeledCounter(
 	"beats_received_total",
 	"Accepted pings per beat (unknown ids are rejected and not counted).",
+	measure.UnitCount,
 	[]string{beatLabel},
 )
 
@@ -145,6 +149,7 @@ var beatsReceived = measure.NewLabeledCounter(
 var beatOutages = measure.NewLabeledCounter(
 	"beat_outages_total",
 	"Detected outages per beat: one increment per deadline crossing detected, independent of notification delivery.",
+	measure.UnitCount,
 	[]string{beatLabel},
 )
 
@@ -155,6 +160,7 @@ var beatOutages = measure.NewLabeledCounter(
 var outageRecordsDropped = measure.NewLabeledCounter(
 	"outage_records_dropped_total",
 	"Ended-outage records discarded per beat because the per-beat queue was full; no notice for them will ever arrive.",
+	measure.UnitCount,
 	[]string{beatLabel},
 )
 
@@ -163,6 +169,7 @@ var outageRecordsDropped = measure.NewLabeledCounter(
 var notificationsSent = measure.NewLabeledCounter(
 	"notifications_sent_total",
 	"Webhook notifications delivered, by kind ("+notificationKindsText+"); one per delivered message.",
+	measure.UnitCount,
 	[]string{kindLabel},
 )
 
@@ -173,6 +180,7 @@ var notificationsSent = measure.NewLabeledCounter(
 var notificationsFailed = measure.NewLabeledCounter(
 	"notifications_failed_total",
 	"Webhook delivery attempts that failed after retries, by kind ("+notificationKindsText+"); one per failed message. kind=recovered never moves here: recovered is fire-once with nothing left to retry, so a failed recovered send is counted on notifications_dropped_total instead.",
+	measure.UnitCount,
 	[]string{kindLabel},
 )
 
@@ -183,6 +191,7 @@ var notificationsFailed = measure.NewLabeledCounter(
 var notificationsDropped = measure.NewLabeledCounter(
 	"notifications_dropped_total",
 	"Notification messages that will never be delivered, by kind ("+notificationKindsText+"); a fire-once recovered notice whose send failed with nothing left to retry from; distinct from a delivery that failed and will retry.",
+	measure.UnitCount,
 	[]string{kindLabel},
 )
 
@@ -192,6 +201,7 @@ var notificationsDropped = measure.NewLabeledCounter(
 var preRouteRefusals = measure.NewLabeledCounter(
 	"pre_route_refusals_total",
 	"Requests refused before the mux routes, by reason ("+refusalReasonsText+"); a diagnostic for a missing beat, not an alert source.",
+	measure.UnitCount,
 	[]string{reasonLabel},
 )
 
@@ -201,6 +211,7 @@ var preRouteRefusals = measure.NewLabeledCounter(
 var httpRequests = measure.NewLabeledCounter(
 	"http_requests_total",
 	"Served HTTP requests by matched route template, method and status. Series are not pre-minted, so a status series is born with its first request and increase() cannot see that first event; alert on the absolute value (status=401 > 0), which latches until restart.",
+	measure.UnitCount,
 	[]string{methodLabel, pathLabel, statusLabel},
 )
 
@@ -209,6 +220,7 @@ var httpRequests = measure.NewLabeledCounter(
 var listenerAcceptErrors = measure.NewCounter(
 	"listener_accept_errors_total",
 	"Failed accepts on the HTTP listener, which retries them; a shutdown's close is not counted.",
+	measure.UnitCount,
 )
 
 // httpDuration observes served-request latency across the whole surface. It
@@ -217,6 +229,7 @@ var listenerAcceptErrors = measure.NewCounter(
 var httpDuration = measure.NewHistogram(
 	"http_request_duration_seconds",
 	"Served HTTP request duration in seconds.",
+	measure.UnitSeconds,
 )
 
 // buildInfo is the build_info series a rule joins on to scope a family every
@@ -224,13 +237,11 @@ var httpDuration = measure.NewHistogram(
 var buildInfo = measure.NewLabeledGauge(
 	"build_info",
 	"Always 1; the version label is the version of the running knell build.",
+	measure.UnitNone,
 	[]string{"version"},
 )
 
 func init() {
-	// MustRegister: init-time registration has no caller to hand an error to.
-	// metrics v4 captures a construction error into the metric value rather
-	// than panicking, so registration is where it surfaces, at process start.
 	registry.MustRegister(
 		beatFresh,
 		beatLastSeen,
@@ -251,9 +262,10 @@ func init() {
 	mintRefusalReasons()
 }
 
-// Handler serves the Prometheus exposition: every registered metric plus
-// process metrics. It is the only exported view of the registry, so a consumer
-// can scrape the metrics but cannot mint, delete or re-register a series.
+// Handler serves the Prometheus exposition: every registered metric plus the
+// Go and process metrics. It is the only exported view of the registry, so a
+// consumer can scrape the metrics but cannot mint, delete or re-register a
+// series.
 func Handler() http.Handler {
 	return registry.Handler()
 }
