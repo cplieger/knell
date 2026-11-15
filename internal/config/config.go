@@ -6,9 +6,11 @@
 package config
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -69,6 +71,9 @@ const asciiWhitespace = " \t\r\n\v\f"
 // defaultListenAddr is used when LISTEN_ADDR is unset or blank.
 const defaultListenAddr = ":9190"
 
+// defaultOpsListenAddr is used when OPS_LISTEN_ADDR is unset or blank.
+const defaultOpsListenAddr = ":9191"
+
 // MaxBeatIDLen is the longest beat id beatIDPattern admits; the pattern is
 // built from it, so the bound lives in one place. Exported because a notifier
 // has to render an id of this length inside a bounded message.
@@ -103,6 +108,8 @@ type Config struct {
 	WebhookSource envx.SecretSource
 	Node          string
 	ListenAddr    string
+	// OpsListenAddr serves /healthz and /metrics, never on ListenAddr's port.
+	OpsListenAddr string
 	BeatToken     string
 	// BeatTokenSource is the channel BEAT_TOKEN arrived through, carried for the
 	// same reason. warnPlainVarIgnored fires only when BOTH variables are set, so
@@ -133,6 +140,7 @@ func (c Config) LogValue() slog.Value {
 		slog.Int("beats", len(c.Beats)),
 		slog.String("node", c.Node),
 		slog.String("listen_addr", c.ListenAddr),
+		slog.String("ops_listen_addr", c.OpsListenAddr),
 		slog.String("webhook", string(c.WebhookSource)),
 		slog.String("beat_token", string(c.BeatTokenSource)),
 		slog.String("allowed_hosts", allowedHosts),
@@ -179,6 +187,10 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...httpserver.HostAllowlistOption
 	cfg.Node = node
 
 	cfg.ListenAddr = ListenAddr()
+	cfg.OpsListenAddr = OpsListenAddr()
+	if addrErr := checkListenAddrs(cfg.ListenAddr, cfg.OpsListenAddr); addrErr != nil {
+		return cfg, addrErr
+	}
 
 	hosts, err := allowedHosts(hostPolicyOpts)
 	if err != nil {
@@ -262,10 +274,9 @@ func hostnameNode() string {
 	return host
 }
 
-// ListenAddr resolves the listener address: LISTEN_ADDR when set to a
+// ListenAddr resolves the ping listener's address: LISTEN_ADDR when set to a
 // non-blank value, else the default :9190. A blank value falls back to the
-// default rather than to "", which would bind an ephemeral port. Load and the
-// `knell health` check both read it here, so they cannot disagree.
+// default rather than to "", which would bind an ephemeral port.
 func ListenAddr() string {
 	// TrimFunc with invisibleInURL, not TrimSpace: a pasted value can carry
 	// invisible runes TrimSpace keeps, which net.Listen then fails to resolve.
@@ -273,6 +284,41 @@ func ListenAddr() string {
 		return addr
 	}
 	return defaultListenAddr
+}
+
+// OpsListenAddr resolves the operations listener's address, OPS_LISTEN_ADDR,
+// trimmed as ListenAddr trims, else the default :9191. Load and `knell
+// health` both read it here.
+func OpsListenAddr() string {
+	if addr := strings.TrimFunc(os.Getenv("OPS_LISTEN_ADDR"), invisibleInURL); addr != "" {
+		return addr
+	}
+	return defaultOpsListenAddr
+}
+
+// checkListenAddrs refuses an operations address on the ping listener's port,
+// which would either fail to bind or put /metrics wherever pings are
+// reachable. Ports compare as the numbers net.Listen resolves, so 09190 is
+// 9190. Two port-0 addresses pass, as does a port that does not resolve,
+// which the bind itself then refuses naming the variable.
+func checkListenAddrs(listen, ops string) error {
+	listenPort, lok := resolvedPort(listen)
+	opsPort, ook := resolvedPort(ops)
+	if !lok || !ook || listenPort != opsPort || listenPort == 0 {
+		return nil
+	}
+	return fmt.Errorf("OPS_LISTEN_ADDR %.64q uses LISTEN_ADDR's port %d. /healthz and /metrics are served on their own port, %s unless OPS_LISTEN_ADDR is set, so give one of the two another port", ops, listenPort, defaultOpsListenAddr)
+}
+
+// resolvedPort is the port number addr's port resolves to, as net.Listen
+// would resolve it.
+func resolvedPort(addr string) (int, bool) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, false
+	}
+	n, err := net.DefaultResolver.LookupPort(context.Background(), "tcp", port)
+	return n, err == nil
 }
 
 // allowedHosts parses the ALLOWED_HOSTS exact-match Host allowlist. Unset

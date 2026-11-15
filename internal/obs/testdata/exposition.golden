@@ -35,7 +35,7 @@ knell_pre_route_refusals_total{reason="non_canonical_beat_path"} 0
 knell_http_requests_total{method="GET",path="/metrics",status="200"} 1
 knell_http_requests_total{method="GET",path="unmatched",status="404"} 1
 knell_http_requests_total{method="POST",path="/beat/{id}",status="204"} 1
-# HELP knell_listener_accept_errors_total Failed accepts on the HTTP listener, which retries them; a shutdown's close is not counted.
+# HELP knell_listener_accept_errors_total Failed accepts on the ping listener, which retries them; a shutdown's close is not counted.
 # TYPE knell_listener_accept_errors_total counter
 knell_listener_accept_errors_total 1
 # HELP knell_beat_fresh Whether the beat's observed silence is within its deadline (1 = fresh, 0 = overdue; silence runs from process start until the first ping).

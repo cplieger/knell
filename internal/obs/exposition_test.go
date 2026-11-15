@@ -1,6 +1,7 @@
 package obs
 
 import (
+	"flag"
 	"net/http"
 	"os"
 	"os/exec"
@@ -12,8 +13,11 @@ import (
 
 const (
 	expositionGolden = "testdata/exposition.golden"
-	expositionChild  = "KNELL_OBS_EXPOSITION_CHILD"
-	expositionRegen  = "regenerate with UPDATE_GOLDEN=1 go test ./internal/obs/ -run '^TestExpositionMatchesGolden$'"
+	// expositionChild, as the first argument after the test flags, names
+	// the child scrape; an argument, so no ambient environment value can turn
+	// a test run into a child that skips the golden compare.
+	expositionChild = "knell-obs-exposition-child"
+	expositionRegen = "regenerate with UPDATE_GOLDEN=1 go test ./internal/obs/ -run '^TestExpositionMatchesGolden$'"
 )
 
 // TestExpositionMatchesGolden pins every byte of knell's own /metrics families
@@ -23,7 +27,8 @@ const (
 // package move, so the page is taken in a fresh child process of this test
 // binary, from the init() cold start plus fixedState.
 func TestExpositionMatchesGolden(t *testing.T) {
-	if path := os.Getenv(expositionChild); path != "" {
+	if args := flag.Args(); len(args) == 2 && args[0] == expositionChild {
+		path := args[1]
 		fixedState()
 		if err := os.WriteFile(path, []byte(ownFamilies(exposition(t))), 0o600); err != nil {
 			t.Fatalf("write the child scrape: %v", err)
@@ -32,8 +37,7 @@ func TestExpositionMatchesGolden(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "exposition")
-	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestExpositionMatchesGolden$", "-test.count=1")
-	cmd.Env = append(os.Environ(), expositionChild+"="+path)
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestExpositionMatchesGolden$", "-test.count=1", expositionChild, path)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("child scrape: %v\n%s", err, out)
 	}

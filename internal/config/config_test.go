@@ -46,6 +46,7 @@ func TestMain(m *testing.M) {
 		"LOG_LEVEL",
 		"MISSING_REPEAT",
 		"NODE_NAME",
+		"OPS_LISTEN_ADDR",
 		"TRUSTED_PROXIES",
 	} {
 		if err := os.Unsetenv(key); err != nil {
@@ -260,6 +261,9 @@ func TestLoadDefaultsAndFailures(t *testing.T) {
 	}
 	if cfg.ListenAddr != ":9190" {
 		t.Errorf("ListenAddr default = %q, want :9190", cfg.ListenAddr)
+	}
+	if cfg.OpsListenAddr != ":9191" {
+		t.Errorf("OpsListenAddr default = %q, want :9191", cfg.OpsListenAddr)
 	}
 
 	t.Setenv("BEATS", "")
@@ -1015,8 +1019,7 @@ func TestLoadTrustedProxiesDegradesRestrictively(t *testing.T) {
 // from HostPolicyOptions directly, and the lifecycle test's host_not_allowed
 // assertion matches httpserver's DEFAULT code — so without this, a Load that
 // forwards nothing keeps the whole suite green while the shipped allowlist 403s
-// the in-container `curl http://127.0.0.1:9190/healthz` the README promises
-// keeps working.
+// the in-container `knell health` probe of http://127.0.0.1:9191/healthz.
 func TestLoadThreadsTheHostPolicyOptionsThrough(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv.
 	setValidLoadEnv(t)
@@ -1026,7 +1029,7 @@ func TestLoadThreadsTheHostPolicyOptionsThrough(t *testing.T) {
 	// shape WithLoopbackExempt admits. It is NOT in the allowlist, so it is
 	// admitted by the option or by nothing.
 	loopback := func() *http.Request {
-		r := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9190/healthz", nil)
+		r := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9191/healthz", nil)
 		r.RemoteAddr = "127.0.0.1:54321"
 		return r
 	}
@@ -1036,7 +1039,7 @@ func TestLoadThreadsTheHostPolicyOptionsThrough(t *testing.T) {
 		t.Fatalf("Load() with the loopback exemption: %v", err)
 	}
 	if !exempt.AllowedHosts.Allows(loopback()) {
-		t.Error("Load did not forward its host-policy options: a loopback peer under a loopback Host is refused, so an in-container curl http://127.0.0.1:9190/healthz 403s under any allowlist and an operator's own probe stops working")
+		t.Error("Load did not forward its host-policy options: a loopback peer under a loopback Host is refused, so the in-container knell health probe of http://127.0.0.1:9191/healthz 403s under any allowlist and the container turns unhealthy")
 	}
 
 	bare, err := Load(maxNodeNameBytes)
@@ -1520,6 +1523,77 @@ func TestHostnameNodeFallsBackWhenTheOSCannotAnswer(t *testing.T) {
 	}
 }
 
+// TestLoadReadsTheOpsListenAddr pins OPS_LISTEN_ADDR's trim, its default for a
+// value with nothing visible in it, and that Load carries it into Config.
+func TestLoadReadsTheOpsListenAddr(t *testing.T) {
+	cases := map[string]struct{ raw, want string }{
+		"set":             {"127.0.0.1:19191", "127.0.0.1:19191"},
+		"padded":          {"  0.0.0.0:19191\u200b", "0.0.0.0:19191"},
+		"blank":           {"", defaultOpsListenAddr},
+		"nothing visible": {"\u200b\ufeff", defaultOpsListenAddr},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			t.Setenv("OPS_LISTEN_ADDR", tc.raw)
+			cfg, err := Load(maxNodeNameBytes)
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if cfg.OpsListenAddr != tc.want {
+				t.Errorf("OpsListenAddr = %q, want %q", cfg.OpsListenAddr, tc.want)
+			}
+			if got := OpsListenAddr(); got != tc.want {
+				t.Errorf("OpsListenAddr() = %q, want %q: the health probe and Load must read one value", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadRefusesTheOpsListenerOnThePingPort pins that /healthz and /metrics
+// never share LISTEN_ADDR's port: ports compare as the
+// numbers net.Listen resolves, and the refusal names both settings and the
+// default so an operator whose LISTEN_ADDR is :9191 sees where 9191 came from.
+func TestLoadRefusesTheOpsListenerOnThePingPort(t *testing.T) {
+	refused := map[string]struct{ listen, ops string }{
+		"the same address":                    {":9300", ":9300"},
+		"the same port on another host":       {"127.0.0.1:9300", "0.0.0.0:9300"},
+		"a leading zero":                      {":9300", ":09300"},
+		"a v3 LISTEN_ADDR on the new default": {":9191", ""},
+	}
+	for name, tc := range refused {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			t.Setenv("LISTEN_ADDR", tc.listen)
+			t.Setenv("OPS_LISTEN_ADDR", tc.ops)
+			_, err := Load(maxNodeNameBytes)
+			if err == nil {
+				t.Fatal("Load() accepted an OPS_LISTEN_ADDR on LISTEN_ADDR's port, so /metrics would be served wherever pings are")
+			}
+			for _, want := range []string{"OPS_LISTEN_ADDR", "LISTEN_ADDR", defaultOpsListenAddr} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name %s", err, want)
+				}
+			}
+		})
+	}
+	accepted := map[string]struct{ listen, ops string }{
+		"two ports":           {":9300", ":9301"},
+		"two ephemeral ports": {"127.0.0.1:0", "127.0.0.1:0"},
+		"a port that does not resolve, refused by the bind instead": {":9300", ":nosuchservice"},
+	}
+	for name, tc := range accepted {
+		t.Run(name, func(t *testing.T) {
+			setValidLoadEnv(t)
+			t.Setenv("LISTEN_ADDR", tc.listen)
+			t.Setenv("OPS_LISTEN_ADDR", tc.ops)
+			if _, err := Load(maxNodeNameBytes); err != nil {
+				t.Errorf("Load() = %v, want nil", err)
+			}
+		})
+	}
+}
+
 func TestLoadTrimsPaddedListenAddr(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("LISTEN_ADDR", "  0.0.0.0:9999  ")
@@ -1821,6 +1895,7 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		WebhookSource:  envx.SecretSourceFile,
 		Node:           "observer-1",
 		ListenAddr:     "127.0.0.1:19190",
+		OpsListenAddr:  "127.0.0.1:19191",
 		BeatToken:      "unit-test-beat-token",
 		// The OTHER channel than the webhook's, deliberately: the two source
 		// attrs are the only pair in this fixture that share a value domain, so
@@ -1841,9 +1916,10 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"beats":       "2",
-		"node":        "observer-1",
-		"listen_addr": "127.0.0.1:19190",
+		"beats":           "2",
+		"node":            "observer-1",
+		"listen_addr":     "127.0.0.1:19190",
+		"ops_listen_addr": "127.0.0.1:19191",
 		// The rendered WORD, not string(envx.SecretSourceFile): restating the constant
 		// would assert nothing about what an operator reads, and this attr's
 		// whole job is to name a channel legibly in the startup line.

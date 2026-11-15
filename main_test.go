@@ -58,13 +58,20 @@ func unsetEnv(t *testing.T, key string) {
 }
 
 // installRunEnv installs a complete environment config.Load accepts: the beats
-// spec, the listen address, the webhook (whose token half every leak assertion
+// spec, the two listen addresses (ops on any free loopback port), the webhook (whose token half every leak assertion
 // greps for), and the _FILE and token variables explicitly CLEARED, since one
 // leaked from another test changes what run() reads. It is the single home of
 // "a configuration run() gets past", so a newly required variable cannot leave
 // one boot test failing at the config gate while its sibling still reaches the
 // gate it means to exercise.
 func installRunEnv(t *testing.T, beats, addr string) {
+	t.Helper()
+	installRunEnvOps(t, beats, addr, "127.0.0.1:0")
+}
+
+// installRunEnvOps is installRunEnv with the operations address chosen by the
+// caller.
+func installRunEnvOps(t *testing.T, beats, addr, opsAddr string) {
 	t.Helper()
 	t.Setenv("BEATS", beats)
 	t.Setenv("DISCORD_WEBHOOK_URL", testWebhookURL)
@@ -76,6 +83,7 @@ func installRunEnv(t *testing.T, beats, addr string) {
 	// gate instead of reaching the one it means to exercise.
 	t.Setenv("BEAT_TOKEN", testBeatToken)
 	t.Setenv("LISTEN_ADDR", addr)
+	t.Setenv("OPS_LISTEN_ADDR", opsAddr)
 }
 
 // TestWatchBeatsCarriesEveryFieldIntoTheStateMachine pins the one
@@ -234,11 +242,35 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	if err == nil {
 		t.Fatal("run() = nil, want a bind error; an address already in use must fail the boot instead of leaving the watcher alerting behind a listener nothing can reach")
 	}
-	if !strings.Contains(err.Error(), "binding") {
-		t.Fatalf("run() = %v, want the bind failure surfaced to the caller", err)
+	if !strings.Contains(err.Error(), "binding LISTEN_ADDR") {
+		t.Fatalf("run() = %v, want the bind failure surfaced to the caller, naming LISTEN_ADDR", err)
 	}
 	if strings.Contains(err.Error(), testWebhookSecret) {
 		t.Errorf("bind error leaks the webhook URL: %v", err)
+	}
+}
+
+// TestRunFailsFastWhenTheOpsListenAddressIsAlreadyBound pins that a held
+// operations port fails the boot naming OPS_LISTEN_ADDR, instead of serving
+// pings with no /healthz or /metrics anywhere.
+func TestRunFailsFastWhenTheOpsListenAddressIsAlreadyBound(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, plus run() installs a process-global
+	// slog default.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot bind a probe listener: %v", err)
+	}
+	t.Cleanup(func() { _ = occupied.Close() })
+
+	installRunEnvOps(t, "api:20m", "127.0.0.1:0", occupied.Addr().String())
+	capture.Default(t)
+
+	err = run(nil)
+	if err == nil {
+		t.Fatal("run() = nil, want a bind error for the operations port")
+	}
+	if !strings.Contains(err.Error(), "binding OPS_LISTEN_ADDR "+occupied.Addr().String()) {
+		t.Fatalf("run() = %v, want the bind failure naming OPS_LISTEN_ADDR and its address", err)
 	}
 }
 
@@ -258,14 +290,14 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 
 	bindFailure := errors.New("listen tcp :9190: bind: address already in use")
 
-	got := classifyBindError(t.Context(), ":9190", bindFailure)
+	got := classifyBindError(t.Context(), "LISTEN_ADDR", ":9190", bindFailure)
 	if got == nil {
 		t.Fatal("classifyBindError(live ctx) = nil, want the bind failure surfaced so the boot fails instead of running as a switch nothing can reach")
 	}
 	if !errors.Is(got, bindFailure) {
 		t.Errorf("classifyBindError = %v, want the bind failure still unwrappable", got)
 	}
-	if !strings.Contains(got.Error(), ":9190") {
+	if !strings.Contains(got.Error(), "LISTEN_ADDR :9190") {
 		t.Errorf("classifyBindError = %q, want the address named so the operator knows which port to free", got)
 	}
 	if rec.Contains("shutting down before the listener was bound") {
@@ -278,7 +310,7 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 	// A bind the signal itself cancelled: the error carries the cancellation, so
 	// this is the clean stop.
 	cancelledListen := fmt.Errorf("listen tcp :9190: %w", context.Canceled)
-	if got := classifyBindError(stopped, ":9190", cancelledListen); got != nil {
+	if got := classifyBindError(stopped, "LISTEN_ADDR", ":9190", cancelledListen); got != nil {
 		t.Errorf("classifyBindError(cancelled listen) = %v, want nil: a signal arriving before the bind is a clean stop, not a boot failure", got)
 	}
 	if !rec.Contains("shutting down before the listener was bound") {
@@ -289,7 +321,7 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 	// conflict: the cancelled context is not evidence about this error, and
 	// swallowing it would exit 0 having never bound the listener a quorum
 	// depends on.
-	if got := classifyBindError(stopped, ":9190", bindFailure); got == nil {
+	if got := classifyBindError(stopped, "LISTEN_ADDR", ":9190", bindFailure); got == nil {
 		t.Error("classifyBindError(cancelled ctx, genuine bind failure) = nil, want the failure surfaced: a cancelled context is not evidence that THIS error was the shutdown")
 	}
 }

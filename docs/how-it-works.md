@@ -50,11 +50,11 @@ The webhook URL is treated as a credential. It never appears in a log line or an
 
 ## The endpoints
 
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /beat/{id}` | Records a ping when it carries `Authorization: Bearer <BEAT_TOKEN>`, and answers `{"ok":true}` |
-| `GET /healthz` | Liveness: `200 {"status":"ok"}` while the listener is up, `503 {"status":"unhealthy","reasons":[...]}` while knell shuts down. [Knowing the app is alive](monitoring.md#knowing-the-app-is-alive) has the details |
-| `GET /metrics` | Prometheus metrics |
+| Endpoint | Port | Purpose |
+| --- | --- | --- |
+| `POST /beat/{id}` | `9190` | Records a ping when it carries `Authorization: Bearer <BEAT_TOKEN>`, and answers `{"ok":true}` |
+| `GET /healthz` | `9191` | Liveness: `200 {"status":"ok"}` while knell is serving, `503 {"status":"unhealthy","reasons":[...]}` while knell shuts down. [Knowing the app is alive](monitoring.md#knowing-the-app-is-alive) has the details |
+| `GET /metrics` | `9191` | Prometheus metrics |
 
 ### Answers a ping can get
 

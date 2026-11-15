@@ -4,12 +4,12 @@ This page covers what knell exposes, how to put it behind a reverse proxy and ho
 
 ## What is exposed
 
-knell listens on one port, `9190` by default, and serves plain HTTP.
+knell listens on two ports and serves plain HTTP on both. Pings use `9190` (`LISTEN_ADDR`), and `/healthz` and `/metrics` use `9191` (`OPS_LISTEN_ADDR`).
 
 - `POST /beat/<id>` needs `BEAT_TOKEN`. Without it, a stranger who can reach the port could send forged pings that keep a dead job looking alive.
-- `/healthz` and `/metrics` need no token, so probes and scrapes keep working. `/metrics` publishes every beat id with its last ping and its state. Anyone who can reach the port can list the beats and see which one is about to fire.
+- `/healthz` and `/metrics` need no token, so probes and scrapes keep working. `/metrics` publishes every beat id with its last ping and its state. Anyone who can reach port `9191` can list the beats and see which one is about to fire.
 
-The compose example maps the port on every host interface. Publish it to a trusted network only, or put an authenticating proxy in front of `/metrics`.
+The compose example maps `9190` on every host interface, so publish it to a trusted network only. It leaves `9191` unpublished. A scraper on the network it shares with knell reaches `knell:9191`. To probe from another host, publish `9191` to the address that host reaches, such as `"192.0.2.10:9191:9191"`, and never to the internet.
 
 ## The token on the wire
 

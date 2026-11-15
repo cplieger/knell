@@ -1,6 +1,7 @@
-// Package webapi assembles knell's HTTP surface: the beat ingestion
-// endpoint, the health endpoint, and Prometheus metrics, wrapped in the
-// standard middleware stack.
+// Package webapi assembles knell's two HTTP surfaces, each wrapped in the
+// standard middleware stack: the ping listener's beat ingestion endpoint
+// (New), and the operations listener's health endpoint and Prometheus
+// metrics (NewOps).
 package webapi
 
 import (
@@ -41,14 +42,10 @@ type Beater interface {
 	Beat(id string) watch.BeatOutcome
 }
 
-// Deps carries what the composition root supplies, named rather than
-// positional because the four are otherwise indistinguishable at a call site.
+// Deps carries what the composition root supplies to the ping listener.
 type Deps struct {
-	// Healthz answers liveness.
-	Healthz http.Handler
 	// Hosts is the exact-match Host allowlist (ALLOWED_HOSTS). An inactive
-	// policy accepts every Host; an active one is what breaks DNS rebinding,
-	// since BeatToken gates the beat route only.
+	// policy accepts every Host; an active one is what breaks DNS rebinding.
 	Hosts *httpserver.HostPolicy
 	// BeatToken is the required bearer credential for POST /beat/{id}. An empty
 	// value fails CLOSED and every ping is refused, rather than opening a mode.
@@ -58,10 +55,19 @@ type Deps struct {
 	TrustedProxies []netip.Prefix
 }
 
-// New assembles the routed and middleware-wrapped root handler. The beat
-// endpoint keeps no lifecycle state of its own: watch.Watcher decides
-// admission under the mutex that guards the beat mutation. Only the beat
-// endpoint refuses during the drain; /healthz and /metrics keep serving.
+// OpsDeps carries what the composition root supplies to the operations
+// listener.
+type OpsDeps struct {
+	// Healthz answers liveness.
+	Healthz http.Handler
+	// Hosts is the same ALLOWED_HOSTS policy the ping listener applies.
+	Hosts *httpserver.HostPolicy
+}
+
+// New assembles the ping listener's handler: the /beat routes only, so
+// /healthz and /metrics answer 404 there. The beat endpoint keeps no
+// lifecycle state of its own: watch.Watcher decides admission under the
+// mutex that guards the beat mutation.
 func New(b Beater, deps Deps) http.Handler {
 	mux := http.NewServeMux()
 	// POST is the only method that records: a recording GET is reachable from
@@ -76,8 +82,6 @@ func New(b Beater, deps Deps) http.Handler {
 	mux.HandleFunc("/beat", writeUnknownBeat)
 	mux.HandleFunc("/beat/{$}", writeUnknownBeat)
 	mux.HandleFunc("/beat/{id}/{rest...}", writeUnknownBeat)
-	mux.Handle("GET /healthz", deps.Healthz)
-	mux.Handle("GET /metrics", obs.Handler())
 
 	return httpserver.Chain(mux,
 		httpserver.SecurityHeaders(),
@@ -86,13 +90,11 @@ func New(b Beater, deps Deps) http.Handler {
 		// a request with no valid beat token is answered 429 without reaching
 		// Logging, so a guessing run cannot flood the log.
 		beatAuthFailureLimiter(mux, verifier),
-		// /healthz and /metrics log at Debug: the health verdict logs its own
-		// changes, and a failed scrape shows as up == 0. WithRecordRouteMetric is
-		// the only place a refused ping (401/404/405/503) becomes visible to a
-		// scrape, since none reach beatsReceived. The throttle's 429 is counted
-		// on the pre-route counter instead, outside this wrapper.
+		// WithRecordRouteMetric is the only place a refused ping
+		// (401/404/405/503) becomes visible to a scrape, since none reach
+		// beatsReceived. The throttle's 429 is counted on the pre-route counter
+		// instead, outside this wrapper.
 		httpserver.Logging(
-			httpserver.WithProbeLogLevel("/healthz", "/metrics"),
 			httpserver.WithMaxLoggedPath(loggedPathCap),
 			// Empty unless TRUSTED_PROXIES is set: trusting a forwarded header
 			// with no proxy in front is how the field becomes spoofable.
@@ -102,9 +104,6 @@ func New(b Beater, deps Deps) http.Handler {
 			}),
 		),
 		httpserver.Recoverer(),
-		// The /metrics text exposition is the only body that reaches Gzip's
-		// 1 KiB floor; the JSON envelopes and probe answers stay under it.
-		httpserver.Gzip(httpserver.WithGzipTypes("text/plain")),
 		// Immediately outside the Host policy, so a pre-route 403 collapses
 		// onto the "unmatched" label.
 		countHostRefusals(deps.Hosts),
@@ -112,6 +111,34 @@ func New(b Beater, deps Deps) http.Handler {
 		// Inside the Host policy, so a refused Host is refused as a Host (403)
 		// and not as an unknown beat.
 		canonicalBeatPath,
+	)
+}
+
+// NewOps assembles the operations listener's handler: GET /healthz and GET
+// /metrics, behind the same Host policy as the ping listener, with no
+// credential, since the docker healthcheck and the scraper carry none.
+func NewOps(deps OpsDeps) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("GET /healthz", deps.Healthz)
+	mux.Handle("GET /metrics", obs.Handler())
+	return httpserver.Chain(mux,
+		httpserver.SecurityHeaders(),
+		httpserver.NoStore(),
+		// Debug whatever the status: the health verdict logs its own changes,
+		// and a failed scrape shows as up == 0.
+		httpserver.Logging(
+			httpserver.WithProbeLogLevel("/healthz", "/metrics"),
+			httpserver.WithMaxLoggedPath(loggedPathCap),
+			httpserver.WithRecordRouteMetric(func(m httpserver.RequestMetric) {
+				obs.RecordHTTP(m.Method, m.Path, m.Status, m.Latency)
+			}),
+		),
+		httpserver.Recoverer(),
+		// The /metrics text exposition is the only body that reaches Gzip's
+		// 1 KiB floor.
+		httpserver.Gzip(httpserver.WithGzipTypes("text/plain")),
+		countHostRefusals(deps.Hosts),
+		deps.Hosts.Middleware(),
 	)
 }
 

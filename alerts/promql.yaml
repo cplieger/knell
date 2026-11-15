@@ -67,17 +67,17 @@ groups:
       #   annotations:
       #     summary: "fewer than 2 knell instances see beat {{ $labels.beat }} on time"
 
-      # Scrapes can keep landing between the listener's accept retries, so `up`
-      # can stay 1 while pings are refused. The counter sees every failure.
+      # Scrapes reach the operations port, so `up` can stay 1 while the ping
+      # port fails to accept. The counter sees every ping-port failure.
       - alert: KnellAcceptFailing
         expr: increase(knell_listener_accept_errors_total[15m]) > 0
         for: 0m
         labels:
           severity: critical
         annotations:
-          summary: "knell on {{ $labels.instance }} cannot accept connections"
+          summary: "knell on {{ $labels.instance }}: the ping port cannot accept connections"
           description: >
-            The listener failed to accept a connection, so pings stop landing
+            The ping listener failed to accept a connection, so pings stop landing
             while the process stays up. Beats will report overdue while this
             lasts. Check the container's file-descriptor limit and the rate of
             incoming connections.

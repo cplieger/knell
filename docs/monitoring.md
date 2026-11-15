@@ -6,14 +6,14 @@ This page lists what knell logs and the metrics it publishes, and how to load th
 
 | You run | You get | You set up |
 | --- | --- | --- |
-| Prometheus, Mimir or VictoriaMetrics, with Alertmanager | Every Discord notice, the six PromQL alerts about knell itself, `up` and the [dashboard](dashboard.md) | A scrape job named `knell` for port `9190`, and [`alerts/promql.yaml`](../alerts/promql.yaml) on a ruler that does not run beside knell |
+| Prometheus, Mimir or VictoriaMetrics, with Alertmanager | Every Discord notice, the six PromQL alerts about knell itself, `up` and the [dashboard](dashboard.md) | A scrape job named `knell` for port `9191`, and [`alerts/promql.yaml`](../alerts/promql.yaml) on a ruler that does not run beside knell |
 | Loki and Alertmanager, no metric store | Every Discord notice, and the two LogQL alerts: knell exited with an error, or a notice was lost for good | [`alerts/logql.yaml`](../alerts/logql.yaml) on Loki's ruler, with `LOG_LEVEL` at `info` |
 | Grafana-managed alerting only | The same rules, imported into Grafana | A Prometheus or Loki data source, and the rules |
 | Docker or Unraid only | Every Discord notice, and Docker health | An uptime prober on `/healthz`, because nothing else tells you that knell itself stopped |
 
 ## Metrics
 
-`GET /metrics` is always on, on the same port as the pings, `9190` by default. It has no login, so keep the port on a network you trust. When `ALLOWED_HOSTS` is set, add the name your scraper uses, or knell refuses the scrape with `403` and the down alerts fire. The `beat` label carries the ids you configured in `BEATS`.
+`GET /metrics` is always on, on its own port, `OPS_LISTEN_ADDR`, `9191` by default. It has no login, so publish that port to your monitoring network only, and keep it off the internet. Port `9190` answers pings only, and a scrape that reaches it gets `404`. When `ALLOWED_HOSTS` is set, add the name your scraper uses, or knell refuses the scrape with `403` and the down alerts fire. The `beat` label carries the ids you configured in `BEATS`.
 
 | Metric | Type | Notes |
 | --- | --- | --- |
@@ -26,7 +26,7 @@ This page lists what knell logs and the metrics it publishes, and how to load th
 | `knell_notifications_sent_total{kind}` | counter | Delivered notices by kind, `missing`, `recovered` or `history`, one per message, a repeat counting as `missing`. A history notice covering several outages counts once |
 | `knell_notifications_failed_total{kind}` | counter | Sends that failed after their retries, one per message, with the record still queued. In practice `missing` and `history`, which the next sweep retries |
 | `knell_notifications_dropped_total{kind}` | counter | Notices that will never be delivered, one per message. In practice `recovered`, the one kind sent once. Nothing retries a drop |
-| `knell_listener_accept_errors_total` | counter | Failed accepts on the listener, usually an exhausted file-descriptor budget. The server retries each one. A shutdown is not counted |
+| `knell_listener_accept_errors_total` | counter | Failed accepts on the ping listener, port `9190`, usually an exhausted file-descriptor budget. The server retries each one. A shutdown is not counted |
 | `knell_pre_route_refusals_total{reason}` | counter | Requests refused before routing: `non_canonical_beat_path`, `host_not_allowed` or `auth_throttled`. A diagnostic, see below |
 | `knell_http_requests_total{method,path,status}` | counter | Served requests by route template, never the raw path. Host and malformed-path refusals have `path="unmatched"`. A throttled `429` shows only in `knell_pre_route_refusals_total` |
 | `knell_http_request_duration_seconds` | histogram | Request latency across all endpoints, with no labels |
@@ -63,7 +63,7 @@ The six PromQL rules in [`alerts/promql.yaml`](../alerts/promql.yaml) go to Prom
 | `KnellTargetDown` | `up{job="knell"} == 0` for 15m, so knell is not being scraped and every beat it watches is unmonitored | critical |
 | `KnellTargetAbsent` | `absent(up{job="knell"})` for 15m, so knell is not a scrape target at all | critical |
 | `KnellBeatOverdue` | `knell_beat_fresh == 0` for 5m, so a beat is overdue and its missing notice may not have reached you | warning |
-| `KnellAcceptFailing` | the listener failed to accept connections in the last 15 minutes (`knell_listener_accept_errors_total`), so pings stop landing while the process stays up | critical |
+| `KnellAcceptFailing` | the ping listener failed to accept connections in the last 15 minutes (`knell_listener_accept_errors_total`), so pings stop landing while the process stays up | critical |
 | `KnellNotifyFailing` | a send failed after retries, or a notice or an outage record was dropped for good | warning |
 | `KnellRestartChurn` | knell restarted more than once inside a beat's deadline window | warning |
 | `KnellExitedWithError` | knell logged its own exit: a refused configuration, a port it could not bind, an unknown command, or a stop that outlived its grace | critical |
@@ -77,9 +77,9 @@ Use an exact `job` matcher, never a regex. A regex `absent()` asks whether any m
 
 In the healthy case `KnellBeatOverdue` repeats knell's own Discord notice. It exists for a wedged sender or a Discord outage, so route it to a different receiver or drop it.
 
-`KnellAcceptFailing` reads `knell_listener_accept_errors_total`. A refused connection produces no request and moves no request series, and the usual cause is an exhausted file-descriptor budget. Every beat then crosses its deadline, and a sender seeing a refused connection has no way to report it. The counter sees what `up` misses. The server retries each accept, so scrapes can keep succeeding between failures and `up{job="knell"}` may never hold 0 for 15 minutes.
+`KnellAcceptFailing` reads `knell_listener_accept_errors_total`. A refused connection produces no request and moves no request series, and the usual cause is an exhausted file-descriptor budget. Every beat then crosses its deadline, and a sender seeing a refused connection has no way to report it. The counter sees what `up` misses. Scrapes reach port `9191`, and the server retries each failed accept, so `up{job="knell"}` may never hold 0 for 15 minutes.
 
-`KnellExitedWithError` fires before knell binds its port. Startup fails fast on purpose, because a dead-man switch with the wrong configuration is worse than none. A `BEATS` entry that is not `id:deadline`, a webhook that is not https, a missing or unreadable `BEAT_TOKEN` file, a taken port and a mistyped container command all end here. No metric can carry this, because the process publishes no `/metrics` and a crash-looping container is never scraped. The target rules report the silence 15 minutes later, without a cause. The log line has the cause on its `error` attribute.
+`KnellExitedWithError` fires before knell binds its ports. Startup fails fast on purpose, because a dead-man switch with the wrong configuration is worse than none. A `BEATS` entry that is not `id:deadline`, a webhook that is not https, a missing or unreadable `BEAT_TOKEN` file, a taken port and a mistyped container command all end here. No metric can carry this, because the process publishes no `/metrics` and a crash-looping container is never scraped. The target rules report the silence 15 minutes later, without a cause. The log line has the cause on its `error` attribute.
 
 `KnellNotifyFailing` has three `or` legs on purpose. The `failed` leg means the notice is late and the 15-second sweep retries it, so you wait. Either `dropped` leg means nothing will arrive, and you rebuild the window from `knell_beat_last_seen_timestamp_seconds`. Drop the third leg and a permanently lost outage record pages nobody.
 
@@ -97,21 +97,23 @@ Thresholds and windows are starting points. Set the churn window to your longest
 
 | Route | Method | Port | Login | Answers |
 | --- | --- | --- | --- | --- |
-| `/healthz` | `GET`, `HEAD` | `LISTEN_ADDR`, `9190` by default | none. `ALLOWED_HOSTS` applies, except to knell's own `knell health` check, unless `LISTEN_ADDR` names a host other than `localhost` | `200 {"status":"ok"}`, or `503 {"status":"unhealthy","reasons":[...]}` |
-| `/metrics` | `GET` | the same port | none. Keep the port on your network | Prometheus text format |
+| `/healthz` | `GET`, `HEAD` | `OPS_LISTEN_ADDR`, `9191` by default | none. `ALLOWED_HOSTS` applies, except to knell's own `knell health` check, unless `OPS_LISTEN_ADDR` names a host other than `localhost` | `200 {"status":"ok"}`, or `503 {"status":"unhealthy","reasons":[...]}` |
+| `/metrics` | `GET` | the same port | none. Keep the port on your monitoring network | Prometheus text format |
 
-**What healthy means.** knell answers `/healthz` itself, so a `200` proves the listener accepts and serves requests. Nothing answers before the listener is up. From the moment knell begins to shut down, it answers `503` until the listener closes. knell keeps this verdict in memory, so a read-only root filesystem never makes it unhealthy. Discord being unreachable never makes knell unhealthy. It shows on `knell_notifications_failed_total` and in the log.
+**What healthy means.** knell answers `/healthz` itself, so a `200` proves port `9191` accepts and serves requests. A ping port that stops accepting shows on `knell_listener_accept_errors_total` and `KnellAcceptFailing`, not here.
 
-**Docker health.** The image checks itself every 30 seconds with `knell health`, which asks `/healthz` on the container's loopback, or on the address `LISTEN_ADDR` names. A check fails when no answer comes within 4 seconds. Docker marks the container unhealthy after 3 failures, and allows 15 seconds after a start. Docker's health status notifies nobody on its own, and Docker does not restart an unhealthy container.
+Nothing answers before the listeners are up. From the moment knell begins to shut down, it answers `503`. It keeps answering until the ping port has drained. If port `9191` stops on its own, knell stops too and exits with an error. Your restart policy then brings both ports back. knell keeps this verdict in memory, so a read-only root filesystem never makes it unhealthy. Discord being unreachable never makes knell unhealthy. It shows on `knell_notifications_failed_total` and in the log.
+
+**Docker health.** The image checks itself every 30 seconds with `knell health`, which asks `/healthz` on port `9191` on the container's loopback, or on the address `OPS_LISTEN_ADDR` names. A check fails when no answer comes within 4 seconds. Docker marks the container unhealthy after 3 failures, and allows 15 seconds after a start. Docker's health status notifies nobody on its own, and Docker does not restart an unhealthy container.
 
 **Who is told.**
 
 | You run | A dead knell | A wedged knell |
 | --- | --- | --- |
-| Prometheus with these rules | `KnellTargetDown`, or `KnellTargetAbsent` once the target is gone | `KnellAcceptFailing` for a listener that cannot accept |
+| Prometheus with these rules | `KnellTargetDown`, or `KnellTargetAbsent` once the target is gone | `KnellAcceptFailing` for a ping port that cannot accept |
 | Loki only | `KnellExitedWithError` when it exits with an error. Nothing reports a kill, so add an uptime prober on `/healthz` | an uptime prober on `/healthz` |
 | Docker or Unraid only | an uptime prober on `/healthz`, or something that watches Docker health | the same |
 
 One wedge reaches the down alerts instead. At `LOG_LEVEL=debug`, a log destination that stops reading blocks the loop that judges beats, and it also blocks every scrape, because each scrape's access line waits for the same output. The scrape then fails, so `KnellTargetDown` fires. At `info` neither writes a line per request or per check.
 
-**Probing from outside.** Check `GET http://<host>:9190/healthz` and pass on status 200 only. Do not match the body. Use a 5-second timeout, check every 60 seconds, alert after 3 failures, and wait 15 seconds after a first start. Address knell by a name in `ALLOWED_HOSTS`, or knell refuses the request with `403`. Run the prober somewhere other than the host knell runs on, so it can report that host going down. A Kubernetes liveness probe that must ignore readiness uses a `tcpSocket` probe on the port.
+**Probing from outside.** Check `GET http://<host>:9191/healthz` and pass on status 200 only. Do not match the body. Use a 5-second timeout, check every 60 seconds, alert after 3 failures, and wait 15 seconds after a first start. Address knell by a name in `ALLOWED_HOSTS`, or knell refuses the request with `403`. Run the prober somewhere other than the host knell runs on, so it can report that host going down. Publish `9191` to the address the prober reaches, such as `"192.0.2.10:9191:9191"`, and never to the internet. A Kubernetes liveness probe that must ignore readiness uses a `tcpSocket` probe on port `9191`.
