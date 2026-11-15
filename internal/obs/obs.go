@@ -102,8 +102,8 @@ func mintRefusalReasons() {
 	}
 }
 
-// registry serves every registered metric plus process metrics on /metrics;
-// Handler is its only exported view.
+// registry serves every registered metric plus the Go and process metrics on
+// /metrics; Handler is its only exported view.
 var registry = measure.NewRegistry("knell")
 
 // beatFresh reports per beat whether its observed silence is within its
@@ -242,8 +242,6 @@ var buildInfo = measure.NewLabeledGauge(
 )
 
 func init() {
-	// MustRegister: init-time registration has no caller to hand an error to,
-	// and a construction error surfaces here, at process start.
 	registry.MustRegister(
 		beatFresh,
 		beatLastSeen,
@@ -264,9 +262,10 @@ func init() {
 	mintRefusalReasons()
 }
 
-// Handler serves the Prometheus exposition: every registered metric plus
-// process metrics. It is the only exported view of the registry, so a consumer
-// can scrape the metrics but cannot mint, delete or re-register a series.
+// Handler serves the Prometheus exposition: every registered metric plus the
+// Go and process metrics. It is the only exported view of the registry, so a
+// consumer can scrape the metrics but cannot mint, delete or re-register a
+// series.
 func Handler() http.Handler {
 	return registry.Handler()
 }
