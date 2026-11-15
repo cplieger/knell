@@ -566,7 +566,7 @@
         "spec": {
           "id": 12,
           "title": "Listener",
-          "description": "Shows while the KnellAcceptFailing alert fires: the listener failed to accept a connection in the last 15 minutes, so pings may not land while the process runs. Check the file descriptor limit. Needs the rules from alerts/promql.yaml in a ruler that stores its `ALERTS` series beside the metrics, as Prometheus and Mimir do.",
+          "description": "Shows while the KnellAcceptFailing alert fires: the ping listener failed to accept a connection in the last 15 minutes, so pings may not land while the process runs. Check the file descriptor limit. Needs the rules from alerts/promql.yaml in a ruler that stores its `ALERTS` series beside the metrics, as Prometheus and Mimir do.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1694,7 +1694,7 @@
         "spec": {
           "id": 41,
           "title": "Accept errors in ${span} ${spanunit}",
-          "description": "Connections each knell's listener failed to accept in the selected range, one tile per knell. Red from 1, because pings may have been lost while it lasted. A tile is named by the scrape's hostname label when it sets one. No value means knell was not scraped in the range.",
+          "description": "Connections each knell's ping listener failed to accept in the selected range, one tile per knell. Red from 1, because pings may have been lost while it lasted. A tile is named by the scrape's hostname label when it sets one. No value means knell was not scraped in the range.",
           "links": [],
           "data": {
             "kind": "QueryGroup",

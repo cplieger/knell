@@ -12,6 +12,6 @@ services:
       NODE_NAME: "server-1"  # names this instance in every notice
 
     ports:
-      # /metrics needs no token and lists every beat. Publish this port only to a
-      # network you trust, see README "Security".
+      # Pings. Publish this port only to a network you trust, see README "Security".
+      # /healthz and /metrics stay unpublished on 9191: a scraper on this network reaches knell:9191.
       - "9190:9190"

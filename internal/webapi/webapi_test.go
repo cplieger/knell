@@ -58,9 +58,8 @@ const testBeatToken = "unit-test-beat-token"
 // quietly weakening every assertion below.
 const authFailBurst = 10
 
-// newTestHandler assembles the routed handler around b with a healthy
-// liveness endpoint; token is the required beat credential, exactly as in
-// production. Beat acceptance is whatever b reports: a fakeBeater with
+// newTestHandler assembles knell's surface around b with a healthy liveness
+// endpoint; token is the required beat credential, exactly as in production. Beat acceptance is whatever b reports: a fakeBeater with
 // closed=true is a watcher that has shut admission (watch.Watcher.StopAccepting),
 // which is the endpoint's only shutdown state.
 func newTestHandler(b *fakeBeater, token string) http.Handler {
@@ -71,7 +70,21 @@ func newTestHandler(b *fakeBeater, token string) http.Handler {
 // test control, so a test can drive a FAILING probe: /healthz answers 503
 // whenever the health verdict is unhealthy (boot, or after the pre-drain flip).
 func newTestHandlerHealthz(b *fakeBeater, token string, healthzStatus int) http.Handler {
-	return New(b, Deps{Healthz: staticHealthz(healthzStatus), BeatToken: token})
+	return surface(New(b, Deps{BeatToken: token}), NewOps(OpsDeps{Healthz: staticHealthz(healthzStatus)}))
+}
+
+// surface stands in for knell's two listeners in one handler: GET /healthz
+// and /metrics reach ops, as a request to the operations port does, and every
+// other path reaches ping. TestPingListenerServesNoOperationsRoute pins that
+// the ping handler itself serves neither.
+func surface(ping, ops http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/metrics" {
+			ops.ServeHTTP(w, r)
+			return
+		}
+		ping.ServeHTTP(w, r)
+	})
 }
 
 // newBeatRequest builds a request presenting testBeatToken. The bearer gate is
@@ -659,10 +672,7 @@ func TestPanicUnderBeatHandlerAnswers500AndIsLogged(t *testing.T) {
 	// net/http: the sender sees a reset connection rather than a 500, and the
 	// access log never reports a status for the endpoint that feeds the switch.
 	rec := capture.Default(t)
-	h := New(panicBeater{}, Deps{
-		Healthz:   staticHealthz(http.StatusOK),
-		BeatToken: testBeatToken,
-	})
+	h := New(panicBeater{}, Deps{BeatToken: testBeatToken})
 
 	req := newBeatRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
 	w := httptest.NewRecorder()
@@ -893,8 +903,8 @@ func TestTokenGateScopedToBeatEndpoint(t *testing.T) {
 	// /healthz and /metrics must stay reachable without the beat token:
 	// the docker healthcheck and the Prometheus scraper carry no
 	// Authorization header, and gating them would break liveness and the
-	// quorum ground truth the moment BEAT_TOKEN is set.
-	h := newTestHandler(&fakeBeater{}, "s3cret")
+	// quorum ground truth.
+	h := NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK)})
 
 	for _, path := range []string{"/healthz", "/metrics"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -902,6 +912,30 @@ func TestTokenGateScopedToBeatEndpoint(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Errorf("GET %s without token = %d, want 200 (token gates only /beat)", path, rec.Code)
+		}
+	}
+}
+
+// TestPingListenerServesNoOperationsRoute pins the ops-port split: the ping
+// listener is the one an operator publishes to the internet, and /metrics
+// lists every beat with its last ping, so neither operations route may answer
+// there, with or without a token.
+func TestPingListenerServesNoOperationsRoute(t *testing.T) {
+	h := New(&fakeBeater{known: map[string]bool{"api": true}}, Deps{BeatToken: testBeatToken})
+	for _, path := range []string{"/healthz", "/metrics"} {
+		for _, auth := range []string{"", "Bearer " + testBeatToken} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			if auth != "" {
+				req.Header.Set("Authorization", auth)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("GET %s on the ping listener (auth %t) = %d, want 404", path, auth != "", rec.Code)
+			}
+			if strings.Contains(rec.Body.String(), "knell_") || strings.Contains(rec.Body.String(), "status") {
+				t.Errorf("GET %s on the ping listener answered an operations body: %q", path, rec.Body.String())
+			}
 		}
 	}
 }
@@ -914,7 +948,7 @@ func TestTokenGateScopedToBeatEndpoint(t *testing.T) {
 // verifier refuses everything instead, including the bare scheme.
 func TestEmptyBeatTokenFailsClosed(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := New(b, Deps{Healthz: staticHealthz(http.StatusOK)})
+	h := New(b, Deps{})
 
 	for _, auth := range []string{"", "Bearer ", "Bearer", "Bearer anything"} {
 		t.Run("auth "+auth, func(t *testing.T) {
@@ -1281,7 +1315,7 @@ func newShutdownHarness(t *testing.T, id string) (http.Handler, func(), *fakeClo
 	start := time.Unix(1_700_000_000, 0).UTC()
 	clock := &fakeClock{now: start}
 	watcher := watch.New([]watch.Beat{{ID: id, Deadline: time.Minute}}, &deliveringNotifier{}, clock.Now, start)
-	h := New(watcher, Deps{Healthz: staticHealthz(http.StatusOK), BeatToken: testBeatToken})
+	h := surface(New(watcher, Deps{BeatToken: testBeatToken}), NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK)}))
 	return h, watcher.StopAccepting, clock, start
 }
 
@@ -1903,7 +1937,7 @@ func TestAccessLogClientIPResolvesOnlyThroughTrustedProxies(t *testing.T) {
 		t.Fatalf("ParseCIDRs rejected %v; the fixture must be a valid trusted-proxy set", invalid)
 	}
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := New(b, Deps{Healthz: staticHealthz(http.StatusOK), BeatToken: testBeatToken, TrustedProxies: trusted})
+	h := New(b, Deps{BeatToken: testBeatToken, TrustedProxies: trusted})
 
 	// httptest.NewRequest's RemoteAddr is 192.0.2.1:1234, inside the set above,
 	// so the forwarded header is a trusted proxy's own report of the sender.
@@ -1920,7 +1954,7 @@ func TestAccessLogClientIPResolvesOnlyThroughTrustedProxies(t *testing.T) {
 
 	// The same request with NO trusted set must report the socket peer.
 	bare := capture.Default(t)
-	plain := New(b, Deps{Healthz: staticHealthz(http.StatusOK), BeatToken: testBeatToken})
+	plain := New(b, Deps{BeatToken: testBeatToken})
 	spoofed := newBeatRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
 	spoofed.Header.Set("X-Forwarded-For", "203.0.113.7")
 	plain.ServeHTTP(httptest.NewRecorder(), spoofed)
@@ -1975,11 +2009,9 @@ func hostPolicy(t *testing.T, entries string) *httpserver.HostPolicy {
 // /beat case below proves the allowlist answers before the route's own refusals.
 func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := New(b, Deps{
-		Healthz:   staticHealthz(http.StatusOK),
-		Hosts:     hostPolicy(t, "knell.example"),
-		BeatToken: testBeatToken,
-	})
+	hosts := hostPolicy(t, "knell.example")
+	h := surface(New(b, Deps{Hosts: hosts, BeatToken: testBeatToken}),
+		NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK), Hosts: hosts}))
 
 	tests := map[string]struct {
 		host       string
@@ -2007,20 +2039,20 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 		// browser-facing names. Both halves must be loopback: a rebinding
 		// request carries the attacker's hostname, and a remote client forging
 		// Host: 127.0.0.1 is not a loopback socket peer.
-		"loopback probe exempt": {host: "127.0.0.1:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
-		// LISTEN_ADDR=localhost:9190 makes the probe send Host localhost.
-		"localhost probe exempt": {host: "localhost:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
-		// When LISTEN_ADDR names one address that is neither loopback nor
+		"loopback probe exempt": {host: "127.0.0.1:9191", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
+		// OPS_LISTEN_ADDR=localhost:9191 makes the probe send Host localhost.
+		"localhost probe exempt": {host: "localhost:9191", path: "/healthz", method: http.MethodGet, remoteAddr: "127.0.0.1:54321", wantStatus: http.StatusOK},
+		// When OPS_LISTEN_ADDR names one address that is neither loopback nor
 		// unspecified, the probe connects from and to that address, so the
 		// carve-out admits a peer at the listener's own address whose Host is
 		// that address, without the address in ALLOWED_HOSTS.
-		"single-address probe exempt": {host: "192.0.2.10:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.10:9190", wantStatus: http.StatusOK},
+		"single-address probe exempt": {host: "192.0.2.10:9191", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.10:9191", wantStatus: http.StatusOK},
 		// A peer that is not the listener's own address cannot borrow the
 		// carve-out by sending its own IP as Host.
-		"peer at another address refused": {host: "192.0.2.10:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.20:9190", wantStatus: http.StatusForbidden},
-		// A host-name LISTEN_ADDR makes the probe send that name as Host, and
+		"peer at another address refused": {host: "192.0.2.10:9191", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.20:9191", wantStatus: http.StatusForbidden},
+		// A host-name OPS_LISTEN_ADDR makes the probe send that name as Host, and
 		// only an IP-literal Host is exempt, so the name must be listed.
-		"host-name probe refused when unlisted": {host: "knell.lan:9190", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.10:9190", wantStatus: http.StatusForbidden},
+		"host-name probe refused when unlisted": {host: "knell.lan:9191", path: "/healthz", method: http.MethodGet, remoteAddr: "192.0.2.10:54321", localAddr: "192.0.2.10:9191", wantStatus: http.StatusForbidden},
 		"forged loopback host refused":          {host: "127.0.0.1:9190", path: "/beat/api", remoteAddr: "203.0.113.7:44444", wantStatus: http.StatusForbidden},
 		"malformed host cannot match":           {host: "knell.example:notaport", path: "/beat/api", wantStatus: http.StatusForbidden},
 		"bracketed hostname is refused":         {host: "[knell.example]", path: "/beat/api", wantStatus: http.StatusForbidden},
@@ -2086,11 +2118,9 @@ func scrapeAs(t *testing.T, h http.Handler, host string) string {
 // exists to close for the other 403.
 func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := New(b, Deps{
-		Healthz:   staticHealthz(http.StatusOK),
-		Hosts:     hostPolicy(t, "knell.example"),
-		BeatToken: testBeatToken,
-	})
+	hosts := hostPolicy(t, "knell.example")
+	h := surface(New(b, Deps{Hosts: hosts, BeatToken: testBeatToken}),
+		NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK), Hosts: hosts}))
 
 	// The refusal happens before the mux routes, so the path label is the
 	// "unmatched" marker rather than a /beat template — which is why the cause

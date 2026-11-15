@@ -6,7 +6,7 @@ This page describes knell's Grafana dashboard, what each tab shows and how to ke
 
 - Overview counts the beats past their deadline, which mirrors `KnellBeatOverdue`, and the beats watched, with the pings and outages in the selected range. Below them, the Needs attention row has one hidden tile for each other rule in `alerts/promql.yaml`, and appears only while one of those alerts fires. The Beats row below it holds the Beats table, which shows each beat as Fresh or Missing, when knell last accepted a ping for it, its deadline, the share of the deadline left and its outages in the range.
 - History shows when each beat was fresh or missing, ranks the beats by their outages in the range, and charts the notices sent, failed or lost.
-- knell health shows the scrape, the listener's accept errors, the requests refused before routing and why, when knell last started, and the request latency and status codes.
+- knell health shows the scrape, the ping listener's accept errors, the requests refused before routing and why, when knell last started, and the request latency and status codes.
 
 The tiles and the count of beats past their deadline read each rule's `ALERTS` series, which Prometheus and the Mimir ruler store beside your metrics. The Needs attention row stays hidden while those rules are not loaded. Without them, the count shows the beats that have been past their deadline for 7 minutes. The two LogQL rules read the log, so the dashboard has no tile for them.
 

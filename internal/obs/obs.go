@@ -215,11 +215,12 @@ var httpRequests = measure.NewLabeledCounter(
 	[]string{methodLabel, pathLabel, statusLabel},
 )
 
-// listenerAcceptErrors counts failed accepts on the listener, which net/http
-// retries with backoff, so scrapes can keep landing while pings are refused.
+// listenerAcceptErrors counts failed accepts on the ping listener, which
+// net/http retries with backoff. The operations listener is not counted: a
+// wedged one shows as up == 0.
 var listenerAcceptErrors = measure.NewCounter(
 	"listener_accept_errors_total",
-	"Failed accepts on the HTTP listener, which retries them; a shutdown's close is not counted.",
+	"Failed accepts on the ping listener, which retries them; a shutdown's close is not counted.",
 	measure.UnitCount,
 )
 

@@ -21,7 +21,7 @@ Each watched job is a beat. Its deadline is the longest silence allowed between 
 
 knell is built for a home lab that gets its alerts in Discord and wants a small watchdog with no database or web page. It sends only to a Discord webhook or a relay that accepts Discord's message format. It keeps its state in memory, so a restart starts every deadline over.
 
-You need a Discord webhook, a Docker host and jobs that can send an HTTP POST. Keep its port on a network you trust.
+You need a Discord webhook, a Docker host and jobs that can send an HTTP POST. Keep its ports on a network you trust.
 
 Two projects suit a different setup:
 
@@ -49,8 +49,8 @@ services:
       NODE_NAME: "server-1"  # names this instance in every notice
 
     ports:
-      # /metrics needs no token and lists every beat. Publish this port only to a
-      # network you trust, see README "Security".
+      # Pings. Publish this port only to a network you trust, see README "Security".
+      # /healthz and /metrics stay unpublished on 9191: a scraper on this network reaches knell:9191.
       - "9190:9190"
 ```
 
@@ -82,7 +82,8 @@ knell reads its settings from environment variables when it starts and never rel
 | `DISCORD_WEBHOOK_URL` | The `https` webhook URL notices are posted to. `DISCORD_WEBHOOK_URL_FILE` reads it from a secret file instead | required |
 | `BEAT_TOKEN` | The token every ping presents as `Authorization: Bearer <token>`, 16 to 512 bytes. `BEAT_TOKEN_FILE` reads it from a secret file | required |
 | `NODE_NAME` | Names this instance in every notice, at most 256 bytes | container hostname |
-| `LISTEN_ADDR` | TCP listen address, `host:port` | `:9190` |
+| `LISTEN_ADDR` | TCP listen address of the pings, `host:port` | `:9190` |
+| `OPS_LISTEN_ADDR` | TCP listen address of `/healthz` and `/metrics`, `host:port`. It must use another port than `LISTEN_ADDR` | `:9191` |
 | `ALLOWED_HOSTS` | Comma-separated exact-match `Host` names or IPs to serve. Unset accepts every `Host` | _(unset)_ |
 | `TRUSTED_PROXIES` | Comma-separated CIDRs or IPs of the reverse proxies whose `X-Forwarded-For` names the real sender | _(unset)_ |
 | `MISSING_REPEAT` | Repeats a beat's missing notice at this interval while it stays missing, such as `6h`. At least `10m`. `0` sends one notice per outage | `0` |
@@ -90,7 +91,8 @@ knell reads its settings from environment variables when it starts and never rel
 
 | Port | Description |
 | --- | --- |
-| `9190` | Pings on `POST /beat/<id>`, the health endpoint `/healthz` and Prometheus metrics on `/metrics` |
+| `9190` | Pings on `POST /beat/<id>`. `LISTEN_ADDR` moves it |
+| `9191` | The health endpoint `/healthz` and Prometheus metrics on `/metrics`, which need no token. Publish it only to your monitoring network. `OPS_LISTEN_ADDR` moves it |
 
 knell needs no volume.
 
@@ -98,7 +100,7 @@ knell needs no volume.
 
 knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext on every ping, and anything that reads one ping can replay it. Put a [TLS reverse proxy](https://github.com/cplieger/docs/blob/main/docs/reverse-proxy.md) in front, or keep pings on a network you trust to the same standard.
 
-One token gates `POST /beat/<id>` for every beat, so any job that holds it can ping any beat. `/healthz` and `/metrics` answer anyone who can reach the port, and `/metrics` lists every beat with its last ping. Publish the port to a trusted network only, or put an authenticating proxy in front of `/metrics`. Set `ALLOWED_HOSTS` to the names you use to reach knell. Then a web page in your browser cannot read `/metrics` through a domain an attacker points at knell.
+One token gates `POST /beat/<id>` for every beat, so any job that holds it can ping any beat. `/healthz` and `/metrics` answer on port `9191` with no token. `/metrics` lists every beat with its last ping, so publish `9191` to your monitoring network only. Set `ALLOWED_HOSTS` to the names you use to reach knell. Then a web page in your browser cannot read `/metrics` through a domain an attacker points at knell.
 
 The image runs as the non-root user 65534 on `scratch`, and the webhook URL never appears in a log line or an error. [Security](docs/hardening.md) covers reverse proxies, `ALLOWED_HOSTS` and the hardened compose profile.
 
@@ -117,7 +119,7 @@ The image checks itself every 30 seconds with `knell health`, which asks `/healt
 
 ## Monitoring
 
-knell publishes Prometheus metrics on `/metrics` and writes logfmt logs, one `key=value` line per event, to standard error. Eight alert rules that watch knell ship in [`alerts/`](alerts/), six in `alerts/promql.yaml` and two in `alerts/logql.yaml`. Load both. The [Grafana dashboard](docs/dashboard.md), shipped as [`grafana-dashboard.json`](grafana-dashboard.json), needs Grafana 13.2 or newer. [Monitoring and alerts](docs/monitoring.md) lists the metrics and rules, and says who is told when knell itself stops.
+knell publishes Prometheus metrics on `/metrics`, on port `9191`, and writes logfmt logs, one `key=value` line per event, to standard error. Eight alert rules that watch knell ship in [`alerts/`](alerts/), six in `alerts/promql.yaml` and two in `alerts/logql.yaml`. Load both. The [Grafana dashboard](docs/dashboard.md), shipped as [`grafana-dashboard.json`](grafana-dashboard.json), needs Grafana 13.2 or newer. [Monitoring and alerts](docs/monitoring.md) lists the metrics and rules, and says who is told when knell itself stops.
 
 ## Documentation
 

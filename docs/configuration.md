@@ -61,20 +61,26 @@ The 512-byte ceiling keeps the token inside the 8704-byte request-header limit w
 
 `NODE_NAME` names this instance in every notice. It defaults to the container hostname, or `unknown` when the hostname is blank. It holds at most 256 bytes, because it prefixes every notice and Discord caps a message at 2000 characters.
 
-## Listen address
+## Listen addresses
 
-`LISTEN_ADDR` is the `host:port` knell binds, `:9190` by default. A blank value uses the default. A port another process holds stops startup.
+knell opens two listeners, so the port you publish for pings never serves `/metrics`.
+
+- `LISTEN_ADDR` is the `host:port` of the pings, `:9190` by default.
+- `OPS_LISTEN_ADDR` is the `host:port` of `/healthz` and `/metrics`, `:9191` by default. The built-in `knell health` check asks this one.
+- A blank value uses the default. Spaces and invisible characters around a value are removed.
+- The two must use different ports. `OPS_LISTEN_ADDR` on `LISTEN_ADDR`'s port stops startup, so if your `LISTEN_ADDR` is `:9191`, set `OPS_LISTEN_ADDR` to another port.
+- A port another process holds stops startup, with the error naming the setting.
 
 ## Host allowlist
 
 `ALLOWED_HOSTS` is a comma-separated list of exact `Host` names to serve, such as `knell.internal,192.0.2.10`. Each entry is a bare hostname or IP with an optional port, with no scheme, path or CIDR.
 
 - Unset, knell answers every `Host`.
-- Set, a request with any other `Host` is refused with `403 host_not_allowed` on every endpoint. This is what blocks DNS rebinding from a browser inside your network.
-- It covers `/healthz` and `/metrics` too, so list every name your probes and your Prometheus scraper use.
-- knell's own requests are always served. Those are a request from loopback to a loopback `Host`, and one from the address `LISTEN_ADDR` binds to that same address as `Host`.
+- Set, a request with any other `Host` is refused with `403 host_not_allowed` on both ports. This is what blocks DNS rebinding from a browser inside your network.
+- It covers `/healthz` and `/metrics` on port `9191` too, so list every name your probes and your Prometheus scraper use.
+- knell's own requests are always served. Those are a request from loopback to a loopback `Host`, and one from the address a listener binds to that same address as `Host`.
 - An entry no `Host` could ever match stops startup, because a dropped entry would leave pings to that name refused.
-- The built-in `knell health` check is one of those requests when the host in `LISTEN_ADDR` is empty, `0.0.0.0`, `::`, `localhost` or an IP address without a zone. When `LISTEN_ADDR` names any other host, such as `knell.lan:9190`, the check sends that name as `Host`, so list it in `ALLOWED_HOSTS`.
+- The built-in `knell health` check is one of those requests when the host in `OPS_LISTEN_ADDR` is empty, `0.0.0.0`, `::`, `localhost` or an IP address without a zone. When `OPS_LISTEN_ADDR` names any other host, such as `knell.lan:9191`, the check sends that name as `Host`, so list it in `ALLOWED_HOSTS`.
 
 ## Trusted proxies
 
@@ -91,7 +97,7 @@ The 512-byte ceiling keeps the token inside the 8704-byte request-header limit w
 
 ## Startup summary
 
-After the settings pass, knell logs one `watching beat` line per beat and one `configuration loaded` line. That line carries `beats`, `node`, `listen_addr`, `webhook` and `beat_token` as `env` or `file`, `allowed_hosts` as `any` or `allowlist(N)`, the `trusted_proxies` count, `log_level` and `missing_repeat` as a Go duration, `0s` when unset. It never carries a credential. A misspelled `ALLOWED_HOSTS` looks the same as an unset one, `allowed_hosts=any`, so check that field after you set it.
+After the settings pass, knell logs one `watching beat` line per beat and one `configuration loaded` line. That line carries `beats`, `node`, `listen_addr`, `ops_listen_addr`, `webhook` and `beat_token` as `env` or `file`, `allowed_hosts` as `any` or `allowlist(N)`, the `trusted_proxies` count, `log_level` and `missing_repeat` as a Go duration, `0s` when unset. It never carries a credential. A misspelled `ALLOWED_HOSTS` looks the same as an unset one, `allowed_hosts=any`, so check that field after you set it.
 
 ## What stops startup
 
@@ -104,6 +110,7 @@ knell refuses to start rather than run with a setting it cannot honor, because a
 - an `ALLOWED_HOSTS` entry no `Host` could match,
 - a `BEAT_TOKEN` that is unset, empty, outside 16 to 512 bytes, wrapped in whitespace or carrying a forbidden control character,
 - a `_FILE` variable that is set but unusable,
+- an `OPS_LISTEN_ADDR` on `LISTEN_ADDR`'s port,
 - a listen address it cannot bind.
 
 Each one logs `knell exited with error` with an `error` field naming the setting and the fix.

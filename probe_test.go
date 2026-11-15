@@ -41,7 +41,7 @@ func TestProbeHealthPassesOnlyAnAnsweringHealthyListener(t *testing.T) {
 		"unhealthy":                     {serving(http.StatusServiceUnavailable), 1},
 		"nothing listening":             {unusedLoopbackAddr(t), 1},
 		"bound but no longer accepting": {wedged.Addr().String(), 1},
-		"malformed LISTEN_ADDR":         {"9190", 1},
+		"malformed OPS_LISTEN_ADDR":     {"9191", 1},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -52,8 +52,7 @@ func waitForHealthyWithin(t *testing.T, addr string, timeout time.Duration) {
 }
 
 // drainLine is the line the health verdict logs when shutdown turns it
-// unhealthy. The listener closes once the drain starts, so this line is the
-// only observable of the verdict flipping before run() returns.
+// unhealthy: the signal that the drain has begun.
 const drainLine = `msg="health state changed" healthy=false draining=true`
 
 // waitForLogWithin blocks until logs holds line, or fails the test.
@@ -70,27 +69,19 @@ func waitForLogWithin(t *testing.T, logs *runLog, line string, timeout time.Dura
 }
 
 // prepareLifecycleRun installs the one process-global contract every full
-// run() test shares and returns the address run() will bind. It reserves and
-// releases an ephemeral port (so the test knows the address before run()
-// chooses it), installs a complete beat/webhook environment with the _FILE and
+// run() test shares and returns the ping and operations addresses run() will
+// bind. It reserves and releases two ephemeral ports (so the test knows the
+// addresses before run() chooses them), installs a complete beat/webhook environment with the _FILE and
 // token variables explicitly cleared (a leaked one from another test changes
 // what run() reads), swaps in a fresh slog default that is restored at test
 // end. It is deliberately separate from startLifecycleRun, so a test can
 // still observe state (e.g. a boot floor) between this setup and the boot.
-func prepareLifecycleRun(t *testing.T, beat string) string {
+func prepareLifecycleRun(t *testing.T, beat string) (addr, opsAddr string) {
 	t.Helper()
-	free, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Skipf("cannot reserve a port: %v", err)
-	}
-	addr := free.Addr().String()
-	if err := free.Close(); err != nil {
-		t.Fatalf("releasing the reserved port: %v", err)
-	}
-
-	installRunEnv(t, beat+":1m", addr)
+	addr, opsAddr = unusedLoopbackAddr(t), unusedLoopbackAddr(t)
+	installRunEnvOps(t, beat+":1m", addr, opsAddr)
 	capture.Default(t)
-	return addr
+	return addr, opsAddr
 }
 
 // lifecycleRun is one background run() under test: the channel its return
@@ -210,11 +201,11 @@ func startHeldBeatRequest(t *testing.T, addr, beat string, contentLength int) (n
 func TestRunTracksHealthAcrossServeAndDrain(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default and
 	// os.Stderr, and a process-wide signal.
-	addr := prepareLifecycleRun(t, "api")
+	addr, opsAddr := prepareLifecycleRun(t, "api")
 	logs := captureRunLog(t)
 
 	r := startLifecycleRun(t)
-	waitForHealthyWithin(t, addr, 10*time.Second)
+	waitForHealthyWithin(t, opsAddr, 10*time.Second)
 
 	// Hold one real request open across the shutdown so the interval between
 	// pre-drain and the deferred cleanup becomes observable. Expect:
@@ -235,6 +226,11 @@ func TestRunTracksHealthAcrossServeAndDrain(t *testing.T) {
 		t.Fatalf("run() returned before its active request drained: %v", err)
 	default:
 	}
+	// The operations listener outlives the ping drain, so a probe during it
+	// gets an answer, 503, and never a refused connection.
+	if status, body := getHealthz(t, opsAddr); status != http.StatusServiceUnavailable || !strings.Contains(body, notServingReason) {
+		t.Errorf("/healthz on the ops port during the ping drain = %d %q, want 503 naming %q: the operations listener must stop only after the ping listener has drained", status, body, notServingReason)
+	}
 
 	if err := conn.Close(); err != nil {
 		t.Fatalf("release slow beat request: %v", err)
@@ -252,7 +248,7 @@ func TestRunTracksHealthAcrossServeAndDrain(t *testing.T) {
 func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal.
-	addr := prepareLifecycleRun(t, "api")
+	_, opsAddr := prepareLifecycleRun(t, "api")
 
 	entered := make(chan struct{})
 	held := make(chan struct{})
@@ -285,8 +281,8 @@ func TestRunPublishesTheBootArmedBaselineFromProcessStart(t *testing.T) {
 	time.Sleep(time.Until(configBoundary) + 10*time.Millisecond)
 	release()
 
-	waitForHealthyWithin(t, addr, 10*time.Second)
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/metrics", nil)
+	waitForHealthyWithin(t, opsAddr, 10*time.Second)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+opsAddr+"/metrics", nil)
 	if err != nil {
 		t.Fatalf("building the /metrics request: %v", err)
 	}
@@ -380,12 +376,12 @@ func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
 	// A beat id no other test in this package pings, since the metrics
 	// registry is a package-level singleton shared by the whole test binary.
 	const beat = "drain-guard"
-	addr := prepareLifecycleRun(t, beat)
+	addr, opsAddr := prepareLifecycleRun(t, beat)
 	logs := captureRunLog(t)
 
 	received := `knell_beats_received_total{beat="` + beat + `"}`
 	r := startLifecycleRun(t)
-	waitForHealthyWithin(t, addr, 10*time.Second)
+	waitForHealthyWithin(t, opsAddr, 10*time.Second)
 	before := scrapeCounter(t, received)
 
 	// Admit the ping while the app is live, then hold it inside the handler's
@@ -460,13 +456,13 @@ func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 	// A token no other boot in this package uses, so the gate cannot pass by
 	// admitting the value installRunEnv installs for every other test.
 	const token = "lifecycle-token-gate-token"
-	addr := prepareLifecycleRun(t, beat)
+	addr, opsAddr := prepareLifecycleRun(t, beat)
 	// prepareLifecycleRun installs the shared testBeatToken; this overrides it
 	// with the value under test.
 	t.Setenv("BEAT_TOKEN", token)
 
 	r := startLifecycleRun(t)
-	waitForHealthyWithin(t, addr, 10*time.Second)
+	waitForHealthyWithin(t, opsAddr, 10*time.Second)
 
 	url := "http://" + addr + "/beat/" + beat
 	unauthorized := postBeat(t, url, "")
@@ -506,15 +502,15 @@ func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 func TestRunAppliesConfiguredHostAllowlist(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default, a
 	// process-wide signal.
-	addr := prepareLifecycleRun(t, "host-gate")
+	addr, opsAddr := prepareLifecycleRun(t, "host-gate")
 	// Every other lifecycle boot leaves ALLOWED_HOSTS unset (the policy is
 	// then inactive and admits any Host), so this is the variable under test.
 	t.Setenv("ALLOWED_HOSTS", "knell.internal")
 
 	r := startLifecycleRun(t)
-	waitForHealthyWithin(t, addr, 10*time.Second)
+	waitForHealthyWithin(t, opsAddr, 10*time.Second)
 
-	blockedStatus, blockedBody := getHealthzAsHost(t, addr, "attacker.example")
+	blockedStatus, blockedBody := getHealthzAsHost(t, opsAddr, "attacker.example")
 	if blockedStatus != http.StatusForbidden {
 		t.Errorf("request with an unlisted Host = %d, want 403: an unwired ALLOWED_HOSTS policy leaves the DNS-rebinding guard disabled (body %s)", blockedStatus, blockedBody)
 	}
@@ -522,8 +518,24 @@ func TestRunAppliesConfiguredHostAllowlist(t *testing.T) {
 		t.Errorf("blocked-host body = %s, want the host_not_allowed code", blockedBody)
 	}
 
-	if allowedStatus, allowedBody := getHealthzAsHost(t, addr, "knell.internal"); allowedStatus != http.StatusOK {
+	if allowedStatus, allowedBody := getHealthzAsHost(t, opsAddr, "knell.internal"); allowedStatus != http.StatusOK {
 		t.Errorf("request with the configured Host = %d, want 200: the allowlist must admit the hostname the operator configured (body %s)", allowedStatus, allowedBody)
+	}
+
+	// The ping listener applies the same policy: run() must wire it into both.
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+addr+"/beat/host-gate", nil)
+	if err != nil {
+		t.Fatalf("building the beat request: %v", err)
+	}
+	req.Host = "attacker.example"
+	req.Header.Set("Authorization", "Bearer "+testBeatToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /beat/host-gate: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("ping with an unlisted Host = %d, want 403: ALLOWED_HOSTS covers the ping listener too", resp.StatusCode)
 	}
 
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
@@ -554,7 +566,7 @@ func TestRunResolvesClientIPThroughConfiguredTrustedProxies(t *testing.T) {
 	// A beat id no other test in this package pings, since the metrics registry
 	// is a package-level singleton shared by the whole test binary.
 	const beat = "client-ip"
-	addr := prepareLifecycleRun(t, beat)
+	addr, opsAddr := prepareLifecycleRun(t, beat)
 	// Loopback, because that is what the socket peer of the request below is:
 	// the trusted set has to contain the PEER for a forwarded header to be
 	// consulted at all. Every other lifecycle boot leaves the variable unset.
@@ -564,7 +576,7 @@ func TestRunResolvesClientIPThroughConfiguredTrustedProxies(t *testing.T) {
 	logs := captureRunLog(t)
 
 	r := startLifecycleRun(t)
-	waitForHealthyWithin(t, addr, 10*time.Second)
+	waitForHealthyWithin(t, opsAddr, 10*time.Second)
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+addr+"/beat/"+beat, nil)
 	if err != nil {
@@ -1105,6 +1117,9 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 	// requestReadTimeout past that sum sail through the one check that exists to
 	// catch it.
 	const teardownReserve = 3 * time.Second // what the constants' comment promises awaitWatchLoop
+	if stop := shutdownGrace + opsShutdownGrace; stop >= 10*time.Second {
+		t.Errorf("shutdownGrace + opsShutdownGrace = %s, want under Docker's default 10s stop timeout: the operations listener drains after the ping listener, so the two budgets add, and SIGKILL would cut the abandoned-loop WARN", stop)
+	}
 	if worst := max(requestReadTimeout, requestHeaderTimeout+requestWriteTimeout); worst > shutdownGrace-teardownReserve {
 		t.Errorf("worst-case active request = %s, want <= %s (shutdownGrace %s less the %s the constants' comment reserves for the watch-loop teardown): a bound this size lets one authenticated slow caller eat the grace awaitWatchLoop needs to collect the loop and flush its abandoned-notice WARN", worst, shutdownGrace-teardownReserve, shutdownGrace, teardownReserve)
 	}
@@ -1133,12 +1148,15 @@ func TestRunServesTheHealthVerdictOnHealthz(t *testing.T) {
 	//
 	// A beat id no other test in this package pings, since the metrics
 	// registry is a package-level singleton shared by the whole test binary.
-	addr := prepareLifecycleRun(t, "healthz-probe")
+	addr, opsAddr := prepareLifecycleRun(t, "healthz-probe")
 
 	r := startLifecycleRun(t)
-	waitForHealthyWithin(t, addr, 10*time.Second)
+	waitForHealthyWithin(t, opsAddr, 10*time.Second)
 
-	if status, body := getHealthz(t, addr); status != http.StatusOK || body != `{"status":"ok"}`+"\n" {
+	if status, _ := getHealthz(t, addr); status != http.StatusNotFound {
+		t.Errorf("GET /healthz on the ping port = %d, want 404: /healthz and /metrics are served only on OPS_LISTEN_ADDR", status)
+	}
+	if status, body := getHealthz(t, opsAddr); status != http.StatusOK || body != `{"status":"ok"}`+"\n" {
 		t.Errorf("/healthz on a serving switch = %d %q, want 200 {\"status\":\"ok\"}", status, body)
 	}
 	if got := scrapeCounter(t, `knell_build_info{version="`+version+`"}`); got != 1 {
@@ -1210,4 +1228,123 @@ func getHealthzAsHost(t *testing.T, addr, host string) (int, string) {
 		t.Fatalf("close /healthz body: %v", err)
 	}
 	return resp.StatusCode, string(body)
+}
+
+// failingListener is a listener whose Accept fails for good at once, the way
+// an exhausted or revoked socket makes Serve return.
+type failingListener struct{ net.Listener }
+
+func (failingListener) Accept() (net.Conn, error) { return nil, errors.New("accept failed for good") }
+
+// TestServeListenersStopsKnellWhenTheOpsListenerFails pins the early-exit rule:
+// an operations listener that stops on its own cancels the ping listener as a
+// signal would, and the returned error makes knell exit non-zero so the
+// restart policy brings /healthz and /metrics back. A signal instead stops
+// both with no error.
+func TestServeListenersStopsKnellWhenTheOpsListenerFails(t *testing.T) {
+	// serve runs serveListeners with ops as the operations socket, sending the
+	// shutdown signal itself when signal is set, and returns its outcome.
+	serve := func(t *testing.T, ops net.Listener, signal bool) (context.Context, error) {
+		t.Helper()
+		ping, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Skipf("cannot bind: %v", err)
+		}
+		ctx, stop := context.WithCancel(t.Context())
+		t.Cleanup(stop)
+		srv := func() *http.Server {
+			return &http.Server{Handler: http.NotFoundHandler(), ReadHeaderTimeout: time.Second}
+		}
+		done := make(chan error, 1)
+		go func() {
+			done <- serveListeners(ctx, stop, srv(), ping, srv(), ops)
+		}()
+		if signal {
+			stop()
+		}
+		select {
+		case err := <-done:
+			return ctx, err
+		case <-time.After(10 * time.Second):
+			t.Fatal("serveListeners did not return")
+			return ctx, nil
+		}
+	}
+
+	t.Run("ops listener fails on its own", func(t *testing.T) {
+		inner, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Skipf("cannot bind: %v", err)
+		}
+		t.Cleanup(func() { _ = inner.Close() })
+		ctx, err := serve(t, failingListener{inner}, false)
+		if err == nil || !strings.Contains(err.Error(), "operations listener on "+inner.Addr().String()+" stopped") {
+			t.Errorf("serveListeners = %v, want the operations failure naming its address, so knell exits non-zero", err)
+		}
+		if ctx.Err() == nil {
+			t.Error("the ping listener's context is still live: a failed operations listener must drain the ping listener")
+		}
+	})
+
+	// A scrape still in flight when the ping listener has drained is cut off
+	// at opsShutdownGrace, not httpserver's longer default, and that cutoff
+	// is no exit error.
+	t.Run("a stuck operations request is cut off at opsShutdownGrace", func(t *testing.T) {
+		ping, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Skipf("cannot bind: %v", err)
+		}
+		ops, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Skipf("cannot bind: %v", err)
+		}
+		entered, release := make(chan struct{}), make(chan struct{})
+		t.Cleanup(func() { close(release) })
+		stuck := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			close(entered)
+			<-release
+		})
+		ctx, stop := context.WithCancel(t.Context())
+		t.Cleanup(stop)
+		done := make(chan error, 1)
+		go func() {
+			done <- serveListeners(ctx, stop,
+				&http.Server{Handler: http.NotFoundHandler(), ReadHeaderTimeout: time.Second}, ping,
+				&http.Server{Handler: stuck, ReadHeaderTimeout: time.Second}, ops)
+		}()
+		go func() {
+			resp, err := http.Get("http://" + ops.Addr().String() + "/metrics")
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+		}()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the operations request never reached its handler")
+		}
+		stopped := time.Now()
+		stop()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("serveListeners = %v, want nil: a scrape cut off at the end of the operations grace is no exit error", err)
+			}
+			if took := time.Since(stopped); took > opsShutdownGrace+time.Second {
+				t.Errorf("the stop took %s, want at most opsShutdownGrace (%s) plus 1s: the operations drain must not run to httpserver's default grace", took, opsShutdownGrace)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("serveListeners did not return")
+		}
+	})
+
+	t.Run("a signal stops both cleanly", func(t *testing.T) {
+		ops, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Skipf("cannot bind: %v", err)
+		}
+		if _, err := serve(t, ops, true); err != nil {
+			t.Errorf("serveListeners after a signal = %v, want nil", err)
+		}
+	})
 }

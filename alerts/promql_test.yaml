@@ -9,7 +9,7 @@ tests:
   - name: an accept failure pages for the 15 minutes it stays in the window
     interval: 1m
     input_series:
-      - series: 'knell_listener_accept_errors_total{job="knell", instance="knell:9190"}'
+      - series: 'knell_listener_accept_errors_total{job="knell", instance="knell:9191"}'
         values: "0 0 1 1x30"
     alert_rule_test:
       - eval_time: 1m
@@ -21,11 +21,11 @@ tests:
           - exp_labels:
               severity: critical
               job: knell
-              instance: knell:9190
+              instance: knell:9191
             exp_annotations:
-              summary: "knell on knell:9190 cannot accept connections"
+              summary: "knell on knell:9191: the ping port cannot accept connections"
               description: >
-                The listener failed to accept a connection, so pings stop
+                The ping listener failed to accept a connection, so pings stop
                 landing while the process stays up. Beats will report overdue
                 while this lasts. Check the container's file-descriptor limit
                 and the rate of incoming connections.
@@ -36,7 +36,7 @@ tests:
   - name: a listener with no failures never pages
     interval: 1m
     input_series:
-      - series: 'knell_listener_accept_errors_total{job="knell", instance="knell:9190"}'
+      - series: 'knell_listener_accept_errors_total{job="knell", instance="knell:9191"}'
         values: "0x30"
     alert_rule_test:
       - eval_time: 30m
@@ -46,7 +46,7 @@ tests:
   - name: a failing scrape pages after 15 minutes
     interval: 1m
     input_series:
-      - series: 'up{job="knell", instance="knell:9190"}'
+      - series: 'up{job="knell", instance="knell:9191"}'
         values: "1 0x20"
     alert_rule_test:
       - eval_time: 10m
@@ -58,7 +58,7 @@ tests:
           - exp_labels:
               severity: critical
               job: knell
-              instance: knell:9190
+              instance: knell:9191
             exp_annotations:
               summary: "knell is not being scraped successfully"
               description: >
@@ -92,7 +92,7 @@ tests:
   - name: an overdue beat pages after 5 minutes
     interval: 1m
     input_series:
-      - series: 'knell_beat_fresh{job="knell", instance="knell:9190", beat="backup"}'
+      - series: 'knell_beat_fresh{job="knell", instance="knell:9191", beat="backup"}'
         values: "1 0x10"
     alert_rule_test:
       - eval_time: 4m
@@ -104,10 +104,10 @@ tests:
           - exp_labels:
               severity: warning
               job: knell
-              instance: knell:9190
+              instance: knell:9191
               beat: backup
             exp_annotations:
-              summary: "beat backup is overdue on knell:9190"
+              summary: "beat backup is overdue on knell:9191"
               description: >
                 In the healthy case this repeats knell's own Discord notice. It
                 exists for a wedged sender or a Discord outage, so route it to
