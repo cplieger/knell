@@ -456,7 +456,7 @@ func TestDashboardMatchesOnlyTheSelectedInstance(t *testing.T) {
 			checked++
 			// absent() keeps only its equality matchers' labels, so its alert has no instance:
 			// https://prometheus.io/docs/prometheus/latest/querying/functions/#absent
-			if !scoped && !(sel.name == "ALERTS" && slices.Contains(instanceless, alert)) {
+			if !scoped && (sel.name != "ALERTS" || !slices.Contains(instanceless, alert)) {
 				t.Errorf("%s reads %s without instance=\"$instance\": %s", where, sel.name, expr)
 			}
 		}
