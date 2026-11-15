@@ -176,6 +176,20 @@ func variableQuery(v *dashVariable) string {
 	return q.Spec.Query
 }
 
+// dashboardQueries is every variable and panel query, keyed by where it sits.
+func dashboardQueries(d *dashboard) map[string]string {
+	queries := map[string]string{}
+	for name, v := range d.variables() {
+		queries["variable "+name] = variableQuery(&v)
+	}
+	for name, p := range d.Spec.Elements {
+		for i, e := range panelExprs(&p) {
+			queries[fmt.Sprintf("%s %s query %d", name, p.Spec.Title, i)] = e
+		}
+	}
+	return queries
+}
+
 func tab(t *testing.T, d *dashboard, title string) *layoutNode {
 	t.Helper()
 	for i := range d.Spec.Layout.Spec.Tabs {
@@ -203,6 +217,8 @@ func row(t *testing.T, tb *layoutNode, title string) *layoutNode {
 func servedSeries(t *testing.T) map[string][]string {
 	t.Helper()
 	InitBeat("dashboard-beat", time.Minute, time.Unix(1700000000, 0))
+	SetBuildInfo("v0.0.0-dashboard")
+	t.Cleanup(func() { buildInfo.Delete("v0.0.0-dashboard") })
 	SetBeatFresh("dashboard-beat", true)
 	RecordHTTP(http.MethodGet, "/beat/{id}", http.StatusOK, time.Millisecond)
 	rec := httptest.NewRecorder()
@@ -243,7 +259,7 @@ var (
 	ruleNameRe    = regexp.MustCompile(`(?m)^\s*- alert: (\w+)$`)
 )
 
-var promqlKeywords = []string{"and", "or", "unless", "bool", "offset"}
+var promqlKeywords = []string{"and", "or", "unless", "bool", "offset", "group_left", "group_right"}
 
 // seriesIn returns the series names a panel or variable query reads;
 // label_values names a label after its series, which is no series.
@@ -268,15 +284,7 @@ func seriesIn(expr string) []string {
 func TestDashboardReadsOnlySeriesKnellServes(t *testing.T) {
 	served := servedSeries(t)
 	d := loadDashboard(t)
-	queries := map[string]string{}
-	for name, v := range d.variables() {
-		queries["variable "+name] = variableQuery(&v)
-	}
-	for name, p := range d.Spec.Elements {
-		for i, e := range panelExprs(&p) {
-			queries[fmt.Sprintf("%s %s query %d", name, p.Spec.Title, i)] = e
-		}
-	}
+	queries := dashboardQueries(&d)
 	scrape := []string{"job", "instance", "le"}
 	for where, expr := range queries {
 		var labels []string
@@ -324,8 +332,8 @@ var (
 // TestDashboardMatchesOnlyTheSelectedInstance fails when a series a query
 // reads is not narrowed to instance="$instance", or when a query matches on
 // job, hostname or container, labels each user names in their own scrape
-// config. An absent() rule's alert carries only the labels of its equality
-// matchers, so its ALERTS series has no instance to match:
+// config. An absent() rule's alert has no instance label, because absent()
+// keeps only its equality matchers' labels:
 // https://prometheus.io/docs/prometheus/latest/querying/functions/#absent
 func TestDashboardMatchesOnlyTheSelectedInstance(t *testing.T) {
 	d := loadDashboard(t)
@@ -337,26 +345,20 @@ func TestDashboardMatchesOnlyTheSelectedInstance(t *testing.T) {
 	for _, m := range absentRuleRe.FindAllStringSubmatch(string(raw), -1) {
 		instanceless = append(instanceless, m[1])
 	}
-	queries := map[string]string{}
-	for name, v := range d.variables() {
-		queries["variable "+name] = variableQuery(&v)
-	}
-	for name, p := range d.Spec.Elements {
-		for i, e := range panelExprs(&p) {
-			queries[fmt.Sprintf("%s %s query %d", name, p.Spec.Title, i)] = e
-		}
-	}
+	queries := dashboardQueries(&d)
 	checked := 0
 	for where, expr := range queries {
+		for _, group := range matchersRe.FindAllString(quotedRe.ReplaceAllString(expr, `""`), -1) {
+			for _, mm := range matcherNameRe.FindAllStringSubmatch(group, -1) {
+				if slices.Contains([]string{"job", "hostname", "container"}, mm[1]) {
+					t.Errorf("%s matches on %s, a label each user names: %s", where, mm[1], expr)
+				}
+			}
+		}
 		series := seriesIn(expr)
 		for _, m := range selectorAtRe.FindAllStringSubmatch(expr, -1) {
 			if !slices.Contains(series, m[1]) {
 				continue
-			}
-			for _, mm := range matcherNameRe.FindAllStringSubmatch(quotedRe.ReplaceAllString(m[2], `""`), -1) {
-				if slices.Contains([]string{"job", "hostname", "container"}, mm[1]) {
-					t.Errorf("%s matches %s on %s, a label each user names: %s", where, m[1], mm[1], expr)
-				}
 			}
 			if where == "variable instance" {
 				continue
@@ -372,6 +374,31 @@ func TestDashboardMatchesOnlyTheSelectedInstance(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Error("no query reads a series; the check no longer reads the dashboard")
+	}
+}
+
+// TestDashboardScopesSharedFamiliesToKnell fails when a query reads up or a
+// process_ or go_ family without joining knell_build_info. Every target on a
+// shared instance writes those families, so instance="$instance" alone also
+// shows the other jobs there.
+func TestDashboardScopesSharedFamiliesToKnell(t *testing.T) {
+	d := loadDashboard(t)
+	checked := 0
+	for where, expr := range dashboardQueries(&d) {
+		series := seriesIn(expr)
+		shared := slices.ContainsFunc(series, func(name string) bool {
+			return name == "up" || strings.HasPrefix(name, "process_") || strings.HasPrefix(name, "go_")
+		})
+		if !shared {
+			continue
+		}
+		checked++
+		if !slices.Contains(series, "knell_build_info") {
+			t.Errorf("%s reads a family every target writes without joining knell_build_info: %s", where, expr)
+		}
+	}
+	if checked == 0 {
+		t.Error("no query reads up, process_ or go_; the check no longer reads the dashboard")
 	}
 }
 
