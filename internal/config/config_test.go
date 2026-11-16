@@ -474,15 +474,10 @@ func TestLoadRefusesWithoutABeatToken(t *testing.T) {
 }
 
 // TestLoadRefusesAShortBeatTokenWithoutLeakingIt pins the length floor as a
-// REFUSAL. A guessable token is not a weaker gate, it is a bypassable one, and
-// the failed-auth throttle only slows a guessing run down; since the token is
-// the endpoint's only gate, a short one is refused at startup, where the
-// operator is watching, rather than warned about in a line nobody reads.
-//
-// The message may name the MINIMUM and nothing else about the value: the startup
-// log ships to a store whose audience is far wider than the encrypted file the
-// token lives in, so the token itself, its exact length and its character class
-// all stay out.
+// startup refusal: the token is the endpoint's only gate and the throttle only
+// slows a guessing run, so a guessable token is refused where the operator is
+// watching. The message names the minimum and nothing about the value, since
+// the startup log reaches a wider audience than the token's file.
 func TestLoadRefusesAShortBeatTokenWithoutLeakingIt(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKENS", "api:"+"shorty")
@@ -531,19 +526,12 @@ func digitRuns(s string) []string {
 	return runs
 }
 
-// TestBeatTokenLengthCeiling pins both edges of the token maximum. The bound is
-// not about credential strength — a 512-byte token is absurd, not weak — but
-// about the header budget the credential TRAVELS in: maxTokenLength is the
-// token's share of MaxRequestHeaderBytes, so an accepted token always leaves
-// headerOverheadAllowance bytes for the request line, Host and the "Bearer "
-// prefix. One byte past the maximum still travels — 431 arrives only once the
-// WHOLE header block exceeds MaxRequestHeaderBytes — so what the bound protects
-// is that reserve. Both edges are asserted because either mistake is silent in
-// production: a maximum that refused a token the budget reserves room for would
-// stop deployments that work today, and one that admitted an unbounded token
-// would let a BEAT_TOKENS_FILE pointing at the wrong file eat the reserve until
-// every ping is answered 431 by an endpoint reporting itself gated and one
-// deadline later every configured beat posts a false MISSING notice.
+// TestBeatTokenLengthCeiling pins both edges of the token maximum, which guards
+// the header budget rather than credential strength: maxTokenLength is the
+// token's share of MaxRequestHeaderBytes and leaves headerOverheadAllowance for
+// the request line, Host and "Bearer ". A maximum too low stops working
+// deployments; one too high lets a BEAT_TOKENS_FILE naming the wrong file eat
+// the reserve until every ping is answered 431.
 func TestBeatTokenLengthCeiling(t *testing.T) {
 	atMax := strings.Repeat("a", maxTokenLength)
 
@@ -562,17 +550,11 @@ func TestBeatTokenLengthCeiling(t *testing.T) {
 	})
 
 	t.Run("the header cap carries a token at the maximum", func(t *testing.T) {
-		// The reserve the comment above describes, asserted rather than
-		// described. Spelled from the WIRE instead of from the constants'
-		// own sum, which would only restate the thing under test: the
-		// Authorization line a maximum-length token actually travels in, plus
-		// a generous ceiling on the rest of a ping's header block -- the
-		// request line naming a maximum-length beat id, a maximum-length Host,
-		// Content-Length, and whatever a proxy in front appends. A cap that
-		// cannot carry all of that admits a token at startup and then has
-		// net/http answer 431 to every ping presenting it, while /healthz stays
-		// green and the endpoint reports itself gated; one deadline later every
-		// configured beat posts a false MISSING notice.
+		// The reserve asserted from the wire rather than restated from the constants:
+		// the Authorization line of a maximum-length token plus a generous ceiling for
+		// the rest of a ping's header block (the request line, Host, Content-Length and
+		// what a proxy appends). A cap short of that admits the token at startup and
+		// then answers 431 to every ping presenting it.
 		const restOfTheHeaderBlock = 1 << 10
 		authorization := len("Authorization: Bearer " + atMax + "\r\n")
 
@@ -713,14 +695,12 @@ func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 			},
 			wantErr: true,
 		},
-		// The remaining fatal path after the file read SUCCEEDS: a file-sourced
-		// token carrying an interior control byte while the plain BEAT_TOKENS is
-		// also set. The file wins, the advisory used to fire, and startup then
-		// failed on the token, so the operator was told to delete the only other
-		// token in the environment by a process that never ran. (An edge-padded
-		// file token is a second instance of the same shape, pinned by
-		// TestLoadRejectsAPaddedFileBorneBeatToken; a BLANK file errors earlier,
-		// inside envx.)
+		// The remaining fatal path after the file read succeeds: a file-sourced
+		// token with an interior control byte while plain BEAT_TOKENS is also
+		// set. The file wins, so no advisory may tell the operator to delete the
+		// plain variable before startup fails on the file token. (An edge-padded
+		// file token is pinned by TestLoadRejectsAPaddedFileBorneBeatToken; a
+		// blank file errors earlier, inside envx.)
 		"two-line token file": {
 			setup: func(t *testing.T) {
 				tokenFile := filepath.Join(t.TempDir(), "beat-token")
@@ -882,16 +862,11 @@ func TestLoadRejectsEmptyBeatTokenFile(t *testing.T) {
 	}
 }
 
-// TestAllowedHostsGate pins the ALLOWED_HOSTS states knell itself owns, none of
-// which is asserted anywhere in this package: unset must stay INACTIVE (the
-// documented default that accepts every Host - an accidental deny-all here 403s
-// every beat in every default deployment and turns the whole switch silent),
-// blank entries must not engage the gate, and any entry knell cannot use must
-// REFUSE STARTUP, because a dropped entry leaves an allowlist that is not the one
-// configured: every non-loopback request under that hostname is refused 403,
-// including the pings, which then surface as missing-beat alerts for healthy
-// services. webapi's tests cover the policy's request-time behaviour; this covers
-// the env-to-policy mapping.
+// TestAllowedHostsGate pins the env-to-policy mapping of ALLOWED_HOSTS; webapi's
+// tests cover request time. Unset stays inactive, since an accidental deny-all
+// 403s every beat in a default deployment; blank entries do not engage the
+// gate; and an entry knell cannot use refuses startup, since dropping it would
+// 403 the pings sent under that name and page them as missing beats.
 func TestAllowedHostsGate(t *testing.T) {
 	tests := map[string]struct {
 		raw        string
@@ -1015,15 +990,12 @@ func TestLoadTrustedProxiesDegradesRestrictively(t *testing.T) {
 	}
 }
 
-// TestLoadThreadsTheHostPolicyOptionsThrough pins the hop the cycle-7 refactor
-// introduced. The loopback exemption and the ALLOWED_HOSTS-naming 403 envelope
-// are no longer applied inside allowedHosts; they arrive as a Load PARAMETER
-// (internal/webapi's HostPolicyOptions, passed by the composition root). Every
-// other Load call in this suite passes none, webapi's tests build the policy
-// from HostPolicyOptions directly, and the lifecycle test's host_not_allowed
-// assertion matches httpserver's DEFAULT code — so without this, a Load that
-// forwards nothing keeps the whole suite green while the shipped allowlist 403s
-// the in-container `knell health` probe of http://127.0.0.1:9191/healthz.
+// TestLoadThreadsTheHostPolicyOptionsThrough pins that Load forwards its host
+// policy options (webapi's HostPolicyOptions: the loopback exemption and the
+// 403 envelope naming ALLOWED_HOSTS). Every other Load call here passes none,
+// and webapi's tests build the policy directly, so a Load that forwarded nothing
+// would pass the suite while the allowlist 403ed the in-container `knell health`
+// probe.
 func TestLoadThreadsTheHostPolicyOptionsThrough(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv.
 	setValidLoadEnv(t)
@@ -1182,17 +1154,11 @@ func TestLoadTrimsPaddedPlainWebhook(t *testing.T) {
 	}
 }
 
-// TestLoadRejectsAPaddedPlainBeatToken pins that a BEAT_TOKENS carrying edge
-// ASCII whitespace FAILS STARTUP instead of being silently trimmed. Trimming
-// (the behaviour through cycle 8) was justified as "HTTP strips leading and
-// trailing spaces and tabs, so the trimmed form is what arrives on the wire" —
-// which is false for the LEADING edge: webapi verifies "Bearer "+token, so a
-// leading run is INTERIOR to the Authorization value and is delivered intact.
-// Configuring " secret" armed the gate for "secret", so a sender using the
-// configured value sent "Bearer  secret" and got 401 while startup reported the
-// gate armed and every beat went falsely missing one deadline later. Refusing
-// keeps "the value you configured" and "the value that authenticates" the same
-// string: a dead-man switch must not silently rewrite a credential.
+// TestLoadRejectsAPaddedPlainBeatToken pins that a BEAT_TOKENS token with edge
+// ASCII whitespace fails startup rather than being trimmed. webapi verifies
+// "Bearer "+token, so a leading run is interior to the header and arrives
+// intact: trimming " secret" to "secret" would arm the gate for a value no
+// sender presents, and every beat would go falsely missing one deadline later.
 func TestLoadRejectsAPaddedPlainBeatToken(t *testing.T) {
 	tests := map[string]string{
 		"leading space":  " unit-test-beat-token",
@@ -1226,20 +1192,11 @@ func TestLoadRejectsAPaddedPlainBeatToken(t *testing.T) {
 	}
 }
 
-// TestLoadRejectsAPaddedFileBorneBeatToken pins the _FILE half of the refusal
-// TestLoadRejectsAPaddedPlainBeatToken gives the plain variable: a secret file
-// whose CONTENT carries edge ASCII whitespace FAILS STARTUP.
-//
-// envx returns the file's content as written apart from at most ONE trailing
-// line ending, so the padded bytes reach checkBeatToken and both channels now
-// refuse the same value — which is what keeps "the token you configured" and
-// "the token that authenticates" the same string on the mounted-secret path too.
-// The earlier envx contract ran strings.TrimSpace over the file's bytes, so the
-// same file armed the gate with a REWRITTEN credential and nothing in this
-// package could observe it; without this test the next envx bump can restore
-// that silently. The trailing-newline cases are here to prove the one line
-// ending envx still removes does not rescue a padded value: `printf '%s\n'
-// token > file` stays unaffected, `printf '%s \n' token > file` does not.
+// TestLoadRejectsAPaddedFileBorneBeatToken pins the _FILE half of the padded
+// token refusal: envx returns a file's content as written apart from one
+// trailing line ending, so padded bytes reach checkBeatToken and both channels
+// refuse the same value. The trailing-newline cases prove that line ending does
+// not rescue a padded value: `printf '%s\n'` passes, `printf '%s \n'` does not.
 func TestLoadRejectsAPaddedFileBorneBeatToken(t *testing.T) {
 	tests := map[string]string{
 		"leading space":               " unit-test-beat-token",
@@ -1281,17 +1238,11 @@ func TestLoadRejectsAPaddedFileBorneBeatToken(t *testing.T) {
 }
 
 func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
-	// The boundary of the refusal above, and the one place a naive
-	// strings.TrimSpace check would be wrong. TrimSpace follows
-	// unicode.IsSpace and treats NBSP (U+00A0) as blank, but net/textproto
-	// strips only spaces and tabs: an NBSP-only token IS presented verbatim
-	// and DOES authenticate, so refusing it would fail startup on a working
-	// configuration, and trimming it to "" would leave webapi's gate with no
-	// credential to verify. Accepted verbatim, gate armed.
-	//
-	// Eight NBSPs, because the token has to clear the minTokenLength floor to
-	// be accepted at all: NBSP encodes as two bytes, so this is exactly a
-	// 16-byte token — a value can read as blank and still be long enough.
+	// The boundary of the refusal above: net/textproto strips only spaces and
+	// tabs, so an NBSP-only token arrives verbatim and authenticates, although
+	// strings.TrimSpace calls it blank. Refusing or trimming it would break a
+	// working configuration. Eight NBSPs make exactly 16 bytes, clearing the
+	// length floor.
 	const token = "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0"
 	setValidLoadEnv(t)
 	t.Setenv("BEAT_TOKENS", "api:"+token)
@@ -1579,17 +1530,11 @@ func TestLoadTrimsPaddedListenAddr(t *testing.T) {
 }
 
 // TestLoadTrimsInvisibleConfigPadding pins the part of LISTEN_ADDR's and
-// DISCORD_WEBHOOK_URL's trim that strings.TrimSpace does NOT
-// do. The padded test above uses ASCII spaces, so it stays green against
-// either predicate and cannot tell them apart; every value here survives
-// TrimSpace (a zero-width space, a soft hyphen and a BOM are Cf format runes,
-// not Unicode White_Space), so reverting either of the two
-// strings.TrimFunc(…, invisibleInURL) calls to TrimSpace fails exactly one case
-// below. Without this test the invisible-padding behavior is unpinned in both
-// places: a padded LISTEN_ADDR goes back to
-// crash-looping on a bind error whose cause cannot be seen in the log line, and
-// a padded DISCORD_WEBHOOK_URL goes back to refusing
-// startup through parseWebhookURL over a rune nobody can see in the value.
+// DISCORD_WEBHOOK_URL's trim that strings.TrimSpace does not do: a zero-width
+// space, a soft hyphen and a BOM are format runes, not White_Space, so
+// reverting either TrimFunc(…, invisibleInURL) to TrimSpace fails a case here.
+// Unpinned, a padded LISTEN_ADDR crash-loops on a bind error whose cause the
+// log line cannot show.
 func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv.
 	const (
@@ -1703,18 +1648,11 @@ func TestLoadCountsNodeNameLengthInBytesNotRunes(t *testing.T) {
 	})
 }
 
-// TestConfigLogValueNeverRendersASecret pins the redaction seam:
-// LogValue is the reason a call site can log a whole Config without leaking, so
-// DISCORD_WEBHOOK_URL and BEAT_TOKENS are both reported by their SOURCE and
-// neither by its value — and neither gets a presence attr, because both are
-// required, so presence reports no state while giving a future edit somewhere to
-// render the credential. Each source is state and each value is not: no
-// channel's name can carry a byte of the credential, and the plain channel is
-// the one worth naming because that credential is then also in `docker inspect`
-// output. The
-// receiver under test is a VALUE, not a pointer: Load returns
-// Config by value and that is the form a future slog call would hand a
-// logger, so a seam that only covers *Config would not cover the leak.
+// TestConfigLogValueNeverRendersASecret pins the redaction seam that lets a
+// call site log a whole Config: both credentials are reported by source, never
+// by value, and neither gets a presence attr, since both are required and
+// presence reports no state. The receiver is a value, not a pointer, because
+// Load returns Config by value and that is what a slog call would receive.
 func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 	t.Parallel()
 
@@ -1753,17 +1691,11 @@ func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 	}
 }
 
-// TestConfigLogValueReportsEachCredentialSource pins the two source attrs'
-// whole value domain against Load, the only producer of the fields behind them.
-// The point of each attr is that it reports STATE: the _FILE channel keeps the
-// credential out of the process environment and out of `docker inspect` output,
-// the plain variable does not, and warnPlainVarIgnored only speaks up when BOTH
-// variables are set — so for a plain-only deployment this line is the whole
-// signal. A rendering keyed off presence instead of source passes every other
-// assertion in this file and fails here, because presence is identical in both
-// cases. Both credentials are pinned the same way because they carry the same
-// exposure: publishing the webhook's channel and not the token's would tell an
-// operator half of where their secrets live.
+// TestConfigLogValueReportsEachCredentialSource pins both source attrs against
+// Load. Each reports state: the _FILE channel keeps a credential out of the
+// environment and `docker inspect`, the plain variable does not, and for a
+// plain-only deployment this line is the whole signal. A rendering keyed off
+// presence instead of source fails only here.
 func TestConfigLogValueReportsEachCredentialSource(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv.
 	const (
@@ -2121,16 +2053,12 @@ func TestLoadRefusesAHeaderIllegalTokenBeforeTheLengthFloor(t *testing.T) {
 	}
 }
 
-// TestLoadWarnsOnlyWhenLogLevelIsUnparseable pins the ONLY signal that a
-// mistyped LOG_LEVEL was ignored. slogx.ParseLevel returns ok=true for an unset
-// value and ok=false only for a non-empty unparseable one, so this WARN is what
-// separates "the operator asked for debug and got debug" from "the operator
-// typo'd and is silently running at info" — a distinction that matters exactly
-// when someone is turning up logging to diagnose a live outage.
-// The table pins both the resulting level and the warning's presence, so a
-// regression in either half — an inverted or dropped !ok guard that loses the
-// warning on a typo, or gains a spurious one on a perfectly valid level — fails
-// this one behavior-focused test.
+// TestLoadWarnsOnlyWhenLogLevelIsUnparseable pins the only signal that a
+// mistyped LOG_LEVEL was ignored: slogx.ParseLevel reports !ok only for a
+// non-empty unparseable value, and this WARN separates "asked for debug, got
+// debug" from a typo running silently at info. The table pins the level and the
+// warning together, so losing the warning on a typo or adding one on a valid
+// level both fail.
 func TestLoadWarnsOnlyWhenLogLevelIsUnparseable(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and t.Setenv forbids parallel tests anyway.

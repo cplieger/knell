@@ -203,20 +203,12 @@ func TestLogConfigNeverPublishesTheBeatToken(t *testing.T) {
 	}
 }
 
-// TestRunEnforcesTheNodeNameCapNotifyOwns pins the second value main mediates
-// between two internal packages: notify owns the NODE_NAME bound (it renders
-// every template the Discord budget is measured over), config ENFORCES
-// whatever bound it is handed, and main is the only place the two meet.
-// notify's budget test proves the templates fit at MaxNodeNameBytes and the
-// config tests alias the same constant into their own local copy, so neither
-// can see what the composition root actually passes: a larger bound admits a
-// node name whose notices exceed Discord's content limit, where the switch
-// arms and every notice is refused with 400 -- the exact failure the constant
-// exists to prevent, and one that is invisible until an outage.
-//
-// The listen address is an OCCUPIED one so a bound passed too LARGE fails this
-// test instead of hanging it: the boot would then clear the configuration gate
-// and go on to serve, and the bind is the next thing run() does.
+// TestRunEnforcesTheNodeNameCapNotifyOwns pins the bound main passes from
+// notify, which owns the NODE_NAME limit its templates fit Discord under, to
+// config, which enforces it; neither package sees what main passes. A larger
+// bound admits a name whose notices Discord refuses with 400. The listen
+// address is occupied, so a too-large bound fails at the bind instead of
+// serving.
 func TestRunEnforcesTheNodeNameCapNotifyOwns(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, plus run() installs a process-global
 	// slog default of its own.
@@ -290,15 +282,12 @@ func TestRunFailsFastWhenTheOpsListenAddressIsAlreadyBound(t *testing.T) {
 	}
 }
 
-// TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict pins the boot
-// path a container stopped during startup takes. A signal that arrives before
-// the bind cancels the Listen itself, so the resulting error IS the shutdown:
-// reported as a bind failure it would exit 1 (a restart loop) and name an
-// address that was never the problem. The inverse matters just as much: a real
-// port conflict must still surface, or knell idles as a dead switch behind a
-// listener nothing can reach — including when it coincides with a signal, which
-// is why the classification turns on httpserver.CausedByCancellation PROVING the
-// error is the cancellation rather than on the context merely being cancelled.
+// TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict pins the boot of a
+// container stopped during startup: a signal before the bind cancels Listen, so
+// the error is the shutdown, and reporting it as a bind failure would exit 1
+// into a restart loop. A real port conflict must still surface, even beside a
+// signal, which is why httpserver.CausedByCancellation must prove the error is
+// the cancellation.
 func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default.
@@ -342,16 +331,12 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 	}
 }
 
-// TestClassifyServeErrorNamesADrainThatOutlivedTheGrace pins the one ERROR
-// line a container emits when its drain runs out of budget. httpserver.Run wraps
-// that outcome in ErrShutdownGraceExpired, which is the only thing that
-// identifies WHICH deadline expired; classifyServeError is what turns it into a
-// line naming the drain and the grace constant that bounds it. If the branch
-// were dropped, a container SIGKILLed mid-drain would exit 1 with "context
-// deadline exceeded" and the operator would have no way to tell a stuck drain
-// from any other expired context; if the classification keyed on a bare
-// context.DeadlineExceeded instead, a deadline of the caller's own making would
-// be reported as a drain overrun that never happened.
+// TestClassifyServeErrorNamesADrainThatOutlivedTheGrace pins the ERROR line a
+// drain out of budget emits: httpserver.Run's ErrShutdownGraceExpired is the only
+// mark of which deadline expired, and classifyServeError names the drain and its
+// grace constant. Dropped, a SIGKILLed drain reads as a bare "context deadline
+// exceeded"; keyed on context.DeadlineExceeded instead, a caller's own deadline
+// would be reported as a drain overrun.
 func TestClassifyServeErrorNamesADrainThatOutlivedTheGrace(t *testing.T) {
 	t.Parallel()
 

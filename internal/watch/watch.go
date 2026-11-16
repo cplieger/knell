@@ -42,15 +42,12 @@ type Notifier interface {
 	// BeatRecovered reports that id pinged again at live.Observed after having
 	// been declared missing, ending the silence that began at live.Started.
 	BeatRecovered(ctx context.Context, id string, live Transition) error
-	// BeatOutageHistory reports outages of id that were already over by the
-	// time anything about them could be sent, collapsed into a single
-	// past-tense notice. outages is never empty and ascends by BOTH Started and
-	// Recovered -- a beat holds one open outage at a time, so its outages cannot
-	// overlap and the last entry is the most recent recovery -- and every
-	// entry carries its own recovery point, start and delivery blame, which the
-	// implementation must report rather than assume. Those guarantees are the
-	// CALLER's, so an implementation must not re-check them: every error it
-	// returns is read as a delivery failure.
+	// BeatOutageHistory reports outages of id that ended before anything about
+	// them could be sent, as one past-tense notice. The caller guarantees outages
+	// is non-empty, ascends by Started and Recovered (a beat holds one open outage
+	// at a time) and gives each entry its recovery point, start and blame, so an
+	// implementation must not re-check them: every error it returns is read as a
+	// delivery failure.
 	BeatOutageHistory(ctx context.Context, id string, outages []Outage) error
 }
 
@@ -571,16 +568,12 @@ func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Close admission before tallying: StopAccepting and the snapshot
-			// serialize on the same mutex, so nothing can be recorded between
-			// them. The composition root normally closed admission already, but
-			// Run must not depend on someone else having gone first. Observation
-			// is deliberately NOT gated on admission -- it must keep detecting
-			// through the whole drain window -- so joining its goroutine is the
-			// only thing that orders its last mutation before the snapshot. The
-			// wait is unbounded on purpose: ctx is already cancelled, and a
-			// goroutine parked in a stalled log write would park logUndelivered
-			// on the same handler anyway.
+			// Close admission before tallying: StopAccepting and the snapshot share a
+			// mutex, so nothing is recorded between them, and Run must not rely on the
+			// composition root having closed it first. Observation keeps running through
+			// the drain, so joining its goroutine is what orders its last mutation before
+			// the snapshot. The wait is unbounded: ctx is already cancelled, and a stalled
+			// log write would park logUndelivered on the same handler anyway.
 			w.StopAccepting()
 			<-observationDone
 			w.mu.Lock()

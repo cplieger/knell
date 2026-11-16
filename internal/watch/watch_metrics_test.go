@@ -565,16 +565,13 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 }
 
 func TestFailedRecoveredSendIsCountedAsDroppedNotFailed(t *testing.T) {
-	// Serial (no t.Parallel): asserts deltas on the package-global
-	// notification counters and captures the process-global slog default.
+	// Serial: asserts deltas on the package-global notification counters and
+	// captures the process-global slog default.
 	//
-	// A recovered send is FIRE-ONCE: sendRecovered consumes the queued event
-	// and calls finishRecovery unconditionally, so a failed attempt leaves
-	// nothing to retry from and that recovery notice will never arrive. That
-	// is the dropped counter's meaning, so the failure must land there and
-	// NOT on failed, which promises the operator "wait, it retries". The
-	// second half proves the premise rather than assuming it: after the
-	// notifier heals, nothing re-sends.
+	// A recovered send is fire-once: sendRecovered consumes the event whatever the
+	// outcome, so a failed attempt is a notice that never arrives, which is the
+	// dropped counter's meaning, not failed's "it retries". The second half proves
+	// the premise: once the notifier heals, nothing re-sends.
 	const id = "recovered-send-failure-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
@@ -643,14 +640,10 @@ func TestFailedRecoveredSendIsCountedAsDroppedNotFailed(t *testing.T) {
 }
 
 // TestUndeliveredNoticeLogsCarryTheirRetryability pins the retryable field on
-// the loss/failure sites the capture-based tests around it do not reach: the
-// two send failures whose records stay queued, and the three notices abandoned
-// by a shutdown. The field exists because the LEVEL cannot carry this
-// distinction -- a retried send deliberately stays at Error rather than spamming
-// Warn every sweep, and the abandoned recovered notice is a permanent loss
-// logged at Info with no counter behind it at all -- so without it a log rule
-// cannot tell "the notice is late, wait for it" from "no notice will ever
-// arrive, reconstruct the window".
+// the sites the capture tests around it miss: the two failed sends whose records
+// stay queued and the three notices a shutdown abandons. The level cannot carry
+// the distinction (a retried send stays at Error, an abandoned recovery is lost
+// at Info), so a log rule needs the field to tell late from never.
 func TestUndeliveredNoticeLogsCarryTheirRetryability(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, which every other test writes through.
@@ -868,15 +861,11 @@ func TestLogUndeliveredClassifiesOnlyEndedRecordsAsPermanentLoss(t *testing.T) {
 }
 
 func TestLogUndeliveredReportsAnOngoingOutageWithoutTheLossWarning(t *testing.T) {
-	// Serial (no t.Parallel): capture.Default swaps the process-global slog
-	// default. The mixed-queue test cannot see this branch -- its beat has an
-	// ended record, so the WARN fires for it either way. Only a queue holding
-	// nothing but the open tail pins both halves of the classification:
-	// dropping the `p.lost == 0` guard pages the operator that "no notice will
-	// ever arrive" for an outage that will in fact be re-detected (the false
-	// alarm the split exists to avoid), while dropping the Info line hides the
-	// beat whose notice arrives only if the outage outlives the post-restart
-	// deadline -- the one shutdown loss that is conditional rather than certain.
+	// Serial: capture.Default swaps the process-global slog default. Only a queue
+	// holding nothing but the open tail pins both halves of the classification:
+	// without the `p.lost == 0` guard, the operator is told "no notice will ever
+	// arrive" for an outage the restart re-detects; without the Info line, the beat
+	// whose notice depends on the outage outliving the next deadline goes unnamed.
 	const id = "shutdown-ongoing-only-probe"
 	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 

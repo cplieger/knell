@@ -32,16 +32,12 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// childEnv builds the environment a re-executed knell child runs with: the
-// parent environment and a pinned level -- several cases
-// use an INFO line ("listening") as the no-boot oracle, and an inherited
-// LOG_LEVEL=warn would filter it out whether or not the child booted. Each
-// entry from env is then applied: "KEY=" removes KEY from the child
-// environment entirely (config.Load rejects a PRESENT-but-empty _FILE
-// variable, so blanking one would fail the boot at the blank-_FILE gate
-// instead of the gate under test), anything else overrides the parent's value.
-// A caller's own LOG_LEVEL entry is appended after the pinned one and os/exec
-// keeps the last duplicate, so an explicit per-test level still wins.
+// childEnv builds a re-executed knell child's environment: the parent's, with
+// LOG_LEVEL pinned to info because several cases use an INFO line as the
+// no-boot oracle. Each env entry is then applied: "KEY=" removes KEY entirely
+// (config.Load refuses a present but empty _FILE variable, which would fail the
+// wrong gate), anything else overrides. os/exec keeps the last duplicate, so a
+// caller's own LOG_LEVEL still wins.
 func childEnv(env []string) []string {
 	out := append(os.Environ(), "LOG_LEVEL=info")
 	for _, e := range env {
@@ -123,15 +119,10 @@ type servingKnell struct {
 }
 
 // startServingKnell re-executes this test binary as knell with env and blocks
-// until it logs its bound listeners, whose addresses it records. Both CLI boot tests
-// need the identical boot, and a second copy of it drifts from bootEnv's
-// contract and from the "msg=listening addr=" line the oracles parse -- a
-// reworded listening line would then be fixed in one copy and hang the other
-// until the 60s context kills it. Port 0 in the caller's addr keeps the child
-// off any port another test reserved; childEnv pins LOG_LEVEL=info, which the
-// oracles need, since an inherited LOG_LEVEL=warn silences "listening",
-// "shutting down" and "stopped" alike and reports an ambient environment as a
-// missing contract.
+// until it logs its bound listeners, recording their addresses. Both CLI boot
+// tests share it so the boot and the "msg=listening addr=" parse cannot drift
+// apart and hang one of them. Port 0 keeps the child off reserved ports, and
+// childEnv's LOG_LEVEL=info keeps the lines the oracles read.
 func startServingKnell(t *testing.T, env []string) *servingKnell {
 	t.Helper()
 	// Background, not t.Context(): this child must outlive the test body so the
@@ -244,17 +235,11 @@ func TestUnknownSubcommandExitsTwoWithoutBooting(t *testing.T) {
 	}
 }
 
-// TestSignalledKnellLogsTheCleanStopAsItsLastLineAndExitsZero pins the
-// graceful stop as an operator reads it: a signalled knell ends its log with
-// "stopped" and exits 0. Nothing else covers this. The in-process lifecycle
-// tests assert run() returns nil, but main()'s final line is what
-// distinguishes a stop that finished under its own power from one SIGKILLed at
-// the container stop timeout - both log "shutting down" and then go quiet -
-// and the exit status is what keeps a clean stop from being read as a crash.
-//
-// The oracle is the LAST line, not merely its presence: a "stopped" logged
-// before the teardown finished would prove nothing about the drain, and
-// "watch loop stopped" already contains the word.
+// TestSignalledKnellLogsTheCleanStopAsItsLastLineAndExitsZero pins the graceful
+// stop as an operator reads it: "stopped" as the last line and exit 0 tell a
+// stop that finished apart from one killed at the container stop timeout, which
+// also logs "shutting down" and goes quiet. The oracle is the last line, since
+// "watch loop stopped" also contains the word.
 func TestSignalledKnellLogsTheCleanStopAsItsLastLineAndExitsZero(t *testing.T) {
 	child := startServingKnell(t, bootEnv("cli-clean-stop:1m", "127.0.0.1:0"))
 	cmd, lines, scanner := child.cmd, child.lines, child.scanner
@@ -277,20 +262,12 @@ func TestSignalledKnellLogsTheCleanStopAsItsLastLineAndExitsZero(t *testing.T) {
 	}
 }
 
-// TestConfiguredLogLevelReachesTheRunningProcess pins the one configuration
-// field nothing else in the suite can see APPLIED. run() installs the slog
-// handler before config parsing (so config warnings render through it) and
-// applies the parsed level to the handler afterwards; drop that one call and
-// the process keeps slogx's INFO default while the startup summary still
-// reports log_level=DEBUG -- an operator who raises the level to diagnose a
-// missing beat gets the summary's confirmation and none of the detail. The
-// config suite pins env-to-level PARSING only, and the in-process lifecycle
-// tests cannot inspect run()'s handler because run() replaces the default they
-// captured, so nothing outside a child process can catch it.
-//
-// The oracle is the /healthz access line, which httpserver logs at DEBUG for a
-// healthy probe: absent at the INFO default, present only once the parsed level
-// has actually reached the handler.
+// TestConfiguredLogLevelReachesTheRunningProcess pins that run() applies the
+// parsed level to the handler it installed before config parsing. Without that
+// call the process stays at INFO while the startup summary reports DEBUG; the
+// config suite pins parsing only and in-process tests cannot see run()'s
+// handler, so a child process is the oracle, reading the /healthz access line
+// httpserver logs at DEBUG.
 func TestConfiguredLogLevelReachesTheRunningProcess(t *testing.T) {
 	// LOG_LEVEL=debug is appended AFTER childEnv's pinned info and os/exec keeps
 	// the last duplicate, so it is the variable under test.

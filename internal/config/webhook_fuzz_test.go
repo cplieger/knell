@@ -54,15 +54,11 @@ func FuzzParseWebhookURL(f *testing.F) {
 					t.Fatalf("accepted port %q: net/http refuses it on every request, so this URL can never deliver a notice", port)
 				}
 			}
-			// DELIVERABILITY, not just transportability: the two remaining gates
-			// are the ones whose failure is invisible until an outage. A path-less
-			// URL posts every notice to the origin's root, while a space or any
-			// other non-printable rune is percent-encoded on the wire, so the
-			// host or path that reaches Discord is not the configured one - in
-			// both cases startup succeeds, /healthz reports ready, and the bell
-			// never rings. Asserting them on the ACCEPTED side is what makes
-			// dropping either guard fail here as well as in the hand-written
-			// table.
+			// Deliverability, not only transportability: a path-less URL posts every
+			// notice to the origin's root, and a space or other non-printable rune is
+			// percent-encoded on the wire, so the host or path reaching Discord is not the
+			// configured one. Startup and /healthz succeed either way and no notice arrives,
+			// so both guards are asserted on the accepted side.
 			if u.Path == "" || u.Path == "/" {
 				t.Fatalf("accepted a URL whose path is %q: the webhook path IS the Discord credential, so this URL delivers nothing", u.Path)
 			}
