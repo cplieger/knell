@@ -174,6 +174,18 @@ func tokenSetError(err error, lines []int) error {
 	return fmt.Errorf("BEAT_TOKENS could not be loaded: %w", err)
 }
 
+// beatTokenFieldError words httpserver.CheckFieldValue's refusal of line's token.
+func beatTokenFieldError(err error, line int) error {
+	switch {
+	case errors.Is(err, httpserver.ErrFieldInvisible):
+		return fmt.Errorf("BEAT_TOKENS line %d has a token with an invisible character, such as a zero-width space or a bidi control, so the token you read is not the one a sender must present. Retype it, or use `openssl rand -hex 16`", line)
+	case errors.Is(err, httpserver.ErrFieldInvalidUTF8):
+		return fmt.Errorf("BEAT_TOKENS line %d has a token that is not valid UTF-8, so it cannot be read or retyped as written. Use `openssl rand -hex 16`", line)
+	default:
+		return fmt.Errorf("BEAT_TOKENS line %d has a token with a control character that HTTP forbids in a header value, so no sender can present it. Use a token of at least %d printable characters", line, minTokenLength)
+	}
+}
+
 // checkBeatToken validates one entry's token as the exact credential senders
 // present, or refuses it naming its line. It never rewrites the value: edge
 // ASCII whitespace and interior forbidden bytes are refused rather than
@@ -183,8 +195,8 @@ func checkBeatToken(token string, line int) error {
 	if strings.Trim(token, asciiWhitespace) != token {
 		return fmt.Errorf("BEAT_TOKENS line %d has a token with leading or trailing ASCII whitespace. A trailing space or tab is stripped from the header on the wire, CR, LF, VT and FF cannot be sent in one, and a leading one is invisible in the value you read, so the token would never match. Remove the whitespace, and save the file with LF line endings", line)
 	}
-	if !beatTokenFitsHeader(token) {
-		return fmt.Errorf("BEAT_TOKENS line %d has a token with a control character that HTTP forbids in a header value, so no sender can present it. Use a token of at least %d printable characters", line, minTokenLength)
+	if err := httpserver.CheckFieldValue(token); err != nil {
+		return beatTokenFieldError(err, line)
 	}
 	if len(token) < minTokenLength {
 		return fmt.Errorf("BEAT_TOKENS line %d has a token shorter than the %d-byte minimum. A token short enough to guess lets a stranger who can reach this port keep the beats on that line reading fresh while their jobs are dead. Use `openssl rand -hex 16`", line, minTokenLength)

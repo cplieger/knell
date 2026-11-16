@@ -138,6 +138,8 @@ func TestCheckBeatTokenMessagesNameTheirLine(t *testing.T) {
 		"too short":       "shorty",
 		"too long":        strings.Repeat("a", maxTokenLength+1),
 		"a lone carriage": tokenA + "\r",
+		"an invisible":    "aaaaaaaa\u200bbbbbbbbb",
+		"invalid UTF-8":   "aaaaaaaa\xffbbbbbbbb",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
