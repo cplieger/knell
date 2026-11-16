@@ -45,7 +45,9 @@ services:
     environment:
       BEATS: "cron-backup:26h,pipeline-watchdog:20m"  # one id:deadline pair per job you watch
       DISCORD_WEBHOOK_URL: "https://discord.com/"  # replace with your full Discord webhook URL, or knell refuses to start
-      BEAT_TOKEN: "CHANGEME"  # replace with the output of "openssl rand -hex 16", or knell refuses to start
+      BEAT_TOKENS: |  # one <beat>:<token> line per job, each token from "openssl rand -hex 16"; knell refuses to start until every beat has one
+        cron-backup:CHANGEME
+        pipeline-watchdog:CHANGEME-TOO
       NODE_NAME: "server-1"  # names this instance in every notice
 
     ports:
@@ -56,14 +58,14 @@ services:
 
 1. In Discord, open Server Settings, then Integrations, and create a webhook for the channel that should get the notices.
 2. Copy the webhook URL.
-3. Run `openssl rand -hex 16` and keep the output as your token.
-4. Save the file above as `compose.yaml`. Put the webhook URL in `DISCORD_WEBHOOK_URL`, the token in `BEAT_TOKEN`, and one `id:deadline` pair per job in `BEATS`.
+3. Run `openssl rand -hex 16` once per job.
+4. Save the file above as `compose.yaml`. Put the webhook URL in `DISCORD_WEBHOOK_URL`, one `id:deadline` pair per job in `BEATS`, and one `id:token` line per job in `BEAT_TOKENS`.
 5. Run `docker compose up -d`.
-6. Set `BEAT_TOKEN` to the same token in each job's environment, or paste the token in place of `$BEAT_TOKEN` below.
+6. Set `KNELL_TOKEN` in each job's environment to that job's own token, or paste it in place of `$KNELL_TOKEN`.
 7. Add this line at the end of each job, after the commands that must succeed, and end the URL with the beat's id. A job that fails earlier sends no ping, and knell never learns why:
 
 ```sh
-curl -fsS -X POST -H "Authorization: Bearer $BEAT_TOKEN" http://192.0.2.10:9190/beat/cron-backup
+curl -fsS -X POST -H "Authorization: Bearer $KNELL_TOKEN" http://192.0.2.10:9190/beat/cron-backup
 ```
 
 Replace `192.0.2.10` with the address of the host that runs knell, as other devices on your network reach it. A job that runs directly on that host, outside a container, can use `localhost:9190`.
@@ -80,7 +82,7 @@ knell reads its settings from environment variables when it starts and never rel
 | --- | --- | --- |
 | `BEATS` | Comma-separated `id:deadline` list, such as `api:20m,backup:26h`. Deadlines are at least `30s`, at most 64 beats | required |
 | `DISCORD_WEBHOOK_URL` | The `https` webhook URL notices are posted to. `DISCORD_WEBHOOK_URL_FILE` reads it from a secret file instead | required |
-| `BEAT_TOKEN` | The token every ping presents as `Authorization: Bearer <token>`, 16 to 512 bytes. `BEAT_TOKEN_FILE` reads it from a secret file | required |
+| `BEAT_TOKENS` | One `<beats>:<token>` line per token, such as `backup+offsite:<token>`. A token pings only the beats its line names. `BEAT_TOKENS_FILE` reads a secret file | required |
 | `NODE_NAME` | Names this instance in every notice, at most 256 bytes | container hostname |
 | `LISTEN_ADDR` | TCP listen address of the pings, `host:port` | `:9190` |
 | `OPS_LISTEN_ADDR` | TCP listen address of `/healthz` and `/metrics`, `host:port`. It must use another port than `LISTEN_ADDR` | `:9191` |
@@ -98,9 +100,9 @@ knell needs no volume.
 
 ## Security
 
-knell serves plain HTTP, so `BEAT_TOKEN` crosses the network in cleartext on every ping, and anything that reads one ping can replay it. Put a [TLS reverse proxy](https://github.com/cplieger/docs/blob/main/docs/reverse-proxy.md) in front, or keep pings on a network you trust to the same standard.
+knell serves plain HTTP, so a beat's token crosses the network in cleartext on every ping, and anything that reads one ping can replay it. Put a [TLS reverse proxy](https://github.com/cplieger/docs/blob/main/docs/reverse-proxy.md) in front, or keep pings on a network you trust to the same standard. To reach knell from the internet, follow [Reaching knell from the internet](docs/hardening.md#reaching-knell-from-the-internet).
 
-One token gates `POST /beat/<id>` for every beat, so any job that holds it can ping any beat. `/healthz` and `/metrics` answer on port `9191` with no token. `/metrics` lists every beat with its last ping, so publish `9191` to your monitoring network only. Set `ALLOWED_HOSTS` to the names you use to reach knell. Then a web page in your browser cannot read `/metrics` through a domain an attacker points at knell.
+A token pings only the beats its `BEAT_TOKENS` line names, so a leaked one keeps only those beats looking alive. `/healthz` and `/metrics` answer on port `9191` with no token. `/metrics` lists every beat with its last ping, so publish `9191` to your monitoring network only. Set `ALLOWED_HOSTS` to the names you use to reach knell.
 
 The image runs as the non-root user 65534 on `scratch`, and the webhook URL never appears in a log line or an error. [Security](docs/hardening.md) covers reverse proxies, `ALLOWED_HOSTS` and the hardened compose profile.
 
@@ -108,18 +110,19 @@ The image runs as the non-root user 65534 on `scratch`, and the webhook URL neve
 
 The image checks itself every 30 seconds with `knell health`, which asks `/healthz` inside the container. `docker ps` shows `healthy` while knell is serving. Unhealthy means knell is running but not answering, as happens while it shuts down. A restarting container has exited, and `docker logs knell` shows why. Docker health alerts nobody, so to hear that knell stopped, check `/healthz` from another machine as [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) shows.
 
-- If a ping is answered `401`, the `Authorization` header does not match `BEAT_TOKEN` exactly.
-- If a ping is answered `404`, the id is not in `BEATS` or the URL has an extra path segment.
-- If a ping is answered `403` with `host_not_allowed`, add the name the sender uses to `ALLOWED_HOSTS`.
-- If a ping is answered `405`, the sender used `GET` or another method. Only `POST` records a ping.
-- If a down beat never alerts, check whether knell keeps restarting. Each start gives every beat a full deadline, so a beat never fires while knell restarts more often than that.
-- If Discord or the network is down, knell retries a missing notice every 15 seconds until Discord takes it.
+- A `401` means the token matches no line of `BEAT_TOKENS`. A `403` with `beat_not_allowed` means the token's line does not name that beat.
+- A `403` with `host_not_allowed` means the sender's name is missing from `ALLOWED_HOSTS`.
+- A `404` means the id is not in `BEATS`, or the URL has an extra path segment.
+- A `405` means the sender did not use `POST`.
+- A `429` means knell is throttling the sender's address, for its own failed tokens or because many addresses failed. A valid ping is still recorded, and [Monitoring and alerts](docs/monitoring.md#alerting) lists the causes.
+- A down beat that never alerts can mean knell keeps restarting, since each start gives every beat a full deadline.
+- While Discord is down, knell retries a missing notice every 15 seconds.
 
 [How knell works](docs/how-it-works.md) has the retry rules and every answer a ping can get.
 
 ## Monitoring
 
-knell publishes Prometheus metrics on `/metrics`, on port `9191`, and writes logfmt logs, one `key=value` line per event, to standard error. Eight alert rules that watch knell ship in [`alerts/`](alerts/), six in `alerts/promql.yaml` and two in `alerts/logql.yaml`. Load both. The [Grafana dashboard](docs/dashboard.md), shipped as [`grafana-dashboard.json`](grafana-dashboard.json), needs Grafana 13.2 or newer. [Monitoring and alerts](docs/monitoring.md) lists the metrics and rules, and says who is told when knell itself stops.
+knell publishes Prometheus metrics on `/metrics`, on port `9191`, and writes logfmt logs, one `key=value` line per event, to standard error. Ten alert rules that watch knell ship in [`alerts/`](alerts/), eight in `alerts/promql.yaml` and two in `alerts/logql.yaml`. Load both. The [Grafana dashboard](docs/dashboard.md), shipped as [`grafana-dashboard.json`](grafana-dashboard.json), needs Grafana 13.2 or newer. [Monitoring and alerts](docs/monitoring.md) lists the metrics and rules, and says who is told when knell itself stops.
 
 ## Documentation
 

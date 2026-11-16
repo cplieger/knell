@@ -40,7 +40,7 @@ knell can tell you when your alert pipeline itself stops, whether the rule evalu
                credentials_file: /etc/alertmanager/knell_beat_token
    ```
 
-   The file holds your `BEAT_TOKEN`. knell ignores the request body, so Alertmanager's webhook payload is fine. With `ALLOWED_HOSTS` set, add the name in the URL, here `knell`.
+   The file holds the token of the `pipeline-watchdog` line in `BEAT_TOKENS`. knell ignores the request body, so Alertmanager's webhook payload is fine. With `ALLOWED_HOSTS` set, add the name in the URL, here `knell`.
 
 With more than one ruler, give each its own always-firing rule, route and beat, so the Discord notice names the ruler that went quiet.
 

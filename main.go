@@ -123,10 +123,17 @@ func run(args []string) error {
 	watcher := watch.New(watchBeats(cfg.Beats, cfg.MissingRepeat), notifier, time.Now, processStart)
 	st := health.NewStatus()
 
+	limiter, err := webapi.NewLimiter(trustWindow(cfg.Beats))
+	if err != nil {
+		return fmt.Errorf("failure limiter: %w", err)
+	}
 	// The watcher is the single owner of beat admission, so the endpoint holds
 	// no lifecycle state and no context of its own.
-	srv := newServer(webapi.New(watcher, webapi.Deps{
-		BeatToken:      cfg.BeatToken,
+	srv := newServer(webapi.New(watcher, &webapi.Deps{
+		Tokens:         cfg.BeatTokens.Set,
+		Covers:         cfg.BeatTokens.Covers,
+		Beats:          beatIDs(cfg.Beats),
+		Limiter:        limiter,
 		Hosts:          cfg.AllowedHosts,
 		TrustedProxies: cfg.TrustedProxies,
 	}))
@@ -329,4 +336,28 @@ func logConfig(cfg *config.Config) {
 		slog.Info("watching beat", "beat", b.ID, "deadline", b.Deadline.String())
 	}
 	slog.LogAttrs(context.Background(), slog.LevelInfo, "configuration loaded", cfg.LogValue().Group()...)
+	// A wide posture is acceptable only while it says so at startup.
+	if !cfg.AllowedHosts.Active() {
+		slog.Warn("ALLOWED_HOSTS is unset, so knell answers every Host; set it to the names your jobs, probes and scraper use")
+	}
+}
+
+// trustWindow is how long a sender stays exempt from the global failure
+// window after its last recorded ping: two of the longest deadlines, so a
+// beat's own sender stays trusted between its pings.
+func trustWindow(beats []config.Beat) time.Duration {
+	var longest time.Duration
+	for _, b := range beats {
+		longest = max(longest, b.Deadline)
+	}
+	return 2 * longest
+}
+
+// beatIDs lists the configured beat ids.
+func beatIDs(beats []config.Beat) []string {
+	ids := make([]string, len(beats))
+	for i, b := range beats {
+		ids[i] = b.ID
+	}
+	return ids
 }

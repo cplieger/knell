@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// FuzzCheckBeatToken pins the invariant the BEAT_TOKEN gate rests on: every
+// FuzzCheckBeatToken pins the invariant the BEAT_TOKENS gate rests on: every
 // token knell ACCEPTS must reach webapi's verifier as the operator configured
 // it. webapi compares the Authorization header against "Bearer "+token, so a
 // token the transport alters or refuses arms a gate that 401s every ping while
@@ -51,11 +51,11 @@ func FuzzCheckBeatToken(f *testing.F) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, token string) {
-		if err := checkBeatToken(token); err != nil {
+		if err := checkBeatToken(token, 1); err != nil {
 			return
 		}
 		if token == "" {
-			t.Fatal("accepted an empty token: BEAT_TOKEN is required and an empty value is no credential at all, so accepting it would leave webapi's gate with nothing to verify against")
+			t.Fatal("accepted an empty token: BEAT_TOKENS is required and an empty value is no credential at all, so accepting it would leave webapi's gate with nothing to verify against")
 		}
 		if len(token) < minTokenLength {
 			t.Fatalf("accepted a %d-byte token: the gate is /beat/{id}'s only defense, so a value under the %d-byte floor is guessable and must fail startup", len(token), minTokenLength)

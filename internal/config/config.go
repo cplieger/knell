@@ -38,14 +38,15 @@ const minDeadline = 30 * time.Second
 // one outage faster than anyone acts on it, burying other beats' notices.
 const minRepeat = 10 * time.Minute
 
-// minTokenLength is the shortest BEAT_TOKEN knell will start with: the token
-// is the only thing standing between a stranger who can reach the port and a
-// forged ping, so a guessable value is refused rather than warned about.
+// minTokenLength is the shortest beat token knell will start with: a token is
+// the only thing standing between a stranger who can reach the port and a
+// forged ping on its beats, so a guessable value is refused rather than
+// warned about.
 const minTokenLength = 16
 
 // maxTokenLength exists because the token has to travel in a header, and
 // MaxRequestHeaderBytes caps the block knell will read: without a maximum, a
-// token big enough to fill that block (a BEAT_TOKEN_FILE pointing at the
+// token big enough to fill that block (a BEAT_TOKENS_FILE pointing at the
 // wrong file, since envx reads up to 1 MiB) passes startup and then makes
 // every ping fail 431. 512 bytes is 16x an `openssl rand -hex 16` token.
 const maxTokenLength = 512
@@ -62,7 +63,7 @@ const headerOverheadAllowance = 8 << 10
 const MaxRequestHeaderBytes = maxTokenLength + headerOverheadAllowance
 
 // asciiWhitespace is the cutset of edge characters checkBeatToken refuses in
-// a BEAT_TOKEN: SP/HTAB are legal field-value bytes the wire normalizes (a
+// a beat token: SP/HTAB are legal field-value bytes the wire normalizes (a
 // trailing run is stripped, desyncing the verifier from the sender), and
 // CR/LF/VT/FF are illegal in a field value outright. Non-ASCII spaces are not
 // in the set: textproto keeps them, so such a token still authenticates.
@@ -110,12 +111,14 @@ type Config struct {
 	ListenAddr    string
 	// OpsListenAddr serves /healthz and /metrics, never on ListenAddr's port.
 	OpsListenAddr string
-	BeatToken     string
-	// BeatTokenSource is the channel BEAT_TOKEN arrived through, carried for the
-	// same reason. warnPlainVarIgnored fires only when BOTH variables are set, so
-	// without this the plain-only case -- the one with the exposure -- is silent.
-	BeatTokenSource envx.SecretSource
-	Beats           []Beat
+	// BeatTokens holds each beat's token set and what each token covers.
+	BeatTokens BeatTokens
+	// BeatTokensSource is the channel BEAT_TOKENS arrived through, carried for
+	// the same reason. warnPlainVarIgnored fires only when BOTH variables are
+	// set, so without this the plain-only case -- the one with the exposure --
+	// is silent.
+	BeatTokensSource envx.SecretSource
+	Beats            []Beat
 	// MissingRepeat is how often a delivered missing notice is sent again while
 	// its beat stays missing; zero sends one per outage.
 	MissingRepeat time.Duration
@@ -123,8 +126,8 @@ type Config struct {
 }
 
 // LogValue implements slog.LogValuer so a Config can never publish its own
-// secrets: DISCORD_WEBHOOK_URL's path and BeatToken are reported by their
-// SOURCE only. The value receiver is load-bearing: a *Config method set
+// secrets: DISCORD_WEBHOOK_URL's path and BEAT_TOKENS are reported by their
+// SOURCE only, and the token set holds digests. The value receiver is load-bearing: a *Config method set
 // would leave the bare Config Load returns outside slog.LogValuer.
 //
 //nolint:gocritic // hugeParam: slog.LogValuer must sit on the value receiver so a bare Config redacts too; the copy happens at most once per config log line.
@@ -142,7 +145,8 @@ func (c Config) LogValue() slog.Value {
 		slog.String("listen_addr", c.ListenAddr),
 		slog.String("ops_listen_addr", c.OpsListenAddr),
 		slog.String("webhook", string(c.WebhookSource)),
-		slog.String("beat_token", string(c.BeatTokenSource)),
+		slog.String("beat_tokens", string(c.BeatTokensSource)),
+		slog.Int("beat_token_entries", c.BeatTokens.Set.Len()),
 		slog.String("allowed_hosts", allowedHosts),
 		slog.Int("trusted_proxies", len(c.TrustedProxies)),
 		slog.String("missing_repeat", c.MissingRepeat.String()),
@@ -151,7 +155,7 @@ func (c Config) LogValue() slog.Value {
 }
 
 // Load reads the environment and returns the validated configuration. BEATS,
-// DISCORD_WEBHOOK_URL and BEAT_TOKEN are required. maxNodeNameBytes and
+// DISCORD_WEBHOOK_URL and BEAT_TOKENS are required. maxNodeNameBytes and
 // hostPolicyOpts are parameters so this package depends on neither notify
 // nor webapi directly.
 func Load(maxNodeNameBytes int, hostPolicyOpts ...httpserver.HostAllowlistOption) (Config, error) {
@@ -200,12 +204,12 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...httpserver.HostAllowlistOption
 
 	cfg.TrustedProxies = trustedProxies()
 
-	beatToken, beatTokenSource, err := loadBeatToken()
+	beatTokens, beatTokensSource, err := loadBeatTokens(cfg.Beats)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.BeatToken = beatToken
-	cfg.BeatTokenSource = beatTokenSource
+	cfg.BeatTokens = beatTokens
+	cfg.BeatTokensSource = beatTokensSource
 
 	cfg.LogLevel = logLevel()
 
@@ -213,7 +217,7 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...httpserver.HostAllowlistOption
 	// refusal above or the advice would describe a configuration that never
 	// ran.
 	warnPlainVarIgnored("DISCORD_WEBHOOK_URL", "webhook URL", cfg.WebhookSource)
-	warnPlainVarIgnored("BEAT_TOKEN", "token", cfg.BeatTokenSource)
+	warnPlainVarIgnored("BEAT_TOKENS", "beat tokens", cfg.BeatTokensSource)
 
 	return cfg, nil
 }
@@ -323,7 +327,7 @@ func resolvedPort(addr string) (int, bool) {
 
 // allowedHosts parses the ALLOWED_HOSTS exact-match Host allowlist. Unset
 // yields an inactive policy that accepts every Host. An active allowlist is
-// what breaks DNS rebinding on /metrics, which BEAT_TOKEN does not cover. Any
+// what breaks DNS rebinding on /metrics, which BEAT_TOKENS does not cover. Any
 // malformed entry fails startup, since dropping it would leave a partial
 // allowlist whose unlisted pings surface as false missing-beat alerts.
 func allowedHosts(opts []httpserver.HostAllowlistOption) (*httpserver.HostPolicy, error) {
@@ -463,50 +467,6 @@ var errWebhookSetButEmpty = errors.New("DISCORD_WEBHOOK_URL is set but empty. Po
 // errWebhookRequired is the refusal for a DISCORD_WEBHOOK_URL that was never
 // set; its present-but-empty twin is errWebhookSetButEmpty.
 var errWebhookRequired = errors.New("DISCORD_WEBHOOK_URL is required")
-
-// errBeatTokenSetButEmpty and errBeatTokenRequired are the two diagnoses an
-// absent BEAT_TOKEN gets, kept apart because the operator's next move differs.
-// Serving /beat/{id} with no credential is not one of the options: any client
-// that can reach the port would keep every beat reading fresh.
-var (
-	errBeatTokenSetButEmpty = fmt.Errorf("BEAT_TOKEN is set but empty. It is the only thing standing between a stranger who can reach this port and a forged ping, so knell never serves /beat/{id} without it. Set it to a random token of at least %d bytes, for example the output of `openssl rand -hex 16`, or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
-	errBeatTokenRequired    = fmt.Errorf("BEAT_TOKEN is required. It is the only gate on /beat/{id}, so without it any client that can reach this port can keep every beat reading fresh while the thing it watches is dead. Set it to a random token of at least %d bytes, for example the output of `openssl rand -hex 16`, or point BEAT_TOKEN_FILE at a file holding one", minTokenLength)
-)
-
-// checkBeatToken validates a configured BEAT_TOKEN as the exact credential
-// senders must present, or refuses it. It never rewrites the value: edge
-// ASCII whitespace and interior forbidden bytes are refused outright rather
-// than trimmed, since such a token is unsendable as written or unreadable in
-// the value the operator holds.
-func checkBeatToken(token string) error {
-	if strings.Trim(token, asciiWhitespace) != token {
-		return errors.New("BEAT_TOKEN has leading or trailing ASCII whitespace. A trailing space or tab is stripped from the header value on the wire, and CR, LF, VT and FF cannot be sent in one at all. Such a token never reaches the verifier as configured, and POST /beat/{id} would reject every ping while the endpoint reports itself gated. A leading space or tab is refused too, because it authenticates as part of the credential while being invisible in the value you read. knell will not silently rewrite a credential, so remove the surrounding whitespace")
-	}
-	if !beatTokenFitsHeader(token) {
-		return fmt.Errorf("BEAT_TOKEN contains a control character that HTTP forbids in a header value, so no sender can present it. Use a token of at least %d printable characters", minTokenLength)
-	}
-	if len(token) < minTokenLength {
-		return fmt.Errorf("BEAT_TOKEN is shorter than the %d-byte minimum. It is the only gate on /beat/{id}, so a token short enough to guess lets a stranger who can reach this port keep every beat reading fresh while the thing it watches is dead. Set a random token of at least %d bytes, for example the output of `openssl rand -hex 16`", minTokenLength, minTokenLength)
-	}
-	if len(token) > maxTokenLength {
-		return fmt.Errorf("BEAT_TOKEN is longer than the %d-byte maximum. The maximum is the token's share of the %d-byte header block knell reads, so an accepted token always travels with %d bytes left over for the request line, the Host header and the \"Bearer \" prefix. A longer token is refused at startup, because it would eat that reserve until POST /beat/{id} answers 431 to every ping while reporting itself gated. A real credential is far shorter than the maximum, so set a random token of at least %d bytes, for example the output of `openssl rand -hex 16`, or check that BEAT_TOKEN_FILE names the secret file itself and not a bundle the mount picked up", maxTokenLength, MaxRequestHeaderBytes, headerOverheadAllowance, minTokenLength)
-	}
-	return nil
-}
-
-// loadBeatToken reads the required BEAT_TOKEN bearer gate for POST
-// /beat/{id}. The value is stored exactly as configured apart from one
-// trailing line ending, which envx removes.
-func loadBeatToken() (string, envx.SecretSource, error) {
-	token, src, err := resolveSecret("BEAT_TOKEN", errBeatTokenSetButEmpty, errBeatTokenRequired)
-	if err != nil {
-		return "", src, err
-	}
-	if tokenErr := checkBeatToken(token); tokenErr != nil {
-		return "", src, fileSourcedValueError("BEAT_TOKEN", src, tokenErr)
-	}
-	return token, src, nil
-}
 
 // loadWebhook reads and shape-checks DISCORD_WEBHOOK_URL, returning the URL
 // and the channel it arrived through. Only https is accepted: the URL's own
