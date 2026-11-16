@@ -199,16 +199,12 @@ func drainRecoveries(w *Watcher) {
 	}
 }
 
-// TestBeatAfterAdmissionClosedRecordsNothing pins the atomic shutdown
-// boundary. Once admission is closed (StopAccepting, which the composition root
-// calls from the pre-drain hook and Run calls before tallying undelivered
-// work), a ping already in flight must change NOTHING — not lastSeen, not the
-// alerted state, not the received counter, not the freshness gauge, and not the
-// recovery queue — and must report accepting=false so webapi answers 503 rather
-// than 200. This is the endpoint's ONLY shutdown refusal: webapi keeps no
-// lifecycle check of its own, precisely because one made before this call could
-// pass and then be descheduled, and the ping would record behind a tally Run had
-// already reported.
+// TestBeatAfterAdmissionClosedRecordsNothing pins the atomic shutdown boundary.
+// Once admission is closed, a ping in flight changes nothing (lastSeen, the
+// alerted state, the counter, the freshness gauge, the recovery queue) and
+// reports accepting=false so webapi answers 503. This is the endpoint's only
+// shutdown refusal: a separate check in webapi could pass, be descheduled and
+// record behind a tally Run had already reported.
 func TestBeatAfterAdmissionClosedRecordsNothing(t *testing.T) {
 	t.Parallel()
 
@@ -260,15 +256,11 @@ func TestBeatAfterAdmissionClosedRecordsNothing(t *testing.T) {
 	}
 }
 
-// TestAdmissionClosedBeforeRunExitsStillTalliesUndeliveredWork pins the
-// double-close production now performs: the composition root closes admission in
-// httpserver's pre-drain hook, and Run closes it AGAIN when its ctx.Done arm runs.
-// Closing is an assignment, not a transition, so the second call must be an
-// inert no-op — and above all it must not cost the shutdown tally, which is the
-// operator's only trace of the notices this process will never send. A
-// StopAccepting that ever grew a one-shot guard, an early return, or any work
-// beyond the flag would break exactly here, silently: the log line would go
-// missing or arrive with the wrong counts while every other test still passed.
+// TestAdmissionClosedBeforeRunExitsStillTalliesUndeliveredWork pins the double
+// close: the composition root closes admission in the pre-drain hook and Run
+// closes it again on ctx.Done. The second call must be an inert no-op that keeps
+// the shutdown tally, the operator's only trace of notices never sent; a
+// StopAccepting with a one-shot guard or an early return would lose that line.
 func TestAdmissionClosedBeforeRunExitsStillTalliesUndeliveredWork(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default.
@@ -333,15 +325,11 @@ func (h *parkingHandler) Handle(ctx context.Context, r slog.Record) error {
 	return h.Handler.Handle(ctx, r)
 }
 
-// TestRunJoinsTheObservationGoroutineBeforeTallying pins the shutdown JOIN.
-// Observation runs on its own goroutine and is deliberately not gated on
-// admission (it must keep detecting through the whole drain window), so closing
-// admission does not stop it: without the join, Run's ctx.Done arm can publish
-// the undelivered tally while the observation goroutine still owes a mutation,
-// and that tally is the operator's only trace of the notices this process will
-// never send. The observation goroutine is held in a DEBUG write it makes after
-// releasing w.mu, which is the one reachable point where it is running and
-// lockless at once.
+// TestRunJoinsTheObservationGoroutineBeforeTallying pins the shutdown join:
+// observation keeps running through the drain, so without the join Run could
+// publish the undelivered tally while observation still owes a mutation. The
+// observation goroutine is held in a DEBUG write it makes after releasing w.mu,
+// the one point where it is running and unlocked at once.
 func TestRunJoinsTheObservationGoroutineBeforeTallying(t *testing.T) {
 	// Serial (no t.Parallel): the parking handler is installed as the process
 	// slog default.
@@ -720,15 +708,11 @@ func (*failFirstHistoryNotifier) BeatRecovered(context.Context, string, Transiti
 func TestOneBeatsFailedHistorySendDoesNotStarveTheOthers(t *testing.T) {
 	t.Parallel()
 
-	// A failed history send is per-beat: its records stay queued and the next
-	// sweep retries THAT beat, and the sweep must still deliver every other
-	// beat's past-tense notice in the same pass. Abandoning the sweep on a
-	// plain failure would let one permanently failing beat starve the rest for
-	// as long as it keeps failing -- the observers would go quiet about outages
-	// that are over and about the live ones queued behind them.
-	// TestOneBeatsFailedSendDoesNotStarveTheOthers pins the live half of that
-	// contract; every other history test uses a single beat, where giving up
-	// after a failure and carrying on are indistinguishable.
+	// A failed history send is per-beat: its records stay queued for the next
+	// sweep, and the sweep still delivers every other beat's notice in the same
+	// pass, or one permanently failing beat would starve the rest. The single-beat
+	// history tests cannot tell giving up from carrying on;
+	// TestOneBeatsFailedSendDoesNotStarveTheOthers pins the live half.
 	const deadline = 10 * time.Minute
 	beats := budgetProbeBeats("history-starve-probe", 3, deadline)
 	clock := newFakeClock()
@@ -1259,16 +1243,11 @@ func TestRecoveryPointIsTheFirstPingAfterTheOutage(t *testing.T) {
 func TestOutageDetectedWhileTheQueueWasFullDoesNotBlameTheWebhook(t *testing.T) {
 	t.Parallel()
 
-	// The one path where a CLOSED record recorded by a PING is nevertheless an
-	// outage a sweep already saw: the sweep detected it while the queue was at
-	// its bound, so nothing could be queued for it (overflowAccounted), and the
-	// same sweep then drained the ended backlog and freed the slots. A ping now
-	// records the whole closed outage. Reporting that as "ended before a sweep
-	// detected it" would be false — a sweep did see it — but blaming delivery
-	// would be a diagnosis nothing supports: no record and therefore no send
-	// ever existed for this outage, and the queue fills from knell's own
-	// back-pressure as readily as from a broken webhook. So the record stays
-	// unblamed and its notice reports only that nothing was attempted.
+	// The one path where a closed record from a ping is an outage a sweep saw: the
+	// sweep detected it with the queue full (overflowAccounted) and then freed the
+	// slots. "Ended before a sweep detected it" would be false, and blaming delivery
+	// has no support, since no send ever existed and the queue fills from knell's
+	// own back-pressure too. So the record stays unblamed.
 	const id = "overflow-reason-probe"
 	w, clock, n := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
 	w.Beat(id)
@@ -1439,17 +1418,13 @@ func slowSends(n *fakeNotifier, clock *fakeClock, perSend time.Duration) {
 }
 
 func TestSweepStopsAtItsSendBudgetAndDefersTheRest(t *testing.T) {
-	// Serial (no t.Parallel): asserts deltas on the package-global
-	// notification counters, which the parallel tests also move.
+	// Serial: asserts deltas on the package-global notification counters.
 	//
-	// The failure this pins: when whatever fans the heartbeats out dies, every
-	// beat crosses its deadline in the SAME sweep, and the single sender used
-	// to push all of them through one rate-limited webhook back to back --
-	// holding Run's select, and every queued recovery, for minutes. The sweep
-	// must stop once its budget is spent instead. The beats it never reached
-	// must then be untouched: not counted as failed (an attempt that will be
-	// retried), not as dropped (a notice that will never arrive), and not
-	// marked alerted, because nothing was attempted for them at all.
+	// When the heartbeat fan-out dies, every beat crosses its deadline in one
+	// sweep, and the sweep must stop once its budget is spent rather than hold
+	// Run's select through a rate-limited webhook. The beats it never reached stay
+	// untouched: not failed, not dropped and not alerted, since nothing was
+	// attempted for them.
 	const (
 		total    = 12
 		perSend  = 2 * time.Second
@@ -1742,16 +1717,11 @@ func stormNoticesBeforeRecovery(n *fakeNotifier, recoverID string) (before int, 
 	return before, false
 }
 
-// TestHandleTickPrioritizesQueuedRecovery pins the drain-before-sweep ordering
-// of Run's ticker arm, on the helper that arm delegates to. Driving it through
-// Run cannot pin it: when a send overruns the tick, Run's top-level select has
-// BOTH ticker.C and the queued recovery ready, and an unbiased select may take
-// the recovery arm on its own — so a build with the ticker-arm drain DELETED
-// still passes a Run-driven test most of the time (measured 17 of 30 runs).
-// Calling handleTick directly removes the select randomness: with the drain
-// deleted, sweep runs while the recovery is still queued and this test fails
-// every run. No test drives this ordering through Run itself, for the same
-// reason: the select's randomness makes a Run-driven assertion unreliable.
+// TestHandleTickPrioritizesQueuedRecovery pins the drain-before-sweep order of
+// Run's ticker arm on the helper it delegates to. Through Run it cannot be
+// pinned: with both the ticker and a queued recovery ready, an unbiased select
+// may take the recovery arm itself, so a build without the drain often passes.
+// Called directly, the deleted drain fails every run.
 func TestHandleTickPrioritizesQueuedRecovery(t *testing.T) {
 	t.Parallel()
 

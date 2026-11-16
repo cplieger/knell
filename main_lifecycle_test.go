@@ -149,18 +149,12 @@ func (r *lifecycleRun) waitForReturn(t *testing.T, timeout time.Duration, after 
 	}
 }
 
-// startHeldBeatRequest opens a beat request against a serving knell and stops
-// with the handler already inside the body read, leaving the request in flight
-// for the caller to complete or abandon. It presents the required credential:
-// the gate runs before the body is touched, so an unauthenticated request would
-// answer 401 and never reach the handler this helper exists to hold open. The
-// Expect: 100-continue exchange is
-// the oracle: net/http emits the interim response on the first Read of the
-// body, so receiving it proves the request was accepted AND the handler
-// entered, without sending any body bytes. The returned reader holds whatever
-// the connection has buffered past the interim response, so a caller reading
-// the final response must read through it rather than the raw conn. The read
-// deadline set here covers only the handshake; callers clear or replace it.
+// startHeldBeatRequest opens an authenticated beat request against a serving
+// knell and returns once the handler is inside the body read, leaving it in
+// flight. The 100-continue response is the proof, since net/http sends it on
+// the body's first Read. Read the final response through the returned reader,
+// which holds what the connection buffered past the interim response; the read
+// deadline set here covers only the handshake.
 func startHeldBeatRequest(t *testing.T, addr, beat string, contentLength int) (net.Conn, *bufio.Reader) {
 	t.Helper()
 	conn, err := net.Dial("tcp", addr)
@@ -354,21 +348,12 @@ func scrapeCounter(t *testing.T, series string) float64 {
 }
 
 // TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing pins the acceptance
-// window end to end, through a real listener, a real SIGTERM and the real
-// drain. It is the window srv.Shutdown keeps open BY DESIGN: an in-flight
-// request is waited for, so a ping admitted while the app was still live can
-// reach the state machine well after the shared context was cancelled — which
-// is after watch.Run already returned, took its undelivered-work snapshot, and
-// stopped reading the recovery channel. A ping recorded there is a signal
-// accepted with no sender behind it: it moves lastSeen and
-// knell_beats_received_total, republishes the beat as fresh, and can queue a
-// recovered notice nobody will ever deliver, all of it invisible to the
-// shutdown log that just reported zero undelivered work.
-//
-// The request here is admitted BEFORE the signal (the 100-continue proves the
-// handler is already inside the body read) and completes AFTER it, so this can
-// only pass if acceptance is closed on the far side of the body read too, not
-// merely at handler entry.
+// window end to end. srv.Shutdown waits for in-flight requests, so a ping
+// admitted while live can reach the state machine after watch.Run took its
+// undelivered snapshot; recorded there, it moves lastSeen, marks the beat fresh
+// and can queue a recovery nobody delivers. The request is admitted before the
+// signal (the 100-continue proves it) and completes after it, so acceptance
+// must also close after the body read.
 func TestBeatInFlightAtShutdownIsRefusedAndRecordsNothing(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default and
 	// os.Stderr, and a process-wide signal.
@@ -544,21 +529,12 @@ func TestRunAppliesConfiguredHostAllowlist(t *testing.T) {
 	r.waitForReturn(t, 10*time.Second, "after a shutdown signal")
 }
 
-// TestRunResolvesClientIPThroughConfiguredTrustedProxies pins the last of main's
-// four Deps fields, for the reason its three siblings above are pinned: the
-// config suite pins env-to-CIDR parsing and the webapi suite receives the set as
-// an argument, so neither can catch a composition root that drops the field.
-// Dropped, an operator's TRUSTED_PROXIES is still parsed and still reported as
-// trusted_proxies=1 in the startup line, while every access line — including the
-// 401s a token-guessing run writes past the throttle — keeps naming the proxy
-// instead of an address an operator can block.
-//
-// It reads the access LINE rather than an HTTP status because client_ip has no
-// other observable: unlike the allowlist's 403 and the token gate's 401, nothing
-// in a response carries it. The capture prepareLifecycleRun installs cannot serve
-// here either, since run() calls slogx.Setup and replaces it — hence
-// captureRunLog, which redirects the writer slogx.Setup resolves instead of the
-// handler it installs.
+// TestRunResolvesClientIPThroughConfiguredTrustedProxies pins the last Deps
+// field main wires. Dropped, TRUSTED_PROXIES is still parsed and reported at
+// startup while every access line names the proxy instead of an address an
+// operator can block. client_ip is visible only in the access line, and run()
+// replaces the capture prepareLifecycleRun installs, so captureRunLog redirects
+// the writer slogx.Setup resolves.
 func TestRunResolvesClientIPThroughConfiguredTrustedProxies(t *testing.T) {
 	// Serial (no t.Parallel): t.Setenv, a process-global slog default and
 	// os.Stderr, and a process-wide signal.
@@ -637,16 +613,11 @@ func (l *runLog) String() string {
 	return l.buf.String()
 }
 
-// captureRunLog redirects os.Stderr to a pipe for the duration of the test and
-// returns what is written to it. It is the only way to read a line run() logs:
-// run() calls slogx.Setup, which installs its own handler over the capture
-// prepareLifecycleRun set up, and that handler resolves its destination from
-// os.Stderr when NewHandler runs. Nothing in production changes — this swaps a
-// process variable the stdlib exports, not a seam knell owns.
-//
-// The pipe is drained continuously rather than read at the end: its buffer is
-// 64 KiB, and a full one would block run() inside a log write and hang the
-// shutdown the test is waiting for.
+// captureRunLog redirects os.Stderr to a pipe for the test and returns what is
+// written to it: run() calls slogx.Setup, whose handler replaces
+// prepareLifecycleRun's capture and resolves os.Stderr when it is built. The pipe
+// is drained continuously, since a full 64 KiB buffer would block run() in a log
+// write and hang the shutdown the test waits for.
 func captureRunLog(t *testing.T) *runLog {
 	t.Helper()
 	r, w, err := os.Pipe()
@@ -709,19 +680,11 @@ func postBeat(t *testing.T, url, auth string) beatResponse {
 }
 
 // TestAwaitWatchLoopStaysSilentWhenTheLoopStoppedInsideAnExpiredGrace pins the
-// guard the teardown hook exists for. httpserver.Run derives the teardown context
-// from the SAME deadline srv.Shutdown just spent, so a drain that used the whole
-// grace hands the hook an already-expired context: with the loop already stopped
-// AND the context already done, a single select over both would pick
-// pseudo-randomly and log "watch loop still running" on about half of all
-// ordinary shutdowns — a WARN whose whole purpose is to mean the sender's
-// abandoned deliveries went unlogged, so a false one sends the operator hunting
-// for lost notices that were never lost.
-//
-// The repetition is the oracle: collapsing the two selects into one is
-// detected by a single call only half the time, so one call cannot pin the
-// guard at all; 200 calls make the collapse practically certain to show up and
-// still finish in microseconds.
+// teardown hook's guard: httpserver.Run hands the hook a context from the
+// deadline srv.Shutdown just spent, so with the loop stopped and the context
+// done a single select would pick at random and log a false "watch loop still
+// running" on half of ordinary shutdowns. One call catches a collapsed select
+// only half the time, so the test repeats it 200 times.
 func TestAwaitWatchLoopStaysSilentWhenTheLoopStoppedInsideAnExpiredGrace(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default.
@@ -857,15 +820,11 @@ func TestTeardownAfterServeExitMarksUnhealthyThenCancelsAndWaits(t *testing.T) {
 	}
 }
 
-// TestTeardownAfterServeExitDrainsAcceptedHandlers pins the srv.Shutdown drain: a
-// handler accepted before the listener failed must finish (its post-unlock loss
-// diagnostic included) before teardown lets the process exit. Closing beat
-// admission does NOT cover a handler already past its admission check: watch.Beat
-// counts a discarded ended-outage record under the mutex and emits its WARN -- the
-// only line naming the beat and the window an operator must reconstruct -- after
-// releasing it, and the record was never queued, so the watch loop's tally cannot
-// report it either. The sibling test above passes a never-started server, so
-// Shutdown returns immediately there and cannot see this drain being dropped.
+// TestTeardownAfterServeExitDrainsAcceptedHandlers pins the srv.Shutdown drain:
+// a handler accepted before the listener failed must finish before teardown
+// lets the process exit, since closing admission does not stop a handler past
+// its admission check. The sibling test above uses a never-started server, so
+// it cannot see this drain being dropped.
 func TestTeardownAfterServeExitDrainsAcceptedHandlers(t *testing.T) {
 	// Serial (no t.Parallel): the teardown logs through the process-global slog
 	// default.
@@ -950,15 +909,11 @@ func TestTeardownAfterServeExitDrainsAcceptedHandlers(t *testing.T) {
 	}
 }
 
-// TestTeardownAfterServeExitWarnsWhenTheDrainOutlivesTheGrace pins the one
-// loss-family line in main.go nothing drives: srv.Shutdown returning with an
-// accepted handler still in flight. That WARN is the operator's only notice
-// that a handler's own loss diagnostic (the queue-full drop line watch.Beat
-// emits after releasing its mutex) may never have been logged, and it carries
-// the structured retryable=false attribute the whole loss family promises, so
-// a Loki rule keyed on consequence can match it. Swallowing the Shutdown
-// error, dropping the attribute, or demoting the level currently breaks no
-// test.
+// TestTeardownAfterServeExitWarnsWhenTheDrainOutlivesTheGrace pins the WARN for
+// srv.Shutdown returning with an accepted handler still in flight, the
+// operator's only notice that the handler may not have finished. It carries
+// retryable=false like the rest of the loss family, so a Loki rule keyed on
+// consequence matches it.
 func TestTeardownAfterServeExitWarnsWhenTheDrainOutlivesTheGrace(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default.
@@ -1058,37 +1013,13 @@ func TestClassifyAbandonedWatchLoopDeniesACleanExitOverAnAbandonedLoop(t *testin
 	}
 }
 
-// TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog pins the
-// server wirings nothing else in the suite can see. All are silent when
-// dropped: without the read/write bounds a trickled body or a client that never
-// reads /metrics holds a handler goroutine for as long as it likes (httpserver
-// leaves both unset by default, bounding only the headers), without
-// the MaxHeaderBytes cap the header block falls back to net/http's 1 MiB default --
-// so one unauthenticated caller makes this process read a megabyte of header per
-// connection, and the beat token maximum config refuses startup over stops
-// bounding anything real -- and without WithSlogErrorLog net/http's own
-// connection-level lines -- above all "http: Accept error: ...; retrying", the
-// trace of an exhausted fd budget that stops every beat from being received --
-// fall back to the standard logger as unstructured, level-less text a person
-// cannot filter by level.
-//
-// The header assertion reads config.MaxRequestHeaderBytes rather than 8704: the
-// number is one decision made in one place (config derives it from the token
-// maximum it enforces), so a literal here would let the two drift and still pass.
-//
-// The timeout halves assert the configured bound rather than a real trickle: a
-// behavioral version would have to wait the bound out. The grace-margin half is
-// the one assertion here that is not a wiring check -- it pins the INVARIANT the
-// three bounds exist to satisfy (worst-case active request =
-// max(read, header + write), because net/http runs the whole-request read
-// deadline from the same instant as the header deadline and arms the write
-// deadline only once the headers are read, so the two chains are independent and
-// the longer one decides; that worst case has to leave awaitWatchLoop the 3s the
-// constants' comment reserves, inside the single shutdownGrace budget httpserver
-// spends across pre-drain, srv.Shutdown and onShutdown), because otherwise a
-// later bump of any one constant silently re-creates the stop that exits
-// non-zero. The error-log half is behavioral -- the bridge is driven and
-// the resulting record's LEVEL is the assertion.
+// TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog pins
+// server wiring that is silent when dropped: the read and write bounds (else a
+// trickled body holds a goroutine), the MaxHeaderBytes cap (else one caller
+// makes knell read 1 MiB of headers per connection) and WithSlogErrorLog (else
+// "Accept error" lines lose their level). The header cap is read from
+// config.MaxRequestHeaderBytes so the two cannot drift. The grace half pins
+// that max(read, header + write) leaves awaitWatchLoop its reserve.
 func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *testing.T) {
 	// Serial (no t.Parallel): httpserver.WithSlogErrorLog resolves slog.Default()
 	// as NewServer applies it, so the capture must be the default first.
@@ -1105,17 +1036,11 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 	if srv.WriteTimeout != requestWriteTimeout {
 		t.Errorf("WriteTimeout = %s, want %s: an unbounded write lets a client that requests /metrics and never reads the response pin the goroutine in Write", srv.WriteTimeout, requestWriteTimeout)
 	}
-	// srv.Shutdown waits for in-flight requests out of the SAME budget as
-	// pre-drain and awaitWatchLoop, so the worst-case active request has to
-	// finish with grace left over or a routine stop exits non-zero through
-	// classifyServeError. net/http derives the whole-request read deadline from
-	// the SAME instant as the header deadline and arms the write deadline only
-	// once the headers are read (readRequest: one t0 for both read deadlines, a
-	// deferred SetWriteDeadline for the write one), so the worst case is
-	// whichever of the two chains is LONGER -- the read bound on its own, or
-	// header + write. Asserting only the second lets a later bump of
-	// requestReadTimeout past that sum sail through the one check that exists to
-	// catch it.
+	// srv.Shutdown waits for in-flight requests out of the same budget as the
+	// pre-drain and awaitWatchLoop, so the worst-case request must finish with
+	// grace left. net/http starts both read deadlines from one instant and arms the
+	// write deadline after the headers, so the worst case is the longer of the read
+	// bound and header plus write; asserting only one lets the other grow past it.
 	const teardownReserve = 3 * time.Second // what the constants' comment promises awaitWatchLoop
 	if stop := shutdownGrace + opsShutdownGrace; stop >= 10*time.Second {
 		t.Errorf("shutdownGrace + opsShutdownGrace = %s, want under Docker's default 10s stop timeout: the operations listener drains after the ping listener, so the two budgets add, and SIGKILL would cut the abandoned-loop WARN", stop)

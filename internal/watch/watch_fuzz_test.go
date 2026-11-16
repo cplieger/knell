@@ -70,15 +70,11 @@ func checkSwitchStaysArmed(t *testing.T, w *Watcher, id string, now time.Time, o
 }
 
 // checkHistoryPayloads asserts the Notifier contract on what the notifier
-// actually RECEIVED, across every history notice delivered so far: outages is
-// never empty, every reported outage is closed with a positive span, and the
-// outages form one chronological, non-overlapping sequence across notices. The
-// last clause is the one the queue's structural invariants cannot express: an
-// outage reported in two different notices (a delivered run that was not
-// consumed) shows up as a notice whose first outage starts before the
-// previously reported one recovered. That clause assumes a SINGLE beat:
-// fakeNotifier.histories is not keyed by beat and two beats' outages may
-// legitimately overlap, so only call this on a one-beat watcher.
+// received across every history notice so far: outages is never empty, each is
+// closed with a positive span, and they form one chronological, non-overlapping
+// sequence across notices, which catches an outage reported twice. It assumes a
+// single beat, since fakeNotifier.histories is not keyed by beat and two beats'
+// outages may overlap.
 func checkHistoryPayloads(t *testing.T, n *fakeNotifier, ops string) {
 	t.Helper()
 	n.mu.Lock()
@@ -140,18 +136,12 @@ func FuzzMissingQueue(f *testing.F) {
 			deadline = 10 * time.Minute
 		)
 		w, clock, n := newTestWatcher(Beat{ID: id, Deadline: deadline})
-		// The accounting half of the counter split, on whatever interleaving the
-		// fuzzer found: a missing or history notice that cannot go out stays queued
-		// and is retried, so no MESSAGE of either kind is ever lost for good and
-		// knell_notifications_dropped_total must not move for them. A record a full
-		// queue discards is counted per RECORD instead
-		// (knell_outage_records_dropped_total, because one history message covers
-		// several), and the fire-once recovered send is the one kind that
-		// legitimately moves this counter, so both are excluded here. An op stream
-		// that moves either kind fires KnellNotifyFailing and sends an operator to
-		// reconstruct by hand a window this process in fact delivered. The counters
-		// are package-global and this target is serial, so their deltas over one op
-		// stream belong to this iteration.
+		// A missing or history notice that cannot go out stays queued and is retried,
+		// so knell_notifications_dropped_total must not move for either kind on any
+		// interleaving; otherwise KnellNotifyFailing sends an operator to reconstruct a
+		// window this process delivered. Discarded records count per record elsewhere,
+		// and the fire-once recovered notice is excluded. The target is serial, so the
+		// global counters' deltas belong to this iteration.
 		droppedMissing := counterValue(t, "knell_notifications_dropped_total", "missing")
 		droppedHistory := counterValue(t, "knell_notifications_dropped_total", "history")
 		t.Cleanup(func() {
@@ -229,16 +219,12 @@ func beatFreshSeriesCount() int {
 	return n
 }
 
-// FuzzBeatIDMintsNoSeriesForUnconfiguredID fuzzes the untrusted boundary the
-// beat id arrives on. webapi hands Beat the decoded URL path segment verbatim,
-// so an escaped slash, a NUL, a newline, a quote or a 300-byte segment all
-// reach this function as an id. That id then becomes a Prometheus label value,
-// which makes the configured-id map the only thing between an arbitrary
-// request path and permanent label cardinality -- and a raw newline or quote
-// in a label value corrupts the exposition carrying the quorum signal. Both
-// invariants are independent of the map itself: acceptance matches the
-// configured set exactly, and no call for any other id changes the series
-// count.
+// FuzzBeatIDMintsNoSeriesForUnconfiguredID fuzzes the beat id, which webapi
+// hands Beat as the decoded path segment verbatim. The id becomes a Prometheus
+// label value, so the configured-id map is all that stands between a request
+// path and unbounded label cardinality, and a raw newline or quote would corrupt
+// the exposition. Acceptance matches the configured set exactly, and no call for
+// another id changes the series count.
 func FuzzBeatIDMintsNoSeriesForUnconfiguredID(f *testing.F) {
 	const probe = "fuzz-id-boundary-probe"
 	f.Add(probe)

@@ -65,7 +65,7 @@ func (rec *webhookRecorder) handler(t *testing.T) http.HandlerFunc {
 // that shared transport, closing every other notifier's idle connections, and a
 // pooled connection to a port an httptest server has already released is handed
 // to whichever test next binds that port. Both surface as "webhook transport
-// failed" in an unrelated test (measured under -race at 1 run in 20).
+// failed" in an unrelated test.
 func newTestNotifier(t *testing.T, webhookURL, node string) *Discord {
 	t.Helper()
 
@@ -181,16 +181,12 @@ func TestEveryNoticeSuppressesMentions(t *testing.T) {
 func TestMissingNoticeDoesNotPresumeTheBeatEverPinged(t *testing.T) {
 	t.Parallel()
 
-	// BeatMissing's wording has to fit a beat that was configured in BEATS and
-	// never wired to a sender at all -- a typo'd id, a sender pointed at the
-	// wrong observer -- because the boot-armed clock fires this very notice one
-	// deadline after start, and notify cannot tell that case from a sender that
-	// pinged for weeks and stopped (watch.Transition carries no "was ever seen"
-	// bit, and Started collapses the last ping and the process-start baseline
-	// into one field). A rewording that presumes a previous ping sends the
-	// operator to inspect a sender that never existed, and every other
-	// assertion on this notice -- the MISSING keyword, the beat id, the
-	// truncated duration, the length budget -- still passes.
+	// BeatMissing's wording must fit a beat configured in BEATS and never wired to
+	// a sender (a typo'd id, a sender pointed at another observer), because the
+	// boot-armed clock fires this notice one deadline after start and notify cannot
+	// tell that case from a sender that stopped: Transition carries no "was ever
+	// seen" bit. A rewording that presumes a previous ping sends the operator to a
+	// sender that never existed while every other assertion here still passes.
 	rec := newWebhookRecorder(http.StatusNoContent)
 	srv := httptest.NewServer(rec.handler(t))
 	t.Cleanup(srv.Close)
@@ -475,19 +471,12 @@ func TestUnfollowedRedirectIsNotDelivery(t *testing.T) {
 func TestSafeTransportErrorKeepsTheURLOutWithoutBreakingTheChain(t *testing.T) {
 	t.Parallel()
 
-	// The *url.Error net/http builds around a transport failure is the only
-	// error shape that embeds the full request URL, and for a webhook that
-	// URL's path IS the credential. safeTransportError is what postAttempt
-	// returns: it replaces the message entirely, so the chain it exposes
-	// through Unwrap is the only thing left for watch's shutdown exemption
-	// (errors.Is(err, context.Canceled), which decides whether a failed send is
-	// logged as an error or as a cancelled sweep) and for httpclient's
-	// transient classification to read.
-	//
-	// There is deliberately no text-matching backstop for an error that
-	// FORMATS a URL rendering into its own message: nothing in this package
-	// publishes remote text or interpolates d.url, so no such error exists to
-	// defend against.
+	// net/http's *url.Error is the only error shape that embeds the request URL,
+	// and a webhook URL's path is its credential. safeTransportError replaces the
+	// message entirely, so its Unwrap chain is all that watch's shutdown exemption
+	// (errors.Is(err, context.Canceled)) and httpclient's transient classification
+	// can read. Nothing here publishes remote text or interpolates d.url, so no
+	// text-matching backstop exists.
 	const secret = "verysecretchaintoken"
 	rawURL := "https://discord.example/api/webhooks/1234567890/" + secret
 
@@ -516,15 +505,11 @@ func TestSafeTransportErrorKeepsTheURLOutWithoutBreakingTheChain(t *testing.T) {
 }
 
 // TestNestedURLErrorsAreFullyReducedBeforeClassification pins that no
-// *url.Error is left ANYWHERE in the chain safeTransportError classifies, not
-// just at the top: one still nested under the cause would let
-// httpclient.LogSafeError unwrap PAST transportError and render that error's
-// own text instead of knell's phrase, in post's returned error and in
-// httpclient.Do's per-attempt lines. net/http produces exactly this shape when
-// a redirected request fails: the *url.Error for the hop carries the *url.Error
-// of the inner request, whose cause is written from the response's Location
-// header, so the text that surfaces is remote-authored and can echo the
-// webhook path (which IS the credential).
+// *url.Error is left anywhere in the chain safeTransportError classifies: a
+// nested one would let httpclient.LogSafeError unwrap past transportError and
+// render its own text. net/http builds that shape when a redirected request
+// fails, and the inner cause is written from the response's Location header, so
+// it is remote text that can echo the webhook path, which is the credential.
 func TestNestedURLErrorsAreFullyReducedBeforeClassification(t *testing.T) {
 	t.Parallel()
 
@@ -616,21 +601,13 @@ func TestDeliveryLogsNeverLeakWebhookURL(t *testing.T) {
 }
 
 func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
-	// Deliberately NOT t.Parallel: slog.Default() is process-global.
+	// Not t.Parallel: slog.Default() is process-global.
 	//
-	// The exact shape both real leaks in this file's history came from: an edge
-	// in front of the webhook answers with an error page that echoes the
-	// request URI, and for a Discord webhook that path IS the credential. The
-	// body is no longer published in ANY form — not quoted, not filtered, not
-	// partially — so the whole class is closed by construction instead of by
-	// matching strings inside remote text.
-	//
-	// Both surfaces are asserted because they fail independently: post's
-	// returned error, and httpclient.Do's retry/exhausted lines, which log the
-	// ATTEMPT error through the type-based LogSafeError alone (post's own
-	// reduction runs too late for them). What survives is the status, which is
-	// what keeps "the webhook answered and rejected us" apart from "nothing
-	// answered".
+	// An edge in front of the webhook can answer with an error page echoing the
+	// request URI, whose path is the credential. The body is never published in any
+	// form, so the class is closed by construction. Both surfaces are asserted:
+	// post's returned error, and httpclient.Do's retry lines, which log the attempt
+	// error through LogSafeError alone. Only the status survives.
 	const secret = "verysecretbodytoken"
 	const secretPath = "/api/webhooks/1234567890/" + secret
 
@@ -671,19 +648,11 @@ func TestStatusBodyEchoingTheRequestPathContributesNothing(t *testing.T) {
 func TestSuccessfulResponsesAreDrainedForConnectionReuse(t *testing.T) {
 	t.Parallel()
 
-	// newTestNotifier's private transport is what makes the reuse observation
-	// belong to this test alone: on the shared pool, another test's churn
-	// evicted this notifier's idle connection between the two notices and the
-	// second one dialled again (measured: passed alone, failed in the full
-	// package with connections = 2).
-	// The drain's other half, and the one no absence assertion can reach: that
-	// knell's delivery path actually DRAINS a successful response rather than
-	// just closing it. Read VOLUME is not observable from a handler, so the
-	// oracle is the consequence -- an undrained body makes net/http discard the
-	// connection, so two notices open two connections instead of reusing one,
-	// and every notice pays a fresh TLS handshake. Driving the public
-	// BeatMissing keeps httpclient.DrainClose's own bound and read-then-close order
-	// the library's business to test, and pins only what knell depends on.
+	// A private transport, since on the shared pool another test's churn evicts
+	// the idle connection between the two notices. The oracle is reuse: net/http
+	// discards an undrained connection, so two notices opening two connections
+	// means knell closed a successful response without draining it, and every
+	// notice would pay a fresh TLS handshake.
 	var connections atomic.Int64
 	var requests atomic.Int64
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -720,17 +689,12 @@ func TestSuccessfulResponsesAreDrainedForConnectionReuse(t *testing.T) {
 func TestStatusBodyReportsDiscordErrorCode(t *testing.T) {
 	t.Parallel()
 
-	// Discord names WHY it rejected a webhook POST as a numeric code in its
-	// JSON error body, and says WHICH field it blamed inside a nested "errors"
-	// object. Two things are published from that and nothing else: the number,
-	// which cannot carry a credential, and the blamed path projected onto
-	// knell's own payload field names with a class-gated machine code. Every
-	// prose string in the object, top-level and nested, is authored by the
-	// other end and never published. knell claims no meaning for a code, so the
-	// number is always reported bare and a body carrying none leaves the status
-	// as the whole verdict.
-	//
-	// All cases use a non-transient status so each runs exactly one attempt.
+	// Discord names why it rejected a POST as a numeric code and which field it
+	// blamed in a nested "errors" object. Only the number, reported bare since
+	// knell claims no meaning for it, and the blamed paths, mapped onto knell's
+	// own payload field names with a class-gated machine code each, are
+	// published; every prose string is the other end's. A body with no code
+	// leaves the status as the verdict. Each case uses a non-transient status.
 	for name, tc := range map[string]struct {
 		status  int
 		body    string
@@ -995,15 +959,11 @@ func TestRateLimitWaitIsCappedByKnellsOwnCeiling(t *testing.T) {
 	if rateLimitMaxWait <= 0 || sendBudget > 4*watch.DefaultTick {
 		t.Errorf("rateLimitMaxWait = %s gives sendBudget = %s, want a positive ceiling whose delivery budget stays within four %s sweep ticks: the sweep is the single sender, so the budget is what holds every other beat's notice", rateLimitMaxWait, sendBudget, watch.DefaultTick)
 	}
-	// That upper bound has a floor to clear, and the floor is the schedule the
-	// budget is derived from rather than the derivation itself: httpclient parks up
-	// to rateLimitMaxWait before a retry and then spends up to attemptTimeout
-	// running it, so a budget that cannot fit one park plus one attempt is
-	// spent on the first attempt alone. maxAttempts would then read as 3 and
-	// behave as 1 the moment anything in front of Discord answers a
-	// header-less 429 -- and a non-positive budget is worse again, being
-	// ContextWithDefaultTimeout's pass-through path, which leaves the delivery
-	// with no deadline at all and the sweep's single sender parked on it.
+	// The budget has a floor: httpclient parks up to rateLimitMaxWait before a
+	// retry and then spends up to attemptTimeout on it, so a budget below one park
+	// plus one attempt makes maxAttempts behave as 1 behind a header-less 429. A
+	// non-positive budget is worse: ContextWithDefaultTimeout passes it through,
+	// leaving the delivery and the sweep's single sender with no deadline.
 	if sendBudget <= rateLimitMaxWait+attemptTimeout {
 		t.Errorf("sendBudget = %s, want more than one %s rate-limit park plus one %s attempt: a budget the retry schedule cannot fit inside is spent on attempt one, so the other %d never run", sendBudget, rateLimitMaxWait, attemptTimeout, maxAttempts-1)
 	}
@@ -1192,16 +1152,11 @@ func TestBeatMissingEscapesEveryDiscordMarkdownCharacterInNodeName(t *testing.T)
 func TestEscapeMarkdownLeavesEveryOtherCharacterAlone(t *testing.T) {
 	t.Parallel()
 
-	// The other half of escapeMarkdown's contract, the half its doc states and
-	// nothing measures: ONLY Discord's own markup characters are
-	// backslash-escaped (line breaks are collapsed, not escaped, and sit
-	// below this loop's 0x20 floor).
-	// Discord strips a backslash solely in front of its markup, so an entry
-	// added for anything else publishes the backslash itself and the operator
-	// can no longer copy the value out of the alert. Every mapping that DOES
-	// exist has a named oracle above; nothing rejects a mapping that should
-	// not. Only the hyphen is covered incidentally today, by the "node-1"
-	// substring every delivery assertion in this file happens to use.
+	// The other half of escapeMarkdown's contract: only Discord's own markup
+	// characters are backslash-escaped (line breaks are collapsed and sit below this
+	// loop's 0x20 floor). Discord strips a backslash only before its markup, so an
+	// entry for anything else publishes the backslash and the operator can no longer
+	// copy the value out of the alert.
 	const markup = "\\*_~`|[]"
 	for r := rune(0x20); r < 0x7f; r++ {
 		if strings.ContainsRune(markup, r) {
@@ -1612,18 +1567,11 @@ func TestSameOriginRedirectIsFollowedAndDelivers(t *testing.T) {
 func TestDeliveryIdentifiesKnellToTheWebhookEdge(t *testing.T) {
 	t.Parallel()
 
-	// Go sends "Go-http-client/1.1" when User-Agent is unset, which an edge or
-	// WAF in front of a webhook commonly refuses -- and that refusal arrives as
-	// a non-transient 4xx the sweep re-posts forever, so every notice for the
-	// beat is lost while /metrics still reports a healthy observer. Nothing
-	// else in this package pins the header, so dropping the Set (or emptying
-	// the constant, which makes net/http fall back to its own default) is
-	// invisible to the suite.
-	//
-	// A stub transport rather than a listener: the assertion is a request
-	// header, so no socket, no dial and no clock belong in the oracle. The
-	// exact string is deliberately NOT compared against userAgent -- that
-	// assertion passes even when the constant is emptied.
+	// Go sends "Go-http-client/1.1" when User-Agent is unset, which an edge or WAF
+	// in front of a webhook often refuses with a non-transient 4xx, so every notice
+	// is lost while /metrics looks healthy. A stub transport, since the assertion is
+	// a request header. The string is not compared against userAgent, which would
+	// pass with the constant emptied.
 	var sent http.Header
 	d := newTestNotifier(t, "https://discord.example/api/webhooks/1234567890/plainsegment", "node-1")
 	t.Cleanup(d.Close)
@@ -1656,13 +1604,10 @@ func TestDeliveryIdentifiesKnellToTheWebhookEdge(t *testing.T) {
 func TestStatusBodyAtTheReadCapKeepsItsDiscordErrorCode(t *testing.T) {
 	t.Parallel()
 
-	// The cap decides whether an operator gets Discord's numeric code -- the
-	// only fact knell publishes from a rejection -- so both sides of the
-	// boundary are pinned. One byte past the cap is READ (statusDetail's +1) so
-	// an over-cap body is detectable and dropped rather than decoded; a body of
-	// exactly the cap is Discord's object and keeps its code. Neither an
-	// off-by-one in the comparison nor a lost +1 in the LimitReader changes any
-	// other test in this file.
+	// The cap decides whether an operator gets Discord's numeric code, so both sides
+	// are pinned: one byte past the cap is read (statusDetail's +1) so an over-cap
+	// body is dropped rather than decoded, and a body of exactly the cap keeps its
+	// code. No other test notices an off-by-one or a lost +1.
 	//
 	// padTo builds a valid Discord error object of exactly n bytes.
 	padTo := func(n int) string {
@@ -1721,15 +1666,12 @@ func TestStatusBodyAtTheReadCapKeepsItsDiscordErrorCode(t *testing.T) {
 }
 
 func TestExhaustedDeliveryIsLoggedBelowAlarmLevel(t *testing.T) {
-	// Deliberately NOT t.Parallel: slog.Default() is process-global.
+	// Not t.Parallel: slog.Default() is process-global.
 	//
-	// watch already publishes the terminal verdict for a failed delivery at
-	// Error (with the beat, the silence and the retry plan), so httpclient's own
-	// exhaustion line is a second, thinner record of the SAME event.
-	// WithExhaustedLevel demotes it to Debug; dropping the option restores
-	// httpclient's default Warn and every failed notification then raises two
-	// alarm-level lines, which is exactly the duplicate an operator reading
-	// the log during a Discord outage has to reconcile.
+	// watch already logs a failed delivery's verdict at Error, so httpclient's
+	// exhaustion line is a second record of the same event. WithExhaustedLevel
+	// demotes it to Debug; without it every failed notification raises two
+	// alarm-level lines for an operator to reconcile during a Discord outage.
 	rec := captureDeliveryLogs(t)
 
 	// Connection refused is transient, so all maxAttempts run and the

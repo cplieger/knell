@@ -52,12 +52,9 @@ func TestMintNotificationKindsPremintsEveryCounterAndKind(t *testing.T) {
 }
 
 // TestMintRefusalReasonsPremintsEveryReason is the pre-route refusal counter's
-// half of the same cold-start contract, and it is the assertion the counter
-// exists for: its predecessor was a path label on the request counter, minted on
-// its FIRST refusal, so increase() could never see the first event of the class
-// and the separation bought nothing. A reason missing from the minting loop
-// reproduces exactly that, and every other test in the tree asserts DELTAS, so
-// nothing else would notice.
+// half of the cold-start contract: a reason first minted on its first refusal
+// gives increase() no earlier sample, and every other test asserts deltas, so a
+// reason missing from the minting loop fails only here.
 func TestMintRefusalReasonsPremintsEveryReason(t *testing.T) {
 	want := []string{
 		`knell_pre_route_refusals_total{reason="non_canonical_beat_path"} 0`,
@@ -203,18 +200,11 @@ func exposition(t *testing.T) string {
 }
 
 // TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat pins the per-beat
-// half of the cold-start guarantee: declaring a beat must publish all six
-// per-beat series, with the three counters born at zero, the last-seen gauge
-// carrying the boot baseline and the deadline gauge carrying the configured
-// deadline. Five of the six come from InitBeat; knell_beat_fresh comes from
-// SetBeatFresh, the single door for the freshness verdict, because the
-// boundary belongs to the watch state machine (watch.New publishes the boot
-// verdict right after InitBeat, and internal/watch's own tests pin that it is
-// 1 at boot). A counter whose first exposed sample is already nonzero has no
-// earlier sample for increase() to diff against, so a series dropped
-// from the declaration path is an alert that stays silent through the first
-// event of the beat's life; a missing last-seen baseline leaves the operator
-// no window to reconstruct after a dropped notice.
+// cold-start series: InitBeat publishes six, with the four counters at zero, the
+// last-seen gauge at the boot baseline and the deadline gauge at the
+// configured deadline; knell_beat_fresh comes from SetBeatFresh, which the
+// watch state machine owns. A counter first exposed nonzero has no sample for
+// increase() to diff against, so its alert misses the beat's first event.
 func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 	// The registry is a package-level singleton shared by every test in this
 	// binary, so the probe id must be unique to this test for the values below
@@ -227,6 +217,7 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 		"knell_beats_received_total",
 		"knell_beat_outages_total",
 		"knell_outage_records_dropped_total",
+		"knell_beats_recorded_while_throttled_total",
 	}
 	// The registry outlives one test iteration, so leaving the probe series
 	// behind makes `go test -count=2` fail on the precondition below instead
@@ -239,6 +230,7 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 		beatsReceived.Delete(id)
 		beatOutages.Delete(id)
 		outageRecordsDropped.Delete(id)
+		beatsRecordedWhileThrottled.Delete(id)
 	})
 	for _, name := range series {
 		if got, ok := beatSeriesValue(t, name, id); ok {
@@ -252,12 +244,13 @@ func TestInitBeatMintsEveryColdStartSeriesForAConfiguredBeat(t *testing.T) {
 	SetBeatFresh(id, true)
 
 	want := map[string]string{
-		"knell_beat_fresh":                       "1",
-		"knell_beat_last_seen_timestamp_seconds": "1700000000",
-		"knell_beat_deadline_seconds":            "1200",
-		"knell_beats_received_total":             "0",
-		"knell_beat_outages_total":               "0",
-		"knell_outage_records_dropped_total":     "0",
+		"knell_beat_fresh":                           "1",
+		"knell_beat_last_seen_timestamp_seconds":     "1700000000",
+		"knell_beat_deadline_seconds":                "1200",
+		"knell_beats_received_total":                 "0",
+		"knell_beat_outages_total":                   "0",
+		"knell_outage_records_dropped_total":         "0",
+		"knell_beats_recorded_while_throttled_total": "0",
 	}
 	for _, name := range series {
 		got, ok := beatSeriesValue(t, name, id)
@@ -339,15 +332,11 @@ func helpText(t *testing.T, name string) (string, bool) {
 	return "", false
 }
 
-// TestRecordHTTPRecordsBothTheCounterAndTheDuration pins that RecordHTTP wires
-// BOTH of its collectors. internal/webapi's routed tests pin the counter and
-// its label derivation, but nothing observes the histogram: with httpDuration
-// dropped from the call, knell_http_request_duration_seconds stays at its
-// registered zero forever and the whole test suite still passes, so the
-// latency view an operator uses to tell a slow webhook from a slow scrape can
-// be silently unwired. Asserted from inside the package because the histogram
-// is unlabelled — there is no series a routed test could attribute to its own
-// request.
+// TestRecordHTTPRecordsBothTheCounterAndTheDuration pins that RecordHTTP feeds
+// both collectors: webapi's tests pin the counter, but nothing else observes the
+// histogram, so with httpDuration dropped the latency view stays at zero and the
+// suite passes. It is asserted inside the package because the histogram is
+// unlabelled, so no routed test can attribute a series to its request.
 func TestRecordHTTPRecordsBothTheCounterAndTheDuration(t *testing.T) {
 	const (
 		method = "POST"
@@ -395,17 +384,11 @@ func TestRecordHTTPRecordsBothTheCounterAndTheDuration(t *testing.T) {
 	}
 }
 
-// TestRecordBeatPublishesLastSeenInWholeUnixSeconds pins the UNIT of the
-// per-beat last-seen sample. The series is named _timestamp_seconds and two
-// documented operator computations read it as Unix seconds: adding
-// beat_deadline_seconds to it to learn when an overdue beat fires, and
-// reconstructing the window of an outage whose record a full queue discarded.
-// A RecordBeat that published milliseconds, nanoseconds or a fractional second
-// leaves both of those silently wrong while every existing assertion stays
-// green: internal/watch's ping test only checks the sample MOVED off the boot
-// baseline, internal/webapi's asserts a refused ping left it UNCHANGED, and the
-// exact-value assertions in this file cover InitBeat's baseline rather than
-// RecordBeat's ping.
+// TestRecordBeatPublishesLastSeenInWholeUnixSeconds pins the unit of the
+// last-seen sample. Operators add beat_deadline_seconds to it and reconstruct
+// dropped outage windows from it, so milliseconds or fractional seconds leave
+// both silently wrong; the other tests only check the sample moved or stayed,
+// and the exact-value ones cover InitBeat's baseline.
 func TestRecordBeatPublishesLastSeenInWholeUnixSeconds(t *testing.T) {
 	const id = "record-beat-unit-probe"
 	// The registry is a package-level singleton that outlives one iteration, so

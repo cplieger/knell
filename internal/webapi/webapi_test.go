@@ -191,15 +191,11 @@ func TestBeatEndpoint(t *testing.T) {
 	}
 }
 
-// TestBareBeatPathAnswersTheCodedNotFound pins the bare /beat prefix, the one
-// misconfigured sender URL net/http used to answer for knell: with only
-// /beat/{$} and the {id} patterns registered, the mux synthesized a 307 to
-// /beat/ for it. 307 is a SUCCESS status, so the documented `curl -fsS` sender
-// (an unset or truncated variable in the URL) exited 0 having recorded nothing,
-// and the beat read as missing a full deadline later with nothing anywhere
-// saying the URL was wrong. So this pins the refusal on both accepted methods:
-// the coded 404 body, no redirect, nothing recorded, and no per-beat series
-// minted from a path that names no beat.
+// TestBareBeatPathAnswersTheCodedNotFound pins the bare /beat prefix, which
+// ServeMux would answer with a synthesized 307 to /beat/. A 307 is success to
+// the documented `curl -fsS` sender, so an unset variable in its URL would exit
+// 0 with nothing recorded. Both accepted methods get the coded 404, no
+// redirect, nothing recorded and no per-beat series.
 func TestBareBeatPathAnswersTheCodedNotFound(t *testing.T) {
 	for _, method := range []string{http.MethodPost, http.MethodGet} {
 		t.Run(method, func(t *testing.T) {
@@ -253,26 +249,19 @@ func beatSeriesLines(exposition string) []string {
 	return lines
 }
 
-// TestNonCanonicalBeatPathsAnswerTheCodedNotFound pins the redirect class no
-// route pattern can close. ServeMux sanitizes repeated slashes and literal dot
-// segments in a pass that runs BEFORE pattern matching, so without
-// canonicalBeatPath every spelling below answers 307 + Location — and a 307 is
-// a SUCCESS status to the documented `curl -fsS` sender, which does not follow
-// redirects unless asked. Such a sender exits 0 having recorded nothing, and
-// the beat reads as missing one full deadline later with nothing saying the URL
-// was malformed. Each case must instead be the coded 404, carry no Location,
-// and record no beat — and must stay countable: the refusal answers before the
-// mux, so the route metric can only call it "unmatched", and knell's own
-// pre-route refusal counter is what names the cause for an operator.
-// The two series a non-canonical refusal must move, spelled once so the route
-// label and the reason label cannot drift apart in the assertions below: the
+// The two series a non-canonical refusal must move, spelled once: the
 // pre-route class shares the request counter's "unmatched" path label with
-// scanner traffic, and knell's own reason counter is what separates them.
+// scanner traffic, and knell's reason counter is what separates them.
 const (
 	nonCanonicalRouteSeries  = `knell_http_requests_total{method="POST",path="` + unmatchedPathLabel + `",status="404"}`
 	nonCanonicalReasonSeries = `knell_pre_route_refusals_total{reason="non_canonical_beat_path"}`
 )
 
+// TestNonCanonicalBeatPathsAnswerTheCodedNotFound pins the redirect class no
+// route pattern can close: ServeMux cleans repeated slashes and dot segments
+// before matching, so without canonicalBeatPath each spelling answers 307,
+// which `curl -fsS` treats as success with nothing recorded. Each must be the
+// coded 404 with no Location and no beat, and stay countable by its reason.
 func TestNonCanonicalBeatPathsAnswerTheCodedNotFound(t *testing.T) {
 	// "//beat/api" enters the /beat namespace only after cleaning;
 	// "/beat/api/../ghost" leaves one id for another; the rest are the
@@ -364,19 +353,11 @@ func TestEscapedSeparatorBeatPathNeverRecordsOrRedirects(t *testing.T) {
 }
 
 // TestNonCanonicalPathOutsideTheBeatNamespaceIsLeftToTheMux pins the other edge
-// of the same guard: canonicalBeatPath refuses the /beat spellings net/http
-// would rewrite, and it must claim nothing else. Two things break if its
-// namespace test ever widens. Traffic that names no beat starts answering
-// knell's unknown_beat envelope, which tells whoever reads it to go check an id
-// against BEATS when no beat was ever addressed; and the pre-route reason
-// counter inflates with it. That counter is the ONLY series separating a
-// malformed sender URL from a port scan — the route metric buckets both as
-// "unmatched" — so drowning it costs the diagnostic
-// TestNonCanonicalBeatPathsAnswerTheCodedNotFound exists to protect, on the one
-// occasion an operator needs it: a beat that stopped arriving because its
-// sender's URL is malformed. Off the namespace the rewrite therefore stays
-// net/http's, and a Location header is exactly what this class must KEEP —
-// the inverse of the assertion the beat cases carry.
+// of canonicalBeatPath: it refuses the /beat spellings net/http would rewrite
+// and claims nothing else. Widened, it would answer unknown_beat for traffic
+// that names no beat and drown the pre-route reason counter, the only series
+// that separates a malformed sender URL from a port scan. Off the namespace the
+// rewrite stays net/http's, Location header included.
 func TestNonCanonicalPathOutsideTheBeatNamespaceIsLeftToTheMux(t *testing.T) {
 	// Non-canonical spellings of a real route and of no route at all. Neither
 	// the raw nor the cleaned form sits under /beat, which is what puts each
@@ -425,32 +406,13 @@ func TestNonCanonicalPathOutsideTheBeatNamespaceIsLeftToTheMux(t *testing.T) {
 	}
 }
 
-// FuzzBeatPathNeverRedirectsOrRecordsNonCanonically fuzzes the untrusted text
-// canonicalBeatPath judges. r.URL.Path is attacker-controlled, and the guard is
-// the only thing standing between a malformed sender URL and net/http's
-// redirect pass: ServeMux sanitizes repeated slashes and dot segments BEFORE
-// pattern selection, so without the guard every rewritten spelling answers 307
-// + Location — a SUCCESS status to the documented `curl -fsS` sender, which
-// then exits 0 having recorded nothing while the beat reads as missing one full
-// deadline later.
-//
-// TestNonCanonicalBeatPathsAnswerTheCodedNotFound pins five NAMED spellings.
-// This target pins the CLASS for arbitrary bytes, which is what a rewrite of
-// canonicalBeatPath, inBeatNamespace, or the chain's ordering can break in a
-// spelling no table names (a repeated slash behind a long id, a non-UTF-8 byte,
-// a path that only ENTERS the namespace after cleaning). It drives the DECODED
-// path only: the harness assigns r.URL.Path and leaves RawPath empty, so
-// EscapedPath re-escapes every '%' and no percent-encoded segment reaches the
-// mux — the "/beat/%2e%2e/ghost" seed is a literal-percent path here, not the
-// encoded dot segment a real request carries (that spelling answers the same
-// coded 404 either way; see canonicalBeatPath's own doc). Three invariants, all
-// decided from the request alone:
-//
-//   - a request in (or cleaning into) the /beat namespace never answers a
-//     redirect, so no sender can be told "success" without recording;
-//   - its status stays inside the coded set knell answers there;
-//   - a beat is recorded ONLY for the exact canonical spelling, so no rewritten
-//     path can re-arm the switch under an id its sender did not name.
+// FuzzBeatPathNeverRedirectsOrRecordsNonCanonically pins canonicalBeatPath's
+// class for arbitrary bytes, beyond the five spellings the table names.
+// ServeMux cleans slashes and dot segments before matching, so an unguarded
+// spelling answers 307, which `curl -fsS` treats as success with nothing
+// recorded. Invariants: a /beat request never redirects, its status stays in
+// knell's coded set, and only the exact canonical spelling records a beat. The
+// harness sets only the decoded path, so a "%2e" seed is a literal percent.
 func FuzzBeatPathNeverRedirectsOrRecordsNonCanonically(f *testing.F) {
 	for _, seed := range []string{
 		"/beat/api", "/beat", "/beat/", "/beat//", "//beat/api", "/beat/./api",
@@ -744,16 +706,11 @@ func (r *unboundedReader) Read(p []byte) (int, error) {
 }
 
 func TestBeatBodyDrainIsBounded(t *testing.T) {
-	// The handler drains the ignored body so keep-alive connections stay
-	// reusable, but only up to maxBeatBody: a hostile endless body must
-	// not tie the handler goroutine to an unbounded read.
-	//
-	// The exact-read oracle is one byte PAST the cap, and that byte is the
-	// point of the http.MaxBytesReader the drain is built on
-	// (httpserver.LimitBody): it is what distinguishes a body that ended exactly
-	// at the cap from one that runs past it, so the overrun can be detected
-	// instead of read as a clean end-of-body. A bare io.LimitReader stops at
-	// 1 MiB exactly and cannot tell the two apart.
+	// The handler drains the ignored body so keep-alive connections stay reusable,
+	// but only up to maxBeatBody, so an endless body cannot hold the goroutine. The
+	// oracle reads one byte past the cap: http.MaxBytesReader (httpserver.LimitBody)
+	// reads it to tell a body that ends at the cap from one that runs past it,
+	// which a bare io.LimitReader cannot.
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	h := newTestHandler(b, testBeatToken)
 	body := &unboundedReader{}
@@ -773,18 +730,11 @@ func TestBeatBodyDrainIsBounded(t *testing.T) {
 	}
 }
 
-// TestBeatOverLimitBodyWarnsAndStillRecords pins what an over-limit payload is
-// observable as, which is the whole reason the drain caps with
-// httpserver.LimitBody (http.MaxBytesReader) instead of io.LimitReader: the
-// overrun becomes an *http.MaxBytesError the handler can report, where a
-// LimitReader would have ended the read as if the body simply stopped there and
-// nothing would ever say a sender is shipping payloads knell refuses to read.
-//
-// The report is a WARN and nothing else. The sender still gets its 200 and the
-// beat is still recorded, because a heartbeat's payload is irrelevant and an
-// oversized body must never turn a legitimate ping into a lost one — on a
-// dead-man's switch a lost ping is a false alert or, worse, a false all-clear.
-// An in-cap ping is silent, so the line means what it says.
+// TestBeatOverLimitBodyWarnsAndStillRecords pins why the drain uses
+// httpserver.LimitBody rather than io.LimitReader: the overrun becomes an
+// *http.MaxBytesError the handler can report. The report is a WARN only: the
+// sender still gets 200 and the beat is recorded, since a heartbeat's payload is
+// irrelevant and a lost ping on a dead man's switch is a false alert.
 func TestBeatOverLimitBodyWarnsAndStillRecords(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default.
@@ -874,16 +824,11 @@ func TestUnauthorizedBeatBodyIsNeverRead(t *testing.T) {
 	}
 }
 
-// FuzzBeatTokenAcceptsOnlyTheExactBearerHeader fuzzes the untrusted header the
-// beat gate reads. A beat token is the only thing between the public internet and
-// a sender that can keep the dead-man switch armed with no real heartbeat
-// behind it, and acceptance is documented as exactly "Authorization: Bearer
-// <token>". The invariant is a security equality, not crash-freedom: for ANY
-// header value, the request is authorized iff the value equals the expected
-// string exactly, an unauthorized ping records no beat, the 401 names its
-// challenge (RFC 9110 §11.6.1, so a sender reads the expected scheme off the
-// protocol rather than off the README), and the 401 body never echoes the
-// configured token.
+// FuzzBeatTokenAcceptsOnlyTheExactBearerHeader fuzzes the header the beat gate
+// reads. The invariant is a security equality: for any value, the request is
+// authorized iff it equals "Bearer <token>" exactly, an unauthorized ping records
+// no beat, the 401 names its challenge (RFC 9110 §11.6.1), and its body never
+// echoes the configured token.
 func FuzzBeatTokenAcceptsOnlyTheExactBearerHeader(f *testing.F) {
 	const token = "s3cret"
 	const expected = "Bearer " + token
@@ -996,15 +941,11 @@ func TestEmptyBeatTokenFailsClosed(t *testing.T) {
 	}
 }
 
-// TestEveryRejectedMethodAnswersTheSameRefusal pins that the Allow header is
-// TRUE for every rejected method. The method-agnostic /beat/{id} route is the
-// reason they all share one response: it catches GET, HEAD and every other
-// non-POST verb and answers this file's coded 405 with Allow: POST. Without it
-// net/http answers instead, with whatever it synthesizes from the remaining
-// patterns, and none of those shapes carries a code a sender can parse. A GET
-// or HEAD that recorded a ping would keep the switch armed with
-// no heartbeat behind it, so a prober reading Allow must never be steered at
-// them.
+// TestEveryRejectedMethodAnswersTheSameRefusal pins that Allow is true for every
+// rejected method: the method-agnostic /beat/{id} route catches GET, HEAD and
+// every other non-POST verb with the coded 405 and Allow: POST. Without it,
+// net/http answers with no code a sender can parse, and a GET or HEAD that
+// recorded a ping would keep the switch armed with no heartbeat behind it.
 func TestEveryRejectedMethodAnswersTheSameRefusal(t *testing.T) {
 	for _, method := range []string{
 		http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete,
@@ -1047,23 +988,12 @@ func TestEveryRejectedMethodAnswersTheSameRefusal(t *testing.T) {
 	}
 }
 
-// FuzzLoggedPathIsBounded fuzzes the untrusted text the access line records as
-// its path. r.URL.Path is attacker-controlled, net/http accepts a megabyte of
-// it, and httpserver.Logging sits OUTSIDE the mux, so the access line is emitted
-// before beatHandler's token gate and the bound is the only thing limiting an
-// unauthenticated caller's influence on knell's log lines -- the channel that
-// carries the undelivered-notice warnings no counter backs.
-//
-// The bound itself is httpserver's now, so what this pins is knell's WIRING of it:
-// that every request really does travel through a logger carrying
-// WithMaxLoggedPath(loggedPathCap), for arbitrary bytes as well as for the
-// shapes its committed seeds name -- the two probe endpoints and an ordinary
-// ping, the longest configurable beat id, the cap boundary from both sides, a
-// multibyte path, a megabyte path, and a path carrying raw non-UTF-8 bytes (%80
-// decodes to one), where the rune-boundary backoff can walk the cut all the way
-// to zero. It drives the real assembled handler because there is no local
-// transform left to call, which also means a future middleware that re-wrote
-// the path before Logging saw it would be caught here.
+// FuzzLoggedPathIsBounded pins knell's wiring of httpserver's logged-path
+// bound: r.URL.Path is attacker-controlled and Logging runs before the token
+// gate, so the bound is all that limits an unauthenticated caller's text in the
+// log carrying the undelivered-notice warnings. It drives the assembled
+// handler, so a middleware that rewrote the path before Logging is caught too.
+// The seeds cover the cap from both sides and multibyte and non-UTF-8 paths.
 func FuzzLoggedPathIsBounded(f *testing.F) {
 	f.Add("/beat/api")
 	f.Add("")
@@ -1215,14 +1145,12 @@ func beatRequest(t *testing.T, h http.Handler, method, path string) *httptest.Re
 }
 
 // newShutdownHarness builds the routed handler over the real state machine for
-// one beat, on a fake clock. The returned func closes beat admission the way
-// the composition root does at the start of the drain (httpserver's pre-drain hook
-// calls watch.Watcher.StopAccepting), and it is the only trigger the endpoint's
-// refusal keys on. Each caller passes its OWN beat id: the metrics registry is
-// a package-level singleton shared by the whole test binary. capture.Default is
-// installed before New because httpserver.Logging resolves slog.Default() when the
-// chain is built; it swaps the process-global default, so every caller stays
-// serial (no t.Parallel).
+// one beat on a fake clock. The returned func closes admission as the pre-drain
+// hook does, the only trigger the endpoint's refusal keys on. Each caller passes
+// its own beat id because the metrics registry is shared. capture.Default is
+// installed before New because httpserver.Logging resolves slog.Default() as
+// the chain is built, and it swaps the process-global default, so every caller
+// stays serial.
 func newShutdownHarness(t *testing.T, id string) (http.Handler, func(), *fakeClock, time.Time) {
 	t.Helper()
 	capture.Default(t)
@@ -1335,16 +1263,11 @@ func TestRefusedUnknownBeatMintsNoSeries(t *testing.T) {
 	}
 }
 
-// TestRefusedBeatStillDrainsTheBody pins the accepted cost of letting the
-// watcher own admission alone: the verdict comes from watch.Watcher.Beat, which
-// is only asked on the far side of the ignored body, so a ping refused during
-// the drain has been READ before it is refused. That is deliberate — the read is
-// what keeps the connection reusable, and it is bounded twice over (maxBeatBody
-// caps the bytes, the server's read timeout caps the time), so a trickling
-// sender delays only its own refusal. The assertion is here so the cost is
-// visible and pinned rather than rediscovered: if a future change wants to
-// refuse before reading, it needs a second lifecycle view in this package, which
-// is exactly what New explains it must not have.
+// TestRefusedBeatStillDrainsTheBody pins the accepted cost of the watcher owning
+// admission: watch.Watcher.Beat is asked only after the body is read, so a ping
+// refused during the drain has been read first. The read keeps the connection
+// reusable and is bounded by maxBeatBody and the read timeout. Refusing before
+// the read would need a second lifecycle view in webapi, which New must not have.
 func TestRefusedBeatStillDrainsTheBody(t *testing.T) {
 	const id = "webapi-shutdown-body"
 	h, closeAdmission, _, _ := newShutdownHarness(t, id)
@@ -1443,16 +1366,11 @@ func httpRequestSeries(exposition string) map[string]bool {
 	return out
 }
 
-// TestRefusedPingIsVisibleInTheRequestCounter is the whole point of the request
-// metric: knell_beats_received_total counts ACCEPTED pings only, so before this
-// counter existed every refusal — a rotated beat token (401), a misspelled beat
-// id (404), a disallowed method (405), a ping during the drain (503) — was
-// invisible to a scrape and could only be found by reading access logs. knell's
-// own README points alert rules at a second vantage point scraping /metrics, so
-// a refusal class with no series behind it cannot be alerted on at all: the
-// operator's first hard signal would be the missing notice a full deadline
-// later. Each case pins that the refusal lands on its own method/path/status
-// series AND that it still records no beat.
+// TestRefusedPingIsVisibleInTheRequestCounter pins the request metric's purpose:
+// knell_beats_received_total counts accepted pings only, so each refusal (a
+// rotated token's 401, a misspelled id's 404, a wrong method's 405, a 503 during
+// the drain) needs its own method, path and status series to be alertable before
+// a missing notice arrives a deadline later. Each case also records no beat.
 func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 	const id = "api"
 
@@ -1510,9 +1428,8 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 			wantStatus: http.StatusMethodNotAllowed,
 			wantSeries: `knell_http_requests_total{method="HEAD",path="/beat/{id}",status="405"}`,
 		},
-		// PUT falls to the method-AGNOSTIC /beat/{id} route, which names no
-		// method — the case knell's own derivation used to collapse to
-		// "other". httpserver's derivation keeps a STANDARD method real (PUT is
+		// PUT falls to the method-agnostic /beat/{id} route, which names no
+		// method. httpserver's derivation keeps a STANDARD method real (PUT is
 		// one of nine) and buckets only a non-standard token, so a
 		// method-probing scanner stays bounded while an operator can still see
 		// which real method a sender is misconfigured to use. See
@@ -1707,20 +1624,11 @@ func TestRequestMetricLabelsBoundedByTheRouteTable(t *testing.T) {
 }
 
 // TestUnroutedRequestsAreCountedUnderTheCollapsedSeries pins the unmatched case
-// of httpserver's label derivation as knell wires it: a request that matched no
-// route is still counted, with its PATH collapsed onto the single "unmatched"
-// marker and its real method kept.
-// TestRequestMetricLabelsBoundedByTheRouteTable only proves such a request
-// cannot MINT a caller-spelled series, so a hook that skipped unmatched
-// requests entirely passes it -- and then scanner floods and every misrouted
-// sender (a wrong-method scrape included) are invisible to the vantage point
-// knell's own alert rules read.
-//
-// Only the path collapses. knell's own derivation used to collapse the method
-// here too, because an unrouted request's method was caller-chosen text; the
-// closed method set removes that reason, so a 404 flood stays visible per method
-// (GET scanners vs POST senders) at no cardinality cost. That is a label change:
-// the method="unmatched" value no longer exists in this exposition.
+// of httpserver's labels as knell wires them: a request matching no route is
+// still counted, its path collapsed to "unmatched" and its method kept. A hook
+// that skipped unmatched requests would hide scanner floods and misrouted
+// senders from the series knell's alert rules read. The method stays because
+// the method set is closed, so a 404 flood stays visible per method.
 func TestUnroutedRequestsAreCountedUnderTheCollapsedSeries(t *testing.T) {
 	tests := map[string]struct {
 		method, path string
@@ -1770,17 +1678,12 @@ func TestUnroutedRequestsAreCountedUnderTheCollapsedSeries(t *testing.T) {
 	}
 }
 
-// TestAccessLogMethodIsBoundedForRefusedRequests pins the access line's method
-// bound, which is httpserver's and carries no knob (its ceiling follows from the
-// IANA method registry, whose longest entry is UPDATEREDIRECTREF at 17
-// characters, not from anything knell serves). The bound has to exist
-// somewhere: net/http accepts any RFC 9110 token as a method with no length cap
-// of its own, and the request line is bounded only by MaxHeaderBytes+4096 (1 MiB
-// by default), so without it one unauthenticated caller writes ~1 MiB of its own
-// text into a single access line and pushes knell's permanently-lost-notice
-// WARNs out of the retained log window — the same consequence the path cap
-// exists to prevent, on a request the token gate never sees (httpserver.Logging
-// sits outside the mux, ahead of beatHandler's token gate).
+// TestAccessLogMethodIsBoundedForRefusedRequests pins httpserver's method bound
+// as knell wires it. net/http accepts any token as a method, bounded only by
+// the server's header read limit (MaxHeaderBytes + 4096, about 12.5 KiB here),
+// and Logging runs before the token gate, so without the bound one caller
+// writes kilobytes of its own text into every access line and pushes the
+// lost-notice WARNs out of the retained log window.
 func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and must be installed BEFORE New, because httpserver.Logging
@@ -1827,23 +1730,11 @@ func TestAccessLogMethodIsBoundedForRefusedRequests(t *testing.T) {
 	})
 }
 
-// TestAccessLogClientIPResolvesOnlyThroughTrustedProxies pins the wiring of
-// Deps.TrustedProxies into httpserver.WithClientIP. internal/config pins
-// TRUSTED_PROXIES parsing and httpserver pins ClientIP's spoof model, so neither can
-// catch a Deps field that never reaches the option: an operator's TRUSTED_PROXIES
-// would then be parsed, reported as trusted_proxies=1 at startup, and silently
-// ignored, leaving every access line — including the 401s a token-guessing run
-// writes past the throttle — naming the proxy instead of an address an operator
-// can block. Losing the variadic expansion (or the field on the composition
-// root's Deps literal) is a one-character edit that nothing else in the module
-// fails on.
-//
-// Both halves matter: the trusted half proves the set REACHES the option, the
-// empty half pins the spoof-proof default an unset TRUSTED_PROXIES has to keep.
-// Deliberately at the webapi level rather than in main_lifecycle_test.go, where
-// the other Deps fields are pinned: their oracles are HTTP-observable (200/401/
-// 403), while client_ip is observable only in the access line, and run() calls
-// slogx.Setup, which replaces the capture a lifecycle test installs.
+// TestAccessLogClientIPResolvesOnlyThroughTrustedProxies pins that
+// Deps.TrustedProxies reaches httpserver.WithClientIP: config pins the parsing
+// and httpserver the spoof model, so neither sees a field that never arrives.
+// The trusted half proves the set reaches the option; the empty half pins the
+// spoof-proof default an unset TRUSTED_PROXIES keeps.
 func TestAccessLogClientIPResolvesOnlyThroughTrustedProxies(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and must be installed BEFORE New, because httpserver.Logging
@@ -2025,15 +1916,11 @@ func scrapeAs(t *testing.T, h http.Handler, host string) string {
 	return rec.Body.String()
 }
 
-// TestHostRefusalKeepsTheStandardEnvelope pins WHERE the Host allowlist sits in
-// the chain, which New's own comment claims but nothing checked: inside the
-// standard wrappers and outside canonicalBeatPath, so
-// the 403 still carries SecurityHeaders and Cache-Control: no-store, and still
-// rides httpserver.Logging -- so a rebinding attempt appears in the access log and
-// in the request counter. Hoisting the policy above httpserver.Logging keeps every
-// other test green while the refusal becomes invisible to both vantage points,
-// which is the same alertability gap TestRefusedPingIsVisibleInTheRequestCounter
-// exists to close for the other 403.
+// TestHostRefusalKeepsTheStandardEnvelope pins where the Host allowlist sits in
+// the chain: inside the standard wrappers and outside canonicalBeatPath, so the
+// 403 keeps SecurityHeaders and Cache-Control: no-store and passes through
+// httpserver.Logging. Hoisted above Logging, a rebinding attempt would vanish
+// from the access log and the request counter while every other test passed.
 func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	hosts := hostPolicy(t, "knell.example")

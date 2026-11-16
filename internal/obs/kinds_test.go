@@ -11,24 +11,12 @@ import (
 	"testing"
 )
 
-// TestEveryKindConstantIsPreMinted enforces the sync rule notificationKinds'
-// own doc states ("Add every new Kind constant here so those two exposition
-// views stay aligned"). Nothing else can: the cold-start test iterates
-// notificationKinds, so a Kind constant missing from that slice is invisible to
-// it, and the watch/webapi counter tests all assert DELTAS against a baseline
-// rather than the zero sample. A kind whose three counters are never pre-minted
-// has no earlier sample for increase() to diff against, so KnellNotifyFailing
-// stays silent through the first failure or drop of that kind - on the app whose
-// entire job is being alertable.
-//
-// The source is parsed rather than reflected over because Go erases constant
-// declarations at runtime: the declaration site is the only place the full set
-// exists. Every production .go file in the directory is parsed individually
-// (parser.ParseDir is deprecated, and its build-tag-blind package grouping is
-// exactly what the deprecation warns about); _test.go files are excluded
-// because the contract is the PRODUCTION kind set, so a test-only Kind fixture
-// must not be counted as an advertised notification kind. The scan is guarded
-// below by a "found nothing" failure so a broken walk cannot pass silently.
+// TestEveryKindConstantIsPreMinted enforces notificationKinds' sync rule: a
+// Kind missing from that slice is invisible to the cold-start test, and a kind
+// whose counters are never pre-minted leaves KnellNotifyFailing silent through
+// its first failure or drop. The source is parsed because constants do not exist at
+// runtime: production files one by one (parser.ParseDir is deprecated),
+// _test.go files excluded, and a scan that finds nothing fails.
 func TestEveryKindConstantIsPreMinted(t *testing.T) {
 	t.Parallel()
 
@@ -47,16 +35,11 @@ func TestEveryKindConstantIsPreMinted(t *testing.T) {
 	}
 }
 
-// TestEveryRefusalConstantIsPreMinted is the refusal half of the same sync rule
-// refusalReasons' own doc states ("Add every new Refusal constant here so those
-// two exposition views stay aligned"), and nothing else enforces it: the
-// cold-start test iterates refusalReasons, so a Refusal constant missing from
-// that slice is invisible to it, and its guard only fires when the SLICE grows.
-// A reason whose series is never pre-minted has no earlier sample for
-// increase() to diff against, so the first refusal of that reason is invisible
-// to a windowed query over it - which is the exact flaw that retired this
-// counter's predecessor, so losing it silently gives the reason label back the
-// shape it was introduced to fix.
+// TestEveryRefusalConstantIsPreMinted enforces refusalReasons' sync rule, the
+// refusal half of the one above: a Refusal constant missing from that slice is
+// invisible to the cold-start test, whose guard fires only when the slice grows.
+// A reason never pre-minted has no earlier sample for increase() to diff
+// against, so its first refusal is invisible to a windowed query.
 func TestEveryRefusalConstantIsPreMinted(t *testing.T) {
 	t.Parallel()
 
