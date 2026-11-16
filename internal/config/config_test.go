@@ -92,7 +92,7 @@ func unsetEnv(t *testing.T, key string) {
 
 // authEchoServer starts a throwaway server that echoes the Authorization header
 // it received back in X-Echo, so a test can compare what the wire carried
-// against what beatTokenFitsHeader claims about it.
+// against what checkBeatToken claims about it.
 func authEchoServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1310,26 +1310,11 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 }
 
 // TestLoadKeepsABeatTokenWithInteriorASCIIWhitespaceArmed pins the SCOPE of the
-// padding refusal: it is an EDGE rule, and a space or tab INSIDE the credential
-// is accepted and stored verbatim. asciiWhitespace's two mechanisms both act on
-// the edges only -- the wire strips a TRAILING SP/HTAB run and a LEADING run is
-// invisible in the value the operator reads -- while an interior SP or HTAB is a
-// legal field-value byte that net/textproto delivers untouched, so an
-// interior-whitespace token authenticates exactly as configured.
-//
-// Nothing else in the package pins the ACCEPTING side of that scope.
-// checkBeatToken's refusals are pinned by value, FuzzCheckBeatToken asserts only
-// on tokens it ACCEPTS (a rejection returns early, so an over-strict validator
-// satisfies it vacuously), and every OTHER interior-whitespace fixture in the
-// package is too short to be ACCEPTED: the 10-byte "alpha<byte>beta" fixtures
-// that sweep the interior byte range call beatTokenFitsHeader directly and never
-// reach checkBeatToken at all, and "alpha\tbeta" is also a committed
-// FuzzCheckBeatToken seed, where it does reach it but the 16-byte floor refuses
-// its 10 bytes before any acceptance assertion runs. So tightening the edge test
-// to refuse SP/HTAB anywhere -- the shape a "harden the credential" edit reaches
-// for -- leaves every existing test green while a passphrase-style BEAT_TOKENS
-// stops the observer from starting at all, which for a dead-man switch is the one
-// refusal nobody is watching for.
+// padding refusal through Load: it is an EDGE rule, and a space or tab INSIDE the
+// credential is accepted and stored verbatim, since net/textproto delivers an
+// interior SP or HTAB untouched. Refusing them anywhere, the shape a "harden the
+// credential" edit reaches for, stops an observer with a passphrase-style token
+// from starting at all.
 func TestLoadKeepsABeatTokenWithInteriorASCIIWhitespaceArmed(t *testing.T) {
 	// Serial (t.Setenv forbids t.Parallel). A space AND a tab, both interior,
 	// and 20 bytes so the value clears the minTokenLength floor on its own.
@@ -1358,23 +1343,13 @@ func TestLoadKeepsABeatTokenWithInteriorASCIIWhitespaceArmed(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsABeatTokenHTTPCannotCarry(t *testing.T) {
-	// Distinct from a token made only of ASCII whitespace (refused by the
-	// padding cutset like any other edge run): these values are non-empty
-	// after an ASCII trim, so trimming cannot rescue them, yet HTTP forbids
-	// the byte they carry in a field value. Go's client refuses to write the
-	// header and Go's server rejects a handcrafted one before beatHandler, so
-	// the gate would be armed with a token no sender could ever present —
-	// knell starts, reports healthy, records no ping, and one deadline later
-	// declares every configured beat missing. The interior spellings are caught
-	// by beatTokenFitsHeader and the edge ones by the padding cutset; the
-	// classification is one class to the operator, which is why they share this
-	// table.
-	// Each row names the DIAGNOSIS it must draw, and every fixture clears the
-	// minTokenLength floor. Both are load-bearing: with a 10-byte fixture and an
-	// err != nil oracle the length refusal answers for the byte rule, so deleting
-	// checkBeatToken's beatTokenFitsHeader call left this whole table green while
-	// the gate armed for a token no sender can present.
+func TestLoadRejectsABeatTokenNoSenderCanPresentAsRead(t *testing.T) {
+	// Each value survives an ASCII trim, yet HTTP forbids its byte in a field
+	// value or the operator cannot read the token as configured. Armed with it,
+	// knell reports healthy, records no ping, and one deadline later declares
+	// every beat missing. Each row names the diagnosis it must draw and clears
+	// the length floor, or the length refusal answers for the byte rule and
+	// deleting the field-value check leaves this table green.
 	tests := map[string]struct {
 		token   string
 		wantErr string
@@ -1385,19 +1360,23 @@ func TestLoadRejectsABeatTokenHTTPCannotCarry(t *testing.T) {
 		// EDGE rule, so the byte rule is the only one that can refuse this value.
 		"vertical tab interior": {token: "unit-test\vbeat-token", wantErr: "control character"},
 		// EDGE position, for the bytes asciiWhitespace does NOT cover: DEL and the
-		// C0 controls other than HTAB/CR/LF/VT/FF survive the edge trim untouched,
-		// so beatTokenFitsHeader is the only rule that can refuse them, and every
-		// other fixture in this package puts its forbidden byte in the INTERIOR.
-		// The predicate scans by index, so skipping either bound accepts a token
-		// the transport refuses to write: the gate reports itself armed, every ping
-		// 401s, and one deadline later every configured beat posts a false MISSING
-		// notice.
+		// C0 controls other than HTAB/CR/LF/VT/FF survive the edge trim, so the
+		// field-value check is the only rule that can refuse them there, and a
+		// check that skipped either end would arm a token no sender can write.
 		"leading control byte": {token: "\x01unit-test-beat-token", wantErr: "control character"},
 		"trailing delete byte": {token: "unit-test-beat-token\x7f", wantErr: "control character"},
 		// The EDGE spelling of CR: a forbidden field-value byte that the padding
 		// cutset refuses first, so this row draws the whitespace diagnosis rather
 		// than the byte one. LF never reaches a token: it separates entries.
 		"trailing carriage return": {token: "unit-test-beat-token\r", wantErr: "leading or trailing ASCII whitespace"},
+		// HTTP carries these bytes, so the wire alone accepts them, but the operator
+		// cannot read them in the token they hold: a pasted zero-width space or bidi
+		// control makes the value the sender types differ from the configured one.
+		"zero-width space":    {token: "unit-test\u200bbeat-token", wantErr: "invisible character"},
+		"bidi override":       {token: "unit-test\u202ebeat-token", wantErr: "invisible character"},
+		"leading byte order":  {token: "\ufeffunit-test-beat-token", wantErr: "invisible character"},
+		"invalid UTF-8 byte":  {token: "unit-test\xffbeat-token", wantErr: "not valid UTF-8"},
+		"C1 control in UTF-8": {token: "unit-test\u0085beat-token", wantErr: "invisible character"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -1407,7 +1386,7 @@ func TestLoadRejectsABeatTokenHTTPCannotCarry(t *testing.T) {
 
 			_, err := Load(maxNodeNameBytes)
 			if err == nil {
-				t.Fatalf("Load() with BEAT_TOKENS=%q = nil, want error: HTTP forbids that byte in a field value, so every ping 401s against an endpoint that reports itself gated", tt.token)
+				t.Fatalf("Load() with BEAT_TOKENS=%q = nil, want the %q refusal: the gate would arm for a token no sender can present as the operator reads it, so every ping 401s against an endpoint that reports itself gated", tt.token, tt.wantErr)
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("error = %q, want the %q diagnosis: every fixture here also clears the length floor, so any other refusal means the rule that owns this byte no longer runs", err, tt.wantErr)
@@ -1422,29 +1401,21 @@ func TestLoadRejectsABeatTokenHTTPCannotCarry(t *testing.T) {
 	}
 }
 
-// TestBeatTokenFitsHeaderAgreesWithTheTransportForEveryByte sweeps the
-// whole byte space against the transport itself, which is the only oracle for
-// this predicate. It claims to model exactly what an HTTP field
-// value can carry, and both directions of a divergence are silent: a byte it
-// wrongly ACCEPTS arms a gate no sender can present (every ping 401s and every
-// beat goes falsely missing one deadline later), and a byte it wrongly REJECTS
-// fails startup on a working configuration. Only the interior position is
-// swept, because the predicate's precondition is that edge ASCII whitespace was
-// already trimmed.
-func TestBeatTokenFitsHeaderAgreesWithTheTransportForEveryByte(t *testing.T) {
+// TestCheckBeatTokenAgreesWithTheTransportForEveryASCIIByte sweeps every ASCII
+// byte in the interior of a token against the transport, the only oracle for
+// it. Both directions of a divergence are silent: a byte wrongly ACCEPTED arms
+// a gate no sender can present (every ping 401s and every beat goes falsely
+// missing one deadline later), and a byte wrongly REFUSED fails startup on a
+// working configuration. A byte from 0x80 up is refused by design whatever the
+// wire carries: alone it is invalid UTF-8.
+func TestCheckBeatTokenAgreesWithTheTransportForEveryASCIIByte(t *testing.T) {
 	srv := authEchoServer(t)
-
-	for b := range 256 {
-		// INTERIOR placement only: a trailing SP or HTAB is legal in a field
-		// value yet stripped by the wire, and the predicate answers the
-		// byte-legality question for an already-trimmed value (see
-		// asciiWhitespace).
-		token := "alpha" + string([]byte{byte(b)}) + "beta"
+	for b := range 0x80 {
+		token := "unit-test" + string([]byte{byte(b)}) + "beat-token"
 		echoed, doErr := echoAuthHeader(t, srv, token)
-
 		carried := doErr == nil && echoed == "Bearer "+token
-		if got := beatTokenFitsHeader(token); got != carried {
-			t.Errorf("interior byte 0x%02x: beatTokenFitsHeader = %v, but the transport carried it verbatim = %v (err=%v echo=%q); the predicate and the wire must agree or startup either arms an unpresentable token or refuses a working one", b, got, carried, doErr, echoed)
+		if accepted := checkBeatToken(token, 1) == nil; accepted != carried {
+			t.Errorf("interior byte 0x%02x: checkBeatToken accepts = %v, but the transport carried it verbatim = %v (err=%v echo=%q); the two must agree or startup either arms an unpresentable token or refuses a working one", b, accepted, carried, doErr, echoed)
 		}
 	}
 }

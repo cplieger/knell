@@ -52,7 +52,8 @@ backup+backup-offsite:9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d
 - One token may not appear on two lines, because it would ping the beats of both. Two lines may name one beat, which lets you move a job to a new token without a gap.
 - Blank lines are skipped. At most 128 lines, two per beat.
 - Each token is 16 to 512 bytes. `openssl rand -hex 16` makes a 32-character token.
-- Each token is checked exactly as written. One with leading or trailing spaces, tabs or a carriage return is refused, and so is one with a control character HTTP forbids in a header.
+- Each token is checked exactly as written. One with leading or trailing spaces, tabs or a carriage return is refused.
+- A token with a control character HTTP forbids in a header is refused, and so is one with an invisible character, such as a zero-width space or a bidi control, or with bytes that are not valid UTF-8.
 - Save a token file with LF line endings. In a file with CRLF endings every line but the last keeps its carriage return, and knell refuses it.
 - A refusal names the line number, never the token. A line written token first, `<token>:<beat>`, is refused for naming a beat not in `BEATS`.
 
@@ -124,7 +125,8 @@ knell refuses to start rather than run with a setting it cannot honor, because a
 - a `MISSING_REPEAT` that is not a Go duration, is negative, or is above `0` and below `10m`,
 - a `NODE_NAME` over 256 bytes,
 - an `ALLOWED_HOSTS` entry no `Host` could match,
-- a `BEAT_TOKENS` that is unset or empty, a line with no colon or naming a beat not in `BEATS`, a beat no line names, a token on two lines, more than 128 lines, or a token outside 16 to 512 bytes, wrapped in whitespace or carrying a forbidden control character,
+- a `BEAT_TOKENS` that is unset or empty, a line with no colon or naming a beat not in `BEATS`, a beat no line names, a token on two lines, or more than 128 lines,
+- a token outside 16 to 512 bytes, wrapped in whitespace, or carrying a forbidden control character, an invisible character or invalid UTF-8,
 - a `_FILE` variable that is set but unusable,
 - an `OPS_LISTEN_ADDR` on `LISTEN_ADDR`'s port,
 - a listen address it cannot bind.

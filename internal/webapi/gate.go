@@ -143,7 +143,7 @@ func (g *gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case verdictNone:
 		obs.RecordAuthFailure(obs.AuthInvalidToken)
 		// RFC 9110 §11.6.1: a 401 must name at least one challenge.
-		w.Header().Set("WWW-Authenticate", "Bearer")
+		httpserver.SetChallenge(w.Header(), httpserver.Challenge{Scheme: "Bearer"})
 		httpserver.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
 	case verdictNotCovered:
 		obs.RecordAuthFailure(obs.AuthBeatNotAllowed)

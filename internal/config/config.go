@@ -444,20 +444,6 @@ func resolveSecret(key envx.Key, setButEmpty, missing error) (string, envx.Secre
 	}
 }
 
-// beatTokenFitsHeader reports whether value can be carried verbatim in an
-// HTTP field value, assuming edge ASCII whitespace has already been refused.
-// HTTP permits SP, HTAB, visible ASCII and obs-text, and rejects every other
-// ASCII control byte and DEL.
-func beatTokenFitsHeader(value string) bool {
-	for i := range len(value) {
-		b := value[i]
-		if (b < ' ' && b != '\t') || b == 0x7f {
-			return false
-		}
-	}
-	return true
-}
-
 // errWebhookSetButEmpty is the refusal for a DISCORD_WEBHOOK_URL that is present
 // and carries no value: resolveSecret returns it for the present-but-empty
 // variable, and loadWebhook for a value with nothing visible left after the
