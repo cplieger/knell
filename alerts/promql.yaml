@@ -1,4 +1,4 @@
-# Recommended alert rules for knell, the PromQL half: six rules for
+# Recommended alert rules for knell, the PromQL half: eight rules for
 # Prometheus, or any ruler that reads Prometheus rules, and one commented rule
 # for several instances. alerts/logql.yaml is complementary: load both, each
 # into its own ruler.
@@ -67,17 +67,17 @@ groups:
       #   annotations:
       #     summary: "fewer than 2 knell instances see beat {{ $labels.beat }} on time"
 
-      # Scrapes can keep landing between the listener's accept retries, so `up`
-      # can stay 1 while pings are refused. The counter sees every failure.
+      # Scrapes reach the operations port, so `up` can stay 1 while the ping
+      # port fails to accept. The counter sees every ping-port failure.
       - alert: KnellAcceptFailing
         expr: increase(knell_listener_accept_errors_total[15m]) > 0
         for: 0m
         labels:
           severity: critical
         annotations:
-          summary: "knell on {{ $labels.instance }} cannot accept connections"
+          summary: "knell on {{ $labels.instance }}: the ping port cannot accept connections"
           description: >
-            The listener failed to accept a connection, so pings stop landing
+            The ping listener failed to accept a connection, so pings stop landing
             while the process stays up. Beats will report overdue while this
             lasts. Check the container's file-descriptor limit and the rate of
             incoming connections.
@@ -106,3 +106,34 @@ groups:
           severity: warning
         annotations:
           summary: "knell on {{ $labels.instance }} keeps restarting inside a beat deadline"
+
+      # Counts tokens knell checked and refused. A throttled 429 was charged to
+      # no window, so it counts only past a rate no retrying job reaches: a
+      # throttled request is still checked, and a guessing run replays there.
+      - alert: KnellAuthFailures
+        expr: >
+          sum without (reason) (increase(knell_auth_failures_total{reason=~"invalid_token|beat_not_allowed"}[15m])) > 15
+          or sum without (reason) (increase(knell_auth_failures_total{reason="throttled"}[15m])) > 1000
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "knell on {{ $labels.instance }} refused over 15 ping tokens in 15 minutes"
+          description: >
+            Several addresses are sending tokens knell does not have, or one
+            throttled address keeps sending them: guessing, a leaked token
+            trying other beats, or jobs on an old token.
+
+      # A valid ping answered 429 because its sender's address was throttled.
+      - alert: KnellPingsThrottled
+        expr: >
+          sum without (beat) (increase(knell_beats_recorded_while_throttled_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "knell on {{ $labels.instance }} answered valid pings with 429"
+          description: >
+            knell recorded these pings, but each sender saw a failure. Its
+            address shares failures with another client, a spray filled the
+            global limit, or someone guessed a token.

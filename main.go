@@ -1,8 +1,9 @@
 // Package main is the knell entry point: a dead-man switch that listens for
 // heartbeat pings and rings a Discord webhook when a beat falls silent.
 // main.go is the composition root plus what only the process boundary owns:
-// the `knell health` probe dispatch, the health verdict lifecycle, and
-// shutdown/exit-code classification; everything else lives in internal/*.
+// the two listeners, the `knell health` probe dispatch, the health verdict
+// lifecycle, and shutdown/exit-code classification; everything else lives in
+// internal/*.
 package main
 
 import (
@@ -27,10 +28,10 @@ import (
 	"github.com/cplieger/knell/internal/webapi"
 )
 
-// shutdownGrace bounds the whole stop sequence: pre-drain, request drain and
-// watch-loop teardown share this one budget. 8s rather than Docker's default
-// 10s stop timeout, so the "watch loop still running" WARN has time to flush
-// before SIGKILL.
+// shutdownGrace bounds the ping listener's stop: pre-drain, request drain and
+// watch-loop teardown share this one budget. With opsShutdownGrace after it,
+// the stop ends 1s inside Docker's default 10s stop timeout, so the "watch
+// loop still running" WARN has time to flush before SIGKILL.
 const shutdownGrace = 8 * time.Second
 
 // The three request bounds must each fit inside shutdownGrace with margin for
@@ -54,7 +55,7 @@ var loadConfig = config.Load
 func main() {
 	// The Docker healthcheck: the scratch image has no shell and no curl.
 	if len(os.Args) > 1 && os.Args[1] == "health" {
-		os.Exit(probeHealth(os.Stderr, config.ListenAddr(), healthProbeTimeout))
+		os.Exit(probeHealth(os.Stderr, config.OpsListenAddr(), healthProbeTimeout))
 	}
 
 	if err := run(os.Args[1:]); err != nil {
@@ -70,8 +71,12 @@ func main() {
 // a hung listener fails the check with a written reason instead of a kill.
 const healthProbeTimeout = 4 * time.Second
 
+// opsShutdownGrace bounds the operations listener's own drain, which starts
+// only once the ping listener's Run has returned, so it adds to shutdownGrace.
+const opsShutdownGrace = time.Second
+
 // notServingReason is what /healthz reports while the verdict is unhealthy:
-// before the listener is bound and from the start of a shutdown.
+// before the listeners are bound and from the start of a shutdown.
 const notServingReason = "knell is starting or shutting down"
 
 // errUnknownCommand is the usage error main exits 2 for; every other failure
@@ -118,23 +123,39 @@ func run(args []string) error {
 	watcher := watch.New(watchBeats(cfg.Beats, cfg.MissingRepeat), notifier, time.Now, processStart)
 	st := health.NewStatus()
 
+	limiter, err := webapi.NewLimiter(trustWindow(cfg.Beats))
+	if err != nil {
+		return fmt.Errorf("failure limiter: %w", err)
+	}
 	// The watcher is the single owner of beat admission, so the endpoint holds
 	// no lifecycle state and no context of its own.
-	handler := webapi.New(watcher, webapi.Deps{
-		Healthz:        healthzHandler(st),
-		BeatToken:      cfg.BeatToken,
+	srv := newServer(webapi.New(watcher, &webapi.Deps{
+		Tokens:         cfg.BeatTokens.Set,
+		Covers:         cfg.BeatTokens.Covers,
+		Beats:          beatIDs(cfg.Beats),
+		Limiter:        limiter,
 		Hosts:          cfg.AllowedHosts,
 		TrustedProxies: cfg.TrustedProxies,
-	})
-	srv := newServer(handler)
+	}))
+	opsSrv := newServer(webapi.NewOps(webapi.OpsDeps{
+		Healthz: healthzHandler(st),
+		Hosts:   cfg.AllowedHosts,
+	}))
 
-	// Bind up front so a port-in-use error surfaces synchronously.
-	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ListenAddr)
+	// Bind both up front so a port-in-use error surfaces synchronously, and
+	// before the verdict goes healthy.
+	lc := &net.ListenConfig{}
+	ln, err := lc.Listen(ctx, "tcp", cfg.ListenAddr)
 	if err != nil {
-		return classifyBindError(ctx, cfg.ListenAddr, err)
+		return classifyBindError(ctx, "LISTEN_ADDR", cfg.ListenAddr, err)
+	}
+	opsLn, err := lc.Listen(ctx, "tcp", cfg.OpsListenAddr)
+	if err != nil {
+		_ = ln.Close()
+		return classifyBindError(ctx, "OPS_LISTEN_ADDR", cfg.OpsListenAddr, err)
 	}
 	ln = countAcceptErrors(ln)
-	slog.Info("listening", "addr", ln.Addr().String())
+	slog.Info("listening", "addr", ln.Addr().String(), "ops_addr", opsLn.Addr().String())
 	st.Set(true)
 
 	watcherDone := make(chan struct{})
@@ -163,8 +184,45 @@ func run(args []string) error {
 	serveExit := httpserver.WithServeExit(func(exitCtx context.Context) {
 		watchLoopStopped = teardownAfterServeExit(exitCtx, srv, st, watcher.StopAccepting, stop, watcherDone)
 	})
-	err = httpserver.Run(ctx, srv, ln, httpserver.WithTeardown(onShutdown), httpserver.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
+	err = serveListeners(ctx, stop, srv, ln, opsSrv, opsLn,
+		httpserver.WithTeardown(onShutdown), httpserver.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
 	return classifyAbandonedWatchLoop(classifyServeError(err), watchLoopStopped)
+}
+
+// serveListeners serves srv on ln, with pingOpts, and opsSrv on opsLn until
+// ctx ends or either fails. The
+// operations listener outlives the ping listener's drain, so /healthz answers
+// 503 through it instead of refusing connections. If it stops on its own,
+// stop drains the ping listener as a signal would, and the joined error makes
+// knell exit non-zero for the restart policy.
+func serveListeners(ctx context.Context, stop context.CancelFunc, srv *http.Server, ln net.Listener, opsSrv *http.Server, opsLn net.Listener, pingOpts ...httpserver.RunOption) error {
+	opsCtx, stopOps := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopOps()
+	opsDone := make(chan error, 1)
+	go func() {
+		opsDone <- httpserver.Run(opsCtx, opsSrv, opsLn, httpserver.WithShutdownGrace(opsShutdownGrace),
+			httpserver.WithServeExit(func(context.Context) { stop() }))
+	}()
+	err := httpserver.Run(ctx, srv, ln, pingOpts...)
+	stopOps()
+	return errors.Join(err, classifyOpsError(opsLn.Addr().String(), <-opsDone))
+}
+
+// classifyOpsError turns the operations listener's outcome into run's own
+// contract. A probe or scrape still in flight at the end of opsShutdownGrace
+// is cut off and warned about, never an exit error: the ping listener has
+// already drained and the watch loop has stopped. Any other error is the
+// listener failing on its own, which exits non-zero naming its address.
+func classifyOpsError(addr string, err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, httpserver.ErrShutdownGraceExpired):
+		slog.Warn("operations listener requests were still in flight at the end of its shutdown grace and were cut off",
+			"ops_addr", addr, "grace", opsShutdownGrace.String())
+		return nil
+	}
+	return fmt.Errorf("operations listener on %s stopped: %w", addr, err)
 }
 
 func healthzHandler(st *health.Status) http.Handler {
@@ -207,12 +265,12 @@ func teardownAfterServeExit(exitCtx context.Context, srv *http.Server, st *healt
 // signal that arrives before the bind cancels the Listen itself, so
 // CausedByCancellation distinguishes that from a genuine bind failure (a port
 // conflict coinciding with a SIGTERM is still a port conflict).
-func classifyBindError(ctx context.Context, addr string, err error) error {
+func classifyBindError(ctx context.Context, key, addr string, err error) error {
 	if httpserver.CausedByCancellation(ctx, err) {
 		slog.Info("shutting down before the listener was bound")
 		return nil
 	}
-	return fmt.Errorf("binding %s: %w", addr, err)
+	return fmt.Errorf("binding %s %s: %w", key, addr, err)
 }
 
 // watchBeats translates the config DTOs into the watch package's own input
@@ -278,4 +336,28 @@ func logConfig(cfg *config.Config) {
 		slog.Info("watching beat", "beat", b.ID, "deadline", b.Deadline.String())
 	}
 	slog.LogAttrs(context.Background(), slog.LevelInfo, "configuration loaded", cfg.LogValue().Group()...)
+	// A wide posture is acceptable only while it says so at startup.
+	if !cfg.AllowedHosts.Active() {
+		slog.Warn("ALLOWED_HOSTS is unset, so knell answers every Host; set it to the names your jobs, probes and scraper use")
+	}
+}
+
+// trustWindow is how long a sender stays exempt from the global failure
+// window after its last recorded ping: two of the longest deadlines, so a
+// beat's own sender stays trusted between its pings.
+func trustWindow(beats []config.Beat) time.Duration {
+	var longest time.Duration
+	for _, b := range beats {
+		longest = max(longest, b.Deadline)
+	}
+	return 2 * longest
+}
+
+// beatIDs lists the configured beat ids.
+func beatIDs(beats []config.Beat) []string {
+	ids := make([]string, len(beats))
+	for i, b := range beats {
+		ids[i] = b.ID
+	}
+	return ids
 }

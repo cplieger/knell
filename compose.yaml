@@ -8,10 +8,12 @@ services:
     environment:
       BEATS: "cron-backup:26h,pipeline-watchdog:20m"  # one id:deadline pair per job you watch
       DISCORD_WEBHOOK_URL: "https://discord.com/"  # replace with your full Discord webhook URL, or knell refuses to start
-      BEAT_TOKEN: "CHANGEME"  # replace with the output of "openssl rand -hex 16", or knell refuses to start
+      BEAT_TOKENS: |  # one <beat>:<token> line per job, each token from "openssl rand -hex 16"; knell refuses to start until every beat has one
+        cron-backup:CHANGEME
+        pipeline-watchdog:CHANGEME-TOO
       NODE_NAME: "server-1"  # names this instance in every notice
 
     ports:
-      # /metrics needs no token and lists every beat. Publish this port only to a
-      # network you trust, see README "Security".
+      # Pings. Publish this port only to a network you trust, see README "Security".
+      # /healthz and /metrics stay unpublished on 9191: a scraper on this network reaches knell:9191.
       - "9190:9190"

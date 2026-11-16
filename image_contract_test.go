@@ -27,24 +27,29 @@ func dockerfileInstructions(t *testing.T) [][]string {
 	return out
 }
 
-// TestDockerfileExposesTheDefaultListenPort pins EXPOSE to the port knell
-// binds when LISTEN_ADDR is unset, so `docker run -P` and tools that read the
-// image's ports find the listener.
-func TestDockerfileExposesTheDefaultListenPort(t *testing.T) {
+// TestDockerfileExposesTheDefaultListenPorts pins EXPOSE to the two ports
+// knell binds when LISTEN_ADDR and OPS_LISTEN_ADDR are unset, so `docker run
+// -P` and tools that read the image's ports find both listeners.
+func TestDockerfileExposesTheDefaultListenPorts(t *testing.T) {
 	t.Setenv("LISTEN_ADDR", "")
-	_, port, err := net.SplitHostPort(config.ListenAddr())
-	if err != nil {
-		t.Fatalf("default LISTEN_ADDR: %v", err)
+	t.Setenv("OPS_LISTEN_ADDR", "")
+	var want []string
+	for _, addr := range []string{config.ListenAddr(), config.OpsListenAddr()} {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			t.Fatalf("default address %q: %v", addr, err)
+		}
+		want = append(want, port)
 	}
 	for _, f := range dockerfileInstructions(t) {
 		if f[0] == "EXPOSE" {
-			if !slices.Contains(f[1:], port) {
-				t.Errorf("EXPOSE lists %v, want the default listen port %s", f[1:], port)
+			if !slices.Equal(f[1:], want) {
+				t.Errorf("EXPOSE lists %v, want the default ping and operations ports %v", f[1:], want)
 			}
 			return
 		}
 	}
-	t.Errorf("Dockerfile has no EXPOSE, want EXPOSE %s", port)
+	t.Errorf("Dockerfile has no EXPOSE, want EXPOSE %v", want)
 }
 
 // TestDockerfileShipsNoTmp pins that the image writes nothing to disk: the

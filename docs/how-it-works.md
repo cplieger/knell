@@ -50,28 +50,28 @@ The webhook URL is treated as a credential. It never appears in a log line or an
 
 ## The endpoints
 
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /beat/{id}` | Records a ping when it carries `Authorization: Bearer <BEAT_TOKEN>`, and answers `{"ok":true}` |
-| `GET /healthz` | Liveness: `200 {"status":"ok"}` while the listener is up, `503 {"status":"unhealthy","reasons":[...]}` while knell shuts down. [Knowing the app is alive](monitoring.md#knowing-the-app-is-alive) has the details |
-| `GET /metrics` | Prometheus metrics |
+| Endpoint | Port | Purpose |
+| --- | --- | --- |
+| `POST /beat/{id}` | `9190` | Records a ping when it carries `Authorization: Bearer <token>` with a token whose `BEAT_TOKENS` line names the beat, and answers `{"ok":true}` |
+| `GET /healthz` | `9191` | Liveness: `200 {"status":"ok"}` while knell is serving, `503 {"status":"unhealthy","reasons":[...]}` while knell shuts down. [Knowing the app is alive](monitoring.md#knowing-the-app-is-alive) has the details |
+| `GET /metrics` | `9191` | Prometheus metrics |
 
 ### Answers a ping can get
 
 | Status | Meaning |
 | --- | --- |
 | `200` | The ping was recorded |
-| `401` | The token is missing or wrong |
-| `403` | The `Host` is not in `ALLOWED_HOSTS` |
+| `401` | The token is missing or matches no line of `BEAT_TOKENS` |
+| `403` | `beat_not_allowed`: the token is valid, but its line does not name this beat. `host_not_allowed`: the `Host` is not in `ALLOWED_HOSTS` |
 | `404` | The id is not in `BEATS`, or the URL has an empty, extra or repeated path segment |
 | `405` | Any method other than `POST` |
-| `429` | Too many pings with a wrong token, with a `Retry-After` hint |
+| `429` | The sender's address is throttled, after its own wrong tokens or because many addresses sent wrong tokens, with a `Retry-After` hint. A valid ping is still recorded |
 | `431` | The request headers are larger than 8704 bytes |
 | `503` | knell is shutting down |
 
 Only `POST` records. `GET` and `HEAD` are answered `405` and never feed the switch. Nothing that merely fetches a URL can keep a beat looking alive, such as a link preview, a crawler, an uptime prober or an image on a web page.
 
-Pings without a valid token share one throttle budget and get `429` once it is spent. That limits both guessing and the log lines a bad sender writes. A ping with the right token is never throttled, however many senders you run.
+An address that sends 10 wrong tokens within 15 minutes is throttled. Once all addresses together pass 60, every address is throttled except a sender whose ping was answered `200` recently and that has sent no wrong token in the last 15 minutes. A throttled address gets the same `429` whatever token it sends, so a guess is never confirmed. A valid ping behind that `429` is still recorded, so throttling never makes a beat look missing. [Security](hardening.md#failed-tokens) has the details.
 
 ### Request bodies and headers
 
@@ -81,7 +81,7 @@ Headers are limited the other way round, because knell must read them before it 
 
 ### Probe logging
 
-`/healthz` and `/metrics` are logged as machine probes, at `debug` whatever the status, so set `LOG_LEVEL=debug` to confirm a probe or scrape reaches knell. knell logs `health state changed` once each time its health verdict changes, and a failed scrape shows as `up` 0 in Prometheus. A scrape that never reaches knell produces no request log.
+`/healthz` and `/metrics` are logged as machine probes, at `debug` whatever the status. Set `LOG_LEVEL=debug` to confirm a probe or scrape reaches knell. knell logs `health state changed` once each time its health verdict changes, and a failed scrape shows as `up` 0 in Prometheus. A scrape that never reaches knell produces no request log.
 
 ## Several instances
 

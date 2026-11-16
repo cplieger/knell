@@ -62,7 +62,9 @@ func TestMintRefusalReasonsPremintsEveryReason(t *testing.T) {
 	want := []string{
 		`knell_pre_route_refusals_total{reason="non_canonical_beat_path"} 0`,
 		`knell_pre_route_refusals_total{reason="host_not_allowed"} 0`,
-		`knell_pre_route_refusals_total{reason="auth_throttled"} 0`,
+		`knell_auth_failures_total{reason="invalid_token"} 0`,
+		`knell_auth_failures_total{reason="beat_not_allowed"} 0`,
+		`knell_auth_failures_total{reason="throttled"} 0`,
 	}
 
 	// Before this test touches the counter: the real cold start, so it pins
@@ -71,11 +73,14 @@ func TestMintRefusalReasonsPremintsEveryReason(t *testing.T) {
 
 	// Keyed off refusalReasons so a new reason fails here until its cold-start
 	// line is added, rather than silently dropping out of the contract.
-	if len(want) != len(refusalReasons) {
-		t.Fatalf("want has %d lines for %d refusal reasons: add the new reason's cold-start line", len(want), len(refusalReasons))
+	if len(want) != len(refusalReasons)+len(authReasons) {
+		t.Fatalf("want has %d lines for %d refusal and %d auth reasons: add the new reason's cold-start line", len(want), len(refusalReasons), len(authReasons))
 	}
 	for _, reason := range refusalReasons {
 		preRouteRefusals.Delete(string(reason))
+	}
+	for _, reason := range authReasons {
+		authFailures.Delete(string(reason))
 	}
 
 	mintRefusalReasons()
@@ -308,7 +313,7 @@ func TestNotificationCountersAdvertiseTheKindListInTheirHelpText(t *testing.T) {
 // sample lines leaves the advertised list free to go stale, naming reasons that
 // no longer exist or omitting one that does.
 func TestPreRouteRefusalsAdvertiseTheReasonListInTheirHelpText(t *testing.T) {
-	const reasonList = "(non_canonical_beat_path, host_not_allowed, auth_throttled)"
+	const reasonList = "(non_canonical_beat_path, host_not_allowed)"
 	const name = "knell_pre_route_refusals_total"
 
 	help, ok := helpText(t, name)

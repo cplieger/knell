@@ -14,12 +14,18 @@ import (
 	"time"
 )
 
-// TestMain re-executes the test binary as knell itself when the re-exec
-// variable is set, so main()'s argv dispatch — which ends in os.Exit on every
-// branch — can be observed from a child process. Without the variable it just
-// runs the package's tests.
+// reexecMain is the first argument that turns this test binary into knell
+// itself. An argument, not an environment variable: `go test` never passes it,
+// so an ambient value cannot replace a test run with a boot.
+const reexecMain = "knell-test-reexec-main"
+
+// TestMain re-executes the test binary as knell itself when its first
+// argument is reexecMain, so main()'s argv dispatch, which ends in os.Exit on
+// every branch, can be observed from a child process. The sentinel is removed
+// before main() reads os.Args. Otherwise it just runs the package's tests.
 func TestMain(m *testing.M) {
-	if os.Getenv("KNELL_TEST_REEXEC_MAIN") == "1" {
+	if len(os.Args) > 1 && os.Args[1] == reexecMain {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
 		main()
 		return
 	}
@@ -27,7 +33,7 @@ func TestMain(m *testing.M) {
 }
 
 // childEnv builds the environment a re-executed knell child runs with: the
-// parent environment, the re-exec marker, and a pinned level -- several cases
+// parent environment and a pinned level -- several cases
 // use an INFO line ("listening") as the no-boot oracle, and an inherited
 // LOG_LEVEL=warn would filter it out whether or not the child booted. Each
 // entry from env is then applied: "KEY=" removes KEY from the child
@@ -37,7 +43,7 @@ func TestMain(m *testing.M) {
 // A caller's own LOG_LEVEL entry is appended after the pinned one and os/exec
 // keeps the last duplicate, so an explicit per-test level still wins.
 func childEnv(env []string) []string {
-	out := append(os.Environ(), "KNELL_TEST_REEXEC_MAIN=1", "LOG_LEVEL=info")
+	out := append(os.Environ(), "LOG_LEVEL=info")
 	for _, e := range env {
 		if key, val, _ := strings.Cut(e, "="); val == "" {
 			out = slices.DeleteFunc(out, func(entry string) bool {
@@ -56,18 +62,24 @@ func childEnv(env []string) []string {
 // test failing at the config gate while its sibling reaches the gate it means
 // to exercise -- the CLI half of main_test.go's installRunEnv.
 func bootEnv(beats, addr string) []string {
+	return bootEnvOps(beats, addr, "127.0.0.1:0")
+}
+
+// bootEnvOps is bootEnv with the operations address chosen by the caller.
+func bootEnvOps(beats, addr, opsAddr string) []string {
 	env := []string{
 		"BEATS=" + beats,
 		"DISCORD_WEBHOOK_URL=" + testWebhookURL,
 		"LISTEN_ADDR=" + addr,
+		"OPS_LISTEN_ADDR=" + opsAddr,
 	}
 	for _, key := range secretEnvKeys {
 		env = append(env, key+"=")
 	}
-	// After the clearing sweep, because BEAT_TOKEN is in it: the token is
-	// REQUIRED, so a child that cleared it exits at the configuration gate
+	// After the clearing sweep, because BEAT_TOKENS is in it: the tokens are
+	// REQUIRED, so a child that cleared them exits at the configuration gate
 	// instead of booting.
-	env = append(env, "BEAT_TOKEN="+testBeatToken)
+	env = append(env, "BEAT_TOKENS="+beatTokensFor(beats, testBeatToken))
 	return env
 }
 
@@ -84,7 +96,7 @@ func runMain(t *testing.T, env []string, args ...string) (int, string) {
 	// t.Context() is already cancelled by the time Cleanups run.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
-	cmd := exec.CommandContext(ctx, os.Args[0], args...)
+	cmd := exec.CommandContext(ctx, os.Args[0], append([]string{reexecMain}, args...)...)
 	cmd.Env = childEnv(env)
 	out, err := cmd.CombinedOutput()
 	var exitErr *exec.ExitError
@@ -99,18 +111,19 @@ func runMain(t *testing.T, env []string, args ...string) (int, string) {
 	}
 }
 
-// servingKnell is one knell child that has reported a bound listener: the
-// process, the address it bound, the lines read so far, and the scanner the
-// caller drains after signalling it.
+// servingKnell is one knell child that has reported its bound listeners: the
+// process, the ping and operations addresses it bound, the lines read so far,
+// and the scanner the caller drains after signalling it.
 type servingKnell struct {
 	cmd     *exec.Cmd
 	scanner *bufio.Scanner
 	lines   []string
 	addr    string
+	opsAddr string
 }
 
 // startServingKnell re-executes this test binary as knell with env and blocks
-// until it logs a bound listener, whose address it records. Both CLI boot tests
+// until it logs its bound listeners, whose addresses it records. Both CLI boot tests
 // need the identical boot, and a second copy of it drifts from bootEnv's
 // contract and from the "msg=listening addr=" line the oracles parse -- a
 // reworded listening line would then be fixed in one copy and hang the other
@@ -126,7 +139,7 @@ func startServingKnell(t *testing.T, env []string) *servingKnell {
 	// registered as a Cleanup, by which point t.Context() is already cancelled.
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)
-	cmd := exec.CommandContext(ctx, os.Args[0])
+	cmd := exec.CommandContext(ctx, os.Args[0], reexecMain)
 	cmd.Env = childEnv(env)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -142,25 +155,28 @@ func startServingKnell(t *testing.T, env []string) *servingKnell {
 		line := child.scanner.Text()
 		child.lines = append(child.lines, line)
 		if _, rest, found := strings.Cut(line, "msg=listening addr="); found {
-			if fields := strings.Fields(rest); len(fields) > 0 {
-				child.addr = fields[0]
+			if fields := strings.Fields(rest); len(fields) > 1 {
+				if ops, ok := strings.CutPrefix(fields[1], "ops_addr="); ok {
+					child.addr, child.opsAddr = fields[0], ops
+				}
 			}
 			break
 		}
 	}
-	if child.addr == "" {
+	if child.addr == "" || child.opsAddr == "" {
 		t.Fatalf("knell never reported a bound listener; log:\n%s", strings.Join(child.lines, "\n"))
 	}
 	return child
 }
 
 // TestHealthSubcommandAsksTheListenerWithoutBooting pins the Docker
-// healthcheck contract: `knell health` GETs /healthz on LISTEN_ADDR's port, on
-// loopback or on the one address LISTEN_ADDR names, exits with that verdict,
-// and never falls through into the server.
+// healthcheck contract: `knell health` GETs /healthz on OPS_LISTEN_ADDR's
+// port, on loopback or on the one address OPS_LISTEN_ADDR names, exits with
+// that verdict, and never falls through into the server. LISTEN_ADDR's port
+// serves no /healthz, so a probe aimed there fails.
 func TestHealthSubcommandAsksTheListenerWithoutBooting(t *testing.T) {
 	t.Run("nothing listening", func(t *testing.T) {
-		code, out := runMain(t, []string{"LISTEN_ADDR=" + unusedLoopbackAddr(t)}, "health")
+		code, out := runMain(t, []string{"OPS_LISTEN_ADDR=" + unusedLoopbackAddr(t)}, "health")
 		if code != 1 {
 			t.Errorf("knell health with no listener = exit %d, want 1: %s", code, out)
 		}
@@ -170,15 +186,22 @@ func TestHealthSubcommandAsksTheListenerWithoutBooting(t *testing.T) {
 	})
 
 	t.Run("serving knell", func(t *testing.T) {
-		addr := unusedLoopbackAddr(t)
-		startServingKnell(t, bootEnv("cli-health-probe:1m", addr))
-		_, port, err := net.SplitHostPort(addr)
+		addr, opsAddr := unusedLoopbackAddr(t), unusedLoopbackAddr(t)
+		startServingKnell(t, bootEnvOps("cli-health-probe:1m", addr, opsAddr))
+		_, port, err := net.SplitHostPort(opsAddr)
+		if err != nil {
+			t.Fatalf("split %q: %v", opsAddr, err)
+		}
+		code, out := runMain(t, []string{"OPS_LISTEN_ADDR=:" + port}, "health")
+		if code != 0 {
+			t.Errorf("knell health against a serving knell = exit %d, want 0: %s", code, out)
+		}
+		_, pingPort, err := net.SplitHostPort(addr)
 		if err != nil {
 			t.Fatalf("split %q: %v", addr, err)
 		}
-		code, out := runMain(t, []string{"LISTEN_ADDR=:" + port}, "health")
-		if code != 0 {
-			t.Errorf("knell health against a serving knell = exit %d, want 0: %s", code, out)
+		if code, out := runMain(t, []string{"OPS_LISTEN_ADDR=:" + pingPort}, "health"); code != 1 {
+			t.Errorf("knell health aimed at the ping port = exit %d, want 1: /healthz is served only on the operations port: %s", code, out)
 		}
 	})
 }
@@ -272,9 +295,9 @@ func TestConfiguredLogLevelReachesTheRunningProcess(t *testing.T) {
 	// LOG_LEVEL=debug is appended AFTER childEnv's pinned info and os/exec keeps
 	// the last duplicate, so it is the variable under test.
 	child := startServingKnell(t, append(bootEnv("cli-log-level:1m", "127.0.0.1:0"), "LOG_LEVEL=debug"))
-	cmd, addr, lines, scanner := child.cmd, child.addr, child.lines, child.scanner
+	cmd, opsAddr, lines, scanner := child.cmd, child.opsAddr, child.lines, child.scanner
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/healthz", nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+opsAddr+"/healthz", nil)
 	if err != nil {
 		t.Fatalf("building the healthz request: %v", err)
 	}
@@ -317,8 +340,8 @@ func TestRejectedConfigExitsOneWithoutLeakingTheWebhook(t *testing.T) {
 		"BEATS=api:20m",
 		"DISCORD_WEBHOOK_URL=" + testPlainHTTPWebhookURL,
 		"DISCORD_WEBHOOK_URL_FILE=",
-		"BEAT_TOKEN=",
-		"BEAT_TOKEN_FILE=",
+		"BEAT_TOKENS=",
+		"BEAT_TOKENS_FILE=",
 	})
 	if code != 1 {
 		t.Errorf("knell with a plain-http webhook = exit %d, want 1: %s", code, out)

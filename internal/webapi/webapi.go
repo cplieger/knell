@@ -1,6 +1,7 @@
-// Package webapi assembles knell's HTTP surface: the beat ingestion
-// endpoint, the health endpoint, and Prometheus metrics, wrapped in the
-// standard middleware stack.
+// Package webapi assembles knell's two HTTP surfaces, each wrapped in the
+// standard middleware stack: the ping listener's beat ingestion endpoint
+// (New), and the operations listener's health endpoint and Prometheus
+// metrics (NewOps).
 package webapi
 
 import (
@@ -28,9 +29,7 @@ const loggedPathCap = 128
 // under.
 const bearerPrefix = "Bearer "
 
-// beatRoutePattern is the one spelling of the recording route: what New
-// registers and what the failed-auth throttle compares the mux's own verdict
-// against. Do not inline it at either site.
+// beatRoutePattern is the recording route.
 const beatRoutePattern = "POST /beat/{id}"
 
 // Beater records pings. Implemented by watch.Watcher.
@@ -41,34 +40,52 @@ type Beater interface {
 	Beat(id string) watch.BeatOutcome
 }
 
-// Deps carries what the composition root supplies, named rather than
-// positional because the four are otherwise indistinguishable at a call site.
+// Deps carries what the composition root supplies to the ping listener.
 type Deps struct {
-	// Healthz answers liveness.
-	Healthz http.Handler
 	// Hosts is the exact-match Host allowlist (ALLOWED_HOSTS). An inactive
-	// policy accepts every Host; an active one is what breaks DNS rebinding,
-	// since BeatToken gates the beat route only.
+	// policy accepts every Host; an active one is what breaks DNS rebinding.
 	Hosts *httpserver.HostPolicy
-	// BeatToken is the required bearer credential for POST /beat/{id}. An empty
-	// value fails CLOSED and every ping is refused, rather than opening a mode.
-	BeatToken string
+	// Tokens are the configured beat tokens, and Covers[i] the beat ids token
+	// i may ping. The zero TokenSet matches nothing, so every ping is refused.
+	Tokens httpserver.TokenSet
+	Covers [][]string
+	// Beats are the configured beat ids, so a covered verdict always names
+	// one.
+	Beats []string
+	// Limiter bounds failed tokens per client and across clients
+	// (NewLimiter). Required.
+	Limiter *httpserver.FailureLimiter
 	// TrustedProxies is the reverse-proxy CIDR set client_ip is resolved
 	// against. Empty honors no X-Forwarded-For, the spoof-proof default.
 	TrustedProxies []netip.Prefix
 }
 
-// New assembles the routed and middleware-wrapped root handler. The beat
-// endpoint keeps no lifecycle state of its own: watch.Watcher decides
-// admission under the mutex that guards the beat mutation. Only the beat
-// endpoint refuses during the drain; /healthz and /metrics keep serving.
-func New(b Beater, deps Deps) http.Handler {
+// OpsDeps carries what the composition root supplies to the operations
+// listener.
+type OpsDeps struct {
+	// Healthz answers liveness.
+	Healthz http.Handler
+	// Hosts is the same ALLOWED_HOSTS policy the ping listener applies.
+	Hosts *httpserver.HostPolicy
+}
+
+// New assembles the ping listener's handler: the /beat routes only, so
+// /healthz and /metrics answer 404 there. The beat endpoint keeps no
+// lifecycle state of its own: watch.Watcher decides admission under the
+// mutex that guards the beat mutation.
+func New(b Beater, deps *Deps) http.Handler {
 	mux := http.NewServeMux()
 	// POST is the only method that records: a recording GET is reachable from
 	// a link preview or crawler and would re-arm the switch with no heartbeat
 	// behind it.
-	verifier := beatTokenVerifier(deps.BeatToken)
-	mux.HandleFunc(beatRoutePattern, beatHandler(b, verifier))
+	beats := make(map[string]bool, len(deps.Beats))
+	for _, id := range deps.Beats {
+		beats[id] = true
+	}
+	mux.Handle(beatRoutePattern, &gate{
+		beater: b, tokens: deps.Tokens, covers: deps.Covers, beats: beats,
+		limiter: deps.Limiter, trusted: deps.TrustedProxies,
+	})
 	mux.HandleFunc("/beat/{id}", writeMethodNotAllowed)
 	// The /beat spellings a misconfigured sender URL produces. Without a route
 	// they fall to net/http's own 404 -- or, for the bare path, a 307, a
@@ -76,24 +93,17 @@ func New(b Beater, deps Deps) http.Handler {
 	mux.HandleFunc("/beat", writeUnknownBeat)
 	mux.HandleFunc("/beat/{$}", writeUnknownBeat)
 	mux.HandleFunc("/beat/{id}/{rest...}", writeUnknownBeat)
-	mux.Handle("GET /healthz", deps.Healthz)
-	mux.Handle("GET /metrics", obs.Handler())
 
 	return httpserver.Chain(mux,
 		httpserver.SecurityHeaders(),
 		httpserver.NoStore(),
-		// Outermost among the refusing middleware, ahead of the access logger:
-		// a request with no valid beat token is answered 429 without reaching
-		// Logging, so a guessing run cannot flood the log.
-		beatAuthFailureLimiter(mux, verifier),
-		// /healthz and /metrics log at Debug: the health verdict logs its own
-		// changes, and a failed scrape shows as up == 0. WithRecordRouteMetric is
-		// the only place a refused ping (401/404/405/503) becomes visible to a
-		// scrape, since none reach beatsReceived. The throttle's 429 is counted
-		// on the pre-route counter instead, outside this wrapper.
+		// WithRecordRouteMetric is the only scrape view of a 404, 405 or 503
+		// ping; refused tokens also move knell_auth_failures_total.
 		httpserver.Logging(
-			httpserver.WithProbeLogLevel("/healthz", "/metrics"),
 			httpserver.WithMaxLoggedPath(loggedPathCap),
+			// A throttled client gets no Info line per attempt, so a guessing
+			// run past its limit cannot flood the log.
+			httpserver.WithLogLevel(throttledAtDebug),
 			// Empty unless TRUSTED_PROXIES is set: trusting a forwarded header
 			// with no proxy in front is how the field becomes spoofable.
 			httpserver.WithClientIP(deps.TrustedProxies...),
@@ -102,9 +112,6 @@ func New(b Beater, deps Deps) http.Handler {
 			}),
 		),
 		httpserver.Recoverer(),
-		// The /metrics text exposition is the only body that reaches Gzip's
-		// 1 KiB floor; the JSON envelopes and probe answers stay under it.
-		httpserver.Gzip(httpserver.WithGzipTypes("text/plain")),
 		// Immediately outside the Host policy, so a pre-route 403 collapses
 		// onto the "unmatched" label.
 		countHostRefusals(deps.Hosts),
@@ -112,6 +119,34 @@ func New(b Beater, deps Deps) http.Handler {
 		// Inside the Host policy, so a refused Host is refused as a Host (403)
 		// and not as an unknown beat.
 		canonicalBeatPath,
+	)
+}
+
+// NewOps assembles the operations listener's handler: GET /healthz and GET
+// /metrics, behind the same Host policy as the ping listener, with no
+// credential, since the docker healthcheck and the scraper carry none.
+func NewOps(deps OpsDeps) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("GET /healthz", deps.Healthz)
+	mux.Handle("GET /metrics", obs.Handler())
+	return httpserver.Chain(mux,
+		httpserver.SecurityHeaders(),
+		httpserver.NoStore(),
+		// Debug whatever the status: the health verdict logs its own changes,
+		// and a failed scrape shows as up == 0.
+		httpserver.Logging(
+			httpserver.WithProbeLogLevel("/healthz", "/metrics"),
+			httpserver.WithMaxLoggedPath(loggedPathCap),
+			httpserver.WithRecordRouteMetric(func(m httpserver.RequestMetric) {
+				obs.RecordHTTP(m.Method, m.Path, m.Status, m.Latency)
+			}),
+		),
+		httpserver.Recoverer(),
+		// The /metrics text exposition is the only body that reaches Gzip's
+		// 1 KiB floor.
+		httpserver.Gzip(httpserver.WithGzipTypes("text/plain")),
+		countHostRefusals(deps.Hosts),
+		deps.Hosts.Middleware(),
 	)
 }
 
@@ -171,55 +206,12 @@ func drainBeatBody(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// beatTokenVerifier builds the constant-time verifier for the beat gate over
-// the whole expected field value, once and outside the request path.
-func beatTokenVerifier(token string) httpserver.StaticTokenVerifier {
-	if token == "" {
-		return httpserver.StaticTokenVerifier{}
+// throttledAtDebug logs a 429 at Debug and every other request at Info.
+func throttledAtDebug(_ *http.Request, status int) slog.Level {
+	if status == http.StatusTooManyRequests {
+		return slog.LevelDebug
 	}
-	return httpserver.NewStaticTokenVerifier(bearerPrefix + token)
-}
-
-// presentsValidBeatToken reports whether r carries the configured beat
-// credential. Shared by the handler's gate and the throttle's predicate so the
-// two cannot drift apart.
-func presentsValidBeatToken(verifier httpserver.StaticTokenVerifier, r *http.Request) bool {
-	return verifier.Verify(r.Header.Get("Authorization"))
-}
-
-// failedBeatAuth reports whether r is a failed authentication on the beat
-// endpoint: the exact class the throttle bounds. The endpoint half of that
-// verdict is read from the router (mux.Handler), never modeled independently,
-// so no local unescaping logic can drift from net/http's own. A non-canonical
-// spelling still draws a token: over-inclusion is harmless, under-inclusion is
-// a bypass.
-func failedBeatAuth(mux *http.ServeMux, verifier httpserver.StaticTokenVerifier, r *http.Request) bool {
-	_, pattern := mux.Handler(r)
-	return pattern == beatRoutePattern && !presentsValidBeatToken(verifier, r)
-}
-
-// beatAuthFailureLimiter throttles failed authentication on the beat endpoint
-// through one shared httpserver.FailedAuthRateLimit bucket, so a valid ping is
-// never throttled. The bucket is deliberately aggregate, with no per-client
-// identity: it caps the total failed-auth rate and the one-line-per-attempt
-// log flood, and per-client fairness would need a trusted identity knell does
-// not have.
-func beatAuthFailureLimiter(mux *http.ServeMux, verifier httpserver.StaticTokenVerifier) httpserver.Middleware {
-	limit := httpserver.FailedAuthRateLimit(nil, "too many failed beat token attempts")
-	return func(next http.Handler) http.Handler {
-		limited := limit(next)
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !failedBeatAuth(mux, verifier, r) {
-				next.ServeHTTP(w, r)
-				return
-			}
-			recorder := httpserver.NewStatusRecorder(w)
-			limited.ServeHTTP(recorder, r)
-			if recorder.Status() == http.StatusTooManyRequests {
-				obs.RecordPreRouteRefusal(obs.RefusalAuthThrottled)
-			}
-		})
-	}
+	return slog.LevelInfo
 }
 
 // countHostRefusals counts an ALLOWED_HOSTS refusal by reason, reading the
@@ -247,43 +239,5 @@ func HostPolicyOptions() []httpserver.HostAllowlistOption {
 		httpserver.WithLoopbackExempt(true),
 		httpserver.WithHostAllowlistError(httpserver.ErrorCode(obs.RefusalHostNotAllowed),
 			"host not allowed. Add it to ALLOWED_HOSTS to serve this hostname"),
-	}
-}
-
-// beatHandler records a ping and answers {"ok":true}, or 404 for an id that is
-// not configured. Unknown ids are never recorded or counted.
-func beatHandler(b Beater, verifier httpserver.StaticTokenVerifier) http.HandlerFunc {
-	record := beatRecorder(b)
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Authorize before touching the body, so a rejected sender cannot hold
-		// the handler open by trickling a payload.
-		if !presentsValidBeatToken(verifier, r) {
-			// RFC 9110 §11.6.1: a 401 must name at least one challenge.
-			w.Header().Set("WWW-Authenticate", "Bearer")
-			httpserver.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
-			return
-		}
-		record(w, r)
-	}
-}
-
-// beatRecorder builds the recording half of the beat endpoint: the body
-// drain, watcher admission and the unknown-id 404.
-func beatRecorder(b Beater) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		drainBeatBody(w, r)
-		id := r.PathValue("id")
-		// Beat decides admission under the mutex guarding the state change, so
-		// a ping arriving during the drain gets its verdict on the far side of
-		// the read.
-		switch b.Beat(id) {
-		case watch.BeatClosed:
-			httpserver.WriteError(w, r, http.StatusServiceUnavailable, "shutting_down",
-				"knell is shutting down and is no longer accepting beats")
-		case watch.BeatUnknown:
-			writeUnknownBeat(w, r)
-		case watch.BeatRecorded:
-			httpserver.OK(w)
-		}
 	}
 }

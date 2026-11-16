@@ -9,7 +9,7 @@ tests:
   - name: an accept failure pages for the 15 minutes it stays in the window
     interval: 1m
     input_series:
-      - series: 'knell_listener_accept_errors_total{job="knell", instance="knell:9190"}'
+      - series: 'knell_listener_accept_errors_total{job="knell", instance="knell:9191"}'
         values: "0 0 1 1x30"
     alert_rule_test:
       - eval_time: 1m
@@ -21,11 +21,11 @@ tests:
           - exp_labels:
               severity: critical
               job: knell
-              instance: knell:9190
+              instance: knell:9191
             exp_annotations:
-              summary: "knell on knell:9190 cannot accept connections"
+              summary: "knell on knell:9191: the ping port cannot accept connections"
               description: >
-                The listener failed to accept a connection, so pings stop
+                The ping listener failed to accept a connection, so pings stop
                 landing while the process stays up. Beats will report overdue
                 while this lasts. Check the container's file-descriptor limit
                 and the rate of incoming connections.
@@ -36,7 +36,7 @@ tests:
   - name: a listener with no failures never pages
     interval: 1m
     input_series:
-      - series: 'knell_listener_accept_errors_total{job="knell", instance="knell:9190"}'
+      - series: 'knell_listener_accept_errors_total{job="knell", instance="knell:9191"}'
         values: "0x30"
     alert_rule_test:
       - eval_time: 30m
@@ -46,7 +46,7 @@ tests:
   - name: a failing scrape pages after 15 minutes
     interval: 1m
     input_series:
-      - series: 'up{job="knell", instance="knell:9190"}'
+      - series: 'up{job="knell", instance="knell:9191"}'
         values: "1 0x20"
     alert_rule_test:
       - eval_time: 10m
@@ -58,7 +58,7 @@ tests:
           - exp_labels:
               severity: critical
               job: knell
-              instance: knell:9190
+              instance: knell:9191
             exp_annotations:
               summary: "knell is not being scraped successfully"
               description: >
@@ -92,7 +92,7 @@ tests:
   - name: an overdue beat pages after 5 minutes
     interval: 1m
     input_series:
-      - series: 'knell_beat_fresh{job="knell", instance="knell:9190", beat="backup"}'
+      - series: 'knell_beat_fresh{job="knell", instance="knell:9191", beat="backup"}'
         values: "1 0x10"
     alert_rule_test:
       - eval_time: 4m
@@ -104,10 +104,10 @@ tests:
           - exp_labels:
               severity: warning
               job: knell
-              instance: knell:9190
+              instance: knell:9191
               beat: backup
             exp_annotations:
-              summary: "beat backup is overdue on knell:9190"
+              summary: "beat backup is overdue on knell:9191"
               description: >
                 In the healthy case this repeats knell's own Discord notice. It
                 exists for a wedged sender or a Discord outage, so route it to
@@ -234,3 +234,276 @@ tests:
               beat: backup
             exp_annotations:
               summary: "fewer than 2 knell instances see beat backup on time"
+
+  # The dashboard's Requests by status and Notices sent queries, with $instance and a 1m or 5m slot filled in.
+  # TestDashboardQueriesAreTheTestedOnes fails when these differ from the dashboard.
+  - name: 'Requests by status: a slot one scrape long counts the requests made in it'
+    interval: 1m
+    input_series:
+      - series: 'knell_http_requests_total{job="knell", instance="knell:9191", method="POST", path="/beat/{id}", status="200"}'
+        values: '0x10 1 3x10'
+    promql_expr_test:
+      - expr: &requests_by_status 'sum by (status) (((knell_http_requests_total{instance="knell:9191"} - knell_http_requests_total{instance="knell:9191"} offset 1m) unless ((min_over_time(knell_http_requests_total{instance="knell:9191"}[1m]) < knell_http_requests_total{instance="knell:9191"} offset 1m) or (resets(knell_http_requests_total{instance="knell:9191"}[1m]) > 0))) or (knell_http_requests_total{instance="knell:9191"} and ((min_over_time(knell_http_requests_total{instance="knell:9191"}[1m]) < knell_http_requests_total{instance="knell:9191"} offset 1m) or (resets(knell_http_requests_total{instance="knell:9191"}[1m]) > 0))) or (knell_http_requests_total{instance="knell:9191"} - min_over_time(knell_http_requests_total{instance="knell:9191"}[1m])))'
+        eval_time: 11m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 1
+      - expr: *requests_by_status
+        eval_time: 12m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 2
+      - expr: *requests_by_status
+        eval_time: 14m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 0
+  - name: 'Requests by status: knells that share the instance add up'
+    interval: 1m
+    input_series:
+      - series: 'knell_http_requests_total{job="knell", instance="knell:9191", method="POST", path="/beat/{id}", status="200", hostname="a"}'
+        values: '0x10 1x10'
+      - series: 'knell_http_requests_total{job="knell", instance="knell:9191", method="POST", path="/beat/{id}", status="200", hostname="b"}'
+        values: '0x10 2x10'
+    promql_expr_test:
+      - expr: *requests_by_status
+        eval_time: 11m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 3
+  - name: 'Requests by status: a knell restart counts the new total, not the drop from the old one'
+    interval: 1m
+    input_series:
+      - series: 'knell_http_requests_total{job="knell", instance="knell:9191", method="POST", path="/beat/{id}", status="200"}'
+        values: '3x10 1x10'
+    promql_expr_test:
+      - expr: *requests_by_status
+        eval_time: 11m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 1
+  - name: 'Requests by status: a series first seen counts the growth inside the slot, not its whole total'
+    interval: 1m
+    input_series:
+      - series: 'knell_http_requests_total{job="knell", instance="knell:9191", method="POST", path="/beat/{id}", status="200"}'
+        values: '_x11 7 8x10'
+    promql_expr_test:
+      - expr: *requests_by_status
+        eval_time: 11m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 0
+      - expr: *requests_by_status
+        eval_time: 12m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 1
+  - name: 'Requests by status: a failed scrape draws no false spike'
+    interval: 1m
+    input_series:
+      - series: 'knell_http_requests_total{job="knell", instance="knell:9191", method="POST", path="/beat/{id}", status="200"}'
+        values: '4x10 stale 4x10'
+    promql_expr_test:
+      - expr: *requests_by_status
+        eval_time: 12m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 0
+  - name: 'Requests by status: a failed scrape at the start of a slot can show fewer than happened'
+    interval: 1m
+    input_series:
+      - series: 'knell_http_requests_total{job="knell", instance="knell:9191", method="POST", path="/beat/{id}", status="200"}'
+        values: '0x4 stale 1x10'
+    promql_expr_test:
+      - expr: *requests_by_status
+        eval_time: 6m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 0
+  - name: 'Requests by status: a scrape outage that leaves no stale marker can show more than happened'
+    interval: 1m
+    input_series:
+      - series: 'knell_http_requests_total{job="knell", instance="knell:9191", method="POST", path="/beat/{id}", status="200"}'
+        values: '0x4 _ _ 3x3'
+    promql_expr_test:
+      - expr: *requests_by_status
+        eval_time: 7m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 3
+  - name: 'Requests by status: a knell restart whose counter climbs back to the slot-start value counts the new total'
+    interval: 1m
+    input_series:
+      - series: 'knell_http_requests_total{job="knell", instance="knell:9191", method="POST", path="/beat/{id}", status="200"}'
+        values: '4x5 0 1 2 3 4 5 6'
+    promql_expr_test:
+      - expr: &requests_by_status_5m 'sum by (status) (((knell_http_requests_total{instance="knell:9191"} - knell_http_requests_total{instance="knell:9191"} offset 5m) unless ((min_over_time(knell_http_requests_total{instance="knell:9191"}[5m]) < knell_http_requests_total{instance="knell:9191"} offset 5m) or (resets(knell_http_requests_total{instance="knell:9191"}[5m]) > 0))) or (knell_http_requests_total{instance="knell:9191"} and ((min_over_time(knell_http_requests_total{instance="knell:9191"}[5m]) < knell_http_requests_total{instance="knell:9191"} offset 5m) or (resets(knell_http_requests_total{instance="knell:9191"}[5m]) > 0))) or (knell_http_requests_total{instance="knell:9191"} - min_over_time(knell_http_requests_total{instance="knell:9191"}[5m])))'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 4
+  - name: 'Requests by status: a slot five scrapes long counts every request made in it'
+    interval: 1m
+    input_series:
+      - series: 'knell_http_requests_total{job="knell", instance="knell:9191", method="POST", path="/beat/{id}", status="200"}'
+        values: '0x5 1+1x10'
+    promql_expr_test:
+      - expr: *requests_by_status_5m
+        eval_time: 10m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 5
+  - name: 'Requests by status: a missed scrape inside a slot counts only the requests made in it'
+    interval: 1m
+    input_series:
+      - series: 'knell_http_requests_total{job="knell", instance="knell:9191", method="POST", path="/beat/{id}", status="200"}'
+        values: '3x5 _ 3 4x5'
+    promql_expr_test:
+      - expr: *requests_by_status_5m
+        eval_time: 10m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 1
+  - name: 'Requests by status: a knell restart after a failed scrape at the start of a slot counts the new total'
+    interval: 1m
+    input_series:
+      - series: 'knell_http_requests_total{job="knell", instance="knell:9191", method="POST", path="/beat/{id}", status="200"}'
+        values: '5x4 stale 3 4 stale 1 2 2'
+    promql_expr_test:
+      - expr: *requests_by_status_5m
+        eval_time: 10m
+        exp_samples:
+          - labels: '{status="200"}'
+            value: 2
+  - name: 'Notices sent: each kind counts the notices every knell on the instance sent in the slot'
+    interval: 1m
+    input_series:
+      - series: 'knell_notifications_sent_total{job="knell", instance="knell:9191", kind="missing", hostname="a"}'
+        values: '0x10 1x10'
+      - series: 'knell_notifications_sent_total{job="knell", instance="knell:9191", kind="missing", hostname="b"}'
+        values: '0x10 1x10'
+      - series: 'knell_notifications_sent_total{job="knell", instance="knell:9191", kind="recovered", hostname="a"}'
+        values: '0x11 1x9'
+      - series: 'knell_notifications_sent_total{job="knell", instance="knell:9191", kind="history", hostname="a"}'
+        values: '0x21'
+    promql_expr_test:
+      - expr: &notices_sent 'label_replace(label_replace(label_replace(sum by (kind) (((knell_notifications_sent_total{instance="knell:9191"} - knell_notifications_sent_total{instance="knell:9191"} offset 1m) unless ((min_over_time(knell_notifications_sent_total{instance="knell:9191"}[1m]) < knell_notifications_sent_total{instance="knell:9191"} offset 1m) or (resets(knell_notifications_sent_total{instance="knell:9191"}[1m]) > 0))) or (knell_notifications_sent_total{instance="knell:9191"} and ((min_over_time(knell_notifications_sent_total{instance="knell:9191"}[1m]) < knell_notifications_sent_total{instance="knell:9191"} offset 1m) or (resets(knell_notifications_sent_total{instance="knell:9191"}[1m]) > 0))) or (knell_notifications_sent_total{instance="knell:9191"} - min_over_time(knell_notifications_sent_total{instance="knell:9191"}[1m]))), "kind", "Missing", "kind", "missing"), "kind", "Recovered", "kind", "recovered"), "kind", "History", "kind", "history")'
+        eval_time: 11m
+        exp_samples:
+          - labels: '{kind="Missing"}'
+            value: 2
+          - labels: '{kind="Recovered"}'
+            value: 0
+          - labels: '{kind="History"}'
+            value: 0
+      - expr: *notices_sent
+        eval_time: 12m
+        exp_samples:
+          - labels: '{kind="Missing"}'
+            value: 0
+          - labels: '{kind="Recovered"}'
+            value: 1
+          - labels: '{kind="History"}'
+            value: 0
+
+  - name: one address at its failure limit stays quiet, two addresses fire
+    interval: 1m
+    input_series:
+      # One key can be charged 10 times per 15 minutes: 10 here, then two
+      # failures a minute from several keys.
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="invalid_token"}'
+        values: '0+0x3 1+1x9 10+0x6 12+2x14'
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="beat_not_allowed"}'
+        values: '0+0x40'
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="throttled"}'
+        values: '0+50x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: KnellAuthFailures
+        exp_alerts: []
+      - eval_time: 34m
+        alertname: KnellAuthFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: knell
+              instance: knell:9191
+            exp_annotations:
+              summary: "knell on knell:9191 refused over 15 ping tokens in 15 minutes"
+              description: >
+                Several addresses are sending tokens knell does not have, or one
+                throttled address keeps sending them: guessing, a leaked token
+                trying other beats, or jobs on an old token.
+
+  - name: retried 429s stay quiet, a throttled guessing run fires
+    interval: 1m
+    input_series:
+      # 60 throttled answers a minute: a client retrying fast, under the leg.
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="throttled"}'
+        values: '0+60x30'
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="invalid_token"}'
+        values: '10+0x30'
+      # 500 a minute from another knell: a guess list replayed.
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9192", reason="throttled"}'
+        values: '0+500x30'
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9192", reason="invalid_token"}'
+        values: '10+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KnellAuthFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: knell
+              instance: knell:9192
+            exp_annotations:
+              summary: "knell on knell:9192 refused over 15 ping tokens in 15 minutes"
+              description: >
+                Several addresses are sending tokens knell does not have, or one
+                throttled address keeps sending them: guessing, a leaked token
+                trying other beats, or jobs on an old token.
+
+  - name: two knells at one address's limit each stay quiet
+    interval: 1m
+    input_series:
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="invalid_token"}'
+        values: '0+1x9 10+0x20'
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9192", reason="invalid_token"}'
+        values: '0+1x9 10+0x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: KnellAuthFailures
+        exp_alerts: []
+
+  - name: a valid ping answered 429 fires KnellPingsThrottled, a stale sibling alone does not
+    interval: 1m
+    input_series:
+      # A stale job on the sender's address: 10 refused tokens, then the
+      # valid job beside it is answered 429 and recorded.
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="invalid_token"}'
+        values: '0+1x9 10+0x30'
+      - series: 'knell_beats_recorded_while_throttled_total{job="knell", instance="knell:9191", beat="backup"}'
+        values: '0+0x14 1+1x5 6+0x25'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: KnellPingsThrottled
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: KnellAuthFailures
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: KnellPingsThrottled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: knell
+              instance: knell:9191
+            exp_annotations:
+              summary: "knell on knell:9191 answered valid pings with 429"
+              description: >
+                knell recorded these pings, but each sender saw a failure. Its
+                address shares failures with another client, a spray filled the
+                global limit, or someone guessed a token.
+      - eval_time: 40m
+        alertname: KnellPingsThrottled
+        exp_alerts: []

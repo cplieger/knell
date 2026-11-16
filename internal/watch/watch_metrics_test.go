@@ -295,6 +295,7 @@ func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
 	if !recordedBeat(w, id) {
 		t.Fatalf("overflow Beat(%s) = false", id)
 	}
+	w.observeBeats() // the observation loop logs what Beat queued
 
 	// The dropped record belongs to an outage a ping already ended, so it is
 	// the outage's last trace and no notice for it will ever arrive: a
@@ -319,6 +320,31 @@ func TestQueueFullDropIsLoggedAsAWarning(t *testing.T) {
 	// nothing was attempted for this record and nothing survives to attempt.
 	if !rec.HasAttr("pending missing queue full", "retryable", "false") {
 		t.Errorf("drop warning does not report retryable=false, so a log rule cannot tell it from a send that will retry: %v", rec.Records())
+	}
+}
+
+// TestBeatQueuesTheDroppedRecordLineForTheObservationLoop pins that Beat
+// writes no log line itself: the request that pinged never waits on a stalled
+// log driver, and the observation loop, or the shutdown path, writes it.
+func TestBeatQueuesTheDroppedRecordLineForTheObservationLoop(t *testing.T) {
+	// Serial (no t.Parallel): swaps the process-global slog default.
+	const id = "missing-overflow-deferred-log-probe"
+	w, clock, _ := newTestWatcher(Beat{ID: id, Deadline: 10 * time.Minute})
+	w.Beat(id)
+	fillMissingQueue(t, w, clock, id)
+	rec := capture.Default(t)
+	clock.Advance(47 * time.Minute)
+	if !recordedBeat(w, id) {
+		t.Fatalf("overflow Beat(%s) = false", id)
+	}
+	if got := len(rec.Messages()); got != 0 {
+		t.Fatalf("Beat logged %d lines %v, want none", got, rec.Messages())
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	w.Run(ctx, time.Hour)
+	if got := rec.CountLevel(slog.LevelWarn, "pending missing queue full"); got != 1 {
+		t.Errorf("queue-full warnings after a shutdown = %d, want 1: a dropped record queued at shutdown is still logged; %v", got, rec.Messages())
 	}
 }
 
@@ -349,6 +375,7 @@ func TestQueueFullLogsAreEmittedWithTheWatcherMutexReleased(t *testing.T) {
 	if !recordedBeat(w, id) {
 		t.Fatalf("overflow Beat(%s) = false", id)
 	}
+	w.observeBeats() // the observation loop logs what Beat queued
 	if probe.seen != 2 {
 		t.Fatalf("queue-full records seen = %d, want 2 (the deferred-ongoing Debug and the dropped-ended Warn); the probe never observed the lines it exists to place: %v", probe.seen, probe.messages)
 	}
@@ -404,6 +431,7 @@ func TestQueueFullDropKeepsTimestampAttrsTyped(t *testing.T) {
 	wantRecovered := clock.Now().UTC()
 	rec := capture.Default(t)
 	w.Beat(id)
+	w.observeBeats()
 
 	for key, want := range map[string]time.Time{"since": wantSince, "recovered": wantRecovered} {
 		// capture.Recorder.Attr is the typed member of the attr-assertion
@@ -497,6 +525,7 @@ func TestQueueFullOverflowIsAccountedOncePerAffectedOutage(t *testing.T) {
 	if !recordedBeat(w, id) {
 		t.Fatalf("closing Beat(%s) = false", id)
 	}
+	w.observeBeats() // the observation loop logs what Beat queued
 	if got := counterValue(t, "knell_notifications_failed_total", "missing"); got != failedBefore {
 		t.Errorf("failed{missing} = %v after the ping whose record was dropped, want unchanged %v (nothing was ever sent for it)", got, failedBefore)
 	}

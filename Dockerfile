@@ -27,7 +27,7 @@ COPY --from=builder /out/usr/share/licenses /usr/share/licenses
 # Non-root numeric uid:gid (scratch has no /etc/passwd). knell binds a high
 # port and writes no file, so it never needs root.
 USER 65534:65534
-EXPOSE 9190
+EXPOSE 9190 9191
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=15s \
     CMD ["/knell", "health"]
 ENTRYPOINT ["/knell"]

@@ -8,22 +8,11 @@ import (
 	"testing"
 )
 
-// FuzzCheckBeatToken pins the invariant the BEAT_TOKEN gate rests on: every
-// token knell ACCEPTS must reach webapi's verifier as the operator configured
-// it. webapi compares the Authorization header against "Bearer "+token, so a
-// token the transport alters or refuses arms a gate that 401s every ping while
-// startup reports itself gated — and one deadline later every configured beat
-// posts a false MISSING notice.
-//
-// The oracle is the transport, not this package's own constants:
-// TestBeatTokenFitsHeaderAgreesWithTheTransportForEveryByte proves
-// beatTokenFitsHeader agrees with the wire for the INTERIOR bytes of one fixed
-// shape, while the edge cutset (asciiWhitespace) and the length bounds are
-// asserted only against hand-picked values. Fuzzing the whole validator against
-// a header round trip covers the combinations no table enumerates: mixed edges,
-// multi-byte edges, and interior padding beside an edge rune the operator
-// cannot see — every one of which knell now ACCEPTS, so the round trip is the
-// only thing proving the accepted value still reaches the verifier verbatim.
+// FuzzCheckBeatToken pins the invariant the BEAT_TOKENS gate rests on: every
+// token knell ACCEPTS reaches webapi's verifier as the operator configured it,
+// or every ping 401s and one deadline later every beat posts a false MISSING
+// notice. The oracle is a header round trip, not this package's own rules, so
+// it covers the mixed and multi-byte edges no table enumerates.
 func FuzzCheckBeatToken(f *testing.F) {
 	for _, seed := range []string{
 		"unit-test-beat-token",
@@ -51,11 +40,11 @@ func FuzzCheckBeatToken(f *testing.F) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, token string) {
-		if err := checkBeatToken(token); err != nil {
+		if err := checkBeatToken(token, 1); err != nil {
 			return
 		}
 		if token == "" {
-			t.Fatal("accepted an empty token: BEAT_TOKEN is required and an empty value is no credential at all, so accepting it would leave webapi's gate with nothing to verify against")
+			t.Fatal("accepted an empty token: BEAT_TOKENS is required and an empty value is no credential at all, so accepting it would leave webapi's gate with nothing to verify against")
 		}
 		if len(token) < minTokenLength {
 			t.Fatalf("accepted a %d-byte token: the gate is /beat/{id}'s only defense, so a value under the %d-byte floor is guessable and must fail startup", len(token), minTokenLength)
@@ -77,7 +66,7 @@ func FuzzCheckBeatToken(f *testing.F) {
 // "Bearer "+token has made the round trip through net/http's header writer and
 // net/textproto's header reader — the two normalizations that decide whether a
 // configured credential reaches webapi unchanged. It deliberately restates
-// neither asciiWhitespace nor beatTokenFitsHeader: it asks the transport, so
+// neither asciiWhitespace nor httpserver.CheckFieldValue: it asks the transport, so
 // narrowing either one cannot relax the assertion along with the code.
 func wireAuthorizationValue(t *testing.T, token string) (string, error) {
 	t.Helper()

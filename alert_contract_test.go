@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cplieger/go/slogx"
+	"github.com/cplieger/knell/internal/obs"
 )
 
 // logqlFilters returns the backticked line filters of one rule in
@@ -145,5 +149,36 @@ func TestQuorumFixtureIsTheCommentedRule(t *testing.T) {
 	want := strings.TrimRight("      - alert: KnellBeatQuorumLow"+rule, "\n")
 	if got := strings.Join(commented, "\n"); got != want {
 		t.Errorf("uncommented rule in alerts/promql.yaml:\n%s\nwant the tested fixture:\n%s", got, want)
+	}
+}
+
+// TestPromQLRulesReadServedSeries binds every shipped PromQL rule to what
+// knell serves: each knell_* family a rule reads is on /metrics, and each
+// reason KnellAuthFailures names is a reason knell_auth_failures_total
+// carries. A renamed family or label value would otherwise leave a rule that
+// can never fire with every test green.
+func TestPromQLRulesReadServedSeries(t *testing.T) {
+	raw, err := os.ReadFile("alerts/promql.yaml")
+	if err != nil {
+		t.Fatalf("reading the shipped PromQL rules: %v", err)
+	}
+	// Per-beat and build families show once a beat and a build exist.
+	obs.InitBeat("alert-contract", time.Minute, time.Unix(0, 0))
+	obs.SetBeatFresh("alert-contract", true)
+	obs.SetBuildInfo("alert-contract")
+	rec := httptest.NewRecorder()
+	obs.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	page := rec.Body.String()
+	for _, family := range regexp.MustCompile(`\bknell_[a-z_]+`).FindAllString(string(raw), -1) {
+		if !strings.Contains(page, "# TYPE "+family+" ") {
+			t.Errorf("alerts/promql.yaml reads %s, which /metrics does not serve", family)
+		}
+	}
+	for _, m := range regexp.MustCompile(`knell_auth_failures_total\{reason=~?"([^"]+)"\}`).FindAllStringSubmatch(string(raw), -1) {
+		for reason := range strings.SplitSeq(m[1], "|") {
+			if !strings.Contains(page, `knell_auth_failures_total{reason="`+reason+`"}`) {
+				t.Errorf("a rule reads reason %q, which knell_auth_failures_total does not carry", reason)
+			}
+		}
 	}
 }

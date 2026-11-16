@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"slices"
@@ -42,7 +43,18 @@ const (
 // config.Load rejects a PRESENT-but-empty _FILE variable, and one leaked from
 // another test (or the ambient environment) changes what run() reads. One home,
 // so a newly added _FILE gate is cleared everywhere at once.
-var secretEnvKeys = []string{"DISCORD_WEBHOOK_URL_FILE", "BEAT_TOKEN", "BEAT_TOKEN_FILE"}
+var secretEnvKeys = []string{"DISCORD_WEBHOOK_URL_FILE", "BEAT_TOKENS", "BEAT_TOKENS_FILE", "BEAT_TOKEN", "BEAT_TOKEN_FILE"}
+
+// beatTokensFor is a BEAT_TOKENS giving token every beat in a BEATS spec.
+func beatTokensFor(beats, token string) string {
+	var ids []string
+	for entry := range strings.SplitSeq(beats, ",") {
+		if id, _, ok := strings.Cut(strings.TrimSpace(entry), ":"); ok {
+			ids = append(ids, strings.TrimSpace(id))
+		}
+	}
+	return strings.Join(ids, "+") + ":" + token
+}
 
 // unsetEnv removes key for the duration of the test. t.Setenv registers the
 // restore of the original value, so the following os.Unsetenv leaves the
@@ -58,7 +70,7 @@ func unsetEnv(t *testing.T, key string) {
 }
 
 // installRunEnv installs a complete environment config.Load accepts: the beats
-// spec, the listen address, the webhook (whose token half every leak assertion
+// spec, the two listen addresses (ops on any free loopback port), the webhook (whose token half every leak assertion
 // greps for), and the _FILE and token variables explicitly CLEARED, since one
 // leaked from another test changes what run() reads. It is the single home of
 // "a configuration run() gets past", so a newly required variable cannot leave
@@ -66,16 +78,24 @@ func unsetEnv(t *testing.T, key string) {
 // gate it means to exercise.
 func installRunEnv(t *testing.T, beats, addr string) {
 	t.Helper()
+	installRunEnvOps(t, beats, addr, "127.0.0.1:0")
+}
+
+// installRunEnvOps is installRunEnv with the operations address chosen by the
+// caller.
+func installRunEnvOps(t *testing.T, beats, addr, opsAddr string) {
+	t.Helper()
 	t.Setenv("BEATS", beats)
 	t.Setenv("DISCORD_WEBHOOK_URL", testWebhookURL)
 	for _, key := range secretEnvKeys {
 		unsetEnv(t, key)
 	}
-	// After the clearing sweep, because BEAT_TOKEN is in it: the token is
-	// REQUIRED, so a boot test that cleared it would fail at the configuration
-	// gate instead of reaching the one it means to exercise.
-	t.Setenv("BEAT_TOKEN", testBeatToken)
+	// After the clearing sweep, because BEAT_TOKENS is in it: the tokens are
+	// REQUIRED, so a boot test that cleared them would fail at the
+	// configuration gate instead of reaching the one it means to exercise.
+	t.Setenv("BEAT_TOKENS", beatTokensFor(beats, testBeatToken))
 	t.Setenv("LISTEN_ADDR", addr)
+	t.Setenv("OPS_LISTEN_ADDR", opsAddr)
 }
 
 // TestWatchBeatsCarriesEveryFieldIntoTheStateMachine pins the one
@@ -153,20 +173,24 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 }
 
 // TestLogConfigNeverPublishesTheBeatToken pins the startup summary's silence
-// about the credential. BEAT_TOKEN is required, so a presence attr could only
+// about the credential. BEAT_TOKENS is required, so a presence attr could only
 // ever read "required" and would report no state at all — and the summary is the
 // one line that renders a whole Config, so it is where a rendering of the value
 // itself would surface. The token value and a redundant beat_auth presence attr
-// must not appear; the beat_token attr reports only its source channel.
+// must not appear; the beat_tokens attr reports only its source channel.
 func TestLogConfigNeverPublishesTheBeatToken(t *testing.T) {
 	// Serial (no t.Parallel): swaps the process-global slog default.
 	cfg := config.Config{
 		WebhookURL: "https://discord.example/hook",
 		Node:       "node-1",
 		ListenAddr: ":9190",
-		BeatToken:  testBeatToken,
 		Beats:      []config.Beat{{ID: "api", Deadline: 20 * time.Minute}},
 	}
+	tokens, err := httpserver.NewTokenSet([]string{testBeatToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.BeatTokens = config.BeatTokens{Set: tokens, Covers: [][]string{{"api"}}}
 
 	rec := capture.Default(t)
 	logConfig(&cfg)
@@ -234,11 +258,35 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	if err == nil {
 		t.Fatal("run() = nil, want a bind error; an address already in use must fail the boot instead of leaving the watcher alerting behind a listener nothing can reach")
 	}
-	if !strings.Contains(err.Error(), "binding") {
-		t.Fatalf("run() = %v, want the bind failure surfaced to the caller", err)
+	if !strings.Contains(err.Error(), "binding LISTEN_ADDR") {
+		t.Fatalf("run() = %v, want the bind failure surfaced to the caller, naming LISTEN_ADDR", err)
 	}
 	if strings.Contains(err.Error(), testWebhookSecret) {
 		t.Errorf("bind error leaks the webhook URL: %v", err)
+	}
+}
+
+// TestRunFailsFastWhenTheOpsListenAddressIsAlreadyBound pins that a held
+// operations port fails the boot naming OPS_LISTEN_ADDR, instead of serving
+// pings with no /healthz or /metrics anywhere.
+func TestRunFailsFastWhenTheOpsListenAddressIsAlreadyBound(t *testing.T) {
+	// Serial (no t.Parallel): t.Setenv, plus run() installs a process-global
+	// slog default.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot bind a probe listener: %v", err)
+	}
+	t.Cleanup(func() { _ = occupied.Close() })
+
+	installRunEnvOps(t, "api:20m", "127.0.0.1:0", occupied.Addr().String())
+	capture.Default(t)
+
+	err = run(nil)
+	if err == nil {
+		t.Fatal("run() = nil, want a bind error for the operations port")
+	}
+	if !strings.Contains(err.Error(), "binding OPS_LISTEN_ADDR "+occupied.Addr().String()) {
+		t.Fatalf("run() = %v, want the bind failure naming OPS_LISTEN_ADDR and its address", err)
 	}
 }
 
@@ -258,14 +306,14 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 
 	bindFailure := errors.New("listen tcp :9190: bind: address already in use")
 
-	got := classifyBindError(t.Context(), ":9190", bindFailure)
+	got := classifyBindError(t.Context(), "LISTEN_ADDR", ":9190", bindFailure)
 	if got == nil {
 		t.Fatal("classifyBindError(live ctx) = nil, want the bind failure surfaced so the boot fails instead of running as a switch nothing can reach")
 	}
 	if !errors.Is(got, bindFailure) {
 		t.Errorf("classifyBindError = %v, want the bind failure still unwrappable", got)
 	}
-	if !strings.Contains(got.Error(), ":9190") {
+	if !strings.Contains(got.Error(), "LISTEN_ADDR :9190") {
 		t.Errorf("classifyBindError = %q, want the address named so the operator knows which port to free", got)
 	}
 	if rec.Contains("shutting down before the listener was bound") {
@@ -278,7 +326,7 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 	// A bind the signal itself cancelled: the error carries the cancellation, so
 	// this is the clean stop.
 	cancelledListen := fmt.Errorf("listen tcp :9190: %w", context.Canceled)
-	if got := classifyBindError(stopped, ":9190", cancelledListen); got != nil {
+	if got := classifyBindError(stopped, "LISTEN_ADDR", ":9190", cancelledListen); got != nil {
 		t.Errorf("classifyBindError(cancelled listen) = %v, want nil: a signal arriving before the bind is a clean stop, not a boot failure", got)
 	}
 	if !rec.Contains("shutting down before the listener was bound") {
@@ -289,7 +337,7 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 	// conflict: the cancelled context is not evidence about this error, and
 	// swallowing it would exit 0 having never bound the listener a quorum
 	// depends on.
-	if got := classifyBindError(stopped, ":9190", bindFailure); got == nil {
+	if got := classifyBindError(stopped, "LISTEN_ADDR", ":9190", bindFailure); got == nil {
 		t.Error("classifyBindError(cancelled ctx, genuine bind failure) = nil, want the failure surfaced: a cancelled context is not evidence that THIS error was the shutdown")
 	}
 }
@@ -349,5 +397,38 @@ func TestClassifyServeErrorNamesADrainThatOutlivedTheGrace(t *testing.T) {
 				t.Errorf("classifyServeError(%v) = %q, want the grace budget %s named so the ERROR line points at the constant to raise", tt.in, got, shutdownGrace)
 			}
 		})
+	}
+}
+
+// TestLogConfigWarnsWhileEveryHostIsServed pins the startup WARN a wide
+// posture owes: ALLOWED_HOSTS unset answers every Host, so the summary says so
+// at WARN, and a set allowlist draws no warning.
+func TestLogConfigWarnsWhileEveryHostIsServed(t *testing.T) {
+	// Serial (no t.Parallel): swaps the process-global slog default.
+	const warning = "ALLOWED_HOSTS is unset, so knell answers every Host; set it to the names your jobs, probes and scraper use"
+	rec := capture.Default(t)
+	logConfig(&config.Config{})
+	if got := rec.CountLevel(slog.LevelWarn, warning); got != 1 {
+		t.Errorf("warnings with ALLOWED_HOSTS unset = %d, want 1", got)
+	}
+	policy, invalid := httpserver.ParseHostList([]string{"knell.example"})
+	if len(invalid) > 0 {
+		t.Fatal(invalid)
+	}
+	rec = capture.Default(t)
+	logConfig(&config.Config{AllowedHosts: policy})
+	if got := rec.CountExact(warning); got != 0 {
+		t.Errorf("warnings with ALLOWED_HOSTS set = %d, want 0", got)
+	}
+}
+
+// TestTrustWindowIsTwoOfTheLongestDeadlines pins how long a sender stays
+// exempt from the global failure window: twice the longest deadline, so a
+// beat's own sender stays trusted between its pings.
+func TestTrustWindowIsTwoOfTheLongestDeadlines(t *testing.T) {
+	t.Parallel()
+	got := trustWindow([]config.Beat{{ID: "a", Deadline: 20 * time.Minute}, {ID: "b", Deadline: 26 * time.Hour}})
+	if got != 52*time.Hour {
+		t.Errorf("trustWindow = %s, want 52h", got)
 	}
 }

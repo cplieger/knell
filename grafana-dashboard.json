@@ -30,7 +30,7 @@
       }
     ],
     "cursorSync": "Crosshair",
-    "description": "Every job knell watches at once: whether each beat is fresh, when it last checked in, how close it is to its deadline and its outages, with what needs your attention. History charts the check-ins, outages and notices, and knell health shows the scrape and the listener.",
+    "description": "Every job knell watches at once: whether each beat is fresh, when it last checked in, how close it is to its deadline and its outages, with what needs your attention. History shows when each beat was fresh or missing and ranks the beats by outages, with the notices, and knell health shows the scrape and the listener.",
     "editable": true,
     "elements": {
       "panel-1": {
@@ -38,7 +38,7 @@
         "spec": {
           "id": 1,
           "title": "Beats past their deadline",
-          "description": "How many beats are past their deadline now, read from the firing KnellBeatOverdue alerts, so it counts a beat once the alert's 5 minutes have passed. Red from 1. Without the rules from alerts/promql.yaml loaded, the tile counts the beats that have been past their deadline for 7 minutes itself.",
+          "description": "How many beats are past their deadline now, read from the firing KnellBeatOverdue alerts, so it counts a beat once the alert's 5 minutes have passed. Red from 1. Each beat counts once, and only while no knell sharing this instance still has it fresh. Without the rules from alerts/promql.yaml loaded, the tile counts the beats that have been past their deadline for 7 minutes itself.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -55,7 +55,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "count(ALERTS{alertname=\"KnellBeatOverdue\", alertstate=\"firing\", instance=\"$instance\"}) or (count(count_over_time((knell_beat_fresh{instance=\"$instance\"} == 0)[7m:1m]) >= 7) unless on () count(max_over_time(ALERTS{alertname=\"KnellBeatOverdue\", instance=\"$instance\"}[7m]))) or vector(0)",
+                        "expr": "count(count by (beat) (ALERTS{alertname=\"KnellBeatOverdue\", alertstate=\"firing\", instance=\"$instance\"}) unless on (beat) (max by (beat) (knell_beat_fresh{instance=\"$instance\"}) == 1)) or (count(count_over_time((max by (beat) (knell_beat_fresh{instance=\"$instance\"}) == 0)[7m:1m]) >= 7) unless on () count(max_over_time(ALERTS{alertname=\"KnellBeatOverdue\", instance=\"$instance\"}[7m]))) or vector(0)",
                         "legendFormat": "",
                         "instant": true,
                         "range": false
@@ -124,7 +124,7 @@
         "spec": {
           "id": 2,
           "title": "Beats watched",
-          "description": "How many beats this knell watches, one per configured beat. A number lower than you configured means knell runs an older configuration. No value means knell was not scraped.",
+          "description": "How many beats this knell watches, one per configured beat, counted once across the knells that share this instance. A number lower than you configured means knell runs an older configuration. No value means knell was not scraped.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -141,7 +141,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "count(knell_beat_deadline_seconds{instance=\"$instance\"})",
+                        "expr": "count(count by (beat) (knell_beat_deadline_seconds{instance=\"$instance\"}))",
                         "legendFormat": "",
                         "instant": true,
                         "range": false
@@ -206,7 +206,7 @@
         "spec": {
           "id": 3,
           "title": "Pings accepted in ${span} ${spanunit}",
-          "description": "Pings knell accepted across every beat in the selected range. A refused ping never counts here, and knell health shows the refusals. No value means knell was not scraped in the range.",
+          "description": "Pings knell accepted across every beat in the selected range. Knells that share this instance each receive a copy of every ping, so each beat counts the pings of the knell that accepted the most. A refused ping never counts here, and knell health shows the refusals. No value means knell was not scraped in the range.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -223,7 +223,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "round(sum(increase(knell_beats_received_total{instance=\"$instance\"}[$__range])))",
+                        "expr": "round(sum(max by (beat) (increase(knell_beats_received_total{instance=\"$instance\"}[$__range]))))",
                         "legendFormat": "",
                         "instant": true,
                         "range": false
@@ -288,7 +288,7 @@
         "spec": {
           "id": 4,
           "title": "Outages in ${span} ${spanunit}",
-          "description": "Outages knell detected across every beat in the selected range, one each time a beat crossed its deadline. Yellow from 1, and the Beats table names the beat. No value means knell was not scraped in the range.",
+          "description": "Outages knell detected across every beat in the selected range, one each time a beat crossed its deadline. Knells that share this instance each count the same outage, so each beat counts the outages of the knell that saw the most. Yellow from 1, and the Beats table names the beat. No value means knell was not scraped in the range.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -305,7 +305,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "round(sum(increase(knell_beat_outages_total{instance=\"$instance\"}[$__range])))",
+                        "expr": "round(sum(max by (beat) (increase(knell_beat_outages_total{instance=\"$instance\"}[$__range]))))",
                         "legendFormat": "",
                         "instant": true,
                         "range": false
@@ -566,7 +566,7 @@
         "spec": {
           "id": 12,
           "title": "Listener",
-          "description": "Shows while the KnellAcceptFailing alert fires: the listener failed to accept a connection in the last 15 minutes, so pings may not land while the process runs. Check the file descriptor limit. Needs the rules from alerts/promql.yaml in a ruler that stores its `ALERTS` series beside the metrics, as Prometheus and Mimir do.",
+          "description": "Shows while the KnellAcceptFailing alert fires: the ping listener failed to accept a connection in the last 15 minutes, so pings may not land while the process runs. Check the file descriptor limit. Needs the rules from alerts/promql.yaml in a ruler that stores its `ALERTS` series beside the metrics, as Prometheus and Mimir do.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -854,7 +854,7 @@
         "spec": {
           "id": 20,
           "title": "Beats",
-          "description": "One row per beat: whether it is Fresh or Missing, when knell last accepted a ping for it, its deadline, the share of the deadline left, and its outages in the selected range. Time left is red below 20%, yellow from 20% and green from 50%. Until a beat's first ping, Last seen shows when knell started.",
+          "description": "One row per beat: whether it is Fresh or Missing, when knell last accepted a ping for it, its deadline, the share of the deadline left, and its outages in the selected range. A beat is Fresh while any knell sharing this instance has it fresh, and its other columns read the knell that saw it last or counted the most outages. Time left is red below 20%, yellow from 20% and green from 50%. Until a beat's first ping, Last seen shows when knell started.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -959,7 +959,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "sum by (beat) (round(increase(knell_beat_outages_total{instance=\"$instance\"}[$__range])))",
+                        "expr": "max by (beat) (round(increase(knell_beat_outages_total{instance=\"$instance\"}[$__range])))",
                         "legendFormat": "",
                         "instant": true,
                         "range": false,
@@ -1184,99 +1184,12 @@
           }
         }
       },
-      "panel-30": {
-        "kind": "Panel",
-        "spec": {
-          "id": 30,
-          "title": "Check-ins per beat",
-          "description": "Pings knell accepted per beat, as bars over the selected range. A beat whose bars stop is the job that stopped checking in. A refused ping is not counted here.",
-          "links": [],
-          "data": {
-            "kind": "QueryGroup",
-            "spec": {
-              "queries": [
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "query": {
-                      "kind": "DataQuery",
-                      "group": "prometheus",
-                      "version": "v0",
-                      "datasource": {
-                        "name": "${datasource}"
-                      },
-                      "spec": {
-                        "expr": "round(sum by (beat) (increase(knell_beats_received_total{instance=\"$instance\"}[$__interval])))",
-                        "legendFormat": "{{beat}}"
-                      }
-                    },
-                    "refId": "A",
-                    "hidden": false
-                  }
-                }
-              ],
-              "transformations": [],
-              "queryOptions": {
-                "interval": "1m"
-              }
-            }
-          },
-          "vizConfig": {
-            "kind": "VizConfig",
-            "group": "timeseries",
-            "version": "",
-            "spec": {
-              "options": {
-                "legend": {
-                  "displayMode": "table",
-                  "placement": "right",
-                  "calcs": [
-                    "sum"
-                  ]
-                },
-                "tooltip": {
-                  "mode": "multi"
-                }
-              },
-              "fieldConfig": {
-                "defaults": {
-                  "unit": "short",
-                  "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                      {
-                        "value": null,
-                        "color": "green"
-                      }
-                    ]
-                  },
-                  "color": {
-                    "mode": "palette-classic"
-                  },
-                  "custom": {
-                    "fillOpacity": 80,
-                    "lineWidth": 1,
-                    "drawStyle": "bars",
-                    "stacking": {
-                      "mode": "normal"
-                    }
-                  },
-                  "noValue": "No pings",
-                  "min": 0,
-                  "decimals": 0
-                },
-                "overrides": []
-              }
-            }
-          }
-        }
-      },
       "panel-31": {
         "kind": "Panel",
         "spec": {
           "id": 31,
-          "title": "Outages per beat",
-          "description": "Outages knell detected per beat, as bars over the selected range, one each time a beat crossed its deadline. A beat with repeated bars is a job that runs late or fails often. No bars means no beat crossed its deadline.",
+          "title": "Outages per beat in ${span} ${spanunit}",
+          "description": "Outages per beat in the selected range, most first, one each time a beat crossed its deadline, counted once across the knells that share this instance. A beat near the top is a job that runs late or fails often. Yellow from 1. No value means knell was not scraped in the range.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1293,8 +1206,10 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "round(sum by (beat) (increase(knell_beat_outages_total{instance=\"$instance\"}[$__interval])))",
-                        "legendFormat": "{{beat}}"
+                        "expr": "sort_desc(max by (beat) (round(increase(knell_beat_outages_total{instance=\"$instance\"}[$__range]))))",
+                        "legendFormat": "{{beat}}",
+                        "instant": true,
+                        "range": false
                       }
                     },
                     "refId": "A",
@@ -1310,47 +1225,50 @@
           },
           "vizConfig": {
             "kind": "VizConfig",
-            "group": "timeseries",
+            "group": "bargauge",
             "version": "",
             "spec": {
               "options": {
-                "legend": {
-                  "displayMode": "table",
-                  "placement": "right",
+                "displayMode": "basic",
+                "namePlacement": "left",
+                "orientation": "horizontal",
+                "reduceOptions": {
                   "calcs": [
-                    "sum"
-                  ]
+                    "lastNotNull"
+                  ],
+                  "fields": "",
+                  "values": false
                 },
-                "tooltip": {
-                  "mode": "multi"
+                "showUnfilled": true,
+                "sizing": "auto",
+                "valueMode": "color",
+                "text": {
+                  "titleSize": 14,
+                  "valueSize": 14
                 }
               },
               "fieldConfig": {
                 "defaults": {
-                  "unit": "short",
+                  "unit": "none",
+                  "noValue": "knell was not scraped",
+                  "min": 0,
+                  "decimals": 0,
+                  "color": {
+                    "mode": "thresholds"
+                  },
                   "thresholds": {
                     "mode": "absolute",
                     "steps": [
                       {
                         "value": null,
                         "color": "green"
+                      },
+                      {
+                        "value": 1,
+                        "color": "yellow"
                       }
                     ]
-                  },
-                  "color": {
-                    "mode": "palette-classic"
-                  },
-                  "custom": {
-                    "fillOpacity": 80,
-                    "lineWidth": 1,
-                    "drawStyle": "bars",
-                    "stacking": {
-                      "mode": "normal"
-                    }
-                  },
-                  "noValue": "No outages",
-                  "min": 0,
-                  "decimals": 0
+                  }
                 },
                 "overrides": []
               }
@@ -1362,8 +1280,8 @@
         "kind": "Panel",
         "spec": {
           "id": 32,
-          "title": "Fresh or missing",
-          "description": "Each beat's state over the selected range, Fresh in green and Missing in red. A red band is an outage, from the deadline crossing to the next accepted ping. A gap means knell was not scraped.",
+          "title": "Beat status over time",
+          "description": "Each beat's state over the selected range, Fresh in green and Missing in red, one row per beat. A beat is Fresh while any knell sharing this instance has it fresh, and Missing only when none does. A red band is an outage, from the deadline crossing to the next accepted ping. A gap means knell was not scraped.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1380,7 +1298,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "knell_beat_fresh{instance=\"$instance\"}",
+                        "expr": "max by (beat) (knell_beat_fresh{instance=\"$instance\"})",
                         "legendFormat": "{{beat}}"
                       }
                     },
@@ -1462,7 +1380,7 @@
         "spec": {
           "id": 33,
           "title": "Notices sent",
-          "description": "Notices knell delivered, by kind, as bars over the selected range. Missing is a beat that crossed its deadline, Recovered one that pinged again, and History a summary of outages that ended. No bars means knell sent nothing.",
+          "description": "Notices knell delivered, by kind, as bars over the selected range. Missing is a beat that crossed its deadline, Recovered one that pinged again, and History a summary of outages that ended. No bars means knell sent nothing. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1479,7 +1397,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "label_replace(label_replace(label_replace(round(sum by (kind) (increase(knell_notifications_sent_total{instance=\"$instance\"}[$__interval]))), \"kind\", \"Missing\", \"kind\", \"missing\"), \"kind\", \"Recovered\", \"kind\", \"recovered\"), \"kind\", \"History\", \"kind\", \"history\")",
+                        "expr": "label_replace(label_replace(label_replace(sum by (kind) (((knell_notifications_sent_total{instance=\"$instance\"} - knell_notifications_sent_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_notifications_sent_total{instance=\"$instance\"}[$__interval]) < knell_notifications_sent_total{instance=\"$instance\"} offset $__interval) or (resets(knell_notifications_sent_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_notifications_sent_total{instance=\"$instance\"} and ((min_over_time(knell_notifications_sent_total{instance=\"$instance\"}[$__interval]) < knell_notifications_sent_total{instance=\"$instance\"} offset $__interval) or (resets(knell_notifications_sent_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_notifications_sent_total{instance=\"$instance\"} - min_over_time(knell_notifications_sent_total{instance=\"$instance\"}[$__interval]))), \"kind\", \"Missing\", \"kind\", \"missing\"), \"kind\", \"Recovered\", \"kind\", \"recovered\"), \"kind\", \"History\", \"kind\", \"history\")",
                         "legendFormat": "{{kind}}"
                       }
                     },
@@ -1501,8 +1419,9 @@
             "spec": {
               "options": {
                 "legend": {
-                  "displayMode": "table",
-                  "placement": "right",
+                  "showLegend": true,
+                  "displayMode": "list",
+                  "placement": "bottom",
                   "calcs": [
                     "sum"
                   ]
@@ -1549,7 +1468,7 @@
         "spec": {
           "id": 34,
           "title": "Notices failed or lost",
-          "description": "Notices that failed after their retries and will be tried again, notices that will never be sent, and outage records knell had to discard, as bars over the selected range. Any bar here means a notice was late or lost. The container log says why.",
+          "description": "Notices that failed after their retries and will be tried again, notices that will never be sent, and outage records knell had to discard, as bars over the selected range. Any bar here means a notice was late or lost. The container log says why. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1566,7 +1485,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "label_replace(label_replace(label_replace(round(sum by (kind) (increase(knell_notifications_failed_total{instance=\"$instance\"}[$__interval]))), \"kind\", \"Missing\", \"kind\", \"missing\"), \"kind\", \"Recovered\", \"kind\", \"recovered\"), \"kind\", \"History\", \"kind\", \"history\")",
+                        "expr": "label_replace(label_replace(label_replace(sum by (kind) (((knell_notifications_failed_total{instance=\"$instance\"} - knell_notifications_failed_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_notifications_failed_total{instance=\"$instance\"}[$__interval]) < knell_notifications_failed_total{instance=\"$instance\"} offset $__interval) or (resets(knell_notifications_failed_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_notifications_failed_total{instance=\"$instance\"} and ((min_over_time(knell_notifications_failed_total{instance=\"$instance\"}[$__interval]) < knell_notifications_failed_total{instance=\"$instance\"} offset $__interval) or (resets(knell_notifications_failed_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_notifications_failed_total{instance=\"$instance\"} - min_over_time(knell_notifications_failed_total{instance=\"$instance\"}[$__interval]))), \"kind\", \"Missing\", \"kind\", \"missing\"), \"kind\", \"Recovered\", \"kind\", \"recovered\"), \"kind\", \"History\", \"kind\", \"history\")",
                         "legendFormat": "Failed, {{kind}}"
                       }
                     },
@@ -1585,7 +1504,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "label_replace(label_replace(label_replace(round(sum by (kind) (increase(knell_notifications_dropped_total{instance=\"$instance\"}[$__interval]))), \"kind\", \"Missing\", \"kind\", \"missing\"), \"kind\", \"Recovered\", \"kind\", \"recovered\"), \"kind\", \"History\", \"kind\", \"history\")",
+                        "expr": "label_replace(label_replace(label_replace(sum by (kind) (((knell_notifications_dropped_total{instance=\"$instance\"} - knell_notifications_dropped_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_notifications_dropped_total{instance=\"$instance\"}[$__interval]) < knell_notifications_dropped_total{instance=\"$instance\"} offset $__interval) or (resets(knell_notifications_dropped_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_notifications_dropped_total{instance=\"$instance\"} and ((min_over_time(knell_notifications_dropped_total{instance=\"$instance\"}[$__interval]) < knell_notifications_dropped_total{instance=\"$instance\"} offset $__interval) or (resets(knell_notifications_dropped_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_notifications_dropped_total{instance=\"$instance\"} - min_over_time(knell_notifications_dropped_total{instance=\"$instance\"}[$__interval]))), \"kind\", \"Missing\", \"kind\", \"missing\"), \"kind\", \"Recovered\", \"kind\", \"recovered\"), \"kind\", \"History\", \"kind\", \"history\")",
                         "legendFormat": "Never sent, {{kind}}"
                       }
                     },
@@ -1604,7 +1523,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "round(sum(increase(knell_outage_records_dropped_total{instance=\"$instance\"}[$__interval])))",
+                        "expr": "sum(((knell_outage_records_dropped_total{instance=\"$instance\"} - knell_outage_records_dropped_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_outage_records_dropped_total{instance=\"$instance\"}[$__interval]) < knell_outage_records_dropped_total{instance=\"$instance\"} offset $__interval) or (resets(knell_outage_records_dropped_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_outage_records_dropped_total{instance=\"$instance\"} and ((min_over_time(knell_outage_records_dropped_total{instance=\"$instance\"}[$__interval]) < knell_outage_records_dropped_total{instance=\"$instance\"} offset $__interval) or (resets(knell_outage_records_dropped_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_outage_records_dropped_total{instance=\"$instance\"} - min_over_time(knell_outage_records_dropped_total{instance=\"$instance\"}[$__interval])))",
                         "legendFormat": "Outage records discarded"
                       }
                     },
@@ -1626,8 +1545,9 @@
             "spec": {
               "options": {
                 "legend": {
-                  "displayMode": "table",
-                  "placement": "right",
+                  "showLegend": true,
+                  "displayMode": "list",
+                  "placement": "bottom",
                   "calcs": [
                     "sum"
                   ]
@@ -1674,7 +1594,7 @@
         "spec": {
           "id": 40,
           "title": "Scrape",
-          "description": "Whether the last scrape of this knell succeeded, the up series your scraper writes for the job knell. Down means the container is stopped or the scraper cannot reach it, and KnellTargetDown follows. No value means no scrape in the last few minutes.",
+          "description": "Whether the last scrape of each knell succeeded, one tile per knell, the up series of each knell scrape on the selected instance. Down means the container is stopped or the scraper cannot reach it, and KnellTargetDown follows. A tile is named by the scrape's hostname label when it sets one. No value means no scrape in the last few minutes, or no knell on the selected instance in the last 7 days.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1691,8 +1611,8 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "up{job=\"knell\", instance=\"$instance\"}",
-                        "legendFormat": "",
+                        "expr": "up{instance=\"$instance\"} and on (job, instance) last_over_time(knell_build_info{instance=\"$instance\"}[7d])",
+                        "legendFormat": "{{hostname}}",
                         "instant": true,
                         "range": false
                       }
@@ -1725,7 +1645,9 @@
                 "text": {
                   "titleSize": 14,
                   "valueSize": 28
-                }
+                },
+                "orientation": "horizontal",
+                "wideLayout": true
               },
               "fieldConfig": {
                 "defaults": {
@@ -1772,7 +1694,7 @@
         "spec": {
           "id": 41,
           "title": "Accept errors in ${span} ${spanunit}",
-          "description": "Connections the listener failed to accept in the selected range. Red from 1, because pings may have been lost while it lasted. No value means knell was not scraped in the range.",
+          "description": "Connections each knell's ping listener failed to accept in the selected range, one tile per knell. Red from 1, because pings may have been lost while it lasted. A tile is named by the scrape's hostname label when it sets one. No value means knell was not scraped in the range.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1790,7 +1712,7 @@
                       },
                       "spec": {
                         "expr": "round(increase(knell_listener_accept_errors_total{instance=\"$instance\"}[$__range]))",
-                        "legendFormat": "",
+                        "legendFormat": "{{hostname}}",
                         "instant": true,
                         "range": false
                       }
@@ -1823,7 +1745,9 @@
                 "text": {
                   "titleSize": 14,
                   "valueSize": 28
-                }
+                },
+                "orientation": "horizontal",
+                "wideLayout": true
               },
               "fieldConfig": {
                 "defaults": {
@@ -1858,7 +1782,7 @@
         "spec": {
           "id": 42,
           "title": "Refusals in ${span} ${spanunit}",
-          "description": "Requests knell refused before reading them in the selected range: a host not in ALLOWED_HOSTS, a beat path spelled in a way the router would rewrite, or sign-in attempts throttled. A steady count points to a job that pings the wrong address. No value means knell was not scraped in the range.",
+          "description": "Requests knell refused before reading them in the selected range: a host not in ALLOWED_HOSTS, or a beat path spelled in a way the router would rewrite. A steady count points to a job that pings the wrong address. No value means knell was not scraped in the range.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1940,7 +1864,7 @@
         "spec": {
           "id": 43,
           "title": "Started",
-          "description": "When this knell process last started. Each start rearms every deadline, so a recent start means a beat's outage is only noticed after a full deadline. No value means knell was not scraped.",
+          "description": "When each knell process last started, one tile per knell. Each start rearms every deadline, so a recent start means a beat's outage is only noticed after a full deadline. A tile is named by the scrape's hostname label when it sets one. No value means knell was not scraped, or the scrape drops the process_* series.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1957,8 +1881,8 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "process_start_time_seconds{job=\"knell\", instance=\"$instance\"} * 1000",
-                        "legendFormat": "",
+                        "expr": "process_start_time_seconds{instance=\"$instance\"} * 1000 and on (job, instance) knell_build_info{instance=\"$instance\"}",
+                        "legendFormat": "{{hostname}}",
                         "instant": true,
                         "range": false
                       }
@@ -1991,12 +1915,14 @@
                 "text": {
                   "titleSize": 14,
                   "valueSize": 28
-                }
+                },
+                "orientation": "horizontal",
+                "wideLayout": true
               },
               "fieldConfig": {
                 "defaults": {
                   "unit": "dateTimeFromNow",
-                  "noValue": "knell was not scraped",
+                  "noValue": "knell or its process_* series not scraped",
                   "color": {
                     "mode": "fixed",
                     "fixedColor": "text"
@@ -2022,7 +1948,7 @@
         "spec": {
           "id": 44,
           "title": "Refusals by reason",
-          "description": "Requests knell refused before reading them, by reason, as bars over the selected range. Host not allowed means a job addresses knell by a name missing from ALLOWED_HOSTS. No bars means knell refused nothing.",
+          "description": "Requests knell refused before reading them, by reason, as bars over the selected range. Host not allowed means a job addresses knell by a name missing from ALLOWED_HOSTS. No bars means knell refused nothing. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -2039,7 +1965,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "label_replace(label_replace(label_replace(round(sum by (reason) (increase(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]))), \"reason\", \"Beat path spelled oddly\", \"reason\", \"non_canonical_beat_path\"), \"reason\", \"Host not allowed\", \"reason\", \"host_not_allowed\"), \"reason\", \"Sign-in throttled\", \"reason\", \"auth_throttled\")",
+                        "expr": "label_replace(label_replace(sum by (reason) (((knell_pre_route_refusals_total{instance=\"$instance\"} - knell_pre_route_refusals_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) < knell_pre_route_refusals_total{instance=\"$instance\"} offset $__interval) or (resets(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_pre_route_refusals_total{instance=\"$instance\"} and ((min_over_time(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) < knell_pre_route_refusals_total{instance=\"$instance\"} offset $__interval) or (resets(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_pre_route_refusals_total{instance=\"$instance\"} - min_over_time(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]))), \"reason\", \"Beat path spelled oddly\", \"reason\", \"non_canonical_beat_path\"), \"reason\", \"Host not allowed\", \"reason\", \"host_not_allowed\")",
                         "legendFormat": "{{reason}}"
                       }
                     },
@@ -2061,8 +1987,9 @@
             "spec": {
               "options": {
                 "legend": {
-                  "displayMode": "table",
-                  "placement": "right",
+                  "showLegend": true,
+                  "displayMode": "list",
+                  "placement": "bottom",
                   "calcs": [
                     "sum"
                   ]
@@ -2224,7 +2151,7 @@
         "spec": {
           "id": 46,
           "title": "Requests by status",
-          "description": "Requests knell answered, by HTTP status, as bars over the selected range. 200 is an accepted ping or scrape, 401 a ping with a wrong token and 404 an unknown beat. No bars means knell served no request.",
+          "description": "Requests knell answered, by HTTP status, as bars over the selected range. 200 is an accepted ping or scrape, 401 a ping with a wrong token and 404 an unknown beat. No bars means knell served no request. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -2241,7 +2168,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "round(sum by (status) (increase(knell_http_requests_total{instance=\"$instance\"}[$__interval])))",
+                        "expr": "sum by (status) (((knell_http_requests_total{instance=\"$instance\"} - knell_http_requests_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_http_requests_total{instance=\"$instance\"}[$__interval]) < knell_http_requests_total{instance=\"$instance\"} offset $__interval) or (resets(knell_http_requests_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_http_requests_total{instance=\"$instance\"} and ((min_over_time(knell_http_requests_total{instance=\"$instance\"}[$__interval]) < knell_http_requests_total{instance=\"$instance\"} offset $__interval) or (resets(knell_http_requests_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_http_requests_total{instance=\"$instance\"} - min_over_time(knell_http_requests_total{instance=\"$instance\"}[$__interval])))",
                         "legendFormat": "{{status}}"
                       }
                     },
@@ -2263,8 +2190,9 @@
             "spec": {
               "options": {
                 "legend": {
-                  "displayMode": "table",
-                  "placement": "right",
+                  "showLegend": true,
+                  "displayMode": "list",
+                  "placement": "bottom",
                   "calcs": [
                     "sum"
                   ]
@@ -2297,6 +2225,374 @@
                     }
                   },
                   "noValue": "No requests",
+                  "min": 0,
+                  "decimals": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-47": {
+        "kind": "Panel",
+        "spec": {
+          "id": 47,
+          "title": "Tokens",
+          "description": "Shows while the KnellAuthFailures alert fires: more than 15 ping tokens were refused, or more than 1,000 throttled answers given, in 15 minutes. Check the access lines with status 401 or 403. Needs the rules from alerts/promql.yaml in a ruler that stores its `ALERTS` series beside the metrics, as Prometheus and Mimir do.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "0 * max(ALERTS{alertname=\"KnellAuthFailures\", alertstate=\"firing\", instance=\"$instance\"})",
+                        "legendFormat": "",
+                        "instant": true,
+                        "range": false
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {
+                "maxDataPoints": 500
+              }
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "colorMode": "background",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "values": false
+                },
+                "textMode": "auto",
+                "text": {
+                  "titleSize": 14,
+                  "valueSize": 28
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "none",
+                  "noValue": "Nothing to report",
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "red"
+                      }
+                    ]
+                  },
+                  "decimals": 0,
+                  "mappings": [
+                    {
+                      "type": "value",
+                      "options": {
+                        "0": {
+                          "index": 0,
+                          "text": "Tokens refused",
+                          "color": "red"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-48": {
+        "kind": "Panel",
+        "spec": {
+          "id": 48,
+          "title": "Throttled senders",
+          "description": "Shows while the KnellPingsThrottled alert fires: knell answered valid pings with 429 and recorded them, but each sender saw a failure, and one cause is a guessed token. Monitoring and alerts names the causes. Needs the rules from alerts/promql.yaml in a ruler that stores its `ALERTS` series beside the metrics, as Prometheus and Mimir do.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "0 * max(ALERTS{alertname=\"KnellPingsThrottled\", alertstate=\"firing\", instance=\"$instance\"})",
+                        "legendFormat": "",
+                        "instant": true,
+                        "range": false
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {
+                "maxDataPoints": 500
+              }
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "colorMode": "background",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "values": false
+                },
+                "textMode": "auto",
+                "text": {
+                  "titleSize": 14,
+                  "valueSize": 28
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "none",
+                  "noValue": "Nothing to report",
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "red"
+                      }
+                    ]
+                  },
+                  "decimals": 0,
+                  "mappings": [
+                    {
+                      "type": "value",
+                      "options": {
+                        "0": {
+                          "index": 0,
+                          "text": "Valid pings throttled",
+                          "color": "red"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-49": {
+        "kind": "Panel",
+        "spec": {
+          "id": 49,
+          "title": "Refused tokens by reason",
+          "description": "Pings refused for their token, by reason, as bars over the selected range. Invalid token means no configured token matched, Beat not allowed means a valid token named a beat it does not cover, and Throttled means a client past its failure limit was answered 429. No bars means knell refused no token. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "label_replace(label_replace(label_replace(sum by (reason) (((knell_auth_failures_total{instance=\"$instance\"} - knell_auth_failures_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_auth_failures_total{instance=\"$instance\"}[$__interval]) < knell_auth_failures_total{instance=\"$instance\"} offset $__interval) or (resets(knell_auth_failures_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_auth_failures_total{instance=\"$instance\"} and ((min_over_time(knell_auth_failures_total{instance=\"$instance\"}[$__interval]) < knell_auth_failures_total{instance=\"$instance\"} offset $__interval) or (resets(knell_auth_failures_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_auth_failures_total{instance=\"$instance\"} - min_over_time(knell_auth_failures_total{instance=\"$instance\"}[$__interval]))), \"reason\", \"Invalid token\", \"reason\", \"invalid_token\"), \"reason\", \"Beat not allowed\", \"reason\", \"beat_not_allowed\"), \"reason\", \"Throttled\", \"reason\", \"throttled\")",
+                        "legendFormat": "{{reason}}"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {
+                "interval": "1m"
+              }
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "showLegend": true,
+                  "displayMode": "list",
+                  "placement": "bottom",
+                  "calcs": [
+                    "sum"
+                  ]
+                },
+                "tooltip": {
+                  "mode": "multi"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "green"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "fillOpacity": 80,
+                    "lineWidth": 1,
+                    "drawStyle": "bars",
+                    "stacking": {
+                      "mode": "normal"
+                    }
+                  },
+                  "noValue": "No refusals",
+                  "min": 0,
+                  "decimals": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-50": {
+        "kind": "Panel",
+        "spec": {
+          "id": 50,
+          "title": "Valid pings answered 429",
+          "description": "Valid pings knell recorded although it answered them 429, by beat, as bars over the selected range. A bar means the sender shares an address with a failing client, a spray filled the global limit while the sender was not exempt, or someone guessed a token, as Monitoring and alerts explains. No bars means no valid ping was throttled. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "max by (beat) (sum by (beat, instance) (((knell_beats_recorded_while_throttled_total{instance=\"$instance\"} - knell_beats_recorded_while_throttled_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_beats_recorded_while_throttled_total{instance=\"$instance\"}[$__interval]) < knell_beats_recorded_while_throttled_total{instance=\"$instance\"} offset $__interval) or (resets(knell_beats_recorded_while_throttled_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_beats_recorded_while_throttled_total{instance=\"$instance\"} and ((min_over_time(knell_beats_recorded_while_throttled_total{instance=\"$instance\"}[$__interval]) < knell_beats_recorded_while_throttled_total{instance=\"$instance\"} offset $__interval) or (resets(knell_beats_recorded_while_throttled_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_beats_recorded_while_throttled_total{instance=\"$instance\"} - min_over_time(knell_beats_recorded_while_throttled_total{instance=\"$instance\"}[$__interval]))))",
+                        "legendFormat": "{{beat}}"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {
+                "interval": "1m"
+              }
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "showLegend": true,
+                  "displayMode": "list",
+                  "placement": "bottom",
+                  "calcs": [
+                    "sum"
+                  ]
+                },
+                "tooltip": {
+                  "mode": "multi"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "green"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "fillOpacity": 80,
+                    "lineWidth": 1,
+                    "drawStyle": "bars",
+                    "stacking": {
+                      "mode": "normal"
+                    }
+                  },
+                  "noValue": "No throttled pings",
                   "min": 0,
                   "decimals": 0
                 },
@@ -2566,6 +2862,66 @@
                                     }
                                   }
                                 }
+                              },
+                              {
+                                "kind": "AutoGridLayoutItem",
+                                "spec": {
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-47"
+                                  },
+                                  "conditionalRendering": {
+                                    "kind": "ConditionalRenderingGroup",
+                                    "spec": {
+                                      "visibility": "show",
+                                      "condition": "or",
+                                      "items": [
+                                        {
+                                          "kind": "ConditionalRenderingData",
+                                          "spec": {
+                                            "value": true
+                                          }
+                                        },
+                                        {
+                                          "kind": "ConditionalRenderingTimeRangeSize",
+                                          "spec": {
+                                            "value": "0s"
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "AutoGridLayoutItem",
+                                "spec": {
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-48"
+                                  },
+                                  "conditionalRendering": {
+                                    "kind": "ConditionalRenderingGroup",
+                                    "spec": {
+                                      "visibility": "show",
+                                      "condition": "or",
+                                      "items": [
+                                        {
+                                          "kind": "ConditionalRenderingData",
+                                          "spec": {
+                                            "value": true
+                                          }
+                                        },
+                                        {
+                                          "kind": "ConditionalRenderingTimeRangeSize",
+                                          "spec": {
+                                            "value": "0s"
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  }
+                                }
                               }
                             ]
                           }
@@ -2577,7 +2933,6 @@
                       "spec": {
                         "title": "Beats",
                         "collapse": false,
-                        "hideHeader": true,
                         "layout": {
                           "kind": "GridLayout",
                           "spec": {
@@ -2616,7 +2971,7 @@
                     {
                       "kind": "RowsLayoutRow",
                       "spec": {
-                        "title": "Check-ins",
+                        "title": "Beats",
                         "collapse": false,
                         "layout": {
                           "kind": "GridLayout",
@@ -2627,37 +2982,24 @@
                                 "spec": {
                                   "x": 0,
                                   "y": 0,
-                                  "width": 12,
+                                  "width": 16,
                                   "height": 8,
                                   "element": {
                                     "kind": "ElementReference",
-                                    "name": "panel-30"
+                                    "name": "panel-32"
                                   }
                                 }
                               },
                               {
                                 "kind": "GridLayoutItem",
                                 "spec": {
-                                  "x": 12,
+                                  "x": 16,
                                   "y": 0,
-                                  "width": 12,
+                                  "width": 8,
                                   "height": 8,
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-31"
-                                  }
-                                }
-                              },
-                              {
-                                "kind": "GridLayoutItem",
-                                "spec": {
-                                  "x": 0,
-                                  "y": 8,
-                                  "width": 24,
-                                  "height": 6,
-                                  "element": {
-                                    "kind": "ElementReference",
-                                    "name": "panel-32"
                                   }
                                 }
                               }
@@ -2681,7 +3023,7 @@
                                   "x": 0,
                                   "y": 0,
                                   "width": 12,
-                                  "height": 8,
+                                  "height": 10,
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-33"
@@ -2694,7 +3036,7 @@
                                   "x": 12,
                                   "y": 0,
                                   "width": 12,
-                                  "height": 8,
+                                  "height": 10,
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-34"
@@ -2734,7 +3076,7 @@
                                   "x": 0,
                                   "y": 0,
                                   "width": 6,
-                                  "height": 3,
+                                  "height": 6,
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-40"
@@ -2747,7 +3089,7 @@
                                   "x": 6,
                                   "y": 0,
                                   "width": 6,
-                                  "height": 3,
+                                  "height": 6,
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-41"
@@ -2760,7 +3102,7 @@
                                   "x": 12,
                                   "y": 0,
                                   "width": 6,
-                                  "height": 3,
+                                  "height": 6,
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-42"
@@ -2773,7 +3115,7 @@
                                   "x": 18,
                                   "y": 0,
                                   "width": 6,
-                                  "height": 3,
+                                  "height": 6,
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-43"
@@ -2800,7 +3142,7 @@
                                   "x": 0,
                                   "y": 0,
                                   "width": 12,
-                                  "height": 8,
+                                  "height": 10,
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-44"
@@ -2813,7 +3155,7 @@
                                   "x": 12,
                                   "y": 0,
                                   "width": 12,
-                                  "height": 8,
+                                  "height": 10,
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-45"
@@ -2824,12 +3166,38 @@
                                 "kind": "GridLayoutItem",
                                 "spec": {
                                   "x": 0,
-                                  "y": 8,
+                                  "y": 10,
                                   "width": 24,
                                   "height": 8,
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-46"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 18,
+                                  "width": 12,
+                                  "height": 10,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-49"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 12,
+                                  "y": 18,
+                                  "width": 12,
+                                  "height": 10,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-50"
                                   }
                                 }
                               }
@@ -2874,7 +3242,7 @@
       "hideTimepicker": false,
       "fiscalYearStartMonth": 0
     },
-    "title": "knell",
+    "title": "Knell",
     "variables": [
       {
         "kind": "DatasourceVariable",
@@ -2908,7 +3276,7 @@
           "hide": "dontHide",
           "refresh": "onTimeRangeChanged",
           "skipUrlSync": false,
-          "description": "The knell to show, by its scrape instance. Each knell watches its own copy of the beats.",
+          "description": "The knell to show, by its scrape instance. Knells that share one instance, told apart by a label such as hostname, are read as one group: each beat counts once, and knell health shows one tile per knell.",
           "query": {
             "kind": "DataQuery",
             "group": "prometheus",
@@ -3040,10 +3408,10 @@
               "name": "${datasource}"
             },
             "spec": {
-              "query": "query_result(count(label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetDown\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"10\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetAbsent\", alertstate=\"firing\"})), \"tile\", \"11\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellAcceptFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"12\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellNotifyFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"13\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellRestartChurn\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"14\", \"\", \"\")) or vector(0))"
+              "query": "query_result(count(label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetDown\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"10\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetAbsent\", alertstate=\"firing\"})), \"tile\", \"11\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellAcceptFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"12\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellNotifyFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"13\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellRestartChurn\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"14\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellAuthFailures\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"47\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellPingsThrottled\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"48\", \"\", \"\")) or vector(0))"
             }
           },
-          "definition": "query_result(count(label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetDown\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"10\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetAbsent\", alertstate=\"firing\"})), \"tile\", \"11\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellAcceptFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"12\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellNotifyFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"13\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellRestartChurn\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"14\", \"\", \"\")) or vector(0))",
+          "definition": "query_result(count(label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetDown\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"10\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetAbsent\", alertstate=\"firing\"})), \"tile\", \"11\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellAcceptFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"12\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellNotifyFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"13\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellRestartChurn\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"14\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellAuthFailures\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"47\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellPingsThrottled\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"48\", \"\", \"\")) or vector(0))",
           "regex": "/^\\{\\} ([0-9]+) /",
           "sort": "disabled",
           "options": [],
