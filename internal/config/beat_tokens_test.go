@@ -20,11 +20,10 @@ var tokenBeats = []Beat{
 	{ID: "watchdog", Deadline: time.Hour},
 }
 
-// Three distinct tokens that clear every checkBeatToken rule.
+// Two distinct tokens that clear every checkBeatToken rule.
 const (
 	tokenA = "aaaaaaaaaaaaaaaa-token-a"
 	tokenB = "bbbbbbbbbbbbbbbb-token-b"
-	tokenC = "cccccccccccccccc-token-c"
 )
 
 // covering returns the beat ids token covers in tokens, or nil when no entry

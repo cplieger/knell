@@ -2519,7 +2519,7 @@
         "spec": {
           "id": 50,
           "title": "Valid pings answered 429",
-          "description": "Valid pings knell recorded although it answered them 429, by beat, as bars over the selected range. Their sender shares an address with a failing client, a spray filled the global limit while the sender was not exempt, or someone guessed a token. Monitoring and alerts names the causes. No bars means no valid ping was throttled. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
+          "description": "Valid pings knell recorded although it answered them 429, by beat, as bars over the selected range. A bar means the sender shares an address with a failing client, a spray filled the global limit while the sender was not exempt, or someone guessed a token, as Monitoring and alerts explains. No bars means no valid ping was throttled. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -3179,7 +3179,7 @@
                                 "kind": "GridLayoutItem",
                                 "spec": {
                                   "x": 0,
-                                  "y": 0,
+                                  "y": 18,
                                   "width": 12,
                                   "height": 10,
                                   "element": {
@@ -3191,8 +3191,8 @@
                               {
                                 "kind": "GridLayoutItem",
                                 "spec": {
-                                  "x": 0,
-                                  "y": 0,
+                                  "x": 12,
+                                  "y": 18,
                                   "width": 12,
                                   "height": 10,
                                   "element": {
