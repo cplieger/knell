@@ -1782,7 +1782,7 @@
         "spec": {
           "id": 42,
           "title": "Refusals in ${span} ${spanunit}",
-          "description": "Requests knell refused before reading them in the selected range: a host not in ALLOWED_HOSTS, a beat path spelled in a way the router would rewrite, or sign-in attempts throttled. A steady count points to a job that pings the wrong address. No value means knell was not scraped in the range.",
+          "description": "Requests knell refused before reading them in the selected range: a host not in ALLOWED_HOSTS, or a beat path spelled in a way the router would rewrite. A steady count points to a job that pings the wrong address. No value means knell was not scraped in the range.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1864,7 +1864,7 @@
         "spec": {
           "id": 43,
           "title": "Started",
-          "description": "When each knell process last started, one tile per knell. Each start rearms every deadline, so a recent start means a beat's outage is only noticed after a full deadline. A tile is named by the scrape's hostname label when it sets one. No value means knell was not scraped.",
+          "description": "When each knell process last started, one tile per knell. Each start rearms every deadline, so a recent start means a beat's outage is only noticed after a full deadline. A tile is named by the scrape's hostname label when it sets one. No value means knell was not scraped, or the scrape drops the process_* series.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1922,7 +1922,7 @@
               "fieldConfig": {
                 "defaults": {
                   "unit": "dateTimeFromNow",
-                  "noValue": "knell was not scraped",
+                  "noValue": "knell or its process_* series not scraped",
                   "color": {
                     "mode": "fixed",
                     "fixedColor": "text"
@@ -1965,7 +1965,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "label_replace(label_replace(label_replace(sum by (reason) (((knell_pre_route_refusals_total{instance=\"$instance\"} - knell_pre_route_refusals_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) < knell_pre_route_refusals_total{instance=\"$instance\"} offset $__interval) or (resets(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_pre_route_refusals_total{instance=\"$instance\"} and ((min_over_time(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) < knell_pre_route_refusals_total{instance=\"$instance\"} offset $__interval) or (resets(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_pre_route_refusals_total{instance=\"$instance\"} - min_over_time(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]))), \"reason\", \"Beat path spelled oddly\", \"reason\", \"non_canonical_beat_path\"), \"reason\", \"Host not allowed\", \"reason\", \"host_not_allowed\"), \"reason\", \"Sign-in throttled\", \"reason\", \"auth_throttled\")",
+                        "expr": "label_replace(label_replace(sum by (reason) (((knell_pre_route_refusals_total{instance=\"$instance\"} - knell_pre_route_refusals_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) < knell_pre_route_refusals_total{instance=\"$instance\"} offset $__interval) or (resets(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_pre_route_refusals_total{instance=\"$instance\"} and ((min_over_time(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) < knell_pre_route_refusals_total{instance=\"$instance\"} offset $__interval) or (resets(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_pre_route_refusals_total{instance=\"$instance\"} - min_over_time(knell_pre_route_refusals_total{instance=\"$instance\"}[$__interval]))), \"reason\", \"Beat path spelled oddly\", \"reason\", \"non_canonical_beat_path\"), \"reason\", \"Host not allowed\", \"reason\", \"host_not_allowed\")",
                         "legendFormat": "{{reason}}"
                       }
                     },
@@ -2233,6 +2233,374 @@
             }
           }
         }
+      },
+      "panel-47": {
+        "kind": "Panel",
+        "spec": {
+          "id": 47,
+          "title": "Tokens",
+          "description": "Shows while the KnellAuthFailures alert fires: more than 15 ping tokens were refused, or more than 1,000 throttled answers given, in 15 minutes. Check the access lines with status 401 or 403. Needs the rules from alerts/promql.yaml in a ruler that stores its `ALERTS` series beside the metrics, as Prometheus and Mimir do.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "0 * max(ALERTS{alertname=\"KnellAuthFailures\", alertstate=\"firing\", instance=\"$instance\"})",
+                        "legendFormat": "",
+                        "instant": true,
+                        "range": false
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {
+                "maxDataPoints": 500
+              }
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "colorMode": "background",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "values": false
+                },
+                "textMode": "auto",
+                "text": {
+                  "titleSize": 14,
+                  "valueSize": 28
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "none",
+                  "noValue": "Nothing to report",
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "red"
+                      }
+                    ]
+                  },
+                  "decimals": 0,
+                  "mappings": [
+                    {
+                      "type": "value",
+                      "options": {
+                        "0": {
+                          "index": 0,
+                          "text": "Tokens refused",
+                          "color": "red"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-48": {
+        "kind": "Panel",
+        "spec": {
+          "id": 48,
+          "title": "Throttled senders",
+          "description": "Shows while the KnellPingsThrottled alert fires: knell answered valid pings with 429 and recorded them, but each sender saw a failure, and one cause is a guessed token. Monitoring and alerts names the causes. Needs the rules from alerts/promql.yaml in a ruler that stores its `ALERTS` series beside the metrics, as Prometheus and Mimir do.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "0 * max(ALERTS{alertname=\"KnellPingsThrottled\", alertstate=\"firing\", instance=\"$instance\"})",
+                        "legendFormat": "",
+                        "instant": true,
+                        "range": false
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {
+                "maxDataPoints": 500
+              }
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "colorMode": "background",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "values": false
+                },
+                "textMode": "auto",
+                "text": {
+                  "titleSize": 14,
+                  "valueSize": 28
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "none",
+                  "noValue": "Nothing to report",
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "red"
+                      }
+                    ]
+                  },
+                  "decimals": 0,
+                  "mappings": [
+                    {
+                      "type": "value",
+                      "options": {
+                        "0": {
+                          "index": 0,
+                          "text": "Valid pings throttled",
+                          "color": "red"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-49": {
+        "kind": "Panel",
+        "spec": {
+          "id": 49,
+          "title": "Refused tokens by reason",
+          "description": "Pings refused for their token, by reason, as bars over the selected range. Invalid token means no configured token matched, Beat not allowed means a valid token named a beat it does not cover, and Throttled means a client past its failure limit was answered 429. No bars means knell refused no token. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "label_replace(label_replace(label_replace(sum by (reason) (((knell_auth_failures_total{instance=\"$instance\"} - knell_auth_failures_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_auth_failures_total{instance=\"$instance\"}[$__interval]) < knell_auth_failures_total{instance=\"$instance\"} offset $__interval) or (resets(knell_auth_failures_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_auth_failures_total{instance=\"$instance\"} and ((min_over_time(knell_auth_failures_total{instance=\"$instance\"}[$__interval]) < knell_auth_failures_total{instance=\"$instance\"} offset $__interval) or (resets(knell_auth_failures_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_auth_failures_total{instance=\"$instance\"} - min_over_time(knell_auth_failures_total{instance=\"$instance\"}[$__interval]))), \"reason\", \"Invalid token\", \"reason\", \"invalid_token\"), \"reason\", \"Beat not allowed\", \"reason\", \"beat_not_allowed\"), \"reason\", \"Throttled\", \"reason\", \"throttled\")",
+                        "legendFormat": "{{reason}}"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {
+                "interval": "1m"
+              }
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "showLegend": true,
+                  "displayMode": "list",
+                  "placement": "bottom",
+                  "calcs": [
+                    "sum"
+                  ]
+                },
+                "tooltip": {
+                  "mode": "multi"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "green"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "fillOpacity": 80,
+                    "lineWidth": 1,
+                    "drawStyle": "bars",
+                    "stacking": {
+                      "mode": "normal"
+                    }
+                  },
+                  "noValue": "No refusals",
+                  "min": 0,
+                  "decimals": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-50": {
+        "kind": "Panel",
+        "spec": {
+          "id": 50,
+          "title": "Valid pings answered 429",
+          "description": "Valid pings knell recorded although it answered them 429, by beat, as bars over the selected range. Their sender shares an address with a failing client, a spray filled the global limit while the sender was not exempt, or someone guessed a token. Monitoring and alerts names the causes. No bars means no valid ping was throttled. A bar near a knell restart, a failed scrape or a scrape outage can show fewer or more than happened.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "max by (beat) (sum by (beat, instance) (((knell_beats_recorded_while_throttled_total{instance=\"$instance\"} - knell_beats_recorded_while_throttled_total{instance=\"$instance\"} offset $__interval) unless ((min_over_time(knell_beats_recorded_while_throttled_total{instance=\"$instance\"}[$__interval]) < knell_beats_recorded_while_throttled_total{instance=\"$instance\"} offset $__interval) or (resets(knell_beats_recorded_while_throttled_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_beats_recorded_while_throttled_total{instance=\"$instance\"} and ((min_over_time(knell_beats_recorded_while_throttled_total{instance=\"$instance\"}[$__interval]) < knell_beats_recorded_while_throttled_total{instance=\"$instance\"} offset $__interval) or (resets(knell_beats_recorded_while_throttled_total{instance=\"$instance\"}[$__interval]) > 0))) or (knell_beats_recorded_while_throttled_total{instance=\"$instance\"} - min_over_time(knell_beats_recorded_while_throttled_total{instance=\"$instance\"}[$__interval]))))",
+                        "legendFormat": "{{beat}}"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {
+                "interval": "1m"
+              }
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "showLegend": true,
+                  "displayMode": "list",
+                  "placement": "bottom",
+                  "calcs": [
+                    "sum"
+                  ]
+                },
+                "tooltip": {
+                  "mode": "multi"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "green"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "fillOpacity": 80,
+                    "lineWidth": 1,
+                    "drawStyle": "bars",
+                    "stacking": {
+                      "mode": "normal"
+                    }
+                  },
+                  "noValue": "No throttled pings",
+                  "min": 0,
+                  "decimals": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
       }
     },
     "layout": {
@@ -2471,6 +2839,66 @@
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-14"
+                                  },
+                                  "conditionalRendering": {
+                                    "kind": "ConditionalRenderingGroup",
+                                    "spec": {
+                                      "visibility": "show",
+                                      "condition": "or",
+                                      "items": [
+                                        {
+                                          "kind": "ConditionalRenderingData",
+                                          "spec": {
+                                            "value": true
+                                          }
+                                        },
+                                        {
+                                          "kind": "ConditionalRenderingTimeRangeSize",
+                                          "spec": {
+                                            "value": "0s"
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "AutoGridLayoutItem",
+                                "spec": {
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-47"
+                                  },
+                                  "conditionalRendering": {
+                                    "kind": "ConditionalRenderingGroup",
+                                    "spec": {
+                                      "visibility": "show",
+                                      "condition": "or",
+                                      "items": [
+                                        {
+                                          "kind": "ConditionalRenderingData",
+                                          "spec": {
+                                            "value": true
+                                          }
+                                        },
+                                        {
+                                          "kind": "ConditionalRenderingTimeRangeSize",
+                                          "spec": {
+                                            "value": "0s"
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "AutoGridLayoutItem",
+                                "spec": {
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-48"
                                   },
                                   "conditionalRendering": {
                                     "kind": "ConditionalRenderingGroup",
@@ -2746,6 +3174,32 @@
                                     "name": "panel-46"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 0,
+                                  "width": 12,
+                                  "height": 10,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-49"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 0,
+                                  "width": 12,
+                                  "height": 10,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-50"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -2954,10 +3408,10 @@
               "name": "${datasource}"
             },
             "spec": {
-              "query": "query_result(count(label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetDown\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"10\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetAbsent\", alertstate=\"firing\"})), \"tile\", \"11\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellAcceptFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"12\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellNotifyFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"13\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellRestartChurn\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"14\", \"\", \"\")) or vector(0))"
+              "query": "query_result(count(label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetDown\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"10\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetAbsent\", alertstate=\"firing\"})), \"tile\", \"11\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellAcceptFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"12\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellNotifyFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"13\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellRestartChurn\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"14\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellAuthFailures\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"47\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellPingsThrottled\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"48\", \"\", \"\")) or vector(0))"
             }
           },
-          "definition": "query_result(count(label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetDown\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"10\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetAbsent\", alertstate=\"firing\"})), \"tile\", \"11\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellAcceptFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"12\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellNotifyFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"13\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellRestartChurn\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"14\", \"\", \"\")) or vector(0))",
+          "definition": "query_result(count(label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetDown\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"10\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellTargetAbsent\", alertstate=\"firing\"})), \"tile\", \"11\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellAcceptFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"12\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellNotifyFailing\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"13\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellRestartChurn\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"14\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellAuthFailures\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"47\", \"\", \"\") or label_replace(count(0 * max(ALERTS{alertname=\"KnellPingsThrottled\", alertstate=\"firing\", instance=\"$instance\"})), \"tile\", \"48\", \"\", \"\")) or vector(0))",
           "regex": "/^\\{\\} ([0-9]+) /",
           "sort": "disabled",
           "options": [],

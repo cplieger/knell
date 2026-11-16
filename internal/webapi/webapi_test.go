@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,10 +27,15 @@ import (
 type fakeBeater struct {
 	known  map[string]bool
 	seen   []string
+	mu     sync.Mutex
 	closed bool
 }
 
+// Beat is safe for concurrent use: a throttled ping records on its server
+// goroutine after the client already has its answer.
 func (f *fakeBeater) Beat(id string) watch.BeatOutcome {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.closed {
 		return watch.BeatClosed
 	}
@@ -40,23 +46,48 @@ func (f *fakeBeater) Beat(id string) watch.BeatOutcome {
 	return watch.BeatRecorded
 }
 
-// testBeatToken is the credential every test handler is built with. BEAT_TOKEN
+// ids lists the beats f knows.
+func (f *fakeBeater) ids() []string {
+	ids := make([]string, 0, len(f.known))
+	for id := range f.known {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// depsFor builds the ping listener's Deps for one token covering every one of
+// beats, the beats being the configured ones, with a fresh limiter. An empty
+// token is the zero TokenSet, which matches nothing.
+func depsFor(token string, beats ...string) *Deps {
+	d := &Deps{Covers: [][]string{beats}, Beats: beats, Limiter: mustLimiter(time.Hour)}
+	if token != "" {
+		set, err := httpserver.NewTokenSet([]string{token})
+		if err != nil {
+			panic(err)
+		}
+		d.Tokens = set
+	}
+	return d
+}
+
+// withProxies and withHosts set one more field of d.
+func withProxies(d *Deps, trusted []netip.Prefix) *Deps     { d.TrustedProxies = trusted; return d }
+func withHosts(d *Deps, hosts *httpserver.HostPolicy) *Deps { d.Hosts = hosts; return d }
+
+// mustLimiter is NewLimiter for a fixture.
+func mustLimiter(trust time.Duration) *httpserver.FailureLimiter {
+	l, err := NewLimiter(trust)
+	if err != nil {
+		panic(err)
+	}
+	return l
+}
+
+// testBeatToken is the credential every test handler is built with. BEAT_TOKENS
 // is required in production (internal/config refuses to start without it), so
 // there is no ungated handler to test against: a test that is not about the gate
 // itself presents this token and gets the endpoint's real behaviour.
 const testBeatToken = "unit-test-beat-token"
-
-// authFailBurst mirrors the burst of the failed-auth token bucket knell's
-// throttle rides — httpserver.FailedAuthRateLimit's preset, not knell's own tuning
-// any more (the library owns the numbers so the services guarding one static
-// bearer on one route cannot drift apart). It is unexported there, so the tests
-// that need to say HOW MANY attempts fit inside the burst carry this mirror.
-//
-// It is self-verifying rather than a second source of truth: the first subtest
-// of TestFailedAuthIsThrottledInAggregate demands exactly this many 401s and
-// then a 429, so a preset retuned upstream fails there loudly instead of
-// quietly weakening every assertion below.
-const authFailBurst = 10
 
 // newTestHandler assembles knell's surface around b with a healthy liveness
 // endpoint; token is the required beat credential, exactly as in production. Beat acceptance is whatever b reports: a fakeBeater with
@@ -70,7 +101,7 @@ func newTestHandler(b *fakeBeater, token string) http.Handler {
 // test control, so a test can drive a FAILING probe: /healthz answers 503
 // whenever the health verdict is unhealthy (boot, or after the pre-drain flip).
 func newTestHandlerHealthz(b *fakeBeater, token string, healthzStatus int) http.Handler {
-	return surface(New(b, Deps{BeatToken: token}), NewOps(OpsDeps{Healthz: staticHealthz(healthzStatus)}))
+	return surface(New(b, depsFor(token, b.ids()...)), NewOps(OpsDeps{Healthz: staticHealthz(healthzStatus)}))
 }
 
 // surface stands in for knell's two listeners in one handler: GET /healthz
@@ -637,7 +668,7 @@ func TestNoStoreOnEveryRoute(t *testing.T) {
 	t.Run("throttled 429", func(t *testing.T) {
 		h := newTestHandler(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken)
 		var rec *httptest.ResponseRecorder
-		for range authFailBurst + 1 {
+		for range failuresPerKey + 1 {
 			req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
 			req.Header.Set("Authorization", "Bearer wrong")
 			rec = httptest.NewRecorder()
@@ -645,7 +676,7 @@ func TestNoStoreOnEveryRoute(t *testing.T) {
 		}
 		if rec.Code != http.StatusTooManyRequests {
 			t.Fatalf("attempt %d = %d, want 429: this case needs the throttle to have fired (body %s)",
-				authFailBurst+1, rec.Code, rec.Body.String())
+				failuresPerKey+1, rec.Code, rec.Body.String())
 		}
 		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
 			t.Errorf("Cache-Control on the throttled 429 = %q, want %q: a cache may not re-serve \"you are throttled\" to a sender whose budget has refilled",
@@ -672,7 +703,7 @@ func TestPanicUnderBeatHandlerAnswers500AndIsLogged(t *testing.T) {
 	// net/http: the sender sees a reset connection rather than a 500, and the
 	// access log never reports a status for the endpoint that feeds the switch.
 	rec := capture.Default(t)
-	h := New(panicBeater{}, Deps{BeatToken: testBeatToken})
+	h := New(panicBeater{}, depsFor(testBeatToken, "api"))
 
 	req := newBeatRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
 	w := httptest.NewRecorder()
@@ -844,7 +875,7 @@ func TestUnauthorizedBeatBodyIsNeverRead(t *testing.T) {
 }
 
 // FuzzBeatTokenAcceptsOnlyTheExactBearerHeader fuzzes the untrusted header the
-// beat gate reads. BEAT_TOKEN is the only thing between the public internet and
+// beat gate reads. A beat token is the only thing between the public internet and
 // a sender that can keep the dead-man switch armed with no real heartbeat
 // behind it, and acceptance is documented as exactly "Authorization: Bearer
 // <token>". The invariant is a security equality, not crash-freedom: for ANY
@@ -921,7 +952,7 @@ func TestTokenGateScopedToBeatEndpoint(t *testing.T) {
 // lists every beat with its last ping, so neither operations route may answer
 // there, with or without a token.
 func TestPingListenerServesNoOperationsRoute(t *testing.T) {
-	h := New(&fakeBeater{known: map[string]bool{"api": true}}, Deps{BeatToken: testBeatToken})
+	h := New(&fakeBeater{known: map[string]bool{"api": true}}, depsFor(testBeatToken, "api"))
 	for _, path := range []string{"/healthz", "/metrics"} {
 		for _, auth := range []string{"", "Bearer " + testBeatToken} {
 			req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -940,15 +971,11 @@ func TestPingListenerServesNoOperationsRoute(t *testing.T) {
 	}
 }
 
-// TestEmptyBeatTokenFailsClosed pins the wiring guard. internal/config refuses
-// to start without a BEAT_TOKEN, so an empty one reaching webapi is a bug — and
-// the dangerous way to handle it is the one this rules out: building the
-// verifier over "Bearer "+"" would arm the gate for a credential every client
-// can present verbatim, an open endpoint with a published password. The zero
-// verifier refuses everything instead, including the bare scheme.
+// TestEmptyBeatTokenFailsClosed pins that the zero TokenSet matches nothing,
+// the bare scheme included.
 func TestEmptyBeatTokenFailsClosed(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := New(b, Deps{})
+	h := New(b, depsFor("", b.ids()...))
 
 	for _, auth := range []string{"", "Bearer ", "Bearer", "Bearer anything"} {
 		t.Run("auth "+auth, func(t *testing.T) {
@@ -967,119 +994,6 @@ func TestEmptyBeatTokenFailsClosed(t *testing.T) {
 	if len(b.seen) != 0 {
 		t.Errorf("recorded beats = %v, want none: an empty configured token must refuse every ping, never admit one", b.seen)
 	}
-}
-
-// TestFailedAuthIsThrottledInAggregate pins the failed-auth throttle. The token
-// is the endpoint's only gate, so an unthrottled 401 path is a guessing oracle
-// and a log-flood vector. Its three halves are pinned together, because each
-// alone is a plausible mis-implementation: bad bearers are capped, a VALID ping
-// never draws a token (so healthy beats cannot throttle themselves behind a
-// flood), and no other route or method draws one. The 429 is the one refusal
-// outside httpserver.Logging, so the reason counter below is its only vantage point.
-func TestFailedAuthIsThrottledInAggregate(t *testing.T) {
-	badBearer := func(h http.Handler) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
-		req.Header.Set("Authorization", "Bearer wrong")
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		return rec
-	}
-
-	t.Run("bad bearers are capped at the burst", func(t *testing.T) {
-		b := &fakeBeater{known: map[string]bool{"api": true}}
-		h := newTestHandler(b, testBeatToken)
-		// The 429 is answered outside httpserver.Logging, so it reaches neither
-		// the access log nor the request counter: this reason series is the
-		// only vantage point on it. Deltas against the singleton registry.
-		const reasonSeries = `knell_pre_route_refusals_total{reason="auth_throttled"}`
-		reasonBefore := mustSeriesValue(t, scrapeExposition(t, h), reasonSeries)
-
-		// The bucket starts full, so exactly authFailBurst attempts reach the
-		// gate before it empties. A 429 inside that window would throttle an
-		// operator retrying a rotated token by hand.
-		for i := range authFailBurst {
-			if rec := badBearer(h); rec.Code != http.StatusUnauthorized {
-				t.Fatalf("attempt %d = %d, want 401: the burst must absorb %d attempts (body %s)",
-					i+1, rec.Code, authFailBurst, rec.Body.String())
-			}
-		}
-		// A 401 is the handler's refusal, not the throttle's: counting it here
-		// would make the series read as a throttle that fired when it did not.
-		if got := mustSeriesValue(t, scrapeExposition(t, h), reasonSeries); got != reasonBefore {
-			t.Errorf("%s = %v, want %v after %d unthrottled 401s: only a 429 is a throttled refusal",
-				reasonSeries, got, reasonBefore, authFailBurst)
-		}
-		rec := badBearer(h)
-		if rec.Code != http.StatusTooManyRequests {
-			t.Fatalf("attempt %d = %d, want 429: an unbounded 401 path is a guessing oracle and a log flood (body %s)",
-				authFailBurst+1, rec.Code, rec.Body.String())
-		}
-		if !strings.Contains(rec.Body.String(), "too_many_auth_failures") {
-			t.Errorf("429 body = %s, want the too_many_auth_failures coded envelope", rec.Body.String())
-		}
-		if got := mustSeriesValue(t, scrapeExposition(t, h), reasonSeries); got != reasonBefore+1 {
-			t.Errorf("%s = %v, want %v: the 429 is logged and counted nowhere else, so an operator has no other way to see the throttle fired",
-				reasonSeries, got, reasonBefore+1)
-		}
-		// A sender that is merely early has to learn when to come back; the
-		// hint is what makes the refusal actionable rather than opaque.
-		if got := rec.Header().Get("Retry-After"); got == "" {
-			t.Errorf("429 carries no Retry-After: a throttled sender cannot tell when to retry")
-		}
-		if len(b.seen) != 0 {
-			t.Errorf("recorded beats = %v, want none: no failed-auth attempt may record", b.seen)
-		}
-	})
-
-	t.Run("a valid ping is never throttled", func(t *testing.T) {
-		b := &fakeBeater{known: map[string]bool{"api": true}}
-		h := newTestHandler(b, testBeatToken)
-
-		// Empty the bucket first: the point is that a valid ping does not draw
-		// from it at all, so it must succeed even while it is empty.
-		for range authFailBurst + 5 {
-			badBearer(h)
-		}
-		for i := range authFailBurst + 5 {
-			if rec := beatRequest(t, h, http.MethodPost, "/beat/api"); rec.Code != http.StatusOK {
-				t.Fatalf("valid ping %d during a failed-auth flood = %d, want 200: valid beat senders must never be throttled (body %s)",
-					i+1, rec.Code, rec.Body.String())
-			}
-		}
-		if len(b.seen) != authFailBurst+5 {
-			t.Errorf("recorded beats = %d, want %d: every valid ping must record", len(b.seen), authFailBurst+5)
-		}
-	})
-
-	t.Run("other requests draw no token", func(t *testing.T) {
-		b := &fakeBeater{known: map[string]bool{"api": true}}
-		h := newTestHandler(b, testBeatToken)
-
-		// None of these is a failed authentication: the probes are ungated, and
-		// the /beat spellings are refused as a method or as an unknown beat
-		// before any credential matters. Drawing on them would let unrelated
-		// traffic throttle the real senders' 401 budget.
-		for range authFailBurst + 5 {
-			for _, r := range []struct{ method, path string }{
-				{http.MethodGet, "/healthz"},
-				{http.MethodGet, "/metrics"},
-				{http.MethodGet, "/beat/api"},
-				{http.MethodPost, "/beat/api/extra"},
-				{http.MethodPost, "/beat"},
-			} {
-				req := httptest.NewRequest(r.method, r.path, nil)
-				rec := httptest.NewRecorder()
-				h.ServeHTTP(rec, req)
-				if rec.Code == http.StatusTooManyRequests {
-					t.Fatalf("%s %s = 429: only a failed authentication on the beat endpoint may draw a token", r.method, r.path)
-				}
-			}
-		}
-		// The budget is intact: the very next bad bearer is still a 401.
-		if rec := badBearer(h); rec.Code != http.StatusUnauthorized {
-			t.Fatalf("bad bearer after unrelated traffic = %d, want 401: the bucket was drained by requests that are not auth failures", rec.Code)
-		}
-	})
 }
 
 // TestEveryRejectedMethodAnswersTheSameRefusal pins that the Allow header is
@@ -1315,7 +1229,7 @@ func newShutdownHarness(t *testing.T, id string) (http.Handler, func(), *fakeClo
 	start := time.Unix(1_700_000_000, 0).UTC()
 	clock := &fakeClock{now: start}
 	watcher := watch.New([]watch.Beat{{ID: id, Deadline: time.Minute}}, &deliveringNotifier{}, clock.Now, start)
-	h := surface(New(watcher, Deps{BeatToken: testBeatToken}), NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK)}))
+	h := surface(New(watcher, depsFor(testBeatToken, id)), NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK)}))
 	return h, watcher.StopAccepting, clock, start
 }
 
@@ -1411,7 +1325,11 @@ func TestRefusedUnknownBeatMintsNoSeries(t *testing.T) {
 
 	closeAdmission()
 
-	assertBeatRefused(t, h, http.MethodPost, "/beat/"+ghost)
+	// A token-holder's unknown id is answered as unknown without asking the
+	// watcher.
+	if rec := beatRequest(t, h, http.MethodPost, "/beat/"+ghost); rec.Code != http.StatusNotFound {
+		t.Fatalf("POST /beat/%s = %d, want 404 (body %s)", ghost, rec.Code, rec.Body.String())
+	}
 	if exposition := scrapeExposition(t, h); strings.Contains(exposition, ghost) {
 		t.Errorf("exposition mentions %s: a refused ping must mint no series, like the 404 path", ghost)
 	}
@@ -1527,7 +1445,7 @@ func httpRequestSeries(exposition string) map[string]bool {
 
 // TestRefusedPingIsVisibleInTheRequestCounter is the whole point of the request
 // metric: knell_beats_received_total counts ACCEPTED pings only, so before this
-// counter existed every refusal — a rotated BEAT_TOKEN (401), a misspelled beat
+// counter existed every refusal — a rotated beat token (401), a misspelled beat
 // id (404), a disallowed method (405), a ping during the drain (503) — was
 // invisible to a scrape and could only be found by reading access logs. knell's
 // own README points alert rules at a second vantage point scraping /metrics, so
@@ -1555,7 +1473,7 @@ func TestRefusedPingIsVisibleInTheRequestCounter(t *testing.T) {
 			wantStatus: http.StatusOK, wantSeen: 1,
 			wantSeries: `knell_http_requests_total{method="POST",path="/beat/{id}",status="200"}`,
 		},
-		// A rotated or mistyped BEAT_TOKEN. The credential is checked before the
+		// A rotated or mistyped beat token. The credential is checked before the
 		// body drain and before the id lookup, so a caller with no valid token
 		// gets 401 rather than 404 or 503.
 		"unauthorized ping": {
@@ -1937,7 +1855,7 @@ func TestAccessLogClientIPResolvesOnlyThroughTrustedProxies(t *testing.T) {
 		t.Fatalf("ParseCIDRs rejected %v; the fixture must be a valid trusted-proxy set", invalid)
 	}
 	b := &fakeBeater{known: map[string]bool{"api": true}}
-	h := New(b, Deps{BeatToken: testBeatToken, TrustedProxies: trusted})
+	h := New(b, withProxies(depsFor(testBeatToken, b.ids()...), trusted))
 
 	// httptest.NewRequest's RemoteAddr is 192.0.2.1:1234, inside the set above,
 	// so the forwarded header is a trusted proxy's own report of the sender.
@@ -1954,7 +1872,7 @@ func TestAccessLogClientIPResolvesOnlyThroughTrustedProxies(t *testing.T) {
 
 	// The same request with NO trusted set must report the socket peer.
 	bare := capture.Default(t)
-	plain := New(b, Deps{BeatToken: testBeatToken})
+	plain := New(b, depsFor(testBeatToken, b.ids()...))
 	spoofed := newBeatRequest(http.MethodPost, "/beat/api", strings.NewReader(""))
 	spoofed.Header.Set("X-Forwarded-For", "203.0.113.7")
 	plain.ServeHTTP(httptest.NewRecorder(), spoofed)
@@ -2010,7 +1928,7 @@ func hostPolicy(t *testing.T, entries string) *httpserver.HostPolicy {
 func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	hosts := hostPolicy(t, "knell.example")
-	h := surface(New(b, Deps{Hosts: hosts, BeatToken: testBeatToken}),
+	h := surface(New(b, withHosts(depsFor(testBeatToken, b.ids()...), hosts)),
 		NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK), Hosts: hosts}))
 
 	tests := map[string]struct {
@@ -2119,7 +2037,7 @@ func scrapeAs(t *testing.T, h http.Handler, host string) string {
 func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	hosts := hostPolicy(t, "knell.example")
-	h := surface(New(b, Deps{Hosts: hosts, BeatToken: testBeatToken}),
+	h := surface(New(b, withHosts(depsFor(testBeatToken, b.ids()...), hosts)),
 		NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK), Hosts: hosts}))
 
 	// The refusal happens before the mux routes, so the path label is the
@@ -2161,15 +2079,11 @@ func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 	}
 }
 
-// TestThrottledAuthFailureWritesNoAccessLine pins WHY beatAuthFailureLimiter
-// sits OUTSIDE httpserver.Logging: an over-budget attempt must be answered before
-// the access logger, so a guessing run at wire speed cannot write one
-// access line per attempt and push knell's permanently-lost-notice WARNs out of
-// the retained log window. Nothing else pins that ordering -- the throttle's
-// other tests assert the 429 and its reason counter, both of which survive the
-// limiter being moved inside Logging, which restores the flood with the suite
-// green. So: the unthrottled attempts each leave exactly one line, and the
-// throttled ones leave none at all.
+// TestThrottledAuthFailureWritesNoAccessLine pins that a throttled attempt
+// writes no Info access line, so a guessing run at wire speed cannot push
+// knell's permanently-lost-notice WARNs out of the retained log window: the
+// unthrottled attempts each leave one Info line, and the throttled ones only
+// Debug lines.
 func TestThrottledAuthFailureWritesNoAccessLine(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global slog
 	// default, and must be installed BEFORE New, because httpserver.Logging
@@ -2187,14 +2101,14 @@ func TestThrottledAuthFailureWritesNoAccessLine(t *testing.T) {
 
 	// The burst reaches the handler, so each of these IS logged: the bound is on
 	// the flood, not on reporting a failed authentication at all.
-	for i := range authFailBurst {
+	for i := range failuresPerKey {
 		if got := badBearer(); got != http.StatusUnauthorized {
 			t.Fatalf("attempt %d = %d, want 401", i+1, got)
 		}
 	}
-	if got := logs.CountExact("http"); got != authFailBurst {
-		t.Fatalf("access lines after %d unthrottled 401s = %d, want %d: a refused ping must still be greppable",
-			authFailBurst, got, authFailBurst)
+	if got := logs.CountLevel(slog.LevelInfo, "http"); got != failuresPerKey {
+		t.Fatalf("Info access lines after %d unthrottled 401s = %d, want %d: a refused ping must still be greppable",
+			failuresPerKey, got, failuresPerKey)
 	}
 
 	const flood = 50
@@ -2203,22 +2117,18 @@ func TestThrottledAuthFailureWritesNoAccessLine(t *testing.T) {
 			t.Fatalf("throttled attempt %d = %d, want 429", i+1, got)
 		}
 	}
-	if got := logs.CountExact("http"); got != authFailBurst {
-		t.Errorf("%d throttled attempts added %d access lines, want 0: the throttle must answer OUTSIDE httpserver.Logging, or a guessing run writes knell's log at wire speed",
-			flood, got-authFailBurst)
+	if got := logs.CountLevel(slog.LevelInfo, "http"); got != failuresPerKey {
+		t.Errorf("%d throttled attempts added %d Info access lines, want 0: a guessing run past its limit must not write knell's log at wire speed",
+			flood, got-failuresPerKey)
+	}
+	if got := logs.CountLevel(slog.LevelDebug, "http"); got != flood {
+		t.Errorf("Debug access lines = %d, want %d: a throttled attempt stays visible at Debug", got, flood)
 	}
 }
 
-// TestFailedAuthDrawsATokenForEverySpellingTheGateAnswers pins the throttle
-// against the ROUTE rather than one spelling of it. The bucket's endpoint half
-// is the mux's own verdict (failedBeatAuth compares mux.Handler's pattern to
-// beatRoutePattern), and ServeMux matches patterns on the ESCAPED path, so an
-// encoded slash keeps the request on POST /beat/{id} and the bearer gate still
-// answers it 401. Any spelling the gate answers is a guessing attempt against
-// the endpoint's only credential and one access line per attempt, so it has to
-// draw from the same bucket: otherwise a caller who appends %2F to the id has an
-// unbounded oracle and an unbounded log flood, and every existing throttle test
-// stays green.
+// TestFailedAuthDrawsATokenForEverySpellingTheGateAnswers pins that every
+// escaped spelling ServeMux still routes to POST /beat/{id} reaches the gate
+// and draws on the client's failure window.
 func TestFailedAuthDrawsATokenForEverySpellingTheGateAnswers(t *testing.T) {
 	// The families the mux reaches by different rules: an escaped character inside
 	// the {id} segment (matched on the ESCAPED path), an escaped character in the
@@ -2238,7 +2148,7 @@ func TestFailedAuthDrawsATokenForEverySpellingTheGateAnswers(t *testing.T) {
 			h := newTestHandler(b, testBeatToken)
 
 			var throttled bool
-			for i := range authFailBurst * 3 {
+			for i := range failuresPerKey * 3 {
 				req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(""))
 				req.Header.Set("Authorization", "Bearer wrong")
 				rec := httptest.NewRecorder()
@@ -2254,7 +2164,7 @@ func TestFailedAuthDrawsATokenForEverySpellingTheGateAnswers(t *testing.T) {
 			}
 			if !throttled {
 				t.Errorf("POST %s answered %d failed authentications unthrottled: the token is the endpoint's only gate, so every spelling the gate answers must draw from the same bucket",
-					target, authFailBurst*3)
+					target, failuresPerKey*3)
 			}
 			if len(b.seen) != 0 {
 				t.Errorf("recorded %v, want nothing: no failed-auth attempt may record", b.seen)

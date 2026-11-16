@@ -320,10 +320,10 @@ func (st *beatState) queueDetectedOutage(rec *overdueBeat) bool {
 
 // recordEndedOutage queues the missing transition of an outage a ping has
 // already ended, the record that is now that outage's only trace: a full queue
-// loses it for good, so it counts a dropped outage RECORD and warns. The record,
-// not a message: nothing was ever attempted for it, and a history message can
-// cover several records. It reports whether the record was dropped so the CALLER
-// can announce it after releasing w.mu.
+// loses it for good, so it counts a dropped outage RECORD. The record, not a
+// message: nothing was ever attempted for it, and a history message can cover
+// several records. It reports whether the record was dropped, so Beat can queue
+// the warning for the observation loop.
 func (st *beatState) recordEndedOutage(rec *overdueBeat) bool {
 	if st.queueDetectedOutage(rec) {
 		return false
@@ -332,11 +332,11 @@ func (st *beatState) recordEndedOutage(rec *overdueBeat) bool {
 	return true
 }
 
-// logEndedOutageDropped announces a dropped ended-outage record. Beat emits it
-// AFTER w.mu is released, like logOngoingOutageDeferred on the sweep path: slogx
-// installs a synchronous stderr handler, so a stalled container log driver would
-// otherwise block ping admission, the gauge refresh and the pre-drain
-// StopAccepting for as long as the write blocks.
+// logEndedOutageDropped announces a dropped ended-outage record. Beat only
+// queues it, and the observation loop logs it outside w.mu: slogx installs a
+// synchronous stderr handler, so a stalled container log driver would
+// otherwise block ping admission and the request that pinged, whose timing a
+// throttled client could read.
 func logEndedOutageDropped(rec *overdueBeat) {
 	// The two instants go in as time.Time values, not RFC3339 strings: slog
 	// stores a time.Time as a typed Time attr, so the UTC pin holds, sub-second
@@ -397,7 +397,10 @@ type Watcher struct {
 	now        func() time.Time
 	beats      map[string]*beatState
 	recoveries chan recoveryEvent
-	mu         sync.Mutex
+	// droppedEnded holds the ended-outage records Beat discarded, guarded by
+	// mu, until the observation loop logs them.
+	droppedEnded []overdueBeat
+	mu           sync.Mutex
 	// accepting is the authoritative beat-admission state, and the only one: it
 	// is guarded by mu so it orders against the beat mutation itself, making
 	// StopAccepting, Beat and the shutdown snapshot one serialized sequence.
@@ -482,7 +485,6 @@ func (w *Watcher) Beat(id string) BeatOutcome {
 	// record the whole closed outage when no sweep has seen the crossing, so
 	// this ping cannot erase it. Recording does not depend on the queue being
 	// empty. Read overflowAccounted before the reset below clears it.
-	var droppedEnded *overdueBeat
 	if open := st.openMissing(); open != nil {
 		open.recoveredAt = now
 	} else if !wasAlerted && overdue(silence.DownFor(), st.deadline) {
@@ -494,7 +496,7 @@ func (w *Watcher) Beat(id string) BeatOutcome {
 			recoveredAt: now,
 		}
 		if st.recordEndedOutage(&ended) {
-			droppedEnded = &ended
+			w.droppedEnded = append(w.droppedEnded, ended)
 		}
 	}
 	// This ping ends the beat's outage, so a later queue-full overflow
@@ -526,10 +528,6 @@ func (w *Watcher) Beat(id string) BeatOutcome {
 		}
 	}
 	w.mu.Unlock()
-
-	if droppedEnded != nil {
-		logEndedOutageDropped(droppedEnded)
-	}
 	return BeatRecorded
 }
 
@@ -585,6 +583,10 @@ func (w *Watcher) Run(ctx context.Context, tick time.Duration) {
 			// on the same handler anyway.
 			w.StopAccepting()
 			<-observationDone
+			w.mu.Lock()
+			dropped := w.takeDroppedEnded()
+			w.mu.Unlock()
+			logDroppedEnded(dropped)
 			w.logUndelivered()
 			return
 		case ev := <-w.recoveries:
@@ -624,10 +626,27 @@ func (w *Watcher) observeBeats() {
 			deferredOverflow = append(deferredOverflow, *overflow)
 		}
 	}
+	dropped := w.takeDroppedEnded()
 	w.mu.Unlock()
 	// Emitted outside the lock, for the reason collectDue's own loop gives.
 	for i := range deferredOverflow {
 		logOngoingOutageDeferred(&deferredOverflow[i])
+	}
+	logDroppedEnded(dropped)
+}
+
+// takeDroppedEnded returns and clears the queued dropped-record lines. The
+// caller holds w.mu.
+func (w *Watcher) takeDroppedEnded() []overdueBeat {
+	dropped := w.droppedEnded
+	w.droppedEnded = nil
+	return dropped
+}
+
+// logDroppedEnded logs each dropped ended-outage record. Call it outside w.mu.
+func logDroppedEnded(dropped []overdueBeat) {
+	for i := range dropped {
+		logEndedOutageDropped(&dropped[i])
 	}
 }
 

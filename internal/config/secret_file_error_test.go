@@ -93,7 +93,7 @@ func TestSecretFileErrorNamesEveryFailureClass(t *testing.T) {
 		t.Parallel()
 
 		pathErr := &os.PathError{Op: "open", Path: canary, Err: os.ErrPermission}
-		got := secretFileError("BEAT_TOKEN", fmt.Errorf("%w: %w", envx.ErrSecretFileUnreadable, pathErr))
+		got := secretFileError("BEAT_TOKENS", fmt.Errorf("%w: %w", envx.ErrSecretFileUnreadable, pathErr))
 		if got == nil {
 			t.Fatal("secretFileError returned nil for an unreadable secret file")
 		}
@@ -104,7 +104,7 @@ func TestSecretFileErrorNamesEveryFailureClass(t *testing.T) {
 			t.Errorf("secretFileError = %q, want it to carry the OS reason", got)
 		}
 		if strings.Contains(got.Error(), canary) {
-			t.Errorf("secretFileError = %q embeds the path os.PathError carries; that value is the bearer token itself whenever the operator pasted the credential into BEAT_TOKEN_FILE", got)
+			t.Errorf("secretFileError = %q embeds the path os.PathError carries; that value is the bearer token itself whenever the operator pasted the credential into BEAT_TOKENS_FILE", got)
 		}
 	})
 }
@@ -126,20 +126,20 @@ func TestLoadRejectsAnOversizedSecretFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	setValidLoadEnv(t)
-	unsetEnv(t, "BEAT_TOKEN")
-	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+	unsetEnv(t, "BEAT_TOKENS")
+	t.Setenv("BEAT_TOKENS_FILE", tokenFile)
 
 	_, err := Load(maxNodeNameBytes)
 	if err == nil {
-		t.Fatal("Load() with an oversized BEAT_TOKEN_FILE = nil, want error: an unread secret file must fail startup rather than leave the gate unarmed")
+		t.Fatal("Load() with an oversized BEAT_TOKENS_FILE = nil, want error: an unread secret file must fail startup rather than leave the gate unarmed")
 	}
 	if !strings.Contains(err.Error(), "larger than the 1 MiB secret-file limit") {
 		t.Errorf("error = %q, want the too-large diagnosis: it is the only one whose remedy is the mount rather than the file's content", err)
 	}
-	if !strings.Contains(err.Error(), "BEAT_TOKEN_FILE") {
-		t.Errorf("error = %q, want BEAT_TOKEN_FILE named so the operator knows which mount to fix", err)
+	if !strings.Contains(err.Error(), "BEAT_TOKENS_FILE") {
+		t.Errorf("error = %q, want BEAT_TOKENS_FILE named so the operator knows which mount to fix", err)
 	}
 	if strings.Contains(err.Error(), tokenFile) {
-		t.Errorf("error = %q embeds the BEAT_TOKEN_FILE value; that value is the bearer token itself whenever the operator pasted the credential into the file variable, and startup errors are shipped to the log store", err)
+		t.Errorf("error = %q embeds the BEAT_TOKENS_FILE value; that value is the bearer token itself whenever the operator pasted the credential into the file variable, and startup errors are shipped to the log store", err)
 	}
 }

@@ -2,11 +2,13 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -38,8 +40,8 @@ func TestMain(m *testing.M) {
 	for _, key := range []string{
 		"ALLOWED_HOSTS",
 		"BEATS",
-		"BEAT_TOKEN",
-		"BEAT_TOKEN_FILE",
+		"BEAT_TOKENS",
+		"BEAT_TOKENS_FILE",
 		"DISCORD_WEBHOOK_URL",
 		"DISCORD_WEBHOOK_URL_FILE",
 		"LISTEN_ADDR",
@@ -68,9 +70,9 @@ func setValidLoadEnv(t *testing.T) {
 	t.Setenv("BEATS", "api:20m")
 	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook")
 	t.Setenv("NODE_NAME", "node-1")
-	// BEAT_TOKEN is required: the bearer gate is /beat/{id}'s only gate, so Load
+	// BEAT_TOKENS is required: the bearer gate is /beat/{id}'s only gate, so Load
 	// refuses to start without it and every variant test needs one.
-	t.Setenv("BEAT_TOKEN", validBeatToken)
+	t.Setenv("BEAT_TOKENS", "api:"+validBeatToken)
 }
 
 // unsetEnv removes key for the duration of the test. t.Setenv registers the
@@ -78,7 +80,7 @@ func setValidLoadEnv(t *testing.T) {
 // variable absent inside the test and restored afterwards. A plain
 // t.Setenv(key, "") would leave it present-but-empty, which is not equivalent
 // for the keys this helper serves: a `_FILE` key rejects a broken mount with its
-// own message, and BEAT_TOKEN distinguishes "you set it to nothing" from "you
+// own message, and BEAT_TOKENS distinguishes "you set it to nothing" from "you
 // set nothing at all" — both fail startup, with different remedies.
 func unsetEnv(t *testing.T, key string) {
 	t.Helper()
@@ -442,12 +444,12 @@ func TestLoadRejectsPlainHTTPWebhookFromFile(t *testing.T) {
 func TestLoadRefusesWithoutABeatToken(t *testing.T) {
 	tests := map[string]func(t *testing.T){
 		"absent": func(t *testing.T) {
-			unsetEnv(t, "BEAT_TOKEN")
-			unsetEnv(t, "BEAT_TOKEN_FILE")
+			unsetEnv(t, "BEAT_TOKENS")
+			unsetEnv(t, "BEAT_TOKENS_FILE")
 		},
 		"present but empty": func(t *testing.T) {
-			t.Setenv("BEAT_TOKEN", "")
-			unsetEnv(t, "BEAT_TOKEN_FILE")
+			t.Setenv("BEAT_TOKENS", "")
+			unsetEnv(t, "BEAT_TOKENS_FILE")
 		},
 	}
 	for name, setup := range tests {
@@ -457,12 +459,12 @@ func TestLoadRefusesWithoutABeatToken(t *testing.T) {
 
 			_, err := Load(maxNodeNameBytes)
 			if err == nil {
-				t.Fatalf("Load() with %s BEAT_TOKEN succeeded, want a startup refusal: an ungated /beat/{id} lets anything that reaches the port keep the switch armed", name)
+				t.Fatalf("Load() with %s BEAT_TOKENS succeeded, want a startup refusal: an ungated /beat/{id} lets anything that reaches the port keep the switch armed", name)
 			}
 			// The message has to name the variable and what to do next: this is
 			// the refusal a first deployment meets, and the container
 			// crash-loops on it.
-			for _, want := range []string{"BEAT_TOKEN", "16"} {
+			for _, want := range []string{"BEAT_TOKENS", "16"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("Load() error = %q, want it to mention %q so the operator knows what to set", err, want)
 				}
@@ -483,12 +485,12 @@ func TestLoadRefusesWithoutABeatToken(t *testing.T) {
 // all stay out.
 func TestLoadRefusesAShortBeatTokenWithoutLeakingIt(t *testing.T) {
 	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "shorty")
-	unsetEnv(t, "BEAT_TOKEN_FILE")
+	t.Setenv("BEAT_TOKENS", "api:"+"shorty")
+	unsetEnv(t, "BEAT_TOKENS_FILE")
 
 	_, err := Load(maxNodeNameBytes)
 	if err == nil {
-		t.Fatal("Load() with a 6-byte BEAT_TOKEN succeeded, want a startup refusal: the token is the only gate, so a guessable one is a bypassable one")
+		t.Fatal("Load() with a 6-byte BEAT_TOKENS succeeded, want a startup refusal: the token is the only gate, so a guessable one is a bypassable one")
 	}
 	if !strings.Contains(err.Error(), strconv.Itoa(minTokenLength)) {
 		t.Errorf("refusal = %q, want it to name the %d-byte minimum: it is the only actionable number", err, minTokenLength)
@@ -498,8 +500,10 @@ func TestLoadRefusesAShortBeatTokenWithoutLeakingIt(t *testing.T) {
 	}
 	// Every number in the message must be the minimum: the token's own length is
 	// an attribute of a live credential, and this text ships to the log store.
+	// "1" is the line number, a position in the file and no attribute of the
+	// token.
 	for _, run := range digitRuns(err.Error()) {
-		if run != strconv.Itoa(minTokenLength) {
+		if run != strconv.Itoa(minTokenLength) && run != "1" {
 			t.Errorf("refusal carries the number %q: %q; only the %d-byte minimum may appear, or the line bounds the guess space of an already-weak credential for every reader of the log store",
 				run, err, minTokenLength)
 		}
@@ -537,7 +541,7 @@ func digitRuns(s string) []string {
 // is that reserve. Both edges are asserted because either mistake is silent in
 // production: a maximum that refused a token the budget reserves room for would
 // stop deployments that work today, and one that admitted an unbounded token
-// would let a BEAT_TOKEN_FILE pointing at the wrong file eat the reserve until
+// would let a BEAT_TOKENS_FILE pointing at the wrong file eat the reserve until
 // every ping is answered 431 by an endpoint reporting itself gated and one
 // deadline later every configured beat posts a false MISSING notice.
 func TestBeatTokenLengthCeiling(t *testing.T) {
@@ -545,14 +549,14 @@ func TestBeatTokenLengthCeiling(t *testing.T) {
 
 	t.Run("a token at the maximum starts", func(t *testing.T) {
 		setValidLoadEnv(t)
-		t.Setenv("BEAT_TOKEN", atMax)
-		unsetEnv(t, "BEAT_TOKEN_FILE")
+		t.Setenv("BEAT_TOKENS", "api:"+atMax)
+		unsetEnv(t, "BEAT_TOKENS_FILE")
 
 		cfg, err := Load(maxNodeNameBytes)
 		if err != nil {
-			t.Fatalf("Load() with a %d-byte BEAT_TOKEN error = %v, want nil: the maximum is a value knell accepts, and the header budget reserves headerOverheadAllowance bytes on top of it", maxTokenLength, err)
+			t.Fatalf("Load() with a %d-byte BEAT_TOKENS error = %v, want nil: the maximum is a value knell accepts, and the header budget reserves headerOverheadAllowance bytes on top of it", maxTokenLength, err)
 		}
-		if cfg.BeatToken != atMax {
+		if !hasToken(cfg, atMax) {
 			t.Error("BeatToken differs from the configured value: the credential is verified verbatim, so any rewrite 401s every ping")
 		}
 	})
@@ -580,12 +584,12 @@ func TestBeatTokenLengthCeiling(t *testing.T) {
 
 	t.Run("one byte past the maximum refuses startup", func(t *testing.T) {
 		setValidLoadEnv(t)
-		t.Setenv("BEAT_TOKEN", atMax+"a")
-		unsetEnv(t, "BEAT_TOKEN_FILE")
+		t.Setenv("BEAT_TOKENS", "api:"+atMax+"a")
+		unsetEnv(t, "BEAT_TOKENS_FILE")
 
 		_, err := Load(maxNodeNameBytes)
 		if err == nil {
-			t.Fatalf("Load() with a %d-byte BEAT_TOKEN = nil, want a startup refusal: the maximum is the token's share of the %d-byte header block knell reads, so anything past it eats the %d-byte reserve held for the request line, Host and the \"Bearer \" prefix", maxTokenLength+1, MaxRequestHeaderBytes, headerOverheadAllowance)
+			t.Fatalf("Load() with a %d-byte BEAT_TOKENS = nil, want a startup refusal: the maximum is the token's share of the %d-byte header block knell reads, so anything past it eats the %d-byte reserve held for the request line, Host and the \"Bearer \" prefix", maxTokenLength+1, MaxRequestHeaderBytes, headerOverheadAllowance)
 		}
 		if !strings.Contains(err.Error(), strconv.Itoa(maxTokenLength)) {
 			t.Errorf("refusal = %q, want it to name the %d-byte maximum: it is the number the operator has to act on", err, maxTokenLength)
@@ -600,12 +604,12 @@ func TestLoadBeatTokenFileWinsOverPlainVar(t *testing.T) {
 	// Serial (t.Setenv forbids t.Parallel anyway): swaps the process-global
 	// slog default to assert the both-channels-set warning.
 	tokenFile := filepath.Join(t.TempDir(), "beat-token")
-	if err := os.WriteFile(tokenFile, []byte("file-borne-beat-token\n"), 0o600); err != nil {
+	if err := os.WriteFile(tokenFile, []byte("api:file-borne-beat-token\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "stale-env-beat-token")
-	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+	t.Setenv("BEAT_TOKENS", "api:"+"stale-env-beat-token")
+	t.Setenv("BEAT_TOKENS_FILE", tokenFile)
 
 	rec := capture.Default(t)
 
@@ -613,10 +617,10 @@ func TestLoadBeatTokenFileWinsOverPlainVar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
-	if cfg.BeatToken != "file-borne-beat-token" {
-		t.Errorf("BeatToken = %q, want the file-borne token: BEAT_TOKEN_FILE wins over BEAT_TOKEN, so a rotated secret file must not be shadowed by a stale plain variable that would 401 every sender", cfg.BeatToken)
+	if !hasToken(cfg, "file-borne-beat-token") {
+		t.Errorf("BeatToken = %q, want the file-borne token: BEAT_TOKENS_FILE wins over BEAT_TOKENS, so a rotated secret file must not be shadowed by a stale plain variable that would 401 every sender", tokenSummary(cfg))
 	}
-	if !rec.Contains("the plain variable is ignored") || !rec.HasAttr("", "variable", "BEAT_TOKEN") {
+	if !rec.Contains("the plain variable is ignored") || !rec.HasAttr("", "variable", "BEAT_TOKENS") {
 		t.Errorf("log output %v missing the both-channels-set warning that tells the operator the plain variable is ignored, carrying the ignored variable as a queryable attribute", rec.Messages())
 	}
 	if rec.Contains("stale-env-beat-token") || rec.AttrContains("", "", "stale-env-beat-token") ||
@@ -704,13 +708,13 @@ func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 		},
 		"beat token file unreadable": {
 			setup: func(t *testing.T) {
-				t.Setenv("BEAT_TOKEN", "fallback-beat-token")
-				t.Setenv("BEAT_TOKEN_FILE", filepath.Join(t.TempDir(), "missing-beat-token"))
+				t.Setenv("BEAT_TOKENS", "api:"+"fallback-beat-token")
+				t.Setenv("BEAT_TOKENS_FILE", filepath.Join(t.TempDir(), "missing-beat-token"))
 			},
 			wantErr: true,
 		},
 		// The remaining fatal path after the file read SUCCEEDS: a file-sourced
-		// token carrying an interior control byte while the plain BEAT_TOKEN is
+		// token carrying an interior control byte while the plain BEAT_TOKENS is
 		// also set. The file wins, the advisory used to fire, and startup then
 		// failed on the token, so the operator was told to delete the only other
 		// token in the environment by a process that never ran. (An edge-padded
@@ -723,8 +727,8 @@ func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 				if err := os.WriteFile(tokenFile, []byte("alpha\nbeta\n"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				t.Setenv("BEAT_TOKEN", "fallback-beat-token")
-				t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+				t.Setenv("BEAT_TOKENS", "api:"+"fallback-beat-token")
+				t.Setenv("BEAT_TOKENS_FILE", tokenFile)
 			},
 			wantErr: true,
 		},
@@ -746,7 +750,7 @@ func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 		// The CROSS-loader path, which no row above reaches: the webhook's own
 		// channels are both fine, so its advisory fires on a startup a LATER
 		// refusal aborts. Only a position past every refusal keeps it silent.
-		"webhook file wins, BEAT_TOKEN missing": {
+		"webhook file wins, BEAT_TOKENS missing": {
 			setup: func(t *testing.T) {
 				hookFile := filepath.Join(t.TempDir(), "webhook-url")
 				if err := os.WriteFile(hookFile, []byte("https://discord.example/file-borne-hook\n"), 0o600); err != nil {
@@ -754,8 +758,8 @@ func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 				}
 				t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/fallback")
 				t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
-				unsetEnv(t, "BEAT_TOKEN")
-				unsetEnv(t, "BEAT_TOKEN_FILE")
+				unsetEnv(t, "BEAT_TOKENS")
+				unsetEnv(t, "BEAT_TOKENS_FILE")
 			},
 			wantErr: true,
 		},
@@ -768,21 +772,21 @@ func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 			setup: func(t *testing.T) {
 				dir := t.TempDir()
 				tokenFile := filepath.Join(dir, "beat-token")
-				if err := os.WriteFile(tokenFile, []byte("file-borne-beat-token\n"), 0o600); err != nil {
+				if err := os.WriteFile(tokenFile, []byte("api:file-borne-beat-token\n"), 0o600); err != nil {
 					t.Fatal(err)
 				}
 				hookFile := filepath.Join(dir, "webhook-url")
 				if err := os.WriteFile(hookFile, []byte("https://discord.example/file-borne-hook\n"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				unsetEnv(t, "BEAT_TOKEN")
+				unsetEnv(t, "BEAT_TOKENS")
 				unsetEnv(t, "DISCORD_WEBHOOK_URL")
-				t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+				t.Setenv("BEAT_TOKENS_FILE", tokenFile)
 				t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
 			},
 			check: func(t *testing.T, cfg Config) {
-				if cfg.BeatToken != "file-borne-beat-token" || cfg.WebhookURL != "https://discord.example/file-borne-hook" {
-					t.Fatalf("BeatToken = %q, WebhookURL = %q, want both from their _FILE channels", cfg.BeatToken, cfg.WebhookURL)
+				if !hasToken(cfg, "file-borne-beat-token") || cfg.WebhookURL != "https://discord.example/file-borne-hook" {
+					t.Fatalf("BeatToken = %q, WebhookURL = %q, want both from their _FILE channels", tokenSummary(cfg), cfg.WebhookURL)
 				}
 			},
 		},
@@ -793,13 +797,13 @@ func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 		// failing on a missing credential entirely.
 		"plain vars only": {
 			setup: func(t *testing.T) {
-				t.Setenv("BEAT_TOKEN", "plain-only-beat-token")
-				unsetEnv(t, "BEAT_TOKEN_FILE")
+				t.Setenv("BEAT_TOKENS", "api:"+"plain-only-beat-token")
+				unsetEnv(t, "BEAT_TOKENS_FILE")
 				unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
 			},
 			check: func(t *testing.T, cfg Config) {
-				if cfg.BeatToken != "plain-only-beat-token" || cfg.WebhookURL != "https://discord.example/hook" {
-					t.Fatalf("BeatToken = %q, WebhookURL = %q, want both read from their plain variables", cfg.BeatToken, cfg.WebhookURL)
+				if !hasToken(cfg, "plain-only-beat-token") || cfg.WebhookURL != "https://discord.example/hook" {
+					t.Fatalf("BeatToken = %q, WebhookURL = %q, want both read from their plain variables", tokenSummary(cfg), cfg.WebhookURL)
 				}
 			},
 		},
@@ -827,21 +831,21 @@ func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 func TestLoadRejectsUnreadableBeatTokenFile(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing-beat-token")
 	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "env-fallback-token")
-	t.Setenv("BEAT_TOKEN_FILE", missing)
+	t.Setenv("BEAT_TOKENS", "api:"+"env-fallback-token")
+	t.Setenv("BEAT_TOKENS_FILE", missing)
 
 	_, err := Load(maxNodeNameBytes)
 	if err == nil {
-		t.Fatal("Load() with unreadable BEAT_TOKEN_FILE = nil, want error (the secret file must not silently fall back to the environment value, which would arm the gate with the wrong token)")
+		t.Fatal("Load() with unreadable BEAT_TOKENS_FILE = nil, want error (the secret file must not silently fall back to the environment value, which would arm the gate with the wrong token)")
 	}
 	if !strings.Contains(err.Error(), "could not be read because the open call failed") {
 		t.Errorf("error = %q, want the read-failure diagnosis naming the failed operation: envx embeds the path in its os.PathError and this sanitizer replaces it, so the operation plus the OS reason is all the operator has left to tell a missing mount from a permission problem", err)
 	}
-	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
-		t.Errorf("error = %q, want BEAT_TOKEN context", err)
+	if !strings.Contains(err.Error(), "BEAT_TOKENS") {
+		t.Errorf("error = %q, want BEAT_TOKENS context", err)
 	}
 	if strings.Contains(err.Error(), missing) {
-		t.Errorf("error = %q embeds the BEAT_TOKEN_FILE value; os.PathError carries it and the sanitizer must drop it, because that value is the bearer token itself whenever the operator pasted the credential into the file variable", err)
+		t.Errorf("error = %q embeds the BEAT_TOKENS_FILE value; os.PathError carries it and the sanitizer must drop it, because that value is the bearer token itself whenever the operator pasted the credential into the file variable", err)
 	}
 	if strings.Contains(err.Error(), "env-fallback-token") {
 		t.Errorf("error leaks the fallback token value: %v", err)
@@ -857,21 +861,21 @@ func TestLoadRejectsEmptyBeatTokenFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "env-fallback-token")
-	t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+	t.Setenv("BEAT_TOKENS", "api:"+"env-fallback-token")
+	t.Setenv("BEAT_TOKENS_FILE", tokenFile)
 
 	_, err := Load(maxNodeNameBytes)
 	if err == nil {
-		t.Fatal("Load() with an empty BEAT_TOKEN_FILE = nil, want error (an empty secret file is a broken mount, and the token it should have carried is required)")
+		t.Fatal("Load() with an empty BEAT_TOKENS_FILE = nil, want error (an empty secret file is a broken mount, and the token it should have carried is required)")
 	}
 	if !strings.Contains(err.Error(), "blank secret file") {
 		t.Errorf("error = %q, want the blank-secret-file diagnosis: secretFileError names each envx failure class so the operator is told WHICH failure happened, and the generic fallback sends someone whose mount produced an empty file to check the path instead of the content", err)
 	}
-	if !strings.Contains(err.Error(), "BEAT_TOKEN") {
-		t.Errorf("error = %q, want BEAT_TOKEN context", err)
+	if !strings.Contains(err.Error(), "BEAT_TOKENS") {
+		t.Errorf("error = %q, want BEAT_TOKENS context", err)
 	}
 	if strings.Contains(err.Error(), tokenFile) {
-		t.Errorf("error = %q embeds the BEAT_TOKEN_FILE value; envx names the path in its own blank-file error, and this sanitizer exists to drop it because that value is the credential itself whenever the operator pasted the secret into the file variable", err)
+		t.Errorf("error = %q embeds the BEAT_TOKENS_FILE value; envx names the path in its own blank-file error, and this sanitizer exists to drop it because that value is the credential itself whenever the operator pasted the secret into the file variable", err)
 	}
 	if strings.Contains(err.Error(), "env-fallback-token") {
 		t.Errorf("error leaks the fallback token value: %v", err)
@@ -1081,15 +1085,15 @@ func TestLoadRejectsAnUnusableAllowedHostsEntry(t *testing.T) {
 
 func TestLoadRejectsBlankBeatTokenFileVar(t *testing.T) {
 	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "env-fallback-token")
-	t.Setenv("BEAT_TOKEN_FILE", "")
+	t.Setenv("BEAT_TOKENS", "api:"+"env-fallback-token")
+	t.Setenv("BEAT_TOKENS_FILE", "")
 
 	_, err := Load(maxNodeNameBytes)
 	if err == nil {
-		t.Fatal("Load() with a present-but-empty BEAT_TOKEN_FILE = nil, want error; envx cannot tell it from unset, so falling back would serve an unauthenticated /beat/{id} the operator meant to gate")
+		t.Fatal("Load() with a present-but-empty BEAT_TOKENS_FILE = nil, want error; envx cannot tell it from unset, so falling back would serve an unauthenticated /beat/{id} the operator meant to gate")
 	}
-	if !strings.Contains(err.Error(), "BEAT_TOKEN_FILE") {
-		t.Errorf("error = %q, want BEAT_TOKEN_FILE context", err)
+	if !strings.Contains(err.Error(), "BEAT_TOKENS_FILE") {
+		t.Errorf("error = %q, want BEAT_TOKENS_FILE context", err)
 	}
 	if strings.Contains(err.Error(), "env-fallback-token") {
 		t.Errorf("error leaks the fallback token value: %v", err)
@@ -1155,8 +1159,8 @@ func TestLoadRejectsAWebhookWithNothingVisible(t *testing.T) {
 func TestLoadTrimsPaddedPlainWebhook(t *testing.T) {
 	setValidLoadEnv(t)
 	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example/hook ")
-	t.Setenv("BEAT_TOKEN", "unit-test-beat-token")
-	unsetEnv(t, "BEAT_TOKEN_FILE")
+	t.Setenv("BEAT_TOKENS", "api:"+"unit-test-beat-token")
+	unsetEnv(t, "BEAT_TOKENS_FILE")
 
 	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
@@ -1168,17 +1172,17 @@ func TestLoadTrimsPaddedPlainWebhook(t *testing.T) {
 	// knell's own. The webhook is trimmed
 	// rather than refused because knell is its only sender: trimming makes it
 	// deliverable, and there is no second party that must reproduce the value.
-	// BEAT_TOKEN is the opposite case (see the test below) — senders must
+	// BEAT_TOKENS is the opposite case (see the test below) — senders must
 	// reproduce it byte for byte, so rewriting it is what breaks the gate.
 	if cfg.WebhookURL != "https://discord.example/hook" {
 		t.Errorf("WebhookURL = %q, want the padding trimmed", cfg.WebhookURL)
 	}
-	if cfg.BeatToken != "unit-test-beat-token" {
-		t.Errorf("BeatToken = %q, want the configured token verbatim", cfg.BeatToken)
+	if !hasToken(cfg, "unit-test-beat-token") {
+		t.Errorf("BeatToken = %q, want the configured token verbatim", tokenSummary(cfg))
 	}
 }
 
-// TestLoadRejectsAPaddedPlainBeatToken pins that a BEAT_TOKEN carrying edge
+// TestLoadRejectsAPaddedPlainBeatToken pins that a BEAT_TOKENS carrying edge
 // ASCII whitespace FAILS STARTUP instead of being silently trimmed. Trimming
 // (the behaviour through cycle 8) was justified as "HTTP strips leading and
 // trailing spaces and tabs, so the trimmed form is what arrives on the wire" —
@@ -1199,21 +1203,21 @@ func TestLoadRejectsAPaddedPlainBeatToken(t *testing.T) {
 	for name, token := range tests {
 		t.Run(name, func(t *testing.T) {
 			setValidLoadEnv(t)
-			t.Setenv("BEAT_TOKEN", token)
-			unsetEnv(t, "BEAT_TOKEN_FILE")
+			t.Setenv("BEAT_TOKENS", "api:"+token)
+			unsetEnv(t, "BEAT_TOKENS_FILE")
 
 			_, err := Load(maxNodeNameBytes)
 			if err == nil {
-				t.Fatalf("Load() with BEAT_TOKEN=%q = nil, want error: rewriting the credential would arm the gate for a value the sender that uses the configured one cannot present", token)
+				t.Fatalf("Load() with BEAT_TOKENS=%q = nil, want error: rewriting the credential would arm the gate for a value the sender that uses the configured one cannot present", token)
 			}
-			if !strings.Contains(err.Error(), "BEAT_TOKEN") {
-				t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which variable to fix", err)
+			if !strings.Contains(err.Error(), "BEAT_TOKENS") {
+				t.Errorf("error = %q, want BEAT_TOKENS named so the operator knows which variable to fix", err)
 			}
 			// The mirror of the file-borne case: the clause fires only on
 			// envx.SecretSourceFile, so a plain-variable refusal must not send the
 			// operator to a mount they never configured.
-			if strings.Contains(err.Error(), "came from BEAT_TOKEN_FILE") {
-				t.Errorf("error = %q blames BEAT_TOKEN_FILE for a value the plain variable supplied", err)
+			if strings.Contains(err.Error(), "came from BEAT_TOKENS_FILE") {
+				t.Errorf("error = %q blames BEAT_TOKENS_FILE for a value the plain variable supplied", err)
 			}
 			if strings.Contains(err.Error(), "unit-test-beat-token") {
 				t.Errorf("error = %q embeds the token value; the startup error is shipped to Loki, so it must describe the shape and never echo the credential", err)
@@ -1246,27 +1250,27 @@ func TestLoadRejectsAPaddedFileBorneBeatToken(t *testing.T) {
 	for name, content := range tests {
 		t.Run(name, func(t *testing.T) {
 			tokenFile := filepath.Join(t.TempDir(), "beat-token")
-			if err := os.WriteFile(tokenFile, []byte(content), 0o600); err != nil {
+			if err := os.WriteFile(tokenFile, []byte("api:"+content), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			setValidLoadEnv(t)
-			unsetEnv(t, "BEAT_TOKEN")
-			t.Setenv("BEAT_TOKEN_FILE", tokenFile)
+			unsetEnv(t, "BEAT_TOKENS")
+			t.Setenv("BEAT_TOKENS_FILE", tokenFile)
 
 			_, err := Load(maxNodeNameBytes)
 			if err == nil {
-				t.Fatalf("Load() with a BEAT_TOKEN_FILE holding %q = nil, want error: the padding is part of the configured credential, so arming the gate with a trimmed copy 401s every sender that presents the file's token and turns every configured beat falsely missing one deadline later", content)
+				t.Fatalf("Load() with a BEAT_TOKENS_FILE holding %q = nil, want error: the padding is part of the configured credential, so arming the gate with a trimmed copy 401s every sender that presents the file's token and turns every configured beat falsely missing one deadline later", content)
 			}
 			if !strings.Contains(err.Error(), "leading or trailing ASCII whitespace") {
 				t.Errorf("error = %q, want the padding refusal: any other failure would mean the file channel was rejected for the wrong reason, or rewritten before checkBeatToken saw it", err)
 			}
-			if !strings.Contains(err.Error(), "BEAT_TOKEN") {
-				t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which secret to fix", err)
+			if !strings.Contains(err.Error(), "BEAT_TOKENS") {
+				t.Errorf("error = %q, want BEAT_TOKENS named so the operator knows which secret to fix", err)
 			}
-			// The CHANNEL, not just the variable: a BEAT_TOKEN_FILE pointing at
+			// The CHANNEL, not just the variable: a BEAT_TOKENS_FILE pointing at
 			// the wrong file crash-loops the observer, and a refusal naming only
-			// BEAT_TOKEN describes a variable the operator may never have set.
-			if !strings.Contains(err.Error(), "came from BEAT_TOKEN_FILE") {
+			// BEAT_TOKENS describes a variable the operator may never have set.
+			if !strings.Contains(err.Error(), "came from BEAT_TOKENS_FILE") {
 				t.Errorf("error = %q, want it to name the channel the refused value arrived through; the padding refusal itself never mentions the _FILE variable, so only fileSourcedValueError can supply it", err)
 			}
 			if strings.Contains(err.Error(), "unit-test-beat-token") {
@@ -1290,18 +1294,18 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 	// 16-byte token — a value can read as blank and still be long enough.
 	const token = "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0"
 	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", token)
-	unsetEnv(t, "BEAT_TOKEN_FILE")
+	t.Setenv("BEAT_TOKENS", "api:"+token)
+	unsetEnv(t, "BEAT_TOKENS_FILE")
 
 	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
-		t.Fatalf("Load() with an NBSP-only BEAT_TOKEN = %v, want accepted: textproto keeps a non-ASCII space, so the token is presentable and the gate must stay armed", err)
+		t.Fatalf("Load() with an NBSP-only BEAT_TOKENS = %v, want accepted: textproto keeps a non-ASCII space, so the token is presentable and the gate must stay armed", err)
 	}
 	if len(token) != minTokenLength {
 		t.Fatalf("fixture is %d bytes, want exactly %d: the case only clears the length floor at that size", len(token), minTokenLength)
 	}
-	if cfg.BeatToken != token {
-		t.Errorf("BeatToken = %q, want %q preserved verbatim: trimming it would leave webapi's gate with a credential no sender presents", cfg.BeatToken, token)
+	if !hasToken(cfg, token) {
+		t.Errorf("BeatToken = %q, want %q preserved verbatim: trimming it would leave webapi's gate with a credential no sender presents", tokenSummary(cfg), token)
 	}
 }
 
@@ -1323,7 +1327,7 @@ func TestLoadKeepsANonASCIISpaceBeatTokenArmed(t *testing.T) {
 // FuzzCheckBeatToken seed, where it does reach it but the 16-byte floor refuses
 // its 10 bytes before any acceptance assertion runs. So tightening the edge test
 // to refuse SP/HTAB anywhere -- the shape a "harden the credential" edit reaches
-// for -- leaves every existing test green while a passphrase-style BEAT_TOKEN
+// for -- leaves every existing test green while a passphrase-style BEAT_TOKENS
 // stops the observer from starting at all, which for a dead-man switch is the one
 // refusal nobody is watching for.
 func TestLoadKeepsABeatTokenWithInteriorASCIIWhitespaceArmed(t *testing.T) {
@@ -1331,15 +1335,15 @@ func TestLoadKeepsABeatTokenWithInteriorASCIIWhitespaceArmed(t *testing.T) {
 	// and 20 bytes so the value clears the minTokenLength floor on its own.
 	const token = "unit test beat\ttoken"
 	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", token)
-	unsetEnv(t, "BEAT_TOKEN_FILE")
+	t.Setenv("BEAT_TOKENS", "api:"+token)
+	unsetEnv(t, "BEAT_TOKENS_FILE")
 
 	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
-		t.Fatalf("Load() with BEAT_TOKEN=%q = %v, want accepted: HTTP normalizes only the EDGES of a field value, so an interior space or tab reaches the verifier untouched and refusing it fails startup on a working credential", token, err)
+		t.Fatalf("Load() with BEAT_TOKENS=%q = %v, want accepted: HTTP normalizes only the EDGES of a field value, so an interior space or tab reaches the verifier untouched and refusing it fails startup on a working credential", token, err)
 	}
-	if cfg.BeatToken != token {
-		t.Errorf("BeatToken = %q, want %q verbatim: webapi compares against \"Bearer \"+token, so collapsing or stripping an interior byte arms the gate for a value no sender presents and one deadline later every beat posts a false MISSING notice", cfg.BeatToken, token)
+	if !hasToken(cfg, token) {
+		t.Errorf("BeatToken = %q, want %q verbatim: webapi compares against \"Bearer \"+token, so collapsing or stripping an interior byte arms the gate for a value no sender presents and one deadline later every beat posts a false MISSING notice", tokenSummary(cfg), token)
 	}
 	// The transport is the oracle, not this package's own cutset: the accepted
 	// token has to come back off the wire byte for byte, or accepting it was the
@@ -1375,7 +1379,6 @@ func TestLoadRejectsABeatTokenHTTPCannotCarry(t *testing.T) {
 		token   string
 		wantErr string
 	}{
-		"interior newline":  {token: "unit-test\nbeat-token", wantErr: "control character"},
 		"interior carriage": {token: "unit-test\rbeat-token", wantErr: "control character"},
 		"delete byte":       {token: "unit-test\x7fbeat-token", wantErr: "control character"},
 		// An interior VT is inside asciiWhitespace's cutset, but that cutset is an
@@ -1391,29 +1394,26 @@ func TestLoadRejectsABeatTokenHTTPCannotCarry(t *testing.T) {
 		// notice.
 		"leading control byte": {token: "\x01unit-test-beat-token", wantErr: "control character"},
 		"trailing delete byte": {token: "unit-test-beat-token\x7f", wantErr: "control character"},
-		// The EDGE spellings of CR/LF: forbidden field-value bytes that the padding
-		// cutset refuses first, so these two rows draw the whitespace diagnosis
-		// rather than the byte one. Kept in this table because the class is one
-		// class to the operator, and asserted by their own message so a row cannot
-		// silently swap which rule refused it.
-		"trailing newline inside": {token: "unit-test\nbeat-token\n", wantErr: "leading or trailing ASCII whitespace"},
-		"trailing newline":        {token: "unit-test-beat-token\n", wantErr: "leading or trailing ASCII whitespace"},
+		// The EDGE spelling of CR: a forbidden field-value byte that the padding
+		// cutset refuses first, so this row draws the whitespace diagnosis rather
+		// than the byte one. LF never reaches a token: it separates entries.
+		"trailing carriage return": {token: "unit-test-beat-token\r", wantErr: "leading or trailing ASCII whitespace"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			setValidLoadEnv(t)
-			t.Setenv("BEAT_TOKEN", tt.token)
-			unsetEnv(t, "BEAT_TOKEN_FILE")
+			t.Setenv("BEAT_TOKENS", "api:"+tt.token)
+			unsetEnv(t, "BEAT_TOKENS_FILE")
 
 			_, err := Load(maxNodeNameBytes)
 			if err == nil {
-				t.Fatalf("Load() with BEAT_TOKEN=%q = nil, want error: HTTP forbids that byte in a field value, so every ping 401s against an endpoint that reports itself gated", tt.token)
+				t.Fatalf("Load() with BEAT_TOKENS=%q = nil, want error: HTTP forbids that byte in a field value, so every ping 401s against an endpoint that reports itself gated", tt.token)
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("error = %q, want the %q diagnosis: every fixture here also clears the length floor, so any other refusal means the rule that owns this byte no longer runs", err, tt.wantErr)
 			}
-			if !strings.Contains(err.Error(), "BEAT_TOKEN") {
-				t.Errorf("error = %q, want BEAT_TOKEN named so the operator knows which variable to fix", err)
+			if !strings.Contains(err.Error(), "BEAT_TOKENS") {
+				t.Errorf("error = %q, want BEAT_TOKENS named so the operator knows which variable to fix", err)
 			}
 			if strings.Contains(err.Error(), tt.token) {
 				t.Errorf("error = %q embeds the token value; the startup error is shipped to Loki, so it must describe the shape and never echo the credential", err)
@@ -1455,15 +1455,15 @@ func TestBeatTokenFitsHeaderAgreesWithTheTransportForEveryByte(t *testing.T) {
 func TestLoadAcceptsABeatTokenAtTheLengthFloor(t *testing.T) {
 	token := strings.Repeat("x", minTokenLength)
 	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", token)
-	unsetEnv(t, "BEAT_TOKEN_FILE")
+	t.Setenv("BEAT_TOKENS", "api:"+token)
+	unsetEnv(t, "BEAT_TOKENS_FILE")
 
 	cfg, err := Load(maxNodeNameBytes)
 	if err != nil {
-		t.Fatalf("Load() with a %d-byte BEAT_TOKEN = %v, want accepted: the floor is inclusive", minTokenLength, err)
+		t.Fatalf("Load() with a %d-byte BEAT_TOKENS = %v, want accepted: the floor is inclusive", minTokenLength, err)
 	}
-	if cfg.BeatToken != token {
-		t.Errorf("BeatToken = %q, want the configured %d-byte token", cfg.BeatToken, minTokenLength)
+	if !hasToken(cfg, token) {
+		t.Errorf("BeatToken = %q, want the configured %d-byte token", tokenSummary(cfg), minTokenLength)
 	}
 }
 
@@ -1734,7 +1734,7 @@ func TestLoadCountsNodeNameLengthInBytesNotRunes(t *testing.T) {
 
 // TestConfigLogValueNeverRendersASecret pins the redaction seam:
 // LogValue is the reason a call site can log a whole Config without leaking, so
-// DISCORD_WEBHOOK_URL and BEAT_TOKEN are both reported by their SOURCE and
+// DISCORD_WEBHOOK_URL and BEAT_TOKENS are both reported by their SOURCE and
 // neither by its value — and neither gets a presence attr, because both are
 // required, so presence reports no state while giving a future edit somewhere to
 // render the credential. Each source is state and each value is not: no
@@ -1752,14 +1752,14 @@ func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 		secretToken = "leak-me-if-you-can-token"
 	)
 	cfg := Config{
-		WebhookURL:      secretHook,
-		WebhookSource:   envx.SecretSourceEnv,
-		Node:            "node-a",
-		ListenAddr:      ":9190",
-		BeatToken:       secretToken,
-		BeatTokenSource: envx.SecretSourceFile,
-		Beats:           []Beat{{ID: "api", Deadline: time.Hour}},
-		LogLevel:        slog.LevelInfo,
+		WebhookURL:       secretHook,
+		WebhookSource:    envx.SecretSourceEnv,
+		Node:             "node-a",
+		ListenAddr:       ":9190",
+		BeatTokens:       mustBeatTokens(t, "api:"+secretToken),
+		BeatTokensSource: envx.SecretSourceFile,
+		Beats:            []Beat{{ID: "api", Deadline: time.Hour}},
+		LogLevel:         slog.LevelInfo,
 	}
 
 	got := map[string]string{}
@@ -1774,11 +1774,11 @@ func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 	if got["webhook"] != string(envx.SecretSourceEnv) {
 		t.Errorf("webhook = %q, want %q: the attr reports the channel that supplied the credential, never the credential", got["webhook"], envx.SecretSourceEnv)
 	}
-	if got["beat_token"] != string(envx.SecretSourceFile) {
-		t.Errorf("beat_token = %q, want %q: the attr reports the channel that supplied the token, never the token", got["beat_token"], envx.SecretSourceFile)
+	if got["beat_tokens"] != string(envx.SecretSourceFile) {
+		t.Errorf("beat_tokens = %q, want %q: the attr reports the channel that supplied the tokens, never a token", got["beat_tokens"], envx.SecretSourceFile)
 	}
 	if _, reported := got["beat_auth"]; reported {
-		t.Errorf("LogValue renders beat_auth = %q; the token is required, so a presence attr can only ever say \"required\" and reports no state — its CHANNEL is the state, and beat_token publishes that", got["beat_auth"])
+		t.Errorf("LogValue renders beat_auth = %q; the token is required, so a presence attr can only ever say \"required\" and reports no state — its CHANNEL is the state, and beat_tokens publishes that", got["beat_auth"])
 	}
 }
 
@@ -1817,12 +1817,12 @@ func TestConfigLogValueReportsEachCredentialSource(t *testing.T) {
 			field: func(cfg Config) string { return cfg.WebhookURL }, want: envx.SecretSourceFile,
 		},
 		"the plain token variable leaves the token in the environment": {
-			key: "BEAT_TOKEN", value: token, attr: "beat_token",
-			field: func(cfg Config) string { return cfg.BeatToken }, want: envx.SecretSourceEnv,
+			key: "BEAT_TOKENS", value: "api:" + token, attr: "beat_tokens",
+			field: func(cfg Config) string { return tokenLine(cfg, token) }, want: envx.SecretSourceEnv,
 		},
 		"the token _FILE companion keeps it out of the environment": {
-			key: "BEAT_TOKEN", value: token, file: true, attr: "beat_token",
-			field: func(cfg Config) string { return cfg.BeatToken }, want: envx.SecretSourceFile,
+			key: "BEAT_TOKENS", value: "api:" + token, file: true, attr: "beat_tokens",
+			field: func(cfg Config) string { return tokenLine(cfg, token) }, want: envx.SecretSourceFile,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1896,12 +1896,12 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		Node:           "observer-1",
 		ListenAddr:     "127.0.0.1:19190",
 		OpsListenAddr:  "127.0.0.1:19191",
-		BeatToken:      "unit-test-beat-token",
+		BeatTokens:     mustBeatTokens(t, "api:unit-test-beat-token"),
 		// The OTHER channel than the webhook's, deliberately: the two source
 		// attrs are the only pair in this fixture that share a value domain, so
 		// an attr wired to the wrong source field would otherwise render exactly
 		// what the right one does and pass.
-		BeatTokenSource: envx.SecretSourceEnv,
+		BeatTokensSource: envx.SecretSourceEnv,
 		Beats: []Beat{
 			{ID: "watchdog-mimir", Deadline: 20 * time.Minute},
 			{ID: "watchdog-loki", Deadline: 26 * time.Hour},
@@ -1928,8 +1928,9 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		// its own field: both credentials are exposed by the plain variable in the
 		// same way, so publishing one channel and not the other tells an operator
 		// half of where their secrets live.
-		"beat_token":    "env",
-		"allowed_hosts": "allowlist(2)",
+		"beat_tokens":        "env",
+		"beat_token_entries": "1",
+		"allowed_hosts":      "allowlist(2)",
 		// A COUNT, for the reason allowed_hosts publishes one: a misspelled
 		// TRUSTED_PROXIES is indistinguishable from an unset one, so the number
 		// of ranges actually held is the state an operator checks this line for.
@@ -2092,7 +2093,7 @@ func TestLoadRejectsAWebhookWithoutAHostname(t *testing.T) {
 // blank-file, path-policy and os.PathError messages — correct for a path, and a
 // credential leak for the most common misconfiguration of this convention: the
 // operator pastes the secret itself into DISCORD_WEBHOOK_URL_FILE (or
-// BEAT_TOKEN_FILE) instead of a path to it. Wrapping envx's error verbatim
+// BEAT_TOKENS_FILE) instead of a path to it. Wrapping envx's error verbatim
 // copied that live credential into the startup ERROR line, from where Loki
 // keeps it long after the value is rotated.
 func TestLoadDoesNotLeakACredentialPastedIntoASecretFileVariable(t *testing.T) {
@@ -2105,7 +2106,7 @@ func TestLoadDoesNotLeakACredentialPastedIntoASecretFileVariable(t *testing.T) {
 			canary: "https://discord.example/api/webhooks/1/canary-webhook-token",
 		},
 		"bearer token pasted into the file variable": {
-			key:    "BEAT_TOKEN",
+			key:    "BEAT_TOKENS",
 			canary: "canary-bearer-token-value",
 		},
 	}
@@ -2130,7 +2131,7 @@ func TestLoadDoesNotLeakACredentialPastedIntoASecretFileVariable(t *testing.T) {
 
 // TestLoadRefusesAHeaderIllegalTokenBeforeTheLengthFloor pins the ORDER of
 // checkBeatToken's header-legality and minimum-length refusals. A plain
-// BEAT_TOKEN of Unicode spaces around a control byte passes the ASCII-edge
+// BEAT_TOKENS of Unicode spaces around a control byte passes the ASCII-edge
 // refusal and is BOTH header-illegal and under the 16-byte floor, so it is the
 // one fixture whose diagnosis reveals which check ran first: the operator has
 // to be told the token carries a byte HTTP forbids, not that it is too short,
@@ -2138,11 +2139,11 @@ func TestLoadDoesNotLeakACredentialPastedIntoASecretFileVariable(t *testing.T) {
 func TestLoadRefusesAHeaderIllegalTokenBeforeTheLengthFloor(t *testing.T) {
 	// Serial (t.Setenv forbids t.Parallel).
 	setValidLoadEnv(t)
-	t.Setenv("BEAT_TOKEN", "\u00a0\n\u00a0")
+	t.Setenv("BEAT_TOKENS", "api:"+"\u00a0\x01\u00a0")
 
 	_, err := Load(maxNodeNameBytes)
 	if err == nil {
-		t.Fatal("Load() with a BEAT_TOKEN carrying an interior newline = nil, want error: no sender can present a control byte in a header value")
+		t.Fatal("Load() with a BEAT_TOKENS carrying an interior control byte = nil, want error: no sender can present a control byte in a header value")
 	}
 	if !strings.Contains(err.Error(), "control character") {
 		t.Errorf("error = %q, want the control-character refusal", err)
@@ -2202,4 +2203,35 @@ func TestLoadWarnsOnlyWhenLogLevelIsUnparseable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// hasToken reports whether token is one of cfg's beat tokens.
+func hasToken(cfg Config, token string) bool {
+	_, ok := cfg.BeatTokens.Set.Match(token)
+	return ok
+}
+
+// tokenSummary renders cfg's token set for a failure message, without a token.
+func tokenSummary(cfg Config) string {
+	return fmt.Sprintf("%d token(s) covering %v", cfg.BeatTokens.Set.Len(), cfg.BeatTokens.Covers)
+}
+
+// tokenLine is the BEAT_TOKENS line "api:"+token when cfg holds token for api,
+// else "".
+func tokenLine(cfg Config, token string) string {
+	if i, ok := cfg.BeatTokens.Set.Match(token); ok && slices.Contains(cfg.BeatTokens.Covers[i], "api") {
+		return "api:" + token
+	}
+	return ""
+}
+
+// mustBeatTokens parses raw against the one beat api, failing the test on an
+// error.
+func mustBeatTokens(t *testing.T, raw string) BeatTokens {
+	t.Helper()
+	tokens, err := parseBeatTokens(raw, []Beat{{ID: "api", Deadline: time.Hour}})
+	if err != nil {
+		t.Fatalf("parseBeatTokens: %v", err)
+	}
+	return tokens
 }

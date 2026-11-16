@@ -76,10 +76,10 @@ func bootEnvOps(beats, addr, opsAddr string) []string {
 	for _, key := range secretEnvKeys {
 		env = append(env, key+"=")
 	}
-	// After the clearing sweep, because BEAT_TOKEN is in it: the token is
-	// REQUIRED, so a child that cleared it exits at the configuration gate
+	// After the clearing sweep, because BEAT_TOKENS is in it: the tokens are
+	// REQUIRED, so a child that cleared them exits at the configuration gate
 	// instead of booting.
-	env = append(env, "BEAT_TOKEN="+testBeatToken)
+	env = append(env, "BEAT_TOKENS="+beatTokensFor(beats, testBeatToken))
 	return env
 }
 
@@ -340,8 +340,8 @@ func TestRejectedConfigExitsOneWithoutLeakingTheWebhook(t *testing.T) {
 		"BEATS=api:20m",
 		"DISCORD_WEBHOOK_URL=" + testPlainHTTPWebhookURL,
 		"DISCORD_WEBHOOK_URL_FILE=",
-		"BEAT_TOKEN=",
-		"BEAT_TOKEN_FILE=",
+		"BEAT_TOKENS=",
+		"BEAT_TOKENS_FILE=",
 	})
 	if code != 1 {
 		t.Errorf("knell with a plain-http webhook = exit %d, want 1: %s", code, out)

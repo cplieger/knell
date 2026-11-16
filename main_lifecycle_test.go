@@ -459,7 +459,7 @@ func TestRunGatesTheBeatEndpointWithTheConfiguredToken(t *testing.T) {
 	addr, opsAddr := prepareLifecycleRun(t, beat)
 	// prepareLifecycleRun installs the shared testBeatToken; this overrides it
 	// with the value under test.
-	t.Setenv("BEAT_TOKEN", token)
+	t.Setenv("BEAT_TOKENS", beat+":"+token)
 
 	r := startLifecycleRun(t)
 	waitForHealthyWithin(t, opsAddr, 10*time.Second)
@@ -1065,7 +1065,7 @@ func TestClassifyAbandonedWatchLoopDeniesACleanExitOverAnAbandonedLoop(t *testin
 // leaves both unset by default, bounding only the headers), without
 // the MaxHeaderBytes cap the header block falls back to net/http's 1 MiB default --
 // so one unauthenticated caller makes this process read a megabyte of header per
-// connection, and the BEAT_TOKEN maximum config refuses startup over stops
+// connection, and the beat token maximum config refuses startup over stops
 // bounding anything real -- and without WithSlogErrorLog net/http's own
 // connection-level lines -- above all "http: Accept error: ...; retrying", the
 // trace of an exhausted fd budget that stops every beat from being received --
@@ -1124,7 +1124,7 @@ func TestNewServerBoundsWholeRequestsAndRoutesConnectionErrorsThroughSlog(t *tes
 		t.Errorf("worst-case active request = %s, want <= %s (shutdownGrace %s less the %s the constants' comment reserves for the watch-loop teardown): a bound this size lets one authenticated slow caller eat the grace awaitWatchLoop needs to collect the loop and flush its abandoned-notice WARN", worst, shutdownGrace-teardownReserve, shutdownGrace, teardownReserve)
 	}
 	if srv.MaxHeaderBytes != config.MaxRequestHeaderBytes {
-		t.Errorf("MaxHeaderBytes = %d, want %d: the default is net/http's 1 MiB, so an unauthenticated caller can make this process read a megabyte of header per connection, and the BEAT_TOKEN maximum config enforces at startup stops bounding what a ping can actually carry", srv.MaxHeaderBytes, config.MaxRequestHeaderBytes)
+		t.Errorf("MaxHeaderBytes = %d, want %d: the default is net/http's 1 MiB, so an unauthenticated caller can make this process read a megabyte of header per connection, and the beat token maximum config enforces at startup stops bounding what a ping can actually carry", srv.MaxHeaderBytes, config.MaxRequestHeaderBytes)
 	}
 	if srv.ErrorLog == nil {
 		t.Fatal("ErrorLog is nil, so net/http's connection-level errors go to the standard logger: an accept failure -- a whole-service outage here -- arrives as an unstructured, level-less line")

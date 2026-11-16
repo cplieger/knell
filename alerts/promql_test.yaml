@@ -405,3 +405,105 @@ tests:
             value: 1
           - labels: '{kind="History"}'
             value: 0
+
+  - name: one address at its failure limit stays quiet, two addresses fire
+    interval: 1m
+    input_series:
+      # One key can be charged 10 times per 15 minutes: 10 here, then two
+      # failures a minute from several keys.
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="invalid_token"}'
+        values: '0+0x3 1+1x9 10+0x6 12+2x14'
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="beat_not_allowed"}'
+        values: '0+0x40'
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="throttled"}'
+        values: '0+50x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: KnellAuthFailures
+        exp_alerts: []
+      - eval_time: 34m
+        alertname: KnellAuthFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: knell
+              instance: knell:9191
+            exp_annotations:
+              summary: "knell on knell:9191 refused over 15 ping tokens in 15 minutes"
+              description: >
+                Several addresses are sending tokens knell does not have, or one
+                throttled address keeps sending them: guessing, a leaked token
+                trying other beats, or jobs on an old token.
+
+  - name: retried 429s stay quiet, a throttled guessing run fires
+    interval: 1m
+    input_series:
+      # 60 throttled answers a minute: a client retrying fast, under the leg.
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="throttled"}'
+        values: '0+60x30'
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="invalid_token"}'
+        values: '10+0x30'
+      # 500 a minute from another knell: a guess list replayed.
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9192", reason="throttled"}'
+        values: '0+500x30'
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9192", reason="invalid_token"}'
+        values: '10+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KnellAuthFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: knell
+              instance: knell:9192
+            exp_annotations:
+              summary: "knell on knell:9192 refused over 15 ping tokens in 15 minutes"
+              description: >
+                Several addresses are sending tokens knell does not have, or one
+                throttled address keeps sending them: guessing, a leaked token
+                trying other beats, or jobs on an old token.
+
+  - name: two knells at one address's limit each stay quiet
+    interval: 1m
+    input_series:
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="invalid_token"}'
+        values: '0+1x9 10+0x20'
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9192", reason="invalid_token"}'
+        values: '0+1x9 10+0x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: KnellAuthFailures
+        exp_alerts: []
+
+  - name: a valid ping answered 429 fires KnellPingsThrottled, a stale sibling alone does not
+    interval: 1m
+    input_series:
+      # A stale job on the sender's address: 10 refused tokens, then the
+      # valid job beside it is answered 429 and recorded.
+      - series: 'knell_auth_failures_total{job="knell", instance="knell:9191", reason="invalid_token"}'
+        values: '0+1x9 10+0x30'
+      - series: 'knell_beats_recorded_while_throttled_total{job="knell", instance="knell:9191", beat="backup"}'
+        values: '0+0x14 1+1x5 6+0x25'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: KnellPingsThrottled
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: KnellAuthFailures
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: KnellPingsThrottled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: knell
+              instance: knell:9191
+            exp_annotations:
+              summary: "knell on knell:9191 answered valid pings with 429"
+              description: >
+                knell recorded these pings, but each sender saw a failure. Its
+                address shares failures with another client, a spray filled the
+                global limit, or someone guessed a token.
+      - eval_time: 40m
+        alertname: KnellPingsThrottled
+        exp_alerts: []

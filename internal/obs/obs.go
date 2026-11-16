@@ -60,16 +60,33 @@ const (
 	RefusalNonCanonicalBeatPath Refusal = "non_canonical_beat_path"
 	// RefusalHostNotAllowed is a request whose Host is not in ALLOWED_HOSTS.
 	RefusalHostNotAllowed Refusal = "host_not_allowed"
-	// RefusalAuthThrottled is a beat request refused because the shared
-	// failed-auth bucket was empty.
-	RefusalAuthThrottled Refusal = "auth_throttled"
 )
 
 // refusalReasons drives cold-start pre-minting and the HELP reason list. Add
 // every new Refusal constant here so those two views stay aligned.
-var refusalReasons = []Refusal{RefusalNonCanonicalBeatPath, RefusalHostNotAllowed, RefusalAuthThrottled}
+var refusalReasons = []Refusal{RefusalNonCanonicalBeatPath, RefusalHostNotAllowed}
 
 var refusalReasonsText = joinLabelValues(refusalReasons)
+
+// AuthReason distinguishes auth failure reason values from runtime strings;
+// use the constants and keep authReasons in sync.
+type AuthReason string
+
+// The auth failure reasons are the legal values of reasonLabel on
+// auth_failures_total.
+const (
+	// AuthInvalidToken is a ping whose token matches no configured token.
+	AuthInvalidToken AuthReason = "invalid_token"
+	// AuthBeatNotAllowed is a ping whose token is valid for other beats only.
+	AuthBeatNotAllowed AuthReason = "beat_not_allowed"
+	// AuthThrottled is a ping answered 429 whose token did not cover its beat.
+	AuthThrottled AuthReason = "throttled"
+)
+
+// authReasons drives cold-start pre-minting and the HELP reason list.
+var authReasons = []AuthReason{AuthInvalidToken, AuthBeatNotAllowed, AuthThrottled}
+
+var authReasonsText = joinLabelValues(authReasons)
 
 // joinLabelValues renders a closed label vocabulary for a HELP string.
 // Generic over the string-kinded label types so both vocabularies are
@@ -99,6 +116,9 @@ func mintNotificationKinds() {
 func mintRefusalReasons() {
 	for _, reason := range refusalReasons {
 		preRouteRefusals.Add(0, string(reason))
+	}
+	for _, reason := range authReasons {
+		authFailures.Add(0, string(reason))
 	}
 }
 
@@ -205,9 +225,26 @@ var preRouteRefusals = measure.NewLabeledCounter(
 	[]string{reasonLabel},
 )
 
+// authFailures counts pings refused for their credential, and pings without
+// a covering credential answered 429 by the failure limiter.
+var authFailures = measure.NewLabeledCounter(
+	"auth_failures_total",
+	"Pings refused for their credential, and pings without a covering credential answered 429 by the failure limit, by reason ("+authReasonsText+"); a refused credential never counts toward a beat.",
+	measure.UnitCount,
+	[]string{reasonLabel},
+)
+
+// beatsRecordedWhileThrottled counts valid pings recorded behind a 429.
+var beatsRecordedWhileThrottled = measure.NewLabeledCounter(
+	"beats_recorded_while_throttled_total",
+	"Valid pings recorded although knell answered them 429, because their client address, or every address not trusted, was throttled.",
+	measure.UnitCount,
+	[]string{beatLabel},
+)
+
 // httpRequests counts every served HTTP request by matched route template,
-// method and status. It is the only view of a refused ping -- 401, 404, 405
-// and 503 never reach beatsReceived.
+// method and status. It is the only view of a 404, 405 or 503 ping; refused
+// tokens also move authFailures.
 var httpRequests = measure.NewLabeledCounter(
 	"http_requests_total",
 	"Served HTTP requests by matched route template, method and status. Series are not pre-minted, so a status series is born with its first request and increase() cannot see that first event; alert on the absolute value (status=401 > 0), which latches until restart.",
@@ -254,6 +291,8 @@ func init() {
 		notificationsFailed,
 		notificationsDropped,
 		preRouteRefusals,
+		authFailures,
+		beatsRecordedWhileThrottled,
 		httpRequests,
 		httpDuration,
 		listenerAcceptErrors,
@@ -281,6 +320,7 @@ func InitBeat(id string, deadline time.Duration, start time.Time) {
 	beatsReceived.Add(0, id)
 	beatOutages.Add(0, id)
 	outageRecordsDropped.Add(0, id)
+	beatsRecordedWhileThrottled.Add(0, id)
 }
 
 // RecordBeat records an accepted ping for id observed at now. The caller
@@ -336,6 +376,17 @@ func RecordAcceptError() {
 // under the reason knell refused it.
 func RecordPreRouteRefusal(reason Refusal) {
 	preRouteRefusals.Inc(string(reason))
+}
+
+// RecordAuthFailure counts one ping refused for reason.
+func RecordAuthFailure(reason AuthReason) {
+	authFailures.Inc(string(reason))
+}
+
+// RecordBeatRecordedWhileThrottled counts one valid ping for id recorded
+// behind a 429.
+func RecordBeatRecordedWhileThrottled(id string) {
+	beatsRecordedWhileThrottled.Inc(id)
 }
 
 // RecordNotificationSent counts one delivered notification message of kind.

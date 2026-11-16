@@ -25,11 +25,19 @@ knell_notifications_failed_total{kind="recovered"} 0
 knell_notifications_dropped_total{kind="history"} 0
 knell_notifications_dropped_total{kind="missing"} 0
 knell_notifications_dropped_total{kind="recovered"} 1
-# HELP knell_pre_route_refusals_total Requests refused before the mux routes, by reason (non_canonical_beat_path, host_not_allowed, auth_throttled); a diagnostic for a missing beat, not an alert source.
+# HELP knell_pre_route_refusals_total Requests refused before the mux routes, by reason (non_canonical_beat_path, host_not_allowed); a diagnostic for a missing beat, not an alert source.
 # TYPE knell_pre_route_refusals_total counter
-knell_pre_route_refusals_total{reason="auth_throttled"} 2
 knell_pre_route_refusals_total{reason="host_not_allowed"} 1
 knell_pre_route_refusals_total{reason="non_canonical_beat_path"} 0
+# HELP knell_auth_failures_total Pings refused for their credential, and pings without a covering credential answered 429 by the failure limit, by reason (invalid_token, beat_not_allowed, throttled); a refused credential never counts toward a beat.
+# TYPE knell_auth_failures_total counter
+knell_auth_failures_total{reason="beat_not_allowed"} 0
+knell_auth_failures_total{reason="invalid_token"} 1
+knell_auth_failures_total{reason="throttled"} 2
+# HELP knell_beats_recorded_while_throttled_total Valid pings recorded although knell answered them 429, because their client address, or every address not trusted, was throttled.
+# TYPE knell_beats_recorded_while_throttled_total counter
+knell_beats_recorded_while_throttled_total{beat="backup"} 1
+knell_beats_recorded_while_throttled_total{beat="cron-nightly"} 0
 # HELP knell_http_requests_total Served HTTP requests by matched route template, method and status. Series are not pre-minted, so a status series is born with its first request and increase() cannot see that first event; alert on the absolute value (status=401 > 0), which latches until restart.
 # TYPE knell_http_requests_total counter
 knell_http_requests_total{method="GET",path="/metrics",status="200"} 1
