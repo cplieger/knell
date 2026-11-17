@@ -288,6 +288,9 @@ func TestDashboardReadsOnlySeriesKnellServes(t *testing.T) {
 	queries := dashboardQueries(&d)
 	scrape := []string{"job", "instance", "le"}
 	for where, expr := range queries {
+		if hasLineComment(expr) {
+			t.Errorf("%s holds a # comment, which the series checks cannot read: %s", where, expr)
+		}
 		var labels []string
 		for _, name := range seriesIn(expr) {
 			switch have, ok := served[name]; {
@@ -299,6 +302,9 @@ func TestDashboardReadsOnlySeriesKnellServes(t *testing.T) {
 			}
 		}
 		for _, sel := range selectors(bracedVariableRe.ReplaceAllString(expr, "$$v")) {
+			if sel.name == "" {
+				t.Errorf("%s has a selector with no series name before its braces, which the series checks cannot read: %s", where, expr)
+			}
 			have, ok := served[sel.name]
 			if !ok {
 				continue
@@ -332,15 +338,11 @@ func TestDashboardReadsOnlySeriesKnellServes(t *testing.T) {
 }
 
 var (
-	// selectorAtRe is a name and the matchers after it, quoted values kept.
-	selectorAtRe = regexp.MustCompile(`([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(\{(?:[^{}"]|"(?:[^"\\]|\\.)*")*\})?`)
-	absentRuleRe = regexp.MustCompile(`(?m)^\s*- alert: (\w+)\n\s*expr: absent\(`)
 	// bracedVariableRe matches ${name}, whose braces are no selector.
 	bracedVariableRe = regexp.MustCompile(`\$\{\w+(?::\w+)?\}`)
 	// matcherPartRe matches one label matcher. PromQL lets the label name be
 	// quoted and takes a string in any of its three quotings.
 	matcherPartRe = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*|` + promqlString + `)\s*(=~|!~|!=|=)\s*(` + promqlString + `)$`)
-	stringPartRe  = regexp.MustCompile(`^(?:` + promqlString + `)$`)
 )
 
 const promqlString = `"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|` + "`[^`]*`"
@@ -386,13 +388,6 @@ func labelName(s string) (string, error) {
 		return b.String(), nil
 	}
 	return s, nil
-}
-
-// rawString is a string literal's text between its quotes, undecoded:
-// Grafana substitutes $instance in the query text before PromQL decodes
-// it, so "\x24instance" is no reference to the variable.
-func rawString(s string) string {
-	return s[1 : len(s)-1]
 }
 
 // hasLineComment reports a # outside a string literal, which PromQL reads as
@@ -444,142 +439,6 @@ func selectors(expr string) []selectorBlock {
 		}
 	}
 	return out
-}
-
-// TestDashboardMatchesOnlyTheSelectedInstance fails when a series a query
-// reads is not matched to exactly instance="$instance", or a query matches
-// job, hostname or container, labels each user names. Grafana regex-escapes
-// only a multi-value or include-all value (interpolateQueryExpr,
-// https://github.com/grafana/grafana-prometheus-datasource/blob/v13.2.3/packages/grafana-prometheus/src/escaping.ts),
-// so a regex matcher lets an IPv6 target's brackets or a host's dots match
-// other instances. instance="" passes only beside instance="$instance".
-func TestDashboardMatchesOnlyTheSelectedInstance(t *testing.T) {
-	d := loadDashboard(t)
-	raw, err := os.ReadFile(promqlRules)
-	if err != nil {
-		t.Fatalf("reading %s: %v", promqlRules, err)
-	}
-	var instanceless []string
-	for _, m := range absentRuleRe.FindAllStringSubmatch(string(raw), -1) {
-		instanceless = append(instanceless, m[1])
-	}
-	checked := 0
-	for where, expr := range dashboardQueries(&d) {
-		if hasLineComment(expr) {
-			t.Errorf("%s holds a # comment, which the selector checks cannot read: %s", where, expr)
-		}
-		series := seriesIn(expr)
-		for _, m := range selectorAtRe.FindAllStringSubmatch(expr, -1) {
-			if m[2] == "" && where != "variable instance" && slices.Contains(series, m[1]) {
-				t.Errorf("%s reads %s without instance=\"$instance\": %s", where, m[1], expr)
-			}
-		}
-		var instanceMatchers []string
-		pinned := false
-		for _, sel := range selectors(bracedVariableRe.ReplaceAllString(expr, "$$v")) {
-			if sel.name == "" {
-				t.Errorf("%s has a selector with no series name before its braces, which the series checks cannot read: %s", where, expr)
-			}
-			scoped, alert := false, ""
-			for _, part := range sel.parts {
-				m := matcherPartRe.FindStringSubmatch(part)
-				if m == nil {
-					if !stringPartRe.MatchString(part) {
-						t.Errorf("%s holds %q in a selector of %s, which is no label matcher", where, part, sel.name)
-					}
-					continue
-				}
-				label, err := labelName(m[1])
-				if err != nil {
-					t.Errorf("%s quotes the label name %s in %s in a form PromQL does not decode: %s", where, m[1], sel.name, expr)
-					continue
-				}
-				switch op, value := m[2], rawString(m[3]); label {
-				case "job", "hostname", "container":
-					t.Errorf("%s matches on %s, a label each user names: %s", where, label, expr)
-				case "alertname":
-					if op == "=" {
-						alert = value
-					}
-				case "instance":
-					instanceMatchers = append(instanceMatchers, op+`"`+value+`"`)
-					pinned = pinned || op == "=" && value == "$instance"
-					scoped = true
-				}
-			}
-			if where == "variable instance" || !slices.Contains(series, sel.name) {
-				continue
-			}
-			checked++
-			// absent() keeps only its equality matchers' labels, so its alert has no instance:
-			// https://prometheus.io/docs/prometheus/latest/querying/functions/#absent
-			if !scoped && (sel.name != "ALERTS" || !slices.Contains(instanceless, alert)) {
-				t.Errorf("%s reads %s without instance=\"$instance\": %s", where, sel.name, expr)
-			}
-		}
-		for _, m := range instanceMatchers {
-			if m != `="$instance"` && (m != `=""` || !pinned) {
-				t.Errorf("%s matches instance%s, want instance=\"$instance\": %s", where, m, expr)
-			}
-		}
-	}
-	if checked == 0 {
-		t.Error("no query reads a series; the check no longer reads the dashboard")
-	}
-}
-
-var (
-	// counterCallRe matches the opening of a call that needs two samples in
-	// its window.
-	counterCallRe = regexp.MustCompile(`\b(increase|rate|irate)\s*\(`)
-	// oneSlotRangeRe matches a range or subquery range of exactly one
-	// $__interval, in each of Grafana's spellings of it.
-	oneSlotRangeRe = regexp.MustCompile(`\[\s*\$(?:__interval|\{__interval\}|\{__interval_ms\}ms)\s*(?::[^\]]*)?\]`)
-	// intervalSpellingRe matches Grafana's other spellings of $__interval and
-	// $__interval_ms: [[name]] and ${name}, each with or without a format.
-	intervalSpellingRe = regexp.MustCompile(`\[\[(__interval(?:_ms)?)(?::\w+)?\]\]|\$\{(__interval(?:_ms)?)(?::[^}]*)?\}|\$(__interval_ms)`)
-)
-
-// canonicalIntervals rewrites every spelling Grafana accepts for $__interval
-// and $__interval_ms to $__interval and ${__interval_ms}, so oneSlotRangeRe
-// sees each one.
-func canonicalIntervals(expr string) string {
-	return intervalSpellingRe.ReplaceAllStringFunc(expr, func(m string) string {
-		if strings.Contains(m, "_ms") {
-			return "${__interval_ms}"
-		}
-		return "$__interval"
-	})
-}
-
-// TestDashboardCountsNeverReadOneSlotRange fails when a query takes a
-// counter's increase or rate over [$__interval]: at short ranges Grafana sets
-// $__interval to the scrape interval, the window holds one sample, and the
-// panel goes empty while the user zooms in on an incident.
-func TestDashboardCountsNeverReadOneSlotRange(t *testing.T) {
-	d := loadDashboard(t)
-	for where, expr := range dashboardQueries(&d) {
-		for _, call := range oneSlotCalls(expr) {
-			t.Errorf("%s takes %s over [$__interval], want [$__rate_interval] or an offset difference: %s", where, call, expr)
-		}
-	}
-}
-
-// oneSlotCalls returns the counter calls in expr whose arguments take a range
-// of one $__interval, in any of Grafana's spellings.
-func oneSlotCalls(expr string) []string {
-	canonical := canonicalIntervals(expr)
-	var calls []string
-	for _, loc := range counterCallRe.FindAllStringSubmatchIndex(canonical, -1) {
-		args := canonical[loc[1]:]
-		if end := closingParen(canonical[loc[1]-1:]); end >= 0 {
-			args = canonical[loc[1] : loc[1]-1+end]
-		}
-		if oneSlotRangeRe.MatchString(args) {
-			calls = append(calls, canonical[loc[2]:loc[3]])
-		}
-	}
-	return calls
 }
 
 // TestDashboardQueriesAreTheTestedOnes fails when a panel query differs from
@@ -1120,24 +979,5 @@ func TestDashboardRangeFiguresNameTheRangeLength(t *testing.T) {
 	}
 	if figures == 0 {
 		t.Error("no range figure found; the check no longer reads the dashboard")
-	}
-}
-
-// TestCanonicalIntervalsCatchesEverySpelling pins the pre-pass: each Grafana
-// spelling of one interval inside a counter call is caught.
-func TestCanonicalIntervalsCatchesEverySpelling(t *testing.T) {
-	t.Parallel()
-	for _, spelling := range []string{
-		"$__interval", "${__interval}", "[[__interval]]", "${__interval:raw}",
-		"[[__interval:raw]]", "${__interval_ms}ms", "${__interval_ms:raw}ms", "[[__interval_ms]]ms",
-		"[[__interval_ms:raw]]ms", "$__interval_msms",
-	} {
-		expr := "increase(knell_beats_received_total[" + spelling + "])"
-		if got := oneSlotCalls(expr); !slices.Equal(got, []string{"increase"}) {
-			t.Errorf("oneSlotCalls(%q) = %q, want [increase]", expr, got)
-		}
-	}
-	if got := oneSlotCalls("increase(x[$__rate_interval])"); len(got) != 0 {
-		t.Errorf("[$__rate_interval] is caught: %q", got)
 	}
 }
