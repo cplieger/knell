@@ -114,6 +114,7 @@ type dashVariable struct {
 		Hide        string `json:"hide"`
 		Refresh     string `json:"refresh"`
 		Regex       string `json:"regex"`
+		Definition  string `json:"definition"`
 		SkipURLSync bool   `json:"skipUrlSync"`
 		Current     struct {
 			Text  any `json:"text"`
@@ -258,6 +259,7 @@ var (
 	identRe       = regexp.MustCompile(`\b[a-zA-Z_:][a-zA-Z0-9_:]*\b`)
 	alertsRe      = regexp.MustCompile(`ALERTS\{alertname="([A-Za-z]+)"([^}]*)\}`)
 	ruleNameRe    = regexp.MustCompile(`(?m)^\s*- alert: (\w+)$`)
+	ruleRe        = regexp.MustCompile(`(?ms)^\s*- alert: (\w+)\n\s*expr: (.*?)\n\s*for:`)
 )
 
 var promqlKeywords = []string{"and", "or", "unless", "bool", "offset", "group_left", "group_right"}
@@ -411,8 +413,9 @@ type selectorBlock struct {
 }
 
 // selectors returns each {...} block of expr with the series name before it,
-// "" for none, split at its commas. Quoted strings are skipped, so a brace or
-// comma inside a label value neither ends a block nor splits a matcher.
+// "" when none, a keyword (x or {...}) or a variable ($v{...}) is, split at
+// its commas. Quoted strings are skipped, so a brace or comma inside a label
+// value neither ends a block nor splits a matcher.
 func selectors(expr string) []selectorBlock {
 	var out []selectorBlock
 	start, part := -1, 0
@@ -433,6 +436,9 @@ func selectors(expr string) []selectorBlock {
 				name := before[len(strings.TrimRightFunc(before, func(r rune) bool {
 					return r == '_' || r == ':' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
 				})):]
+				if slices.Contains(promqlKeywords, name) || strings.HasSuffix(before[:len(before)-len(name)], "$") {
+					name = ""
+				}
 				out = append(out, selectorBlock{name: name, parts: parts})
 				start = -1
 			}
@@ -508,26 +514,41 @@ func TestDashboardScopesSharedFamiliesToKnell(t *testing.T) {
 	}
 }
 
-func shippedRules(t *testing.T) []string {
+// shippedRules maps each rule in alerts/promql.yaml to its expression.
+func shippedRules(t *testing.T) map[string]string {
 	t.Helper()
 	raw, err := os.ReadFile(promqlRules)
 	if err != nil {
 		t.Fatalf("reading %s: %v", promqlRules, err)
 	}
-	var names []string
-	for _, m := range ruleNameRe.FindAllStringSubmatch(string(raw), -1) {
-		names = append(names, m[1])
+	rules := map[string]string{}
+	for _, m := range ruleRe.FindAllStringSubmatch(string(raw), -1) {
+		rules[m[1]] = m[2]
 	}
-	if len(names) == 0 {
-		t.Fatalf("%s defines no rule", promqlRules)
+	if n := len(ruleNameRe.FindAllString(string(raw), -1)); n == 0 || len(rules) != n {
+		t.Fatalf("%s defines %d rules, %d of them with expr: on the line after the name", promqlRules, n, len(rules))
 	}
-	return names
+	return rules
+}
+
+// attentionTile is the query of the Needs attention tile for the rule name
+// with expression expr. An absent() arm's alert carries no instance label, so
+// only an absent() rule's tile also reads instance="":
+// https://prometheus.io/docs/prometheus/latest/querying/functions/#absent
+func attentionTile(name, expr string) string {
+	read := `ALERTS{alertname="` + name + `", alertstate="firing", instance=`
+	if strings.Contains(expr, "absent(") {
+		return `0 * max((` + read + `"$instance"} or ` + read + `""}))`
+	}
+	return `0 * max(` + read + `"$instance"})`
 }
 
 // TestDashboardOverviewMirrorsEveryShippedRule fails when a rule in
-// alerts/promql.yaml has no Overview tile, or a tile names a rule the file
-// does not hold. Each tile reads its rule's firing ALERTS series and names the
-// rule, and a Needs attention tile starts hidden until its query answers.
+// alerts/promql.yaml has no Overview tile, a tile names a rule the file does
+// not hold or does not name it in its description, a Needs attention tile's
+// query is not exactly attentionTile's for its rule, the row's variable does
+// not count exactly those tiles in layout order, or a tile is not hidden until
+// its query answers.
 func TestDashboardOverviewMirrorsEveryShippedRule(t *testing.T) {
 	d := loadDashboard(t)
 	rules := shippedRules(t)
@@ -539,9 +560,7 @@ func TestDashboardOverviewMirrorsEveryShippedRule(t *testing.T) {
 		gate.Spec.Items[0].Spec.Operator != "matches" || gate.Spec.Items[0].Spec.Value != "^[1-9]" {
 		t.Fatal("Needs attention is not shown by a variable matching ^[1-9]")
 	}
-	vars := d.variables()
-	gateVar := vars[gate.Spec.Items[0].Spec.Variable]
-	counted := variableQuery(&gateVar)
+	var counts []string
 	for _, it := range attention.Spec.Layout.Spec.Items {
 		p := d.Spec.Elements[it.Spec.Element.Name]
 		cr := it.Spec.ConditionalRendering
@@ -557,11 +576,31 @@ func TestDashboardOverviewMirrorsEveryShippedRule(t *testing.T) {
 			p.Spec.Data.Spec.QueryOptions.MaxDataPoints <= 0 {
 			t.Errorf("%q does not show exactly while its query answers: want a shown group or'ing a has-data rule with a 0s range rule, and a maxDataPoints pin", p.Spec.Title)
 		}
-		for _, e := range panelExprs(&p) {
-			if !strings.Contains(counted, "count("+e+")") {
-				t.Errorf("%q query is not counted by the row's variable", p.Spec.Title)
-			}
+		exprs := panelExprs(&p)
+		if len(exprs) != 1 {
+			t.Errorf("%q holds %d queries, want 1", p.Spec.Title, len(exprs))
+			continue
 		}
+		// The tile label keeps each count its own series: or drops a
+		// right-hand series whose labels match one on its left.
+		counts = append(counts, fmt.Sprintf(`label_replace(count(%s), "tile", %q, "", "")`, exprs[0], strings.TrimPrefix(it.Spec.Element.Name, "panel-")))
+		m := alertsRe.FindStringSubmatch(exprs[0])
+		if m == nil {
+			t.Errorf("%q reads no ALERTS series by alertname: %s", p.Spec.Title, exprs[0])
+			continue
+		}
+		if expr, ok := rules[m[1]]; ok && exprs[0] != attentionTile(m[1], expr) {
+			t.Errorf("%q must read exactly\n%s\nso it shows only the picked instance's firing %s alerts, and an absent() rule's missing target too; it reads\n%s",
+				p.Spec.Title, attentionTile(m[1], expr), m[1], exprs[0])
+		}
+	}
+	gateVar := d.variables()[gate.Spec.Items[0].Spec.Variable]
+	want := "query_result(count(" + strings.Join(counts, " or ") + ") or vector(0))"
+	if got := variableQuery(&gateVar); got != want {
+		t.Errorf("the row's variable query must count exactly its tiles in layout order:\n%s\nit reads\n%s", want, got)
+	}
+	if got := gateVar.Spec.Definition; got != want {
+		t.Errorf("the row's variable definition must equal its query:\n%s\nit reads\n%s", want, got)
 	}
 	var mirrored []string
 	for _, r := range overview.Spec.Layout.Spec.Rows {
@@ -579,13 +618,13 @@ func TestDashboardOverviewMirrorsEveryShippedRule(t *testing.T) {
 			}
 		}
 	}
-	for _, name := range rules {
+	for name := range rules {
 		if !slices.Contains(mirrored, name) {
 			t.Errorf("%s has no Overview tile reading its firing alerts", name)
 		}
 	}
 	for _, name := range mirrored {
-		if !slices.Contains(rules, name) {
+		if _, ok := rules[name]; !ok {
 			t.Errorf("a tile mirrors %s, which %s does not hold", name, promqlRules)
 		}
 	}
