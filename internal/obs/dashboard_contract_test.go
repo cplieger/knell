@@ -590,7 +590,12 @@ func TestDashboardOverviewMirrorsEveryShippedRule(t *testing.T) {
 			t.Errorf("%q reads no ALERTS series by alertname: %s", p.Spec.Title, exprs[0])
 			continue
 		}
-		if expr, ok := rules[m[1]]; ok && exprs[0] != attentionTile(m[1], expr) {
+		expr, ok := rules[m[1]]
+		if !ok {
+			t.Errorf("%q reads %s, which %s does not hold", p.Spec.Title, m[1], promqlRules)
+			continue
+		}
+		if exprs[0] != attentionTile(m[1], expr) {
 			t.Errorf("%q must read exactly\n%s\nso it shows only the picked instance's firing %s alerts; it reads\n%s",
 				p.Spec.Title, attentionTile(m[1], expr), m[1], exprs[0])
 		}
