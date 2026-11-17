@@ -257,7 +257,7 @@ var (
 	labelValuesRe = regexp.MustCompile(`label_values\(([^,]+),\s*\w+\)`)
 	functionRe    = regexp.MustCompile(`\b[a-z_]+\s*\(`)
 	identRe       = regexp.MustCompile(`\b[a-zA-Z_:][a-zA-Z0-9_:]*\b`)
-	alertsRe      = regexp.MustCompile(`ALERTS\{alertname="([A-Za-z]+)"([^}]*)\}`)
+	alertsRe      = regexp.MustCompile(`ALERTS\{alertname="(\w+)"([^}]*)\}`)
 	ruleNameRe    = regexp.MustCompile(`(?m)^\s*- alert: (\w+)$`)
 	ruleRe        = regexp.MustCompile(`(?ms)^\s*- alert: (\w+)\n\s*expr: (.*?)\n\s*for:`)
 )
@@ -531,6 +531,31 @@ func shippedRules(t *testing.T) map[string]string {
 	return rules
 }
 
+// absentCallRe matches a call of absent() or absent_over_time(); PromQL lets
+// whitespace stand before a call's parenthesis.
+var absentCallRe = regexp.MustCompile(`(?:^|[^\w:])absent(?:_over_time)?\s*\(`)
+
+// promqlCode is expr with its string literals and # comments blanked, so a
+// function name inside one is not read as a call.
+func promqlCode(expr string) string {
+	b := []byte(expr)
+	for i := 0; i < len(b); i++ {
+		switch b[i] {
+		case '"', '\'', '`':
+			end := skipString(expr, i)
+			for j := i; j < end; j++ {
+				b[j] = ' '
+			}
+			i = end - 1
+		case '#':
+			for ; i < len(b) && b[i] != '\n'; i++ {
+				b[i] = ' '
+			}
+		}
+	}
+	return string(b)
+}
+
 // attentionTile is the query of the Needs attention tile for the rule name
 // with expression expr. absent() and absent_over_time() label their alert
 // with only the selector's equality matchers, and a shipped rule's selector
@@ -538,7 +563,7 @@ func shippedRules(t *testing.T) map[string]string {
 // https://prometheus.io/docs/prometheus/latest/querying/functions/#absent
 func attentionTile(name, expr string) string {
 	read := `ALERTS{alertname="` + name + `", alertstate="firing", instance=`
-	if strings.Contains(expr, "absent(") || strings.Contains(expr, "absent_over_time(") {
+	if absentCallRe.MatchString(promqlCode(expr)) {
 		return `0 * max((` + read + `"$instance"} or ` + read + `""}))`
 	}
 	return `0 * max(` + read + `"$instance"})`
