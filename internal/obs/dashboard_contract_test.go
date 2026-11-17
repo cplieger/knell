@@ -526,18 +526,19 @@ func shippedRules(t *testing.T) map[string]string {
 		rules[m[1]] = m[2]
 	}
 	if n := len(ruleNameRe.FindAllString(string(raw), -1)); n == 0 || len(rules) != n {
-		t.Fatalf("%s defines %d rules, %d of them with expr: on the line after the name", promqlRules, n, len(rules))
+		t.Fatalf("%s has %d - alert: lines but %d distinct names read with expr: on the next line and a for: after it", promqlRules, n, len(rules))
 	}
 	return rules
 }
 
 // attentionTile is the query of the Needs attention tile for the rule name
-// with expression expr. An absent() arm's alert carries no instance label, so
-// only an absent() rule's tile also reads instance="":
+// with expression expr. absent() and absent_over_time() label their alert
+// with only the selector's equality matchers, and a shipped rule's selector
+// names no instance, so only such a rule's tile also reads instance="":
 // https://prometheus.io/docs/prometheus/latest/querying/functions/#absent
 func attentionTile(name, expr string) string {
 	read := `ALERTS{alertname="` + name + `", alertstate="firing", instance=`
-	if strings.Contains(expr, "absent(") {
+	if strings.Contains(expr, "absent(") || strings.Contains(expr, "absent_over_time(") {
 		return `0 * max((` + read + `"$instance"} or ` + read + `""}))`
 	}
 	return `0 * max(` + read + `"$instance"})`
@@ -590,7 +591,7 @@ func TestDashboardOverviewMirrorsEveryShippedRule(t *testing.T) {
 			continue
 		}
 		if expr, ok := rules[m[1]]; ok && exprs[0] != attentionTile(m[1], expr) {
-			t.Errorf("%q must read exactly\n%s\nso it shows only the picked instance's firing %s alerts, and an absent() rule's missing target too; it reads\n%s",
+			t.Errorf("%q must read exactly\n%s\nso it shows only the picked instance's firing %s alerts; it reads\n%s",
 				p.Spec.Title, attentionTile(m[1], expr), m[1], exprs[0])
 		}
 	}
