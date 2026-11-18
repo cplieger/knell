@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/cplieger/go/envx"
-	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/notify"
 )
@@ -908,7 +908,7 @@ func TestAllowedHostsGate(t *testing.T) {
 			// which the serving-side options affect — webapi's tests cover the
 			// shipped envelope and the loopback exemption through
 			// webapi.HostPolicyOptions.
-			policy, err := allowedHosts(nil)
+			policy, _, err := allowedHosts(nil)
 			if tt.wantErr != "" {
 				if err == nil {
 					t.Fatalf("allowedHosts() with %q = nil error, want a startup refusal: knell would serve an allowlist the operator never configured, and every non-loopback ping it should have admitted 403s until one deadline later every beat posts a false MISSING notice", tt.raw)
@@ -1492,7 +1492,7 @@ func TestLoadRefusesTheOpsListenerOnThePingPort(t *testing.T) {
 			if err == nil {
 				t.Fatal("Load() accepted an OPS_LISTEN_ADDR on LISTEN_ADDR's port, so /metrics would be served wherever pings are")
 			}
-			for _, want := range []string{"OPS_LISTEN_ADDR", "LISTEN_ADDR", defaultOpsListenAddr} {
+			for _, want := range []string{"OPS_LISTEN_ADDR", "LISTEN_ADDR"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("error %q does not name %s", err, want)
 				}

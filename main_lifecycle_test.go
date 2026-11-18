@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/cplieger/go/health/v2"
-	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/obs"
@@ -34,6 +34,10 @@ const stillRunningWarn = "watch loop still running at the end of the shutdown gr
 
 // waitForHealthyWithin blocks until /healthz at addr answers 200, or fails
 // the test. A refused connection is not yet serving, so it keeps polling.
+// opsShutdownGrace is the grace httpserver gives the operations listener once
+// the ping listener has drained, so it adds to shutdownGrace.
+const opsShutdownGrace = time.Second
+
 func waitForHealthyWithin(t *testing.T, addr string, timeout time.Duration) {
 	t.Helper()
 	client := &http.Client{Timeout: time.Second}
@@ -1153,123 +1157,4 @@ func getHealthzAsHost(t *testing.T, addr, host string) (int, string) {
 		t.Fatalf("close /healthz body: %v", err)
 	}
 	return resp.StatusCode, string(body)
-}
-
-// failingListener is a listener whose Accept fails for good at once, the way
-// an exhausted or revoked socket makes Serve return.
-type failingListener struct{ net.Listener }
-
-func (failingListener) Accept() (net.Conn, error) { return nil, errors.New("accept failed for good") }
-
-// TestServeListenersStopsKnellWhenTheOpsListenerFails pins the early-exit rule:
-// an operations listener that stops on its own cancels the ping listener as a
-// signal would, and the returned error makes knell exit non-zero so the
-// restart policy brings /healthz and /metrics back. A signal instead stops
-// both with no error.
-func TestServeListenersStopsKnellWhenTheOpsListenerFails(t *testing.T) {
-	// serve runs serveListeners with ops as the operations socket, sending the
-	// shutdown signal itself when signal is set, and returns its outcome.
-	serve := func(t *testing.T, ops net.Listener, signal bool) (context.Context, error) {
-		t.Helper()
-		ping, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Skipf("cannot bind: %v", err)
-		}
-		ctx, stop := context.WithCancel(t.Context())
-		t.Cleanup(stop)
-		srv := func() *http.Server {
-			return &http.Server{Handler: http.NotFoundHandler(), ReadHeaderTimeout: time.Second}
-		}
-		done := make(chan error, 1)
-		go func() {
-			done <- serveListeners(ctx, stop, srv(), ping, srv(), ops)
-		}()
-		if signal {
-			stop()
-		}
-		select {
-		case err := <-done:
-			return ctx, err
-		case <-time.After(10 * time.Second):
-			t.Fatal("serveListeners did not return")
-			return ctx, nil
-		}
-	}
-
-	t.Run("ops listener fails on its own", func(t *testing.T) {
-		inner, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Skipf("cannot bind: %v", err)
-		}
-		t.Cleanup(func() { _ = inner.Close() })
-		ctx, err := serve(t, failingListener{inner}, false)
-		if err == nil || !strings.Contains(err.Error(), "operations listener on "+inner.Addr().String()+" stopped") {
-			t.Errorf("serveListeners = %v, want the operations failure naming its address, so knell exits non-zero", err)
-		}
-		if ctx.Err() == nil {
-			t.Error("the ping listener's context is still live: a failed operations listener must drain the ping listener")
-		}
-	})
-
-	// A scrape still in flight when the ping listener has drained is cut off
-	// at opsShutdownGrace, not httpserver's longer default, and that cutoff
-	// is no exit error.
-	t.Run("a stuck operations request is cut off at opsShutdownGrace", func(t *testing.T) {
-		ping, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Skipf("cannot bind: %v", err)
-		}
-		ops, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Skipf("cannot bind: %v", err)
-		}
-		entered, release := make(chan struct{}), make(chan struct{})
-		t.Cleanup(func() { close(release) })
-		stuck := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-			close(entered)
-			<-release
-		})
-		ctx, stop := context.WithCancel(t.Context())
-		t.Cleanup(stop)
-		done := make(chan error, 1)
-		go func() {
-			done <- serveListeners(ctx, stop,
-				&http.Server{Handler: http.NotFoundHandler(), ReadHeaderTimeout: time.Second}, ping,
-				&http.Server{Handler: stuck, ReadHeaderTimeout: time.Second}, ops)
-		}()
-		go func() {
-			resp, err := http.Get("http://" + ops.Addr().String() + "/metrics")
-			if err == nil {
-				_ = resp.Body.Close()
-			}
-		}()
-		select {
-		case <-entered:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the operations request never reached its handler")
-		}
-		stopped := time.Now()
-		stop()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("serveListeners = %v, want nil: a scrape cut off at the end of the operations grace is no exit error", err)
-			}
-			if took := time.Since(stopped); took > opsShutdownGrace+time.Second {
-				t.Errorf("the stop took %s, want at most opsShutdownGrace (%s) plus 1s: the operations drain must not run to httpserver's default grace", took, opsShutdownGrace)
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("serveListeners did not return")
-		}
-	})
-
-	t.Run("a signal stops both cleanly", func(t *testing.T) {
-		ops, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Skipf("cannot bind: %v", err)
-		}
-		if _, err := serve(t, ops, true); err != nil {
-			t.Errorf("serveListeners after a signal = %v, want nil", err)
-		}
-	})
 }

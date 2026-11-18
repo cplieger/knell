@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/knell/internal/watch"
 )
@@ -162,11 +162,8 @@ func (g *gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // body is never read, for any verdict, so net/http's handling of an unread
 // body cannot tell a right token from a wrong one.
 func (g *gate) throttled(w http.ResponseWriter, r *http.Request, v verdict, wait time.Duration) {
-	body, _ := json.Marshal(httpserver.ErrorResponse{
-		Error:     "too many failed beat token attempts",
-		Code:      "too_many_auth_failures",
-		RequestID: httpserver.RequestIDFromContext(r.Context()),
-	})
+	envelope := httpserver.NewErrorResponse(r, "too_many_auth_failures", "too many failed beat token attempts")
+	body, _ := json.Marshal(envelope)
 	body = append(body, '\n')
 	h := w.Header()
 	h.Set("Content-Type", "application/json")

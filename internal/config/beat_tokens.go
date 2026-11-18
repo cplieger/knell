@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/cplieger/go/envx"
-	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/httpserver/v2"
 )
 
 // maxBeatTokenEntries bounds BEAT_TOKENS: two entries per beat at the

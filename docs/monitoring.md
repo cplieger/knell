@@ -30,8 +30,8 @@ This page lists what knell logs and the metrics it publishes, and how to load th
 | `knell_pre_route_refusals_total{reason}` | counter | Requests refused before routing: `non_canonical_beat_path` or `host_not_allowed`. A diagnostic, see below |
 | `knell_auth_failures_total{reason}` | counter | Refused tokens. `invalid_token` matched no line, `beat_not_allowed` named a beat its line does not cover, and `throttled` was answered `429` without a covering token |
 | `knell_beats_recorded_while_throttled_total{beat}` | counter | Valid pings knell recorded although it answered them `429`: the sender's address passed its own limit, or the shared limit was full while the address was not exempt |
-| `knell_http_requests_total{method,path,status}` | counter | Served requests by route template, never the raw path. Host and malformed-path refusals have `path="unmatched"` |
-| `knell_http_request_duration_seconds` | histogram | Request latency across all endpoints, with no labels |
+| `knell_http_requests_total{method,path,status}` | counter | Requests the ping listener served, by route template, never the raw path. Host and malformed-path refusals have `path="unmatched"`. The operations listener's own `/healthz` and `/metrics` requests are not counted |
+| `knell_http_request_duration_seconds` | histogram | Ping listener request latency across all routes, with no labels |
 | `knell_build_info{version}` | gauge | Always `1`. `version` is the running release. A rule joins on it to read `process_*` for knell alone, whatever the scrape job is named |
 
 The page also carries the Go runtime and process families (`go_*`, `process_*`) under the names Go's official Prometheus client uses, so stock Go dashboards work.

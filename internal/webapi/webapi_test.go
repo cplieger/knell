@@ -16,7 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/knell/internal/watch"
@@ -101,7 +101,7 @@ func newTestHandler(b *fakeBeater, token string) http.Handler {
 // test control, so a test can drive a FAILING probe: /healthz answers 503
 // whenever the health verdict is unhealthy (boot, or after the pre-drain flip).
 func newTestHandlerHealthz(b *fakeBeater, token string, healthzStatus int) http.Handler {
-	return surface(New(b, depsFor(token, b.ids()...)), NewOps(OpsDeps{Healthz: staticHealthz(healthzStatus)}))
+	return surface(New(b, depsFor(token, b.ids()...)), testOps(staticHealthz(healthzStatus), nil))
 }
 
 // surface stands in for knell's two listeners in one handler: GET /healthz
@@ -126,6 +126,17 @@ func newBeatRequest(method, target string, body io.Reader) *http.Request {
 	req := httptest.NewRequest(method, target, body)
 	req.Header.Set("Authorization", "Bearer "+testBeatToken)
 	return req
+}
+
+// testOps stands in for the operations listener httpserver.ListenOps serves
+// in production: GET /healthz and /metrics behind the Host policy. The
+// listener's own behaviour is httpserver's to test; main_test.go wires the
+// real one.
+func testOps(healthz http.Handler, hosts *httpserver.HostPolicy) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("GET /healthz", healthz)
+	mux.Handle("GET /metrics", MetricsHandler())
+	return hosts.Middleware()(mux)
 }
 
 // staticHealthz stands in for health.Handler with a fixed verdict.
@@ -522,85 +533,6 @@ func TestMetricsExpositionGzip(t *testing.T) {
 	}
 }
 
-// TestProbePathAccessLogLevels pins the WithProbeLogLevel policy on knell's two
-// machine-probe endpoints: every request to them logs at Debug whatever its
-// status, so a standing 503 /healthz or a misaimed scraper never floods the
-// shipped stream, while every other path keeps its Info line.
-func TestProbePathAccessLogLevels(t *testing.T) {
-	tests := map[string]struct {
-		method        string
-		path          string
-		healthzStatus int
-		wantStatus    int
-		wantLevel     slog.Level
-	}{
-		"healthy healthz probe": {
-			method: http.MethodGet, path: "/healthz", healthzStatus: http.StatusOK,
-			wantStatus: http.StatusOK, wantLevel: slog.LevelDebug,
-		},
-		"healthy metrics scrape": {
-			method: http.MethodGet, path: "/metrics", healthzStatus: http.StatusOK,
-			wantStatus: http.StatusOK, wantLevel: slog.LevelDebug,
-		},
-		"failing healthz probe": {
-			method: http.MethodGet, path: "/healthz", healthzStatus: http.StatusServiceUnavailable,
-			wantStatus: http.StatusServiceUnavailable, wantLevel: slog.LevelDebug,
-		},
-		"wrong-method healthz probe": {
-			method: http.MethodPost, path: "/healthz", healthzStatus: http.StatusOK,
-			wantStatus: http.StatusMethodNotAllowed, wantLevel: slog.LevelDebug,
-		},
-		"wrong-method metrics scrape": {
-			method: http.MethodPost, path: "/metrics", healthzStatus: http.StatusOK,
-			wantStatus: http.StatusMethodNotAllowed, wantLevel: slog.LevelDebug,
-		},
-		// Everything off the probe list keeps the default Info access line.
-		"beat ping stays at info": {
-			method: http.MethodPost, path: "/beat/api", healthzStatus: http.StatusOK,
-			wantStatus: http.StatusOK, wantLevel: slog.LevelInfo,
-		},
-	}
-
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			// Serial (no t.Parallel): capture.Default swaps the process-global
-			// slog default. It must be installed BEFORE New, because
-			// httpserver.Logging resolves slog.Default() when the chain is built.
-			rec := capture.Default(t)
-			h := newTestHandlerHealthz(&fakeBeater{known: map[string]bool{"api": true}}, testBeatToken, tt.healthzStatus)
-
-			req := newBeatRequest(tt.method, tt.path, nil)
-			w := httptest.NewRecorder()
-			h.ServeHTTP(w, req)
-			if w.Code != tt.wantStatus {
-				t.Fatalf("%s %s = %d, want %d (body %s)", tt.method, tt.path, w.Code, tt.wantStatus, w.Body.String())
-			}
-
-			if got := rec.CountExact("http"); got != 1 {
-				t.Fatalf("access lines = %d %v, want exactly 1: no path is skipped any more, so every request leaves one line",
-					got, rec.Messages())
-			}
-			for _, lvl := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
-				want := 0
-				if lvl == tt.wantLevel {
-					want = 1
-				}
-				if got := rec.CountLevel(lvl, "http"); got != want {
-					t.Errorf("access lines at %v = %d, want %d (%s %s answered %d)",
-						lvl, got, want, tt.method, tt.path, tt.wantStatus)
-				}
-			}
-			// The line is only useful if it names what happened.
-			if !rec.HasAttr("http", "status", strconv.Itoa(tt.wantStatus)) {
-				t.Errorf("access line missing status=%d; records = %v", tt.wantStatus, rec.Records())
-			}
-			if !rec.HasAttr("http", "path", tt.path) {
-				t.Errorf("access line missing path=%s; records = %v", tt.path, rec.Records())
-			}
-		})
-	}
-}
-
 // TestNoStoreOnEveryRoute pins that no response knell serves is cacheable: a
 // cached ping response would let a sender believe a beat was recorded when the
 // request never reached the observer (false MISSING notice), and a cached
@@ -612,7 +544,6 @@ func TestNoStoreOnEveryRoute(t *testing.T) {
 	// ACCEPTED ping's 200, and a GET there is answered 405 instead.
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodPost, "/beat/api"},
-		{http.MethodGet, "/healthz"},
 		{http.MethodGet, "/metrics"},
 	} {
 		t.Run(tc.path, func(t *testing.T) {
@@ -880,7 +811,7 @@ func TestTokenGateScopedToBeatEndpoint(t *testing.T) {
 	// the docker healthcheck and the Prometheus scraper carry no
 	// Authorization header, and gating them would break liveness and the
 	// quorum ground truth.
-	h := NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK)})
+	h := testOps(staticHealthz(http.StatusOK), nil)
 
 	for _, path := range []string{"/healthz", "/metrics"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -998,8 +929,6 @@ func FuzzLoggedPathIsBounded(f *testing.F) {
 	f.Add("/beat/api")
 	f.Add("")
 	f.Add("/")
-	f.Add("/healthz")
-	f.Add("/metrics")
 	f.Add("/beat/" + strings.Repeat("a", 64))
 	f.Add("/beat/" + strings.Repeat("a", loggedPathCap-6))
 	f.Add("/beat/" + strings.Repeat("a", loggedPathCap-5))
@@ -1157,7 +1086,7 @@ func newShutdownHarness(t *testing.T, id string) (http.Handler, func(), *fakeClo
 	start := time.Unix(1_700_000_000, 0).UTC()
 	clock := &fakeClock{now: start}
 	watcher := watch.New([]watch.Beat{{ID: id, Deadline: time.Minute}}, &deliveringNotifier{}, clock.Now, start)
-	h := surface(New(watcher, depsFor(testBeatToken, id)), NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK)}))
+	h := surface(New(watcher, depsFor(testBeatToken, id)), testOps(staticHealthz(http.StatusOK), nil))
 	return h, watcher.StopAccepting, clock, start
 }
 
@@ -1640,12 +1569,6 @@ func TestUnroutedRequestsAreCountedUnderTheCollapsedSeries(t *testing.T) {
 			method: http.MethodGet, path: "/wp-admin/setup.php",
 			wantMethod: http.MethodGet, wantStatus: "404",
 		},
-		// A scrape aimed with the wrong method: /metrics is registered GET-only,
-		// so net/http's own 405 fires with no pattern matched.
-		"wrong-method scrape": {
-			method: http.MethodPost, path: "/metrics",
-			wantMethod: http.MethodPost, wantStatus: "405",
-		},
 		// An unrouted request whose METHOD is also caller-chosen text: the path
 		// collapses and the method buckets, so the pair stays bounded on both
 		// axes without either one disappearing.
@@ -1820,7 +1743,7 @@ func TestHostAllowlistBreaksDNSRebinding(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	hosts := hostPolicy(t, "knell.example")
 	h := surface(New(b, withHosts(depsFor(testBeatToken, b.ids()...), hosts)),
-		NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK), Hosts: hosts}))
+		testOps(staticHealthz(http.StatusOK), hosts))
 
 	tests := map[string]struct {
 		host       string
@@ -1925,7 +1848,7 @@ func TestHostRefusalKeepsTheStandardEnvelope(t *testing.T) {
 	b := &fakeBeater{known: map[string]bool{"api": true}}
 	hosts := hostPolicy(t, "knell.example")
 	h := surface(New(b, withHosts(depsFor(testBeatToken, b.ids()...), hosts)),
-		NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK), Hosts: hosts}))
+		testOps(staticHealthz(http.StatusOK), hosts))
 
 	// The refusal happens before the mux routes, so the path label is the
 	// "unmatched" marker rather than a /beat template — which is why the cause
