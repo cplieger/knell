@@ -5,6 +5,8 @@
 <!-- hub-overview BEGIN -->
 knell sends you a Discord message when a cron job, backup script or alerting pipeline stops checking in. Each job pings knell over HTTP. knell never runs the jobs.
 
+![The bundled Grafana dashboard's Overview tab showing two beats fresh with none past their deadline, the pings accepted and outages in 7 days, and a table of each beat with its state, last ping, deadline and time left](docs/images/header.png)
+
 ## What it does
 
 knell tells you when a scheduled job stops running:
