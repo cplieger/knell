@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,7 +18,7 @@ import (
 	"time"
 
 	"github.com/cplieger/go/health/v2"
-	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/go/slogx"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/notify"
@@ -70,10 +69,6 @@ func main() {
 // healthProbeTimeout sits inside the Dockerfile's 5s HEALTHCHECK --timeout, so
 // a hung listener fails the check with a written reason instead of a kill.
 const healthProbeTimeout = 4 * time.Second
-
-// opsShutdownGrace bounds the operations listener's own drain, which starts
-// only once the ping listener's Run has returned, so it adds to shutdownGrace.
-const opsShutdownGrace = time.Second
 
 // notServingReason is what /healthz reports while the verdict is unhealthy:
 // before the listeners are bound and from the start of a shutdown.
@@ -137,25 +132,27 @@ func run(args []string) error {
 		Hosts:          cfg.AllowedHosts,
 		TrustedProxies: cfg.TrustedProxies,
 	}))
-	opsSrv := newServer(webapi.NewOps(webapi.OpsDeps{
-		Healthz: healthzHandler(st),
-		Hosts:   cfg.AllowedHosts,
-	}))
 
 	// Bind both up front so a port-in-use error surfaces synchronously, and
 	// before the verdict goes healthy.
-	lc := &net.ListenConfig{}
-	ln, err := lc.Listen(ctx, "tcp", cfg.ListenAddr)
+	ln, err := httpserver.Listen(ctx, httpserver.ListenSetting{Name: "LISTEN_ADDR", Addr: cfg.ListenAddr})
 	if err != nil {
-		return classifyBindError(ctx, "LISTEN_ADDR", cfg.ListenAddr, err)
+		return classifyBindError(ctx, err)
 	}
-	opsLn, err := lc.Listen(ctx, "tcp", cfg.OpsListenAddr)
+	ops, err := httpserver.ListenOps(ctx, httpserver.OpsConfig{
+		Metrics: webapi.MetricsHandler(),
+		Healthz: healthzHandler(st),
+		Errors:  webapi.Errors,
+		Setting: "OPS_LISTEN_ADDR",
+		Addr:    cfg.OpsListenAddr,
+		Hosts:   cfg.AllowedHostNames,
+	})
 	if err != nil {
 		_ = ln.Close()
-		return classifyBindError(ctx, "OPS_LISTEN_ADDR", cfg.OpsListenAddr, err)
+		return classifyBindError(ctx, err)
 	}
 	ln = countAcceptErrors(ln)
-	slog.Info("listening", "addr", ln.Addr().String(), "ops_addr", opsLn.Addr().String())
+	slog.Info("listening", "addr", ln.Addr().String(), "ops_addr", ops.Addr().String())
 	st.Set(true)
 
 	watcherDone := make(chan struct{})
@@ -184,45 +181,11 @@ func run(args []string) error {
 	serveExit := httpserver.WithServeExit(func(exitCtx context.Context) {
 		watchLoopStopped = teardownAfterServeExit(exitCtx, srv, st, watcher.StopAccepting, stop, watcherDone)
 	})
-	err = serveListeners(ctx, stop, srv, ln, opsSrv, opsLn,
-		httpserver.WithTeardown(onShutdown), httpserver.WithShutdownGrace(shutdownGrace), preDrain, serveExit)
+	err = httpserver.RunWithOps(ctx, ops, httpserver.Served{
+		Server: srv, Listener: ln,
+		Options: []httpserver.RunOption{httpserver.WithTeardown(onShutdown), httpserver.WithShutdownGrace(shutdownGrace), preDrain, serveExit},
+	})
 	return classifyAbandonedWatchLoop(classifyServeError(err), watchLoopStopped)
-}
-
-// serveListeners serves srv on ln, with pingOpts, and opsSrv on opsLn until
-// ctx ends or either fails. The
-// operations listener outlives the ping listener's drain, so /healthz answers
-// 503 through it instead of refusing connections. If it stops on its own,
-// stop drains the ping listener as a signal would, and the joined error makes
-// knell exit non-zero for the restart policy.
-func serveListeners(ctx context.Context, stop context.CancelFunc, srv *http.Server, ln net.Listener, opsSrv *http.Server, opsLn net.Listener, pingOpts ...httpserver.RunOption) error {
-	opsCtx, stopOps := context.WithCancel(context.WithoutCancel(ctx))
-	defer stopOps()
-	opsDone := make(chan error, 1)
-	go func() {
-		opsDone <- httpserver.Run(opsCtx, opsSrv, opsLn, httpserver.WithShutdownGrace(opsShutdownGrace),
-			httpserver.WithServeExit(func(context.Context) { stop() }))
-	}()
-	err := httpserver.Run(ctx, srv, ln, pingOpts...)
-	stopOps()
-	return errors.Join(err, classifyOpsError(opsLn.Addr().String(), <-opsDone))
-}
-
-// classifyOpsError turns the operations listener's outcome into run's own
-// contract. A probe or scrape still in flight at the end of opsShutdownGrace
-// is cut off and warned about, never an exit error: the ping listener has
-// already drained and the watch loop has stopped. Any other error is the
-// listener failing on its own, which exits non-zero naming its address.
-func classifyOpsError(addr string, err error) error {
-	switch {
-	case err == nil:
-		return nil
-	case errors.Is(err, httpserver.ErrShutdownGraceExpired):
-		slog.Warn("operations listener requests were still in flight at the end of its shutdown grace and were cut off",
-			"ops_addr", addr, "grace", opsShutdownGrace.String())
-		return nil
-	}
-	return fmt.Errorf("operations listener on %s stopped: %w", addr, err)
 }
 
 func healthzHandler(st *health.Status) http.Handler {
@@ -265,12 +228,12 @@ func teardownAfterServeExit(exitCtx context.Context, srv *http.Server, st *healt
 // signal that arrives before the bind cancels the Listen itself, so
 // CausedByCancellation distinguishes that from a genuine bind failure (a port
 // conflict coinciding with a SIGTERM is still a port conflict).
-func classifyBindError(ctx context.Context, key, addr string, err error) error {
+func classifyBindError(ctx context.Context, err error) error {
 	if httpserver.CausedByCancellation(ctx, err) {
 		slog.Info("shutting down before the listener was bound")
 		return nil
 	}
-	return fmt.Errorf("binding %s %s: %w", key, addr, err)
+	return err
 }
 
 // watchBeats translates the config DTOs into the watch package's own input

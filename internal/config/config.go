@@ -6,11 +6,9 @@
 package config
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -22,7 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cplieger/go/envx"
-	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/go/slogx"
 )
 
@@ -98,6 +96,9 @@ type Config struct {
 	// AllowedHosts is the exact-match Host allowlist webapi applies. A nil or
 	// inactive policy accepts every Host (the documented default).
 	AllowedHosts *httpserver.HostPolicy
+	// AllowedHostNames are ALLOWED_HOSTS' entries, for the operations
+	// listener, which parses its own policy. Empty checks no Host.
+	AllowedHostNames []string
 	// TrustedProxies is the reverse-proxy CIDR set X-Forwarded-For is honored
 	// for. Empty (the default) keeps httpserver's spoof-proof behaviour: the
 	// access line's client_ip is the socket peer.
@@ -192,15 +193,18 @@ func Load(maxNodeNameBytes int, hostPolicyOpts ...httpserver.HostAllowlistOption
 
 	cfg.ListenAddr = ListenAddr()
 	cfg.OpsListenAddr = OpsListenAddr()
-	if addrErr := checkListenAddrs(cfg.ListenAddr, cfg.OpsListenAddr); addrErr != nil {
+	if addrErr := httpserver.CheckListenAddrs(
+		httpserver.ListenSetting{Name: "LISTEN_ADDR", Addr: cfg.ListenAddr},
+		httpserver.ListenSetting{Name: "OPS_LISTEN_ADDR", Addr: cfg.OpsListenAddr},
+	); addrErr != nil {
 		return cfg, addrErr
 	}
 
-	hosts, err := allowedHosts(hostPolicyOpts)
+	hosts, names, err := allowedHosts(hostPolicyOpts)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.AllowedHosts = hosts
+	cfg.AllowedHosts, cfg.AllowedHostNames = hosts, names
 
 	cfg.TrustedProxies = trustedProxies()
 
@@ -282,47 +286,14 @@ func hostnameNode() string {
 // non-blank value, else the default :9190. A blank value falls back to the
 // default rather than to "", which would bind an ephemeral port.
 func ListenAddr() string {
-	// TrimFunc with invisibleInURL, not TrimSpace: a pasted value can carry
-	// invisible runes TrimSpace keeps, which net.Listen then fails to resolve.
-	if addr := strings.TrimFunc(os.Getenv("LISTEN_ADDR"), invisibleInURL); addr != "" {
-		return addr
-	}
-	return defaultListenAddr
+	return httpserver.ListenAddr(os.Getenv("LISTEN_ADDR"), defaultListenAddr)
 }
 
 // OpsListenAddr resolves the operations listener's address, OPS_LISTEN_ADDR,
-// trimmed as ListenAddr trims, else the default :9191. Load and `knell
-// health` both read it here.
+// read as ListenAddr reads LISTEN_ADDR, else the default :9191. Load and
+// `knell health` both read it here.
 func OpsListenAddr() string {
-	if addr := strings.TrimFunc(os.Getenv("OPS_LISTEN_ADDR"), invisibleInURL); addr != "" {
-		return addr
-	}
-	return defaultOpsListenAddr
-}
-
-// checkListenAddrs refuses an operations address on the ping listener's port,
-// which would either fail to bind or put /metrics wherever pings are
-// reachable. Ports compare as the numbers net.Listen resolves, so 09190 is
-// 9190. Two port-0 addresses pass, as does a port that does not resolve,
-// which the bind itself then refuses naming the variable.
-func checkListenAddrs(listen, ops string) error {
-	listenPort, lok := resolvedPort(listen)
-	opsPort, ook := resolvedPort(ops)
-	if !lok || !ook || listenPort != opsPort || listenPort == 0 {
-		return nil
-	}
-	return fmt.Errorf("OPS_LISTEN_ADDR %.64q uses LISTEN_ADDR's port %d. /healthz and /metrics are served on their own port, %s unless OPS_LISTEN_ADDR is set, so give one of the two another port", ops, listenPort, defaultOpsListenAddr)
-}
-
-// resolvedPort is the port number addr's port resolves to, as net.Listen
-// would resolve it.
-func resolvedPort(addr string) (int, bool) {
-	_, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return 0, false
-	}
-	n, err := net.DefaultResolver.LookupPort(context.Background(), "tcp", port)
-	return n, err == nil
+	return httpserver.ListenAddr(os.Getenv("OPS_LISTEN_ADDR"), defaultOpsListenAddr)
 }
 
 // allowedHosts parses the ALLOWED_HOSTS exact-match Host allowlist. Unset
@@ -330,15 +301,15 @@ func resolvedPort(addr string) (int, bool) {
 // what breaks DNS rebinding on /metrics, which BEAT_TOKENS does not cover. Any
 // malformed entry fails startup, since dropping it would leave a partial
 // allowlist whose unlisted pings surface as false missing-beat alerts.
-func allowedHosts(opts []httpserver.HostAllowlistOption) (*httpserver.HostPolicy, error) {
+func allowedHosts(opts []httpserver.HostAllowlistOption) (*httpserver.HostPolicy, []string, error) {
 	const key = "ALLOWED_HOSTS"
-	raw := os.Getenv(key)
-	policy, invalid := httpserver.ParseHostList(strings.Split(raw, ","), opts...)
+	names := strings.Split(os.Getenv(key), ",")
+	policy, invalid := httpserver.ParseHostList(names, opts...)
 	if len(invalid) > 0 {
 		// %q escapes an invisible rune pasted in with the hostname.
-		return nil, fmt.Errorf("%s has %d entries no Host can ever match, so the allowlist knell would serve is not the one configured: %.64q. Use bare hostnames or IPs only, with no scheme, path or CIDR, for example localhost,10.0.0.5,knell.example.com. A lone port like :9190 belongs in LISTEN_ADDR", key, len(invalid), invalid[:min(len(invalid), 4)])
+		return nil, nil, fmt.Errorf("%s has %d entries no Host can ever match, so the allowlist knell would serve is not the one configured: %.64q. Use bare hostnames or IPs only, with no scheme, path or CIDR, for example localhost,10.0.0.5,knell.example.com. A lone port like :9190 belongs in LISTEN_ADDR", key, len(invalid), invalid[:min(len(invalid), 4)])
 	}
-	return policy, nil
+	return policy, names, nil
 }
 
 // trustedProxies parses TRUSTED_PROXIES into the CIDR set the access line

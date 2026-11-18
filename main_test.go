@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/cplieger/go/envx"
-	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/notify"
@@ -250,7 +250,7 @@ func TestRunFailsFastWhenTheListenAddressIsAlreadyBound(t *testing.T) {
 	if err == nil {
 		t.Fatal("run() = nil, want a bind error; an address already in use must fail the boot instead of leaving the watcher alerting behind a listener nothing can reach")
 	}
-	if !strings.Contains(err.Error(), "binding LISTEN_ADDR") {
+	if !strings.Contains(err.Error(), "LISTEN_ADDR \""+occupied.Addr().String()+"\"") {
 		t.Fatalf("run() = %v, want the bind failure surfaced to the caller, naming LISTEN_ADDR", err)
 	}
 	if strings.Contains(err.Error(), testWebhookSecret) {
@@ -277,7 +277,7 @@ func TestRunFailsFastWhenTheOpsListenAddressIsAlreadyBound(t *testing.T) {
 	if err == nil {
 		t.Fatal("run() = nil, want a bind error for the operations port")
 	}
-	if !strings.Contains(err.Error(), "binding OPS_LISTEN_ADDR "+occupied.Addr().String()) {
+	if !strings.Contains(err.Error(), "OPS_LISTEN_ADDR \""+occupied.Addr().String()+"\"") {
 		t.Fatalf("run() = %v, want the bind failure naming OPS_LISTEN_ADDR and its address", err)
 	}
 }
@@ -295,15 +295,12 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 
 	bindFailure := errors.New("listen tcp :9190: bind: address already in use")
 
-	got := classifyBindError(t.Context(), "LISTEN_ADDR", ":9190", bindFailure)
+	got := classifyBindError(t.Context(), bindFailure)
 	if got == nil {
 		t.Fatal("classifyBindError(live ctx) = nil, want the bind failure surfaced so the boot fails instead of running as a switch nothing can reach")
 	}
 	if !errors.Is(got, bindFailure) {
 		t.Errorf("classifyBindError = %v, want the bind failure still unwrappable", got)
-	}
-	if !strings.Contains(got.Error(), "LISTEN_ADDR :9190") {
-		t.Errorf("classifyBindError = %q, want the address named so the operator knows which port to free", got)
 	}
 	if rec.Contains("shutting down before the listener was bound") {
 		t.Errorf("a port conflict reported itself as a clean stop: %v", rec.Messages())
@@ -315,7 +312,7 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 	// A bind the signal itself cancelled: the error carries the cancellation, so
 	// this is the clean stop.
 	cancelledListen := fmt.Errorf("listen tcp :9190: %w", context.Canceled)
-	if got := classifyBindError(stopped, "LISTEN_ADDR", ":9190", cancelledListen); got != nil {
+	if got := classifyBindError(stopped, cancelledListen); got != nil {
 		t.Errorf("classifyBindError(cancelled listen) = %v, want nil: a signal arriving before the bind is a clean stop, not a boot failure", got)
 	}
 	if !rec.Contains("shutting down before the listener was bound") {
@@ -326,7 +323,7 @@ func TestClassifyBindErrorSeparatesAPreBindStopFromAPortConflict(t *testing.T) {
 	// conflict: the cancelled context is not evidence about this error, and
 	// swallowing it would exit 0 having never bound the listener a quorum
 	// depends on.
-	if got := classifyBindError(stopped, "LISTEN_ADDR", ":9190", bindFailure); got == nil {
+	if got := classifyBindError(stopped, bindFailure); got == nil {
 		t.Error("classifyBindError(cancelled ctx, genuine bind failure) = nil, want the failure surfaced: a cancelled context is not evidence that THIS error was the shutdown")
 	}
 }

@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/watch"
 )
@@ -56,7 +56,7 @@ func newGateHandler(t *testing.T, b *fakeBeater, clock *gateClock) http.Handler 
 		t.Fatal(err)
 	}
 	return surface(New(b, &Deps{Tokens: set, Covers: [][]string{{"a"}, {"b"}}, Beats: []string{"a", "b"}, Limiter: limiter}),
-		NewOps(OpsDeps{Healthz: staticHealthz(http.StatusOK)}))
+		testOps(staticHealthz(http.StatusOK), nil))
 }
 
 func newGateFixture(t *testing.T) (*fakeBeater, *gateClock, http.Handler) {
@@ -388,7 +388,7 @@ func TestUntrustedForwardingWarnsOnce(t *testing.T) {
 	for range 3 {
 		req := httptest.NewRequest(http.MethodPost, "/beat/a", nil)
 		req.RemoteAddr = "192.0.2.9:40000"
-		req.Header.Set("X-Forwarded-For", "203.0.113.200")
+		req.Header.Set("X-Forwarded-For", "8.8.8.8")
 		req.Header.Set("Authorization", "Bearer "+gateTokenA)
 		h.ServeHTTP(httptest.NewRecorder(), req)
 	}

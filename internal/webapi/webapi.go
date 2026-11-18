@@ -1,7 +1,6 @@
-// Package webapi assembles knell's two HTTP surfaces, each wrapped in the
-// standard middleware stack: the ping listener's beat ingestion endpoint
-// (New), and the operations listener's health endpoint and Prometheus
-// metrics (NewOps).
+// Package webapi assembles knell's ping listener: the beat ingestion endpoint
+// (New) in the standard middleware stack. The operations listener is
+// httpserver.ListenOps, wired in main.
 package webapi
 
 import (
@@ -12,7 +11,7 @@ import (
 	"net/netip"
 	"strings"
 
-	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/knell/internal/obs"
 	"github.com/cplieger/knell/internal/watch"
 )
@@ -60,15 +59,6 @@ type Deps struct {
 	TrustedProxies []netip.Prefix
 }
 
-// OpsDeps carries what the composition root supplies to the operations
-// listener.
-type OpsDeps struct {
-	// Healthz answers liveness.
-	Healthz http.Handler
-	// Hosts is the same ALLOWED_HOSTS policy the ping listener applies.
-	Hosts *httpserver.HostPolicy
-}
-
 // New assembles the ping listener's handler: the /beat routes only, so
 // /healthz and /metrics answer 404 there. The beat endpoint keeps no
 // lifecycle state of its own: watch.Watcher decides admission under the
@@ -112,41 +102,10 @@ func New(b Beater, deps *Deps) http.Handler {
 			}),
 		),
 		httpserver.Recoverer(),
-		// Immediately outside the Host policy, so a pre-route 403 collapses
-		// onto the "unmatched" label.
-		countHostRefusals(deps.Hosts),
 		deps.Hosts.Middleware(),
 		// Inside the Host policy, so a refused Host is refused as a Host (403)
 		// and not as an unknown beat.
 		canonicalBeatPath,
-	)
-}
-
-// NewOps assembles the operations listener's handler: GET /healthz and GET
-// /metrics, behind the same Host policy as the ping listener, with no
-// credential, since the docker healthcheck and the scraper carry none.
-func NewOps(deps OpsDeps) http.Handler {
-	mux := http.NewServeMux()
-	mux.Handle("GET /healthz", deps.Healthz)
-	mux.Handle("GET /metrics", obs.Handler())
-	return httpserver.Chain(mux,
-		httpserver.SecurityHeaders(),
-		httpserver.NoStore(),
-		// Debug whatever the status: the health verdict logs its own changes,
-		// and a failed scrape shows as up == 0.
-		httpserver.Logging(
-			httpserver.WithProbeLogLevel("/healthz", "/metrics"),
-			httpserver.WithMaxLoggedPath(loggedPathCap),
-			httpserver.WithRecordRouteMetric(func(m httpserver.RequestMetric) {
-				obs.RecordHTTP(m.Method, m.Path, m.Status, m.Latency)
-			}),
-		),
-		httpserver.Recoverer(),
-		// The /metrics text exposition is the only body that reaches Gzip's
-		// 1 KiB floor.
-		httpserver.Gzip(httpserver.WithGzipTypes("text/plain")),
-		countHostRefusals(deps.Hosts),
-		deps.Hosts.Middleware(),
 	)
 }
 
@@ -214,30 +173,32 @@ func throttledAtDebug(_ *http.Request, status int) slog.Level {
 	return slog.LevelInfo
 }
 
-// countHostRefusals counts an ALLOWED_HOSTS refusal by reason, reading the
-// verdict through the policy's own predicate rather than re-deriving it. An
-// inactive policy returns next unwrapped.
-func countHostRefusals(hosts *httpserver.HostPolicy) httpserver.Middleware {
-	if !hosts.Active() {
-		return func(next http.Handler) http.Handler { return next }
-	}
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !hosts.Allows(r) {
-				obs.RecordPreRouteRefusal(obs.RefusalHostNotAllowed)
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
+// MetricsHandler is the /metrics body: never cached, since a stale beat_fresh
+// would hide the quorum alert, and gzipped for a scraper that asks.
+func MetricsHandler() http.Handler {
+	return httpserver.Chain(obs.Handler(),
+		httpserver.NoStore(),
+		httpserver.Gzip(httpserver.WithGzipTypes("text/plain")),
+	)
 }
 
 // HostPolicyOptions is the ALLOWED_HOSTS policy shape knell ships: exempt for
-// knell's own probe (httpserver.WithLoopbackExempt), with the
-// ALLOWED_HOSTS-naming 403 envelope.
+// knell's own probe (httpserver.WithLoopbackExempt), refusing through Errors.
 func HostPolicyOptions() []httpserver.HostAllowlistOption {
 	return []httpserver.HostAllowlistOption{
 		httpserver.WithLoopbackExempt(true),
-		httpserver.WithHostAllowlistError(httpserver.ErrorCode(obs.RefusalHostNotAllowed),
-			"host not allowed. Add it to ALLOWED_HOSTS to serve this hostname"),
+		httpserver.WithHostResponder(Errors),
 	}
 }
+
+// Errors writes every refusal of both listeners. A refused Host is counted by
+// reason and answers a message naming ALLOWED_HOSTS.
+func Errors(w http.ResponseWriter, r *http.Request, status int, code httpserver.ErrorCode, msg string) {
+	if code == hostNotAllowed {
+		obs.RecordPreRouteRefusal(obs.RefusalHostNotAllowed)
+		msg = "host not allowed. Add it to ALLOWED_HOSTS to serve this hostname"
+	}
+	httpserver.WriteError(w, r, status, code, msg)
+}
+
+const hostNotAllowed httpserver.ErrorCode = "host_not_allowed"
