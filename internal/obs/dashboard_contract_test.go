@@ -596,6 +596,53 @@ func attentionTile(name, expr string) string {
 	return `0 * max(` + read + `"$instance"})`
 }
 
+// TestDashboardEmptyInstanceReadsArePaired fails when a query reads a rule's
+// alerts with instance="" for a rule whose alerts always carry an instance
+// (it has no absent call), or without also reading them with
+// instance="$instance" in the same query, so no panel can stay empty while the
+// rule fires for the picked instance.
+func TestDashboardEmptyInstanceReadsArePaired(t *testing.T) {
+	d := loadDashboard(t)
+	rules := shippedRules(t)
+	// alertMatch is the alertname an ALERTS selector reads and its instance
+	// matcher, "" for a part that is neither.
+	alertMatch := func(sel selectorBlock) (name, instance string) {
+		if sel.name != "ALERTS" {
+			return "", ""
+		}
+		for _, part := range sel.parts {
+			if v, ok := strings.CutPrefix(part, "alertname="); ok {
+				name = strings.Trim(v, `"`)
+			}
+			if v, ok := strings.CutPrefix(part, "instance="); ok {
+				instance = v
+			}
+		}
+		return name, instance
+	}
+	for where, expr := range dashboardQueries(&d) {
+		sels := selectors(bracedVariableRe.ReplaceAllString(expr, "$$v"))
+		for _, sel := range sels {
+			name, instance := alertMatch(sel)
+			if name == "" || instance != `""` {
+				continue
+			}
+			paired := slices.ContainsFunc(sels, func(o selectorBlock) bool {
+				on, oi := alertMatch(o)
+				return on == name && oi == `"$instance"`
+			})
+			switch rule, ok := rules[name]; {
+			case !ok:
+				t.Errorf("%s reads %s with instance=\"\", which names no rule in %s", where, name, promqlRules)
+			case !absentCallRe.MatchString(promqlCode(rule)):
+				t.Errorf("%s reads %s with instance=\"\", but %s has no absent call, so its alerts always carry an instance and this read finds none", where, name, name)
+			case !paired:
+				t.Errorf("%s reads %s with instance=\"\" but not with instance=\"$instance\" in the same query: a read of only instance=\"\" misses the rule's alerts for the picked instance", where, name)
+			}
+		}
+	}
+}
+
 // TestDashboardOverviewMirrorsEveryShippedRule fails when a rule in
 // alerts/promql.yaml has no Overview tile, a tile names a rule the file does
 // not hold or does not name it in its description, a Needs attention tile's
