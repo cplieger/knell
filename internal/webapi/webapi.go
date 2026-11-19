@@ -101,7 +101,7 @@ func New(b Beater, deps *Deps) http.Handler {
 				obs.RecordHTTP(m.Method, m.Path, m.Status, m.Latency)
 			}),
 		),
-		httpserver.Recoverer(),
+		httpserver.Recoverer(httpserver.WithRecoverResponder(Errors)),
 		deps.Hosts.Middleware(),
 		// Inside the Host policy, so a refused Host is refused as a Host (403)
 		// and not as an unknown beat.
@@ -138,16 +138,14 @@ func inBeatNamespace(p string) bool {
 // and HEAD are deliberately absent from the Allow set: neither records a beat.
 func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 	httpserver.SetAllow(w, http.MethodPost)
-	httpserver.WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed",
-		"use POST to record a beat")
+	Errors(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "use POST to record a beat")
 }
 
 // writeUnknownBeat refuses a ping that names no configured beat. It answers
 // every /beat path the route table matches and every non-canonical one
 // canonicalBeatPath refuses.
 func writeUnknownBeat(w http.ResponseWriter, r *http.Request) {
-	httpserver.WriteError(w, r, http.StatusNotFound, "unknown_beat",
-		"no beat at this URL. Check the id against BEATS, and check the URL for extra or repeated path segments")
+	Errors(w, r, http.StatusNotFound, "unknown_beat", "no beat at this URL")
 }
 
 // drainBeatBody drains the deliberately ignored ping payload so keep-alive
@@ -190,15 +188,3 @@ func HostPolicyOptions() []httpserver.HostAllowlistOption {
 		httpserver.WithHostResponder(Errors),
 	}
 }
-
-// Errors writes every refusal of both listeners. A refused Host is counted by
-// reason and answers a message naming ALLOWED_HOSTS.
-func Errors(w http.ResponseWriter, r *http.Request, status int, code httpserver.ErrorCode, msg string) {
-	if code == hostNotAllowed {
-		obs.RecordPreRouteRefusal(obs.RefusalHostNotAllowed)
-		msg = "host not allowed. Add it to ALLOWED_HOSTS to serve this hostname"
-	}
-	httpserver.WriteError(w, r, status, code, msg)
-}
-
-const hostNotAllowed httpserver.ErrorCode = "host_not_allowed"

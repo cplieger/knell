@@ -61,13 +61,15 @@ The webhook URL is treated as a credential. It never appears in a log line or an
 | Status | Meaning |
 | --- | --- |
 | `200` | The ping was recorded |
-| `401` | The token is missing or matches no line of `BEAT_TOKENS` |
+| `401` | `unauthorized`: the token is missing or matches no line of `BEAT_TOKENS` |
 | `403` | `beat_not_allowed`: the token is valid, but its line does not name this beat. `host_not_allowed`: the `Host` is not in `ALLOWED_HOSTS` |
-| `404` | The id is not in `BEATS`, or the URL has an empty, extra or repeated path segment |
-| `405` | Any method other than `POST` |
-| `429` | The sender's address is throttled, after its own wrong tokens or because many addresses sent wrong tokens, with a `Retry-After` hint. A valid ping is still recorded |
+| `404` | `unknown_beat`: the id is not in `BEATS`, or the URL has an empty, extra or repeated path segment |
+| `405` | `method_not_allowed`: any method other than `POST` |
+| `429` | `too_many_auth_failures`: the sender's address is throttled, after its own wrong tokens or because many addresses sent wrong tokens, with a `Retry-After` hint. A valid ping is still recorded |
 | `431` | The request headers are larger than 8704 bytes |
-| `503` | knell is shutting down |
+| `503` | `shutting_down`: knell is shutting down |
+
+Every answer but `200` and `431` is a JSON body with `code`, `message`, `remediation` and `request_id`. `code` is the word the table names, and `remediation` says what to change before sending again.
 
 Only `POST` records. `GET` and `HEAD` are answered `405` and never feed the switch. Nothing that merely fetches a URL can keep a beat looking alive, such as a link preview, a crawler, an uptime prober or an image on a web page.
 

@@ -144,10 +144,10 @@ func (g *gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		obs.RecordAuthFailure(obs.AuthInvalidToken)
 		// RFC 9110 §11.6.1: a 401 must name at least one challenge.
 		httpserver.SetChallenge(w.Header(), httpserver.Challenge{Scheme: "Bearer"})
-		httpserver.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
+		Errors(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid beat token")
 	case verdictNotCovered:
 		obs.RecordAuthFailure(obs.AuthBeatNotAllowed)
-		httpserver.WriteError(w, r, http.StatusForbidden, "beat_not_allowed", "this token does not cover this beat")
+		Errors(w, r, http.StatusForbidden, "beat_not_allowed", "this token does not cover this beat")
 	case verdictUnknownID:
 		writeUnknownBeat(w, r)
 	case verdictCovers:
@@ -196,8 +196,7 @@ func (g *gate) record(w http.ResponseWriter, r *http.Request) bool {
 		httpserver.OK(w)
 		return true
 	case watch.BeatClosed:
-		httpserver.WriteError(w, r, http.StatusServiceUnavailable, "shutting_down",
-			"knell is shutting down and is no longer accepting beats")
+		Errors(w, r, http.StatusServiceUnavailable, "shutting_down", "knell is shutting down and is no longer accepting beats")
 	case watch.BeatUnknown:
 		writeUnknownBeat(w, r)
 	}
