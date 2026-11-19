@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/envx/v2"
 	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/config"

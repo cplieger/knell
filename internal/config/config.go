@@ -19,7 +19,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/envx/v2"
 	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/go/slogx"
 )
