@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cplieger/go/httpclient"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/knell/internal/watch"
 )
 
@@ -83,7 +84,7 @@ const userAgent = "knell (https://github.com/cplieger/knell)"
 // Discord-compatible webhook.
 type Discord struct {
 	client *http.Client
-	url    string
+	url    masked.Secret
 	// node is already escaped for Discord markdown, so it may occupy only a
 	// slot that RENDERS markdown (the content line, an embed field value).
 	// Escaping it again at a render site would publish the backslashes.
@@ -99,7 +100,7 @@ var _ watch.Notifier = (*Discord)(nil)
 // New builds a Discord notifier for the given webhook URL. node names this
 // observer instance in every message so multi-node deployments read as
 // distinct reports.
-func New(webhookURL, node string) *Discord {
+func New(webhookURL masked.Secret, node string) *Discord {
 	client := httpclient.New(attemptTimeout + 5*time.Second)
 	// Follow only a same-origin hop, never one net/http would rewrite to another
 	// method: the webhook POST must not be replayed as a bodyless GET, nor sent
@@ -447,7 +448,7 @@ func (e transportError) Unwrap() error { return e.cause }
 // call, and response cleanup, leaving the verdict to deliveryError. Every
 // error it returns is URL-free by construction.
 func (d *Discord) postAttempt(ctx context.Context, body []byte) (struct{}, error) {
-	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, d.url, bytes.NewReader(body))
+	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, d.url.Reveal(), bytes.NewReader(body))
 	if reqErr != nil {
 		// The raw error would embed the URL; report the cause only.
 		return struct{}{}, fmt.Errorf("building webhook request: %w", httpclient.LogSafeError(reqErr))

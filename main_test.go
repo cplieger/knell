@@ -13,8 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/envx/v2"
 	"github.com/cplieger/go/httpserver/v2"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/config"
 	"github.com/cplieger/knell/internal/notify"
@@ -128,7 +129,7 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 	// Serial (no t.Parallel): capture.Default swaps the process-global
 	// slog default to inspect the startup summary.
 	cfg := config.Config{
-		WebhookURL:    testWebhookURL,
+		WebhookURL:    masked.NewSecret(testWebhookURL),
 		WebhookSource: envx.SecretSourceEnv,
 		Node:          "node-1",
 		ListenAddr:    ":9190",
@@ -181,7 +182,7 @@ func TestLogConfigNeverLeaksWebhookURL(t *testing.T) {
 func TestLogConfigNeverPublishesTheBeatToken(t *testing.T) {
 	// Serial (no t.Parallel): swaps the process-global slog default.
 	cfg := config.Config{
-		WebhookURL: "https://discord.example/hook",
+		WebhookURL: masked.NewSecret("https://discord.example/hook"),
 		Node:       "node-1",
 		ListenAddr: ":9190",
 		Beats:      []config.Beat{{ID: "api", Deadline: 20 * time.Minute}},
