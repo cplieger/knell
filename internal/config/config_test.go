@@ -14,8 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/envx/v2"
 	"github.com/cplieger/go/httpserver/v2"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/notify"
 )
@@ -237,8 +238,8 @@ func TestLoad(t *testing.T) {
 	if len(cfg.Beats) != 1 || cfg.Beats[0].ID != "api" {
 		t.Errorf("Beats = %+v", cfg.Beats)
 	}
-	if cfg.WebhookURL != "https://discord.example/hook" {
-		t.Errorf("WebhookURL = %q", cfg.WebhookURL)
+	if cfg.WebhookURL.Reveal() != "https://discord.example/hook" {
+		t.Errorf("WebhookURL = %q", cfg.WebhookURL.Reveal())
 	}
 	if cfg.Node != "node-1" {
 		t.Errorf("Node = %q", cfg.Node)
@@ -628,8 +629,8 @@ func TestLoadWebhookFileWinsOverPlainVar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
-	if cfg.WebhookURL != "https://discord.example/file-borne-hook" {
-		t.Errorf("WebhookURL = %q, want the file-borne URL: DISCORD_WEBHOOK_URL_FILE wins, so a rotated webhook must not be shadowed by a stale plain variable every notice would 404 against", cfg.WebhookURL)
+	if cfg.WebhookURL.Reveal() != "https://discord.example/file-borne-hook" {
+		t.Errorf("WebhookURL = %q, want the file-borne URL: DISCORD_WEBHOOK_URL_FILE wins, so a rotated webhook must not be shadowed by a stale plain variable every notice would 404 against", cfg.WebhookURL.Reveal())
 	}
 	if !rec.Contains("the plain variable is ignored") || !rec.HasAttr("", "variable", "DISCORD_WEBHOOK_URL") {
 		t.Errorf("log output %v missing the both-channels-set warning that tells the operator the plain variable is ignored, carrying the ignored variable as a queryable attribute", rec.Messages())
@@ -765,8 +766,8 @@ func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 				t.Setenv("DISCORD_WEBHOOK_URL_FILE", hookFile)
 			},
 			check: func(t *testing.T, cfg Config) {
-				if !hasToken(cfg, "file-borne-beat-token") || cfg.WebhookURL != "https://discord.example/file-borne-hook" {
-					t.Fatalf("BeatToken = %q, WebhookURL = %q, want both from their _FILE channels", tokenSummary(cfg), cfg.WebhookURL)
+				if !hasToken(cfg, "file-borne-beat-token") || cfg.WebhookURL.Reveal() != "https://discord.example/file-borne-hook" {
+					t.Fatalf("BeatToken = %q, WebhookURL = %q, want both from their _FILE channels", tokenSummary(cfg), cfg.WebhookURL.Reveal())
 				}
 			},
 		},
@@ -782,8 +783,8 @@ func TestLoadNeverAdvisesUnsettingThePlainVarWrongly(t *testing.T) {
 				unsetEnv(t, "DISCORD_WEBHOOK_URL_FILE")
 			},
 			check: func(t *testing.T, cfg Config) {
-				if !hasToken(cfg, "plain-only-beat-token") || cfg.WebhookURL != "https://discord.example/hook" {
-					t.Fatalf("BeatToken = %q, WebhookURL = %q, want both read from their plain variables", tokenSummary(cfg), cfg.WebhookURL)
+				if !hasToken(cfg, "plain-only-beat-token") || cfg.WebhookURL.Reveal() != "https://discord.example/hook" {
+					t.Fatalf("BeatToken = %q, WebhookURL = %q, want both read from their plain variables", tokenSummary(cfg), cfg.WebhookURL.Reveal())
 				}
 			},
 		},
@@ -1146,8 +1147,8 @@ func TestLoadTrimsPaddedPlainWebhook(t *testing.T) {
 	// deliverable, and there is no second party that must reproduce the value.
 	// BEAT_TOKENS is the opposite case (see the test below) — senders must
 	// reproduce it byte for byte, so rewriting it is what breaks the gate.
-	if cfg.WebhookURL != "https://discord.example/hook" {
-		t.Errorf("WebhookURL = %q, want the padding trimmed", cfg.WebhookURL)
+	if cfg.WebhookURL.Reveal() != "https://discord.example/hook" {
+		t.Errorf("WebhookURL = %q, want the padding trimmed", cfg.WebhookURL.Reveal())
 	}
 	if !hasToken(cfg, "unit-test-beat-token") {
 		t.Errorf("BeatToken = %q, want the configured token verbatim", tokenSummary(cfg))
@@ -1564,8 +1565,8 @@ func TestLoadTrimsInvisibleConfigPadding(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load() error: %v: TrimSpace keeps these runes, so parseWebhookURL refuses a URL pasted out of a rendered page and the observer never starts", err)
 		}
-		if cfg.WebhookURL != "https://discord.example/api/webhooks/1/abc" {
-			t.Errorf("WebhookURL = %q, want the invisible padding trimmed: an untrimmed rune is percent-encoded on every POST, so Discord answers 404 forever and the switch can never ring", cfg.WebhookURL)
+		if cfg.WebhookURL.Reveal() != "https://discord.example/api/webhooks/1/abc" {
+			t.Errorf("WebhookURL = %q, want the invisible padding trimmed: an untrimmed rune is percent-encoded on every POST, so Discord answers 404 forever and the switch can never ring", cfg.WebhookURL.Reveal())
 		}
 	})
 
@@ -1661,7 +1662,7 @@ func TestConfigLogValueNeverRendersASecret(t *testing.T) {
 		secretToken = "leak-me-if-you-can-token"
 	)
 	cfg := Config{
-		WebhookURL:       secretHook,
+		WebhookURL:       masked.NewSecret(secretHook),
 		WebhookSource:    envx.SecretSourceEnv,
 		Node:             "node-a",
 		ListenAddr:       ":9190",
@@ -1713,11 +1714,11 @@ func TestConfigLogValueReportsEachCredentialSource(t *testing.T) {
 	}{
 		"the plain webhook variable leaves the credential in the environment": {
 			key: "DISCORD_WEBHOOK_URL", value: url, attr: "webhook",
-			field: func(cfg Config) string { return cfg.WebhookURL }, want: envx.SecretSourceEnv,
+			field: func(cfg Config) string { return cfg.WebhookURL.Reveal() }, want: envx.SecretSourceEnv,
 		},
 		"the webhook _FILE companion keeps it out of the environment": {
 			key: "DISCORD_WEBHOOK_URL", value: url, file: true, attr: "webhook",
-			field: func(cfg Config) string { return cfg.WebhookURL }, want: envx.SecretSourceFile,
+			field: func(cfg Config) string { return cfg.WebhookURL.Reveal() }, want: envx.SecretSourceFile,
 		},
 		"the plain token variable leaves the token in the environment": {
 			key: "BEAT_TOKENS", value: "api:" + token, attr: "beat_tokens",
@@ -1794,7 +1795,7 @@ func TestConfigLogValueReportsEveryNonSecretField(t *testing.T) {
 		// zero fixture renders the same "0" an unset TRUSTED_PROXIES does and
 		// would assert nothing, and 1 cannot be told apart from a boolean.
 		TrustedProxies: proxies,
-		WebhookURL:     "https://discord.example/hook",
+		WebhookURL:     masked.NewSecret("https://discord.example/hook"),
 		WebhookSource:  envx.SecretSourceFile,
 		Node:           "observer-1",
 		ListenAddr:     "127.0.0.1:19190",

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/go/httpclient"
+	"github.com/cplieger/go/masked"
 )
 
 // FuzzDeliveryErrorNeverCarriesWebhookURL checks that arbitrary response
@@ -216,7 +217,7 @@ func assertTypedStatusError(t *testing.T, gotErr error, requested bool, status i
 func attemptAgainstStub(t *testing.T, rawURL string, status int, body string) (requested bool, err error) {
 	t.Helper()
 
-	d := New(rawURL, "node-1")
+	d := New(masked.NewSecret(rawURL), "node-1")
 	defer d.Close()
 	d.client.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		requested = true
@@ -380,7 +381,7 @@ func locationNeedles(location string) []string {
 func attemptAgainstRedirectStub(t *testing.T, rawURL string, status int, location string) error {
 	t.Helper()
 
-	d := New(rawURL, "node-1")
+	d := New(masked.NewSecret(rawURL), "node-1")
 	defer d.Close()
 	d.client.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		if _, copyErr := io.Copy(io.Discard, r.Body); copyErr != nil {

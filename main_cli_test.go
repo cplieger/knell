@@ -39,7 +39,9 @@ func TestMain(m *testing.M) {
 // wrong gate), anything else overrides. os/exec keeps the last duplicate, so a
 // caller's own LOG_LEVEL still wins.
 func childEnv(env []string) []string {
-	out := append(os.Environ(), "LOG_LEVEL=info")
+	// atexit_sleep_ms=0: under -race each child would otherwise sleep a
+	// second at exit.
+	out := append(os.Environ(), "LOG_LEVEL=info", "GORACE=atexit_sleep_ms=0")
 	for _, e := range env {
 		if key, val, _ := strings.Cut(e, "="); val == "" {
 			out = slices.DeleteFunc(out, func(entry string) bool {

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cplieger/go/httpclient"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 	"github.com/cplieger/knell/internal/watch"
 )
@@ -69,7 +70,7 @@ func (rec *webhookRecorder) handler(t *testing.T) http.HandlerFunc {
 func newTestNotifier(t *testing.T, webhookURL, node string) *Discord {
 	t.Helper()
 
-	d := New(webhookURL, node)
+	d := New(masked.NewSecret(webhookURL), node)
 	d.client.Transport = &http.Transport{}
 	return d
 }
@@ -1431,7 +1432,7 @@ func TestCrossPortRedirectIsNotDelivery(t *testing.T) {
 
 func redirectOnce(t *testing.T, from, to string) (sent int, err error) {
 	t.Helper()
-	d := New(from, "node-1")
+	d := New(masked.NewSecret(from), "node-1")
 	defer d.Close()
 	d.client.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		sent++

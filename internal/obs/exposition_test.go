@@ -38,6 +38,9 @@ func TestExpositionMatchesGolden(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "exposition")
 	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestExpositionMatchesGolden$", "-test.count=1", expositionChild, path)
+	// atexit_sleep_ms=0: under -race the child would otherwise sleep a second
+	// at exit.
+	cmd.Env = append(os.Environ(), "GORACE=atexit_sleep_ms=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("child scrape: %v\n%s", err, out)
 	}

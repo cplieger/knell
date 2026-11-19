@@ -19,8 +19,9 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/envx/v2"
 	"github.com/cplieger/go/httpserver/v2"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx"
 )
 
@@ -103,7 +104,7 @@ type Config struct {
 	// for. Empty (the default) keeps httpserver's spoof-proof behaviour: the
 	// access line's client_ip is the socket peer.
 	TrustedProxies []netip.Prefix
-	WebhookURL     string
+	WebhookURL     masked.Secret
 	// WebhookSource is the channel DISCORD_WEBHOOK_URL arrived through, as envx
 	// names it: the one non-secret FACT about the credential worth publishing at
 	// startup, since the plain variable sits in `docker inspect` output.
@@ -404,7 +405,9 @@ func resolveSecret(key envx.Key, setButEmpty, missing error) (string, envx.Secre
 	value, src, err := envx.SecretWithSource(key)
 	switch {
 	case err == nil:
-		return value, src, nil
+		// Revealed for this package's own trim and parse only; each caller
+		// masks what it keeps (loadWebhook) or stores it hashed (BEAT_TOKENS).
+		return value.Reveal(), src, nil
 	case errors.As(err, new(*envx.MissingError)):
 		if v, ok := os.LookupEnv(string(key)); ok && v == "" {
 			return "", src, setButEmpty
@@ -429,20 +432,20 @@ var errWebhookRequired = errors.New("DISCORD_WEBHOOK_URL is required")
 // and the channel it arrived through. Only https is accepted: the URL's own
 // path carries the webhook credential, so plain http would send it in
 // cleartext.
-func loadWebhook() (string, envx.SecretSource, error) {
+func loadWebhook() (masked.Secret, envx.SecretSource, error) {
 	webhook, src, err := resolveSecret("DISCORD_WEBHOOK_URL", errWebhookSetButEmpty, errWebhookRequired)
 	if err != nil {
-		return "", src, err
+		return masked.Secret{}, src, err
 	}
 	webhook = strings.TrimFunc(webhook, invisibleInURL)
 	if webhook == "" {
-		return "", src, fileSourcedValueError("DISCORD_WEBHOOK_URL", src, errWebhookSetButEmpty)
+		return masked.Secret{}, src, fileSourcedValueError("DISCORD_WEBHOOK_URL", src, errWebhookSetButEmpty)
 	}
 	if _, err := parseWebhookURL(webhook); err != nil {
-		return "", src, fileSourcedValueError("DISCORD_WEBHOOK_URL",
+		return masked.Secret{}, src, fileSourcedValueError("DISCORD_WEBHOOK_URL",
 			src, fmt.Errorf("DISCORD_WEBHOOK_URL: %w", err))
 	}
-	return webhook, src, nil
+	return masked.NewSecret(webhook), src, nil
 }
 
 // parseBeats parses the BEATS spec list: comma-separated "id:deadline"
