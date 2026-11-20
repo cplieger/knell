@@ -21,7 +21,7 @@ func TestCodeSpecs_matchSource(t *testing.T) {
 	}
 	httpservertest.CheckCodeSpecs(t, ".", written)
 	for code := range written {
-		if spec, ok := catalog.Lookup(string(code)); !ok || spec.Remediation == "" {
+		if spec, ok := catalog.Lookup(code); !ok || spec.Remediation == "" {
 			t.Errorf("catalog has no remediation for %q", code)
 		}
 	}
