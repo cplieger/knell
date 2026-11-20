@@ -6,8 +6,8 @@ github.com/cplieger/go/httpclient v1.2.0 h1:E+lbIpiNkUkcq3fxdMDYn116cwx6tU1XWmn4
 github.com/cplieger/go/httpclient v1.2.0/go.mod h1:couTQSCNdgNwOotbaQREGcM4CjUKZJ4Bdb7FSkNwL8U=
 github.com/cplieger/go/httpserver/v2 v2.0.0-dev.13 h1:XZl3Ld2sMcS5I1gTlfrsFROOzSQnKwR9umje8jjCI9w=
 github.com/cplieger/go/httpserver/v2 v2.0.0-dev.13/go.mod h1:w6gBJDFGQjaYD9/9ozzKk4zY5xYQAdQCmrg2RpsRLcE=
-github.com/cplieger/go/httpwire v1.0.0-dev.6 h1:kWRnWEwa8QViVlwV9VXuOzxsFQXr0NjuJobNgJkEmRk=
-github.com/cplieger/go/httpwire v1.0.0-dev.6/go.mod h1:i8/DLhKvW5jdZ9Q0Dmy8yHeOjH/3VnAnew+/j2mI9yg=
+github.com/cplieger/go/httpwire v1.0.0-dev.7 h1:Xg45xBlST7XatJGHvTAx5vK6WJm5HBOjAhV9UMDmatE=
+github.com/cplieger/go/httpwire v1.0.0-dev.7/go.mod h1:kdjB3MOTGBgxsBBl/XhBpH8QJZN+j1ASK6LFkoCYHMA=
 github.com/cplieger/go/masked v1.0.0-dev.1 h1:Do4+avpvVJP//Jm4LLH1y468Rxrz966dAgESVp/z7wU=
 github.com/cplieger/go/masked v1.0.0-dev.1/go.mod h1:jRx6ZGlfjrDaAQ5n8MTd023wl5rLuacKmtDbnJgrD+g=
 github.com/cplieger/go/measure/v2 v2.1.0-dev.2 h1:Y0zNUFSubYyBdMqS1MpDX5x2qc7Rdr3dnQf/isRAWvI=
