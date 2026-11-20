@@ -26,11 +26,11 @@ const hostNotAllowed httpserver.ErrorCode = "host_not_allowed"
 var catalog = func() *httpwire.Catalog {
 	c := httpwire.NewCatalog()
 	for code, spec := range codeSpecs {
-		if err := c.Add(string(code), spec); err != nil {
+		if err := c.Add(code, spec); err != nil {
 			panic(err)
 		}
 	}
-	if err := c.SetRemediation(string(hostNotAllowed), "Add the host name you sent to ALLOWED_HOSTS, or send one it lists."); err != nil {
+	if err := c.SetRemediation(hostNotAllowed, "Add the host name you sent to ALLOWED_HOSTS, or send one it lists."); err != nil {
 		panic(err)
 	}
 	return c
